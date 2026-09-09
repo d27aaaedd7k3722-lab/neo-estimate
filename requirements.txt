@@ -2,6 +2,7 @@ streamlit
 google-genai
 pypdf
 pdf2image
+pypdfium2
 python-dotenv
 pandas
 Pillow
