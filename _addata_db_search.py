@@ -250,9 +250,18 @@ class AddataSearchEngine:
         decoded = bytes(b ^ 0xFF for b in raw)
         lines = decoded.split(b'\r\n') if b'\r\n' in decoded else decoded.split(b'\n')
         parts = {}
+        # ref_no ごとに、その参照番号が指す（大区分, 枝番）を集める。
+        # 同じ ref_no に別の枝番のレコードがあると、価格一致だけではどれか決められない。
+        _codes: dict[int, set] = {}
 
         for line in lines:
             if len(line) < 55:
+                continue
+            # 部品レコード（先頭2バイトが '12'）だけを見る。
+            # 種別を確かめずに固定位置を読むと、ヘッダや別種別のレコードから
+            # 部品コードを拾って .neo に出しかねない。
+            # （auto_matching.AddataEngine.load_parts_master も同じ条件）
+            if line[0:2] != b'12':
                 continue
             try:
                 ref_str = line[44:48].decode('ascii', errors='replace').strip()
@@ -274,11 +283,28 @@ class AddataSearchEngine:
                     qty = int(m.group(1))
 
                 methods = line[52:55].decode('ascii', errors='replace').strip() if len(line) > 55 else ''
+                # コグニセブンは「部品コード大区分＋枝番」で部品を特定する。
+                # ここで拾わないと、PDF直接経路で作った .neo の
+                # ERParts.PartsCode / PartsCodeSub が空のままになる。
+                # バイト位置は auto_matching.AddataEngine.load_parts_master と同じ。
+                section_code = line[6:8].decode('cp932', errors='replace').strip()
+                line_no = line[10:13].decode('cp932', errors='replace').strip()
 
+                _codes.setdefault(ref_no, set()).add((section_code, line_no))
                 if ref_no not in parts or qty > parts[ref_no].get('quantity', 1):
-                    parts[ref_no] = {'name': name, 'quantity': qty, 'methods': methods}
+                    parts[ref_no] = {'name': name, 'quantity': qty, 'methods': methods,
+                                     'section_code': section_code, 'line_no': line_no}
             except (ValueError, IndexError):
                 continue
+
+        # 同じ ref_no に別の（大区分, 枝番）を持つレコードがあるものは、
+        # どれが該当するかを価格一致だけでは決められない。
+        # 誤った部品コードを協定見積に書くくらいなら出さない。
+        # （J87 では 756 件中 58 件がこれに当たる）
+        for _rn, _cs in _codes.items():
+            if len(_cs) > 1 and _rn in parts:
+                parts[_rn]['section_code'] = ''
+                parts[_rn]['line_no'] = ''
 
         self._cache[cache_key] = parts
         return parts
@@ -498,6 +524,11 @@ class AddataSearchEngine:
                     'total_price': best['price'] * qty,
                     'work_code': best['work_code'],
                     'grade_flags': best['grade_flags'],
+                    # コグニセブンが部品を特定する「大区分＋枝番」。
+                    # ここに載せないと、呼び出し側（_full_addata_match）が
+                    # 読めず、.neo の PartsCode / PartsCodeSub が空になる。
+                    'section_code': p12.get('section_code', ''),
+                    'line_no': p12.get('line_no', ''),
                 })
             else:
                 # 価格ゼロのエントリのみ (参照用に追加)
@@ -511,6 +542,8 @@ class AddataSearchEngine:
                     'total_price': 0,
                     'work_code': r['work_code'],
                     'grade_flags': r['grade_flags'],
+                    'section_code': p12.get('section_code', ''),
+                    'line_no': p12.get('line_no', ''),
                 })
 
         return result

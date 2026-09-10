@@ -2148,15 +2148,14 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
         it["addata_matched"] = level in ("L1", "L2", "L3")
         # app.py の generate_neo_file は ERParts.PartsCode / PartsCodeSub を
         # `_master_section_code` / `_master_branch_code` から書く。
-        # ただしこの経路が使う _addata_db_search.AddataSearchEngine の部品レコードは
-        # name / ref_no / methods しか持たず、部品コード大区分（section_code）と
-        # 枝番（line_no）を露出していない。そのため PDF 直接経路（modes B/C）で
-        # 作った .neo は、照合が当たっていても部品コードが空のままになる。
-        # 【未対応】ここを埋めるには _addata_db_search 側の 12.DB 解析を拡張して
-        # section_code / line_no を返すようにする必要がある（次の周の課題）。
-        # 前の照合の値が残らないよう、いまは明示的に空にしておく。
-        it["_master_section_code"] = ""
-        it["_master_branch_code"] = ""
+        # この経路の L1/L2 は「DB価格があり、OCR単価も 0 より大きく、
+        # 価格差が 2% 未満」のときだけなので、価格で裏が取れている。
+        # L3（価格相違・単価なし・DB価格なし）と L4 では入れない。
+        _code_ok = level in ("L1", "L2")
+        it["_master_section_code"] = (str(entry.get("section_code", "") or "")
+                                      if _code_ok else "")
+        it["_master_branch_code"] = (str(entry.get("line_no", "") or "")
+                                     if _code_ok else "")
         # v13 Step B (iter_006/007): ADDATA 由来の name 上書きは N4 を逆に悪化させたためロールバック。
         # ADDATA マスタの全角カナ表記が正解 NEO の半角カナと記号差で乖離するケースが多く、
         # OCR の半角カナ寄りの値の方が一致しやすい。db_parts_name は参照用に保存のみ。

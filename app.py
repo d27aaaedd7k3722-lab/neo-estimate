@@ -4717,127 +4717,161 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
         pages = _reordered
     _logw(f"③ ページ分割: {len(pages) if pages else 1}ページ")
 
-    # ③-b&c ラスタライズ: PDF→JPEG変換（行ズレ防止）
-    # 最終ページ（合計欄）と1ページ目（車両情報）を並列でラスタライズ
-    raster_bytes       = file_bytes
-    raster_mime        = mime_type
-    first_raster_bytes = file_bytes
-    first_raster_mime  = mime_type
-    if use_rasterize and mime_type == 'application/pdf':
-        try:
-            from pypdf import PdfReader
-            num_pages = len(PdfReader(io.BytesIO(file_bytes)).pages)
-        except Exception:
-            num_pages = 1
-        last_page_idx = max(0, num_pages - 1)
-        # 最終ページと1ページ目を並列ラスタライズ（直列から並列化 → ~2s節約）
-        def _raster_last(_):
-            return rasterize_pdf_page(file_bytes, last_page_idx, dpi=300, enhance=use_enhance)
-        def _raster_first(_):
-            return rasterize_pdf_page(file_bytes, 0, dpi=300, enhance=use_enhance)
-        with ThreadPoolExecutor(max_workers=2) as _ex:
-            _fut_last  = _ex.submit(_raster_last, None)
-            _fut_first = _ex.submit(_raster_first, None)
-            img  = _fut_last.result()
-            img1 = _fut_first.result()
-        if img:
-            raster_bytes = img
-            raster_mime  = 'image/jpeg'
-        if img1:
-            first_raster_bytes = img1
-            first_raster_mime  = 'image/jpeg'
+    # 明細抽出は一番重い呼び出し（30秒〜2分）で、このあとの合計欄の解析とは
+    # 入力も結果も独立している（合計欄の値は結果のマージにしか使わない）。
+    # 合計欄の後ろに直列で置くと、その待ち時間がまるごと積み上がるので、
+    # ページ並べ替えが終わって file_bytes が確定したこの時点で先に投げ、
+    # 合計欄の処理が終わってから結果だけ受け取る。
+    _detail_ex = ThreadPoolExecutor(max_workers=1)
+    _fut_detail = None
+    try:
+        _fut_detail = _detail_ex.submit(
+            analyze_estimate_single, api_key, file_bytes, 'application/pdf',
+            used_model, 1, 1, bool(tax_inclusive))
+    except Exception as _e_sub:
+        _logw(f"③ 明細解析の先行実行に失敗（直列で続行）: {_e_sub}")
+        _detail_ex.shutdown(wait=False)
+        _detail_ex = None
 
-    # ④ 1パス目: 合計値＋車両情報抽出
-    _cb(20, "③ 合計金額・車両情報を読み取り中...（10〜20秒）")
-    # 合計欄は最終ページ、車両情報は1ページ目にあることが多い
-    # 複数ページの場合は最終ページと1ページ目を並列でAPI呼び出し（直列から並列化 → ~10s節約）
-    _need_first_page = bool(pages and len(pages) > 1 and first_raster_bytes != raster_bytes)
-    if _need_first_page:
-        with ThreadPoolExecutor(max_workers=2) as _ex:
-            _fut_totals = _ex.submit(
-                analyze_estimate_totals, api_key, raster_bytes, raster_mime, used_model)
-            _fut_first  = _ex.submit(
-                analyze_estimate_totals, api_key, first_raster_bytes, first_raster_mime, used_model)
-            totals_data     = _fut_totals.result() or {}
-            first_page_data = _fut_first.result() or {}
-    else:
-        totals_data = analyze_estimate_totals(api_key, raster_bytes, raster_mime, used_model) or {}
-    if _need_first_page:
-        # 車両情報は1ページ目の結果を優先
-        vinfo_first = first_page_data.get('vehicle_info', {})
-        # 応答がトップレベルに car_name 等を返してきた場合も拾う。
-        # プロンプトの出力形式と消費側のキーがずれていた名残で、
-        # 拾わないと車両情報が丸ごと捨てられる。
-        _flat_vi = {k: totals_data.get(k) for k in
-                    ('car_name', 'car_model', 'engine_model', 'color_code',
-                     'color_name', 'trim_code', 'grade', 'model_year',
-                     'chassis_no', 'mileage')
-                    if totals_data.get(k) and str(totals_data.get(k)).strip()
-                    and str(totals_data.get(k)).strip() != '不明'}
-        vinfo_last  = dict(_flat_vi)
-        vinfo_last.update(totals_data.get('vehicle_info', {}) or {})
-        merged_vinfo = {k: (vinfo_first.get(k) or vinfo_last.get(k, '')) for k in
-                        set(list(vinfo_first.keys()) + list(vinfo_last.keys()))}
-        totals_data['vehicle_info'] = merged_vinfo
-        # 税区分判定: 最終ページ不明の場合、1ページ目の判定を優先採用
-        # 例: 「内消費税」「(税込)」表記は1ページ目にある場合が多い
-        last_basis  = totals_data.get('amount_basis', 'unknown')
-        first_basis = first_page_data.get('amount_basis', 'unknown')
-        if last_basis not in ('tax_inclusive', 'tax_exclusive') and first_basis in ('tax_inclusive', 'tax_exclusive'):
-            totals_data['amount_basis'] = first_basis
-            totals_data['tax_reason']   = first_page_data.get('tax_reason', totals_data.get('tax_reason', ''))
-        # 合計値の補完: 最終ページに合計がない場合（pdf_grand_total=0）、1ページ目の値を使用
-        # 例: Honda Cars系フォーマット（合計がページ1ヘッダのサマリーボックスに記載）
-        last_grand = safe_int(totals_data.get('pdf_grand_total', 0))
-        if last_grand == 0:
-            first_grand = safe_int(first_page_data.get('pdf_grand_total', 0))
-            if first_grand > 0:
-                totals_data['pdf_grand_total'] = first_grand
-                # 部品合計・工賃合計・値引きも1ページ目から補完（最終ページに0の場合のみ）
-                if safe_int(totals_data.get('pdf_parts_total', 0)) == 0:
-                    totals_data['pdf_parts_total'] = first_page_data.get('pdf_parts_total', 0)
-                if safe_int(totals_data.get('pdf_wage_total', 0)) == 0:
-                    totals_data['pdf_wage_total'] = first_page_data.get('pdf_wage_total', 0)
-                if safe_int(totals_data.get('discount_amount', 0)) == 0:
-                    totals_data['discount_amount'] = first_page_data.get('discount_amount', 0)
-    target_parts = safe_int(totals_data.get('pdf_parts_total', 0))
-    target_wage  = safe_int(totals_data.get('pdf_wage_total', 0))
-    pdf_grand    = safe_int(totals_data.get('pdf_grand_total', 0))
-    discount     = safe_int(totals_data.get('discount_amount', 0))
-    _logw(f"④ 合計抽出: 部品計={target_parts:,} / 工賃計={target_wage:,} / 総合計={pdf_grand:,} / 値引={discount:,}")
+    # 先に投げた明細解析は、このあとの処理（ラスタライズ・合計欄の解析など）が
+    # 途中で例外を投げても必ず閉じる。閉じないと、画面がエラーを出したあとも
+    # ワーカースレッドが残る。
+    try:
 
-    # ④-a Honda Cars形式: pypdfで正確な合計値を取得（Gemini誤読を防ぐ）
-    # Geminiは「小計 195,398 482,976」の数値を誤認することがある。
-    # pypdf解析は列レイアウトに依存しないため確実。
-    if mime_type == 'application/pdf':
-        # 補助的な抽出。ここでの失敗が明細抽出を巻き込まないようにする。
-        try:
-            _pypdf_totals = extract_honda_cars_subtotals(file_bytes)
-        except Exception:
-            _pypdf_totals = None
-        if _pypdf_totals:
-            _pypdf_parts, _pypdf_wages = _pypdf_totals
-            import sys
-            print(f"[INFO] Honda Cars pypdf合計: 部品={_pypdf_parts:,}, 工賃={_pypdf_wages:,} "
-                  f"(Gemini推測: 部品={target_parts:,}, 工賃={target_wage:,})", file=sys.stderr)
-            target_parts = _pypdf_parts
-            target_wage  = _pypdf_wages
-            totals_data['pdf_parts_total'] = _pypdf_parts
-            totals_data['pdf_wage_total']  = _pypdf_wages
 
-    # ⑤ 2パス目: 明細抽出（PDF全ページを一括送信 — ページ境界ズレを防ぐ）
-    _cb(45, f"④ 明細行を解析中...（{len(pages) if pages else 1}ページ / 30秒〜2分かかる場合があります）")
-    _page_count = len(pages) if pages else 1
-    _logw(f"⑤ 全ページ一括解析開始 ({_page_count}ページ)")
-    # 全ページを1リクエストで送っているので、ページ指定の文言は付けない。
-    # 「これは全Nページ中の1ページ目です」と指示すると、2ページ目以降の
-    # 明細を読ませない方向にモデルを誘導してしまう。
-    result = analyze_estimate_single(
-        api_key, file_bytes, 'application/pdf', used_model, 1, 1,
-        # 税込表記であることをモデルに伝える。伝えないと、税込金額を
-        # 勝手に税抜へ割り戻される誤読を防ぐ指示が届かない。
-        tax_inclusive=bool(tax_inclusive)
-    ) or {}
+        # ③-b&c ラスタライズ: PDF→JPEG変換（行ズレ防止）
+        # 最終ページ（合計欄）と1ページ目（車両情報）を並列でラスタライズ
+        raster_bytes       = file_bytes
+        raster_mime        = mime_type
+        first_raster_bytes = file_bytes
+        first_raster_mime  = mime_type
+        if use_rasterize and mime_type == 'application/pdf':
+            try:
+                from pypdf import PdfReader
+                num_pages = len(PdfReader(io.BytesIO(file_bytes)).pages)
+            except Exception:
+                num_pages = 1
+            last_page_idx = max(0, num_pages - 1)
+            # 最終ページと1ページ目を並列ラスタライズ（直列から並列化 → ~2s節約）
+            def _raster_last(_):
+                return rasterize_pdf_page(file_bytes, last_page_idx, dpi=300, enhance=use_enhance)
+            def _raster_first(_):
+                return rasterize_pdf_page(file_bytes, 0, dpi=300, enhance=use_enhance)
+            with ThreadPoolExecutor(max_workers=2) as _ex:
+                _fut_last  = _ex.submit(_raster_last, None)
+                _fut_first = _ex.submit(_raster_first, None)
+                img  = _fut_last.result()
+                img1 = _fut_first.result()
+            if img:
+                raster_bytes = img
+                raster_mime  = 'image/jpeg'
+            if img1:
+                first_raster_bytes = img1
+                first_raster_mime  = 'image/jpeg'
+
+        # ④ 1パス目: 合計値＋車両情報抽出
+        _cb(20, "③ 合計金額・車両情報を読み取り中...（10〜20秒）")
+        # 合計欄は最終ページ、車両情報は1ページ目にあることが多い
+        # 複数ページの場合は最終ページと1ページ目を並列でAPI呼び出し（直列から並列化 → ~10s節約）
+        _need_first_page = bool(pages and len(pages) > 1 and first_raster_bytes != raster_bytes)
+        if _need_first_page:
+            with ThreadPoolExecutor(max_workers=2) as _ex:
+                _fut_totals = _ex.submit(
+                    analyze_estimate_totals, api_key, raster_bytes, raster_mime, used_model)
+                _fut_first  = _ex.submit(
+                    analyze_estimate_totals, api_key, first_raster_bytes, first_raster_mime, used_model)
+                totals_data     = _fut_totals.result() or {}
+                first_page_data = _fut_first.result() or {}
+        else:
+            totals_data = analyze_estimate_totals(api_key, raster_bytes, raster_mime, used_model) or {}
+        if _need_first_page:
+            # 車両情報は1ページ目の結果を優先
+            vinfo_first = first_page_data.get('vehicle_info', {})
+            # 応答がトップレベルに car_name 等を返してきた場合も拾う。
+            # プロンプトの出力形式と消費側のキーがずれていた名残で、
+            # 拾わないと車両情報が丸ごと捨てられる。
+            _flat_vi = {k: totals_data.get(k) for k in
+                        ('car_name', 'car_model', 'engine_model', 'color_code',
+                         'color_name', 'trim_code', 'grade', 'model_year',
+                         'chassis_no', 'mileage')
+                        if totals_data.get(k) and str(totals_data.get(k)).strip()
+                        and str(totals_data.get(k)).strip() != '不明'}
+            vinfo_last  = dict(_flat_vi)
+            vinfo_last.update(totals_data.get('vehicle_info', {}) or {})
+            merged_vinfo = {k: (vinfo_first.get(k) or vinfo_last.get(k, '')) for k in
+                            set(list(vinfo_first.keys()) + list(vinfo_last.keys()))}
+            totals_data['vehicle_info'] = merged_vinfo
+            # 税区分判定: 最終ページ不明の場合、1ページ目の判定を優先採用
+            # 例: 「内消費税」「(税込)」表記は1ページ目にある場合が多い
+            last_basis  = totals_data.get('amount_basis', 'unknown')
+            first_basis = first_page_data.get('amount_basis', 'unknown')
+            if last_basis not in ('tax_inclusive', 'tax_exclusive') and first_basis in ('tax_inclusive', 'tax_exclusive'):
+                totals_data['amount_basis'] = first_basis
+                totals_data['tax_reason']   = first_page_data.get('tax_reason', totals_data.get('tax_reason', ''))
+            # 合計値の補完: 最終ページに合計がない場合（pdf_grand_total=0）、1ページ目の値を使用
+            # 例: Honda Cars系フォーマット（合計がページ1ヘッダのサマリーボックスに記載）
+            last_grand = safe_int(totals_data.get('pdf_grand_total', 0))
+            if last_grand == 0:
+                first_grand = safe_int(first_page_data.get('pdf_grand_total', 0))
+                if first_grand > 0:
+                    totals_data['pdf_grand_total'] = first_grand
+                    # 部品合計・工賃合計・値引きも1ページ目から補完（最終ページに0の場合のみ）
+                    if safe_int(totals_data.get('pdf_parts_total', 0)) == 0:
+                        totals_data['pdf_parts_total'] = first_page_data.get('pdf_parts_total', 0)
+                    if safe_int(totals_data.get('pdf_wage_total', 0)) == 0:
+                        totals_data['pdf_wage_total'] = first_page_data.get('pdf_wage_total', 0)
+                    if safe_int(totals_data.get('discount_amount', 0)) == 0:
+                        totals_data['discount_amount'] = first_page_data.get('discount_amount', 0)
+        target_parts = safe_int(totals_data.get('pdf_parts_total', 0))
+        target_wage  = safe_int(totals_data.get('pdf_wage_total', 0))
+        pdf_grand    = safe_int(totals_data.get('pdf_grand_total', 0))
+        discount     = safe_int(totals_data.get('discount_amount', 0))
+        _logw(f"④ 合計抽出: 部品計={target_parts:,} / 工賃計={target_wage:,} / 総合計={pdf_grand:,} / 値引={discount:,}")
+
+        # ④-a Honda Cars形式: pypdfで正確な合計値を取得（Gemini誤読を防ぐ）
+        # Geminiは「小計 195,398 482,976」の数値を誤認することがある。
+        # pypdf解析は列レイアウトに依存しないため確実。
+        if mime_type == 'application/pdf':
+            # 補助的な抽出。ここでの失敗が明細抽出を巻き込まないようにする。
+            try:
+                _pypdf_totals = extract_honda_cars_subtotals(file_bytes)
+            except Exception:
+                _pypdf_totals = None
+            if _pypdf_totals:
+                _pypdf_parts, _pypdf_wages = _pypdf_totals
+                import sys
+                print(f"[INFO] Honda Cars pypdf合計: 部品={_pypdf_parts:,}, 工賃={_pypdf_wages:,} "
+                      f"(Gemini推測: 部品={target_parts:,}, 工賃={target_wage:,})", file=sys.stderr)
+                target_parts = _pypdf_parts
+                target_wage  = _pypdf_wages
+                totals_data['pdf_parts_total'] = _pypdf_parts
+                totals_data['pdf_wage_total']  = _pypdf_wages
+
+        # ⑤ 2パス目: 明細抽出（PDF全ページを一括送信 — ページ境界ズレを防ぐ）
+        _cb(45, f"④ 明細行を解析中...（{len(pages) if pages else 1}ページ / 30秒〜2分かかる場合があります）")
+        _page_count = len(pages) if pages else 1
+        _logw(f"⑤ 全ページ一括解析開始 ({_page_count}ページ)")
+        # 全ページを1リクエストで送っているので、ページ指定の文言は付けない。
+        # 「これは全Nページ中の1ページ目です」と指示すると、2ページ目以降の
+        # 明細を読ませない方向にモデルを誘導してしまう。
+        # 税込表記であることをモデルに伝える指示は、先に投げた呼び出しに含めてある。
+        if _fut_detail is not None:
+            result = _fut_detail.result() or {}
+        else:
+            result = analyze_estimate_single(
+                api_key, file_bytes, 'application/pdf', used_model, 1, 1,
+                tax_inclusive=bool(tax_inclusive)
+            ) or {}
+    except BaseException:
+        # 途中で失敗したときは、先に投げた明細解析の結果を捨てる。
+        # まだ動き出していなければ取り消せる（走り始めていたら止められないが、
+        # 少なくとも結果を待たずに抜ける）。
+        if _fut_detail is not None:
+            _fut_detail.cancel()
+        raise
+    finally:
+        if _detail_ex is not None:
+            _detail_ex.shutdown(wait=False)
     result.setdefault('items', [])
     result.setdefault('short_parts_wage', 0)
     result['pdf_parts_total']   = target_parts or safe_int(result.get('pdf_parts_total', 0))
