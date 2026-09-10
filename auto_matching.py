@@ -1357,11 +1357,11 @@ def _clear_master_codes(it):
     """照合できなかった行から、前回の照合で入った部品コードを捨てる。
 
     照合器は入力の dict をコピーして使うため、前の車両・前の照合で
-    `_master_section_code` / `_master_branch_code` が入っていると、
-    今回 L4（DBに該当なし）と判断した行にも古い部品コードが残る。
-    app.py はそれを ERParts の PartsCode / PartsCodeSub に書くので、
-    別の部品のコードが協定見積に載ってしまう。
+    `_master_ref_no` が入っていると、今回 L4（DBに該当なし）と
+    判断した行にも古い部品コードが残る。app.py はそれを
+    ERParts.PartsCode に書くので、別の部品のコードが協定見積に載ってしまう。
     """
+    it["_master_ref_no"] = ""
     it["_master_section_code"] = ""
     it["_master_branch_code"] = ""
 
@@ -1556,16 +1556,25 @@ def match_pdf_items_to_addata(items, vehicle_info, addata_root=ADDATA_ROOT):
             # そのときは価格で裏が取れていない。部品コードは部品を断定する情報なので、
             # 品番のフォールバックと同じく、見積に金額のある行だけに入れる。
             _code_ok = level in ('L1', 'L2') and pdf_price > 0
-            it['_master_section_code'] = (
-                str((matched or {}).get('section_code', '') or '')
-                if _code_ok else '')
-            # 枝番。app.py が ERParts.PartsCodeSub に書くために読むキーだが、
-            # これまでどこからも値が入らず、生成した .neo の枝番が常に空だった。
-            # コグニセブンは「部品コード大区分＋枝番」で部品を特定するので、
-            # 枝番が無いと部品が確定しない。大区分と同じく、採用した行だけに入れる。
-            it['_master_branch_code'] = (
-                str((matched or {}).get('line_no', '') or '')
-                if _code_ok else '')
+            # コグニセブンの ERParts.PartsCode は、部品マスタ(*12.DB)の
+            # 参照番号（ref_no）を4桁ゼロ埋めしたもの。実機の .neo 202件・
+            # 明細11,254行すべてが4桁で、'0010' のように先頭ゼロも付く。
+            # 帳票のいちばん左「ｺｰﾄﾞ」列にそのまま印字される。
+            # 以前は *12.DB の別の欄（section_code='35' 等）を入れており、
+            # 協定見積の部品コード欄に無関係な値が並んでいた。
+            _ref = (matched or {}).get('ref_no', -1)
+            try:
+                _ref = int(_ref)
+            except (TypeError, ValueError):
+                _ref = -1
+            it['_master_ref_no'] = (
+                '%04d' % _ref if (_code_ok and 0 <= _ref <= 9999) else '')
+            # PartsCodeSub（枝番）は実機では -1 が既定。同じ参照番号に
+            # ぶら下がる手入力材料（接着剤など）にだけ 1,2,… が入る。
+            # 自由入力行 536行はすべて -1 だった。app.py 側で -1 を書くため、
+            # ここでは値を持たせない。
+            it['_master_section_code'] = ''
+            it['_master_branch_code'] = ''
             it['match_level'] = level
             it['match_note'] = note
             it['price_diff_pct'] = price_diff_pct
@@ -2188,16 +2197,23 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
         it["parts_no_marked"] = marked
         # v12 Phase C-1: addata_matched フラグ
         it["addata_matched"] = level in ("L1", "L2", "L3")
-        # app.py の generate_neo_file は ERParts.PartsCode / PartsCodeSub を
-        # `_master_section_code` / `_master_branch_code` から書く。
+        # app.py の generate_neo_file は ERParts.PartsCode を `_master_ref_no`
+        # から書く。実機の PartsCode は部品マスタの参照番号(ref_no)を
+        # 4桁ゼロ埋めした文字列で、帳票のいちばん左「ｺｰﾄﾞ」列に印字される。
         # この経路の L1/L2 は「DB価格があり、OCR単価も 0 より大きく、
         # 価格差が 2% 未満」のときだけなので、価格で裏が取れている。
         # L3（価格相違・単価なし・DB価格なし）と L4 では入れない。
         _code_ok = level in ("L1", "L2")
-        it["_master_section_code"] = (str(entry.get("section_code", "") or "")
-                                      if _code_ok else "")
-        it["_master_branch_code"] = (str(entry.get("line_no", "") or "")
-                                     if _code_ok else "")
+        try:
+            _ref_i = int(ref_no)
+        except (TypeError, ValueError):
+            _ref_i = -1
+        it["_master_ref_no"] = ("%04d" % _ref_i
+                                if (_code_ok and 0 <= _ref_i <= 9999) else "")
+        # PartsCodeSub（枝番）は実機の自由入力行 536行すべてが -1 で、
+        # app.py 側が -1 を書く。古いキーは互換のため空で置くだけにする。
+        it["_master_section_code"] = ""
+        it["_master_branch_code"] = ""
         # v13 Step B (iter_006/007): ADDATA 由来の name 上書きは N4 を逆に悪化させたためロールバック。
         # ADDATA マスタの全角カナ表記が正解 NEO の半角カナと記号差で乖離するケースが多く、
         # OCR の半角カナ寄りの値の方が一致しやすい。db_parts_name は参照用に保存のみ。

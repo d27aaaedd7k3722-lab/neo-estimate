@@ -65,8 +65,13 @@ exp = {'towing': 20000, 'rental_car': 15000, 'tax_exempt': 11000}
 neo = P._call_generate_neo(TPL, {}, items, is_beta_mode=True, expenses=exp)
 cur, t = totals(neo)
 rows = [r for r in cur.execute('select LineNo, WageOutTax from Expense') if r[1]]
-chk(sorted(rows) == [(5, 20000), (7, 15000), (8, 11000)],
-    f'2: PDF経路の Expense が {rows}（期待 LineNo5=20000/7=15000/8=11000）')
+# レッカー=LineNo5「レッカー代１」/ 非課税=LineNo8「その他控除」は固定費目名。
+# 代車は固定費目に無いので LineNo9 の自由行に費目名ごと入れる（実機と同じ）。
+chk(sorted(rows) == [(5, 20000), (8, 11000), (9, 15000)],
+    f'2: PDF経路の Expense が {rows}（期待 LineNo5=20000/8=11000/9=15000）')
+_nm = dict(cur.execute('select LineNo, Name from Expense').fetchall())
+chk((_nm.get(9) or '').strip() == '代車費用',
+    f'2c: 代車の費目名が {_nm.get(9)!r}（期待 代車費用）')
 chk(t[9] == 112200, f'2b: PDF経路の Total={t[9]:,}（期待 112,200）')
 
 print('REG_EXPENSE:', 'ALL PASS' if not FAIL else f'FAIL {len(FAIL)}件')

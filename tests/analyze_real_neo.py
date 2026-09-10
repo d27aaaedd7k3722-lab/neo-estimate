@@ -116,10 +116,13 @@ def report_erparts(smb):
     print("")
     print("  ▼ 判定のしかた")
     print("    A 作業区分コード : 品名から入力した区分を思い出し、DisposalCode との対応を見る")
-    print("                       （このアプリは 取替=0 / 脱着=1 / 修理=2 で書いている）")
-    print("    B 区分を空欄にした行の DisposalCode（このアプリは -1）")
-    print("    C PartsPriceByManual / OrderFlag（このアプリは '*' / '9'）")
-    print("    D TimeStandard（このアプリは -1）")
+    print("                       取替0 / 脱着1 / 修理2 / 板金6 / 脱着修理3 /")
+    print("                       点検・調整・点検調整4 / 分解調整5")
+    print("                       （実機の AnDefine.ini [WorkSheet] の定義。2026-09-10 確定）")
+    print("    B 区分を空欄にした行の DisposalCode（実機の自由入力行は -1）")
+    print("    C PartsPriceByManual / OrderFlag（自由入力行は '*' と '9' も実機にある値）")
+    print("    D TimeStandard（実機の自由入力行は 0。WageStandard* も 0、")
+    print("                    PartsPriceStandard* だけが -1）")
     print("    E 枝番の先頭ゼロ: PartsCodeSub が 00101 → 101 になっていないか")
 
     # 空欄行（品名だけ入れて区分を空にした行）の候補を拾う
@@ -165,7 +168,8 @@ def report_total(smb):
         if k in cols:
             print("    %-30s = %r" % (k, row[cols.index(k)]))
     print("")
-    print("    F 代車費用   : どの欄に入っているか（このアプリは LineNo=7「写真代他」）")
+    print("    F 代車費用   : LineNo=1〜8 は固定費目名。実機は LineNo=9 以降の")
+    print("                   自由行に費目名ごと書く")
     print("    G 非課税項目 : 正の値で加算か、実機は減算か")
     print("    H レッカー代 : hy_WageTaxTotalOutTax と hy_Wrecker1OutTax の両方に入っているか、")
     print("                   実機が内訳から再計算するなら二重計上になる")
@@ -198,7 +202,8 @@ def report_era(files):
         e = text.find("</%s>" % tag, s)
         print("    <%s> = %r" % (tag, text[s + len(tag) + 2:e]))
     print("")
-    print("    令和の車なら Era=5 か（このアプリは 明治1〜令和5 で書いている）")
+    print("    実機の AnEra.ini [EraValue]: 西暦1 / 昭和2 / 平成3 / 令和4")
+    print("    年・月はゼロ埋めなし、CarRegistedDate は西暦 'YYYY/MM'")
 
 
 # ── J: AnNote.ini の1レコード長 ──────────────────────────────────────────
@@ -224,8 +229,12 @@ def report_annote(files, smb):
         if size % n_rows == 0:
             print("  実測 = %d バイト/行" % (size // n_rows))
     print("")
-    print("    このアプリは 142 バイト固定長で書いている（仕様書も142）。")
-    print("    実機が 144（142＋CRLF）なら、71行目以降が丸ごとずれる。")
+    print("    実機は 144 バイト（本体142＋CRLF）。実機202件すべてで確認済み。")
+    print("    レコードの中身: [0:8]行番号 [8:12]部品コード [12:13]枝番")
+    print("                    [13:14]作業区分 [14:38]品名 [38:62]標準品名")
+    print("                    [62:80]品番 [80:98]標準品番 [98:100]数量")
+    print("                    [100:105]由来（マスタ'00000'/手入力' 0000'）")
+    print("                    [127:133]'F99999'")
     print("")
     print("  ▼ 先頭2レコードを 142 / 144 の両方で切って表示")
     for width in (142, 144):

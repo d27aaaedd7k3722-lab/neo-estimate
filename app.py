@@ -52,6 +52,8 @@ import traceback
 import pandas as pd
 import threading
 from concurrent.futures import ThreadPoolExecutor
+# コグニセブンの「既存見積」一覧が読む先頭424Bの管理領域を書くために使う
+import neo_header
 
 # ============================================================
 # 定数・設定
@@ -74,11 +76,30 @@ def now_jst():
     return datetime.datetime.now(JST)
 
 # ヘッダXML <CarRegistedDateEra> の元号コード。
-# 【実機確認が必要】この対応は日本のシステムで一般的な並び順によるもので、
-# コグニセブンの実機で確認できていない。テンプレート原本は初度登録が
-# 空欄のまま 4 を持っているだけで、根拠にならなかった。
-# 誤っていた場合はここだけ直せば済むように1か所にまとめている。
-_ERA_CODE = {'明治': '1', '大正': '2', '昭和': '3', '平成': '4', '令和': '5'}
+# 実機の元号設定ファイル（Auda7/AudaData/Const/AnEra.ini）の [EraValue] が
+# 西暦=1 令和=4 平成=3 昭和=2 と定めている。実機の .neo 202件でも
+# Era=4 は 2020〜2023年、Era=3 は 2009〜2018年で、この対応で一致した。
+# 以前は明治を1として1つずつ後ろにずらしており、令和の車が 5 として
+# 書かれていた。コグニセブンに 5 という元号は無く、初度登録が化ける。
+# コグニセブンに明治・大正は無いので、来たら空欄（元号なし）に落とす。
+_ERA_CODE = {'西暦': '1', '昭和': '2', '平成': '3', '令和': '4'}
+
+
+def normalized_reg_date(raw) -> str:
+    """初度登録年月を YYYYMM00 に正規化する。元号を決められないものは '00000000'。
+
+    コグニセブンが扱える元号は昭和・平成・令和だけ（AnEra.ini）。
+    大正以前や月が 00 の値をそのまま通すと、見積本体DBには 19260100 が入り、
+    ヘッダXMLは空欄になってテンプレートの値が残るため、同じ .neo の中に
+    初度登録が2通り入る。ここで1か所に決めて、DB・XML の両方から使う。
+    """
+    d = _normalize_ym8(raw) or '00000000'
+    if d == '00000000':
+        return '00000000'
+    era, era_year = get_era_info(d)
+    if era_year == '0000' or era not in _ERA_CODE or d[4:6] == '00':
+        return '00000000'
+    return d
 
 
 def best_intax_for(intax_total):
@@ -810,10 +831,11 @@ def extract_files(full_raw, entries):
 def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclusive=False, is_beta_mode=False):
     """ERParts/Expense/Total を更新（値引き行の負工賃も対応）
     expenses: {
-        'towing': レッカー費用,              # LineNo=5「レッカー代１」
-        'rental_car': 代車費用,              # LineNo=7「写真代他」（専用行が無いため）
-        'short_parts': ショートパーツ,       # LineNo=4（short_parts_wageと同義）
-        'tax_exempt': 非課税費用,            # LineNo=8「その他控除」（消費税なし）
+        'towing': レッカー費用,              # LineNo=5「レッカー代１」（固定費目名）
+        'rental_car': 代車費用,              # LineNo=9（自由行。費目名も書く）
+        'tax_exempt': 非課税費用,            # LineNo=8「その他控除」（OutTaxFlag=1）
+    ショートパーツは expenses ではなく引数 short_parts_wage で受け取り、
+    LineNo=4 の部品欄に入れる（実機も部品列に出す）。
     }
     is_tax_inclusive: True の場合、items の金額は税込値として扱い、
                      OutTax/InTax/Tax を正しく逆算する。
@@ -1092,29 +1114,55 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         # 推定に掛けると「調整」の2文字が修理系の語に当たって
         # 「修理」区分の部品行になり、コグニセブン上で説明できない行になる。
         if not method and not str(item.get('name', '')).startswith('※金額調整'):
-            _name_for_detect = str(item.get('name', ''))
+            # 見積書の品名は半角カナで書かれることが多い（「ｼｮｰﾄﾊﾟｰﾂ」「ﾍﾟｲﾝﾄ」）。
+            # 生の文字列で照合すると、全角で書いたキーワードに当たらず、
+            # 区分なしの行になってしまう。区分の文字列と同じく NFKC で
+            # 揃えてから探す（半角カナ→全角カナ、全角英数→半角英数）。
+            _name_for_detect = unicodedata.normalize(
+                'NFKC', str(item.get('name', '')))
             _parts_amt = safe_int(item.get('parts_amount', 0))
             _wage_amt  = safe_int(item.get('wage', 0))
-            # ルール7: 研磨・磨き・写真代・ショートパーツは空白のまま（最優先）
-            if any(kw in _name_for_detect for kw in ('研磨', '磨き', '写真代', 'ショートパーツ')):
-                method = ''
-            # ルール1: 部品金額あり・工賃なし → 取替
-            elif _parts_amt > 0 and _wage_amt == 0:
+            # 上から順に見て、最初に当たった語を区分にする。
+            # (探す語, 区分として書く文字列)。書く文字列が None なら、
+            # 当たった語そのものを使う。DisposalName は帳票の「修理方法」に
+            # そのまま印字されるので、見積書に「脱着板金」と書いてあった行を
+            # 「脱着修理」に書き換えない（区分コードはどちらも 3 で同じ）。
+            #
+            # 並び順に意味がある。複合語（2語以上）を単独の語より先に置く。
+            # 「脱着修理」を「脱着」より後ろに置くと脱着（コード1）に取られ、
+            # 実機の 3 にならない。
+            _INFER = (
+                # 複合区分
+                (('脱着修理', '脱着鈑金', '脱着板金'), None),
+                (('点検調整', '点検清掃'), None),
+                (('磨き調整',), None),
+                (('分解調整', '分解清掃'), None),
+                # 研磨・磨き・写真代・ショートパーツは区分なしのまま。
+                # 原本に区分が書かれていないものを勝手に決めない。
+                # （「磨き調整」は上で拾うのでここには来ない）
+                (('研磨', '磨き', '写真代', 'ショートパーツ'), ''),
+                # 単独区分
+                (('取替', '交換', '取換', '取り替え'), '取替'),
+                (('脱着', '取外', '取付', '組付', '脱外'), '脱着'),
+                (('鈑金', '板金'), None),
+                (('塗装', 'ペイント', 'ワックス', '加算', 'ブース'), '塗装'),
+                (('分解',), '分解調整'),
+                (('点検', '診断'), '点検'),
+                (('調整', '光軸', 'フィッティング', 'コーディング', '設定', '消去'), '調整'),
+                (('修理', '補修', '修正', '穴あけ', 'シーリング'), '修理'),
+            )
+            # 部品金額があって工賃が無い行は取替。ただし「研磨」等の
+            # 区分なし語が入っている行はそちらを優先する（上の並びの前に置く）。
+            _no_method = any(kw in _name_for_detect
+                             for kw in ('研磨', '磨き', '写真代', 'ショートパーツ'))                 and '磨き調整' not in _name_for_detect
+            if not _no_method and _parts_amt > 0 and _wage_amt == 0:
                 method = '取替'
-            elif any(kw in _name_for_detect for kw in ('取替', '交換', '取換', '取り替え')):
-                method = '取替'
-            elif any(kw in _name_for_detect for kw in ('脱着', '取外', '取付', '組付', '脱外')):
-                method = '脱着'
-            elif any(kw in _name_for_detect for kw in ('鈑金', '板金')):
-                method = '鈑金'
-            elif any(kw in _name_for_detect for kw in ('塗装', 'ペイント', 'ワックス', '加算', 'ブース')):
-                method = '塗装'
-            elif any(kw in _name_for_detect for kw in (
-                '修理', '補修', '分解', '修正',
-                '光軸', 'フィッティング', 'コーディング', '穴あけ',
-                'シーリング', '点検', '消去', '設定', '調整',
-            )):
-                method = '修理'
+            else:
+                for _kws, _label in _INFER:
+                    _hit = next((k for k in _kws if k in _name_for_detect), None)
+                    if _hit is not None:
+                        method = _hit if _label is None else _label
+                        break
 
         qty    = safe_int(item.get('quantity', 1), 1)
         if qty < 1:
@@ -1187,17 +1235,45 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         # 「ｱｯｾﾝﾌﾞﾘ取替」から「取替」が落ちて区分不明になる。
         _method_full = method
         method = cp932_trim(method, _ERPARTS_WIDTH['DisposalName'])
-        # 区分コードは 0=取替 / 1=脱着 / 2=修理(鈑金・塗装含む)。
-        # 実機NEO 244件を解析して確定した値で、_addata_db_search.py の
-        # 冒頭「検証結果」節と auto_matching.py:1877 が同じ対応を使う。
-        # 3 は「区分なし」の番兵で、テンプレートの空行が実際に 3 を持つ。
+        # 区分コードは実機の基本定義ファイル（Auda7/AudaData/Const/AnDefine.ini）の
+        # [WorkSheet] が定めている。Repair<N>=<表示順>,<区分コード>,<名称>,… で、
+        #   0=取替  1=脱着  2=修理  6=板金  3=脱着修理/脱着板金
+        #   4=点検/調整/点検調整  5=分解調整
+        # 実機の .neo 202件・明細11,254行でもこの対応どおりだった
+        # （板金121行はすべて 6、分解調整206行はすべて 5）。
+        # 以前は板金・点検・調整・分解をまとめて 2（修理）にしていた。
+        # 区分名そのものは DisposalName に原文が入るので帳票の見た目は
+        # 変わらないが、コグニセブン側の再計算は区分コードで動く。
+        # 並び順に意味がある。下の部分一致フォールバックは登録順に見るので、
+        # 「脱着修理」を「脱着」より後ろに置くと 1（脱着）に取られる。
         _disposal_map = {
+            # 複合区分（先に置く）
+            '脱着修理': 3, '脱着板金': 3, '脱着鈑金': 3,
+            '脱着取替': 1, '脱着清掃': 1,
+            '点検調整': 4, '点検清掃': 4,
+            '分解調整': 5, '分解清掃': 5,
+            '磨き調整': 2,
+            # 単独区分
             '取替': 0, '交換': 0, '取換': 0, '取り替え': 0, '取替え': 0,
             '脱着': 1, '取外': 1, '取付': 1, '組付': 1, '脱外': 1,
-            '修理': 2, '補修': 2, '分解': 2, '修正': 2, '調整': 2,
-            '光軸': 2, 'フィッティング': 2, 'コーディング': 2, '穴あけ': 2,
-            'シーリング': 2, '点検': 2, '消去': 2, '設定': 2,
-            '鈑金': 2, '板金': 2, '塗装': 2, 'ペイント': 2, 'ワックス': 2, '加算': 2, 'ブース': 2,
+            '板金': 6, '鈑金': 6,
+            # 点検・調整の同義語。CSV や手入力で「光軸」「コーディング」と
+            # 直接書かれても、抽出プロンプトが「調整」に寄せる語と
+            # 同じコード（4）になるようにしておく。
+            '点検': 4, '診断': 4,
+            '調整': 4, '光軸': 4, 'フィッティング': 4, 'コーディング': 4,
+            '設定': 4, '消去': 4,
+            '分解': 5, '清掃': 5,
+            # 区分として「磨き」が来たら 2。実機にも DisposalCode=2 の
+            # 「磨き調整」10行・「磨き」1行があった。
+            # 一方、区分が空欄で品名に「磨き」が入っているだけの行
+            # （「ﾎｲｰﾙ研磨」など）は区分なしのままにする。そちらは上の
+            # 品名からの推定側で扱っていて、ここには来ない。
+            '修理': 2, '補修': 2, '修正': 2, '磨き': 2,
+            '穴あけ': 2, 'シーリング': 2,
+            # 塗装まわりは AnDefine.ini に区分が無い（実機は塗装テーブルに入れる）。
+            # ERParts の1行として出す以上、いちばん近い 2（修理）に寄せる。
+            '塗装': 2, 'ペイント': 2, 'ワックス': 2, '加算': 2, 'ブース': 2,
         }
         # 区分は完全一致だけで引くと、末尾に空白が付いただけ、
         # 「脱着（左）」のように補足が付いただけで -1（区分不明）になる。
@@ -1230,22 +1306,19 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         # すぐ下のコメントが戒めている「指数ゼロの見積」を自分で作ってしまう。
         _idx = round(_idx, 2)
         db_time = _idx if _idx > 0 else -1   # 未入力・負値は -1（空欄）
-        parts_code = item.get('_master_section_code', '')  # 部品コード大区分（例: '01'）
-        # 枝番（例: '00101', '001AA'）。Addata の部品マスタは '101' のような数字のほか
-        # '1AA' のような英字混じりも持つ。ERParts.PartsCodeSub は SQLite の INTEGER 列で
-        # 英字を格納できないため、英字混じりは -1（空欄）に落ちる。
-        # 実機がこの種の枝番をどう格納するかは未確認（引き継ぎ書 §6 E）。
-        _branch_raw = item.get('_master_branch_code', '')
-        # PartsCodeSub は SQLite integer 型。数値変換できる枝番のみ整数で保存
-        try:
-            parts_code_sub = int(_branch_raw) if _branch_raw and _branch_raw.isdigit() else -1
-        except Exception:
-            parts_code_sub = -1
-        # 枝番が英字混じり（'1AA' など）だと INTEGER 列に入らず -1（空欄）になる。
-        # 大区分だけが入った部品コードは、コグニセブン上で別の部品を指しうる。
-        # 片側だけ埋まった状態で協定見積に出すより、両方空にして人に埋めてもらう。
-        if _branch_raw and parts_code_sub < 0:
-            parts_code = ''
+        # ERParts.PartsCode は部品マスタの参照番号を4桁ゼロ埋めした文字列。
+        # 帳票のいちばん左「ｺｰﾄﾞ」列にそのまま印字される。
+        # 照合できなかった行は空欄（実機の自由入力行 536行中 533行も空欄）。
+        parts_code = str(item.get('_master_ref_no', '') or '')
+        if parts_code and not (len(parts_code) == 4 and parts_code.isdigit()):
+            parts_code = ''      # 4桁でないものは書かない（帳票の桁が崩れる）
+        # PartsCodeSub（枝番）は実機では -1 が既定で、同じ参照番号に
+        # ぶら下がる手入力材料（接着剤など）にだけ 1,2,… が入る。
+        # 実機の自由入力行は 536行すべてが -1 だった。
+        # 以前は部品マスタの別の欄を枝番として書こうとしており、
+        # '1AA' のような英字混じりが INTEGER 列に入らず、それを理由に
+        # 部品コードごと捨てていた（主要部品のコードが常に空欄だった）。
+        parts_code_sub = -1
         cur.execute("""INSERT INTO ERParts (
             RecordNo, LineNo, PartsCode, PartsCodeSub, DisposalCode,
             DisposalName, DisposalNameStandard, PartsName, PartsNameStandard,
@@ -1282,9 +1355,13 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             -- 標準部品価格ゼロ・標準指数ゼロの見積として読まれてしまう。
             -1, -1, -1,
             '*',
-            ?, -1,
+            -- 指数は入力値、標準指数は 0。実機の自由入力行 536行すべてが
+            -- TimeStandard=0 で、-1（空欄）を持つ行は1行も無かった。
+            ?, 0,
             ?, ?, ?,
-            -1, -1, -1,
+            -- 標準工賃も 0。実機の自由入力行 527行（98.3%）が 0 で、
+            -- 標準部品価格だけが -1 のまま、という非対称な形をしている。
+            0, 0, 0,
             '*', ?,
             -1, -1, -1,
             '', '', '',
@@ -1312,7 +1389,9 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         # AnNote.ini は ERParts と同じ値でなければならない。生の items から
         # 別に組み立てると、マスタ名への置換・「※」付与・数量ブランクが
         # 反映されず、同じ行なのに品名と数量が2通り存在することになる。
-        annote_rows.append({'line_no': line_no, 'name': name, 'qty': db_qty})
+        annote_rows.append({'line_no': line_no, 'name': name, 'qty': db_qty,
+                            'parts_code': parts_code, 'disposal_code': disposal_code,
+                            'parts_no': parts_no})
     # ── 税込/税抜に応じた費用計算ヘルパー ──
     def _calc_tax(amount, inclusive=False):
         """金額から OutTax, InTax, Tax を計算"""
@@ -1334,8 +1413,12 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
     # サイドバーの費用欄は「（税抜）」と明示しているため、明細の税区分に
     # かかわらず常に税抜として扱う。以前は税込モードで9.1%目減りしていた。
     sp_out, sp_intax, sp_tax = _calc_tax(sp_wage, False)
+    # ショートパーツは部品費。実機は部品欄（PartsEnabled）に入れており、
+    # 帳票でも「部品価格」列に出る。工賃欄に入れると金額は合っていても
+    # 列が1つずれた見積書になる。
     cur.execute("""UPDATE Expense SET
-        WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
+        PartsEnabled=?, PartsPriceOutTax=?, PartsPriceInTax=?, PartsPriceTax=?,
+        WageEnabled=0, WageOutTax=0, WageInTax=0, WageTax=0
         WHERE LineNo=4""", (1 if sp_wage > 0 else 0, sp_out, sp_intax, sp_tax))
 
     # Expense の行名は NameFix=1 の固定名で、コグニセブンはその名前のまま
@@ -1350,14 +1433,17 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
         WHERE LineNo=5""", (1 if towing > 0 else 0, tow_out, tow_intax, tow_tax))
 
-    # LineNo=7: 写真代他（課税）。テンプレートに代車専用の行が無いため、
-    # 汎用の「その他課税費用」行に入れ、Comment に費目を書き添える。
+    # LineNo=9: 自由入力の費用行（NameFix=0）に「代車費用」という費目名で入れる。
+    # LineNo=1〜8 は NameFix=1 の固定費目で、名前を変えられない。以前は
+    # LineNo=7「写真代他」に金額だけ入れていたため、帳票の費目名が
+    # 「写真代他」と印字されていた（協定見積に出す書類として別物になる）。
+    # 実機も代車・室内清掃・エーミング等は LineNo=9 以降に名前を付けて使う。
     rental_car = safe_int(expenses.get('rental_car', 0))
     rent_out, rent_intax, rent_tax = _calc_tax(rental_car, False)
     cur.execute("""UPDATE Expense SET
-        WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?, Comment=?
-        WHERE LineNo=7""", (1 if rental_car > 0 else 0, rent_out, rent_intax, rent_tax,
-                            cp932_trim('代車費用', 30) if rental_car > 0 else ''))
+        Name=?, WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
+        WHERE LineNo=9""", (cp932_trim('代車費用', 30) if rental_car > 0 else '',
+                            1 if rental_car > 0 else 0, rent_out, rent_intax, rent_tax))
 
     # LineNo=8: その他控除（非課税）。OutTaxFlag で非課税であることを示す。
     tax_exempt = safe_int(expenses.get('tax_exempt', 0))
@@ -1473,6 +1559,29 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             wages_tax_total += _tax_resid
         else:
             expenses_tax_total += _tax_resid
+    # 諸経費の内訳を部品側（ショートパーツ）と工賃側（レッカー・代車）に割る。
+    # 足せば taxable_expenses / expenses_tax_total に戻る＝合計は変わらない。
+    _hy_p_out = sp_out
+    _hy_w_out = taxable_expenses - sp_out
+    _hy_p_tax = sp_tax_total if _hy_p_out > 0 else 0
+    _hy_w_tax = expenses_tax_total - _hy_p_tax
+    if _hy_w_out <= 0:
+        # 工賃側が空なら端数も部品側に寄せる（両方に分けると片方が
+        # 「金額ゼロなのに税だけある」欄になる）。
+        _hy_p_tax, _hy_w_tax = expenses_tax_total, 0
+    if _hy_p_out <= 0:
+        _hy_p_tax, _hy_w_tax = 0, expenses_tax_total
+    # expenses_tax_total には請求書単位のまとめ丸めの端数が寄せてあるため、
+    # 部品側の税をそのまま引くと工賃側が負になることがある
+    # （諸経費がいちばん大きい欄で、かつ端数がマイナスのとき）。
+    # 税額欄が負の見積書は帳票として成立しない。はみ出したぶんは
+    # もう一方の欄で吸収する。合計（_hy_p_tax + _hy_w_tax）は変えない。
+    if _hy_w_tax < 0:
+        _hy_p_tax += _hy_w_tax
+        _hy_w_tax = 0
+    if _hy_p_tax < 0:
+        _hy_w_tax += _hy_p_tax
+        _hy_p_tax = 0
     grand_total       = sub_total + tax_total + tax_exempt  # 非課税は税計算後に加算
     cur.execute("""UPDATE Total SET
         ms_PartsTotalOutTax=?,
@@ -1481,6 +1590,9 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         ms_WageTotalOutTax=?,
         ms_WageTotalInTax=?,
         ms_WageTotalTax=?,
+        hy_PartsTaxTotalOutTax=?,
+        hy_PartsTaxTotalInTax=?,
+        hy_PartsTaxTotalTax=?,
         hy_WageTaxTotalOutTax=?,
         hy_WageTaxTotalInTax=?,
         hy_WageTaxTotalTax=?,
@@ -1503,7 +1615,6 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         pn_TotalOutTax=0, pn_TotalInTax=0, pn_TotalTax=0,
         pn_MaterialTotalOutTax=0, pn_MaterialTotalInTax=0, pn_MaterialTotalTax=0,
         nk_TotalOutTax=0, nk_TotalInTax=0, nk_TotalTax=0,
-        hy_PartsTaxTotalOutTax=0, hy_PartsTaxTotalInTax=0, hy_PartsTaxTotalTax=0,
         hy_Wrecker2OutTax=0, hy_Wrecker2InTax=0, hy_Wrecker2Tax=0,
         hy_Wrecker2TaxFlag=0,
         pt_ExtraTotalOutTax=0, pt_ExtraTotalInTax=0, pt_ExtraTotalTax=0,
@@ -1519,15 +1630,22 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
     """, (
         total_parts, total_parts + parts_tax_total, parts_tax_total,
         total_wages, total_wages + wages_tax_total, wages_tax_total,
-        taxable_expenses,
-        taxable_expenses + expenses_tax_total if taxable_expenses > 0 else 0,
-        expenses_tax_total if taxable_expenses > 0 else 0,
+        # 諸経費は部品側（ショートパーツ）と工賃側（レッカー・代車）に分かれる。
+        # 実機もこの2欄を使い分けており、帳票の部品列・工賃列に別々に出る。
+        # 分けても足せば元の taxable_expenses / expenses_tax_total に戻るので、
+        # 課税額計も消費税も総額も1円も動かない。
+        _hy_p_out, _hy_p_out + _hy_p_tax, _hy_p_tax,
+        _hy_w_out, _hy_w_out + _hy_w_tax, _hy_w_tax,
         # 非課税ぶんは工賃側の非課税欄に計上する。どの内訳にも入れないと
         # 小計＋消費税が合計に届かず、帳票の検算が合わなくなる。
         0, 0, 0,
         tax_exempt, tax_exempt, 0,
-        # レッカーは専用欄にも入れる
-        tow_out, tow_intax, tow_tax, (1 if towing > 0 else 0),
+        # レッカー専用欄（hy_Wrecker1）は実機が一度も使っていない。
+        # 実機の .neo 202件はレッカー案件も含めてすべて 0 で、レッカー代は
+        # 費用行（LineNo=5 レッカー代１）か明細行に入っていた。
+        # 課税額計には入らない欄なので総額は変わらないが、専用欄を持つ
+        # 帳票を出したときに同じ金額が2か所に出る。実機に合わせて空にする。
+        0, 0, 0, 0,
         tax_total,   tax_total,
         sub_total,   grand_total
     ))
@@ -1655,7 +1773,7 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
     # 「2026/03/01」のような区切り付きをそのまま通すと、和暦の組み立てで
     # int('/0') となり NEO 生成が丸ごと失敗する。必ず正規化してから使う。
     term_date      = _normalize_date8(cust.get('term_date', '')) or '00000000'
-    car_reg_date   = _normalize_ym8(cust.get('car_reg_date', '')) or '00000000'
+    car_reg_date   = normalized_reg_date(cust.get('car_reg_date', ''))
     term_era, term_era_year = get_era_info(term_date)
     reg_era,  reg_era_year  = get_era_info(car_reg_date)
 
@@ -1847,7 +1965,7 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
     kilometer     = safe_str(cust.get('kilometer', ''))
     # DB側と同じ正規化を通す。ここだけ生の値を使うと、同じNEOの中で
     # DBとヘッダXMLが食い違ったり int('/0') で落ちたりする。
-    car_reg_date  = _normalize_ym8(cust.get('car_reg_date', ''))
+    car_reg_date  = normalized_reg_date(cust.get('car_reg_date', ''))
     term_date     = _normalize_date8(cust.get('term_date', ''))
     ins = insurance_info or {}
     tag_values = {
@@ -1895,29 +2013,32 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
         'BodyName':             '',
         'FVariationNameByUser': '',
     }
-    if term_date and term_date != '00000000':
-        term_era, term_era_year = get_era_info(term_date)
-        era_year_int = int(term_era_year)
-        term_month = term_date[4:6] if len(term_date) >= 6 else ''
-        term_day   = term_date[6:8] if len(term_date) >= 8 else ''
-        tag_values['CarTermEraDate'] = (
-            f'{term_era}{era_year_int}年{int(term_month)}月{int(term_day)}日'
-            if term_month and term_day else ''
-        )
+    term_month = term_date[4:6] if len(term_date) >= 6 else ''
+    term_day   = term_date[6:8] if len(term_date) >= 8 else ''
+    if (term_date and term_date != '00000000'
+            and term_month.isdigit() and term_month != '00'
+            and term_day.isdigit() and term_day != '00'):
+        # タグ名に Era と付くが、実機は西暦の 'YYYY/MM/DD' を書いている
+        # （実機70件すべて）。和暦の「令和10年2月25日」という形は無かった。
+        tag_values['CarTermEraDate'] = f'{term_date[:4]}/{term_month}/{term_day}'
     else:
         tag_values['CarTermEraDate'] = ''
-    if car_reg_date and car_reg_date != '00000000':
-        reg_era, reg_era_year = get_era_info(car_reg_date)
-        reg_year_int = int(reg_era_year)
-        reg_month    = car_reg_date[4:6] if len(car_reg_date) >= 6 else ''
-        tag_values['CarRegistedDate'] = (
-            f'{reg_era}{reg_year_int}年{int(reg_month)}月'
-            if reg_month and reg_month != '00' else ''
-        )
+    reg_era, reg_era_year = get_era_info(car_reg_date)
+    reg_month = car_reg_date[4:6] if len(car_reg_date) >= 6 else ''
+    # get_era_info は元号を決められないとき（空・不正・大正以前）に
+    # ('令和', '0000') を返す。これは「不明」の印であって令和0年ではない。
+    # そのまま書くと初度登録が「令和0年0月」として保険会社に出る。
+    # normalized_reg_date が元号を決められない値を '00000000' に落としている。
+    _reg_known = car_reg_date != '00000000'
+    if _reg_known:
+        # 初度登録は西暦の 'YYYY/MM'（実機70件すべて）。
+        tag_values['CarRegistedDate'] = f'{car_reg_date[:4]}/{reg_month}'
         # 合成文字列だけ書いて構造化タグを空のまま残すと、同じ .neo の中に
         # 初度登録が2通り入る（DB側は Customer.CarRegDate に8桁で入っている）。
-        tag_values['CarRegistedDateYear']  = reg_era_year
-        tag_values['CarRegistedDateMonth'] = reg_month
+        # 年（和暦）と月はゼロ埋めしない。実機は 1〜2桁で、
+        # '0006' のような4桁ゼロ埋めは70件中1件も無かった。
+        tag_values['CarRegistedDateYear']  = str(int(reg_era_year))
+        tag_values['CarRegistedDateMonth'] = str(int(reg_month))
         # 元号コードも一緒に書く。年月だけ入れて元号コードを
         # テンプレートの値のまま残すと、「元号は平成・年は令和の年」という
         # 組み合わせになり、令和6年が平成6年（1994年）として読まれる。
@@ -1989,12 +2110,26 @@ def update_imge_ini(orig_bytes, cust, insurance_info=None, merge_mode=False):
 # ============================================================
 
 def generate_annote(rows):
-    """142B固定長 × 行数 の AnNote.ini を生成
+    """144B固定長（本体142B＋CRLF）× 行数 の AnNote.ini を生成
 
     rows は _update_ansmb_impl が ERParts に実際に書いた値
-    （line_no / name / qty）。生の items から組み直すと、
-    マスタ名への置換や「※」付与、数量ブランクが反映されず、
-    同じ行なのに DB と AnNote で品名・数量が食い違う。
+    （line_no / name / qty / parts_code / disposal_code / parts_no）。
+    生の items から組み直すと、マスタ名への置換や「※」付与、
+    数量ブランクが反映されず、同じ行なのに DB と AnNote で
+    品名・数量が食い違う。
+
+    レコードの中身は実機の .neo 202件から割り出した:
+        [  0:  8] 行番号（8桁ゼロ埋め）
+        [  8: 12] 部品コード（参照番号4桁。手入力行は空欄）
+        [ 12: 13] 枝番（-1 は空欄）
+        [ 13: 14] 作業区分コード（区分なしは空欄）
+        [ 14: 38] 品名
+        [ 38: 62] 標準品名（マスタ由来のときだけ）
+        [ 62: 80] 品番
+        [ 80: 98] 標準品番（マスタ由来のときだけ）
+        [ 98:100] 数量（2桁）
+        [100:105] 由来。マスタ由来 '00000' / 手入力 ' 0000'
+        [127:133] 'F99999'
     """
     if not rows:
         return b''
@@ -2010,20 +2145,42 @@ def generate_annote(rows):
         ln_str = f'{line_no:08d}'
         for j, c in enumerate(ln_str):
             line[j] = ord(c)
+        # 部品コード・作業区分・品番は ERParts と同じ値を書く。
+        # 以前はここを空白のままにしていたので、明細テーブルには
+        # コードが入っているのに注記だけ空、という食い違いが起きていた。
+        _pc = str(row.get('parts_code', '') or '')
+        if len(_pc) == 4 and _pc.isdigit():
+            for j, c in enumerate(_pc):
+                line[8 + j] = ord(c)
+        _dc = row.get('disposal_code', -1)
+        if isinstance(_dc, int) and 0 <= _dc <= 9:
+            line[13] = ord(str(_dc))
         # バイト数で単純に切ると2バイト文字の途中で割れ、末尾に
         # 復号できない片割れが残る。文字境界で切り詰める。
         # 改行やタブが混ざると142B固定長レコードが行単位で割れる。
         # 見積書の部品名が2行に折り返された表をCSV化すると普通に起きる。
-        name_bytes = cp932_trim(_strip_control_chars(name), 30).encode('cp932', errors='replace')
+        # 品名欄は [14:38] の24バイト。ERParts.PartsName と同じ幅で切る。
+        # ここを広く取ると、隣の標準品名欄（[38:62]）へはみ出す。
+        name_bytes = cp932_trim(_strip_control_chars(name),
+                                _ERPARTS_WIDTH['PartsName']).encode('cp932', errors='replace')
         for j, b in enumerate(name_bytes):
             line[14 + j] = b
+        # 品番欄は [62:80] の18バイト。
+        _pno = cp932_trim(_strip_control_chars(str(row.get('parts_no', '') or '')),
+                          _ERPARTS_WIDTH['PartsNo']).encode('cp932', errors='replace')
+        for j, b in enumerate(_pno):
+            line[62 + j] = b
         # 注記の数量欄は2桁固定。3桁以上は入らないので丸めるしかないが、
         # 明細テーブルには150、注記には99と書かれ、同じ .neo の中で
         # 数量が食い違う。丸めたことは画面で知らせる（下の警告で拾う）。
         qty_str = f'{min(qty, 99):02d}'
         line[98] = ord(qty_str[0])
         line[99] = ord(qty_str[1])
-        for j, c in enumerate('90000'):
+        # [100:105] は行の由来。実機は部品マスタから採った行が '00000'、
+        # 手で打った行が ' 0000'（先頭が空白）だった。自由入力行 83件は
+        # すべて ' 0000'。以前ここに書いていた '90000' は、実機の
+        # 202ファイル・11,254行のどこにも現れない値だった。
+        for j, c in enumerate(('0' if _pc else ' ') + '0000'):
             line[100 + j] = ord(c)
         for j, c in enumerate('F99999'):
             line[127 + j] = ord(c)
@@ -2123,7 +2280,121 @@ def generate_neo_file(template_data, customer_info, items, short_parts_wage, ins
     files['AnSvImge.ini'] = update_imge_ini(files['AnSvImge.ini'], customer_info,
                                             insurance_info=insurance_info, merge_mode=merge_mode)
     neo_data = repack_neo(template_data, files, mgmt, entries)
+    # コグニセブンの「既存見積」一覧は、内包ファイルではなく
+    # ファイル先頭 424 バイトの管理領域から 登録番号・顧客名・車名 を読む。
+    # ここを書かないと、一覧に並んでも「どの車の誰の見積か」が空欄で出る。
+    # （2026-09-10 に実機で確認。内包ファイルを実機のものと差し替えても
+    #   直らず、先頭424Bを差し替えたときだけ直った）
+    neo_data = _apply_neo_header(neo_data, files['AnSvEm0001Ex.db'], files['AnSMB.txt'])
     return neo_data, total_parts, total_wages, grand_total
+
+
+def _summary_totals(ansmb_bytes):
+    """管理領域に書く5つの金額を、生成済みの見積本体から読む。
+
+    実機の並びは [部品計, 工賃計, 塗装計, 諸経費計, 総額(税込)]。
+    実機 202 件を復号して Total テーブルと突き合わせて確認した。
+
+    諸経費計には**非課税ぶんも入れる**。非課税は課税額計(SubTotal)には
+    入らないが、この欄には入っていた（非課税のある実機 12 件すべてで
+    ヘッダの値 = 課税諸経費 + 非課税 だった）。
+    """
+    tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    try:
+        tf.write(ansmb_bytes)
+        tf.close()
+        conn = sqlite3.connect(tf.name)
+        try:
+            r = conn.execute(
+                'SELECT ms_PartsTotalOutTax, ms_WageTotalOutTax, pn_TotalOutTax,'
+                ' hy_PartsTaxTotalOutTax, hy_WageTaxTotalOutTax,'
+                ' hy_PartsNoTaxTotalOutTax, hy_WageNoTaxTotalOutTax,'
+                ' Total FROM Total').fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    finally:
+        try:
+            os.unlink(tf.name)
+        except OSError:
+            pass
+    if not r:
+        return None
+    v = [safe_int(x) for x in r]
+    return [v[0], v[1], v[2], v[3] + v[4] + v[5] + v[6], v[7]]
+
+
+def _neo_header_source(em_db_bytes):
+    """管理領域に書く 顧客名・車名・登録番号・協定工場名 を、生成後の見積本体から読む。
+
+    マージモードかどうかで場合分けせず、**出来上がった見積そのもの**を見る。
+    こうしておけば「一覧に出る名前」と「開いたときの名前」は必ず一致する。
+    テンプレート側の管理領域を頼りにすると、本体には顧客が入っているのに
+    管理領域だけ空、という古いアプリ製の .neo をテンプレートにしたときに
+    一覧が空欄のままになる。
+    """
+    tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    try:
+        tf.write(em_db_bytes)
+        tf.close()
+        conn = sqlite3.connect(tf.name)
+        try:
+            cur = conn.cursor()
+            cur.execute('SELECT Name1, CarRegNoDepartment, CarRegNoDivision,'
+                        ' CarRegNoBusiness, CarRegNoSerial FROM Customer')
+            c = cur.fetchone() or ('', '', '', '', '')
+            try:
+                cur.execute('SELECT CarNameByUser, CarName FROM Car')
+                _car = cur.fetchone() or ('', '')
+            except sqlite3.Error:
+                _car = ('', '')
+            try:
+                cur.execute('SELECT ConsultantFactory FROM Insurance')
+                _ins = cur.fetchone() or ('',)
+            except sqlite3.Error:
+                _ins = ('',)
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    finally:
+        try:
+            os.unlink(tf.name)
+        except OSError:
+            pass
+    # 車名は実機の管理領域が CarNameByUser と同じ値を持っていた
+    # （実機 04011406.neo で確認。末尾の全角スペースまで一致）
+    car_name = safe_str(_car[0]) or safe_str(_car[1])
+    return {
+        'name1': safe_str(c[0]),
+        'car_name': car_name,
+        'carno': (safe_str(c[1]), safe_str(c[2]), safe_str(c[3]), safe_str(c[4])),
+        'agreed': safe_str(_ins[0]),
+    }
+
+
+def _apply_neo_header(neo_data, em_db_bytes, ansmb_bytes):
+    """先頭424Bの管理領域に、この見積の 顧客名・車名・登録番号・金額 を書く"""
+    src = _neo_header_source(em_db_bytes)
+    if src is None:
+        # 本体が読めないなら触らない。空欄で一覧に出るだけで、見積の中身は無事。
+        return neo_data
+    try:
+        _now = now_jst()
+        return neo_header.apply(
+            neo_data,
+            agreed=src['agreed'],
+            name1=src['name1'],
+            car_name=src['car_name'],
+            created=_now.date(),
+            totals=_summary_totals(ansmb_bytes),
+            carno=src['carno'],
+            saved=_now.replace(tzinfo=None),
+        )
+    except Exception:
+        # 管理領域を書けなくても見積本体は正しい。空欄で出るだけなので握りつぶす。
+        return neo_data
 
 
 # ============================================================
@@ -2777,6 +3048,7 @@ def _clear_addata_codes(estimate_data):
     for it in (estimate_data.get('items') or []):
         if not isinstance(it, dict):
             continue
+        it['_master_ref_no'] = ''
         it['_master_section_code'] = ''
         it['_master_branch_code'] = ''
         # 照合レベルと品番も一緒に捨てる。残すと、車両を直したあとに
@@ -2792,7 +3064,7 @@ def apply_addata_matching(estimate_data, vehicle_data, progress=None):
 
     step2（車検証＋見積書）と CSV 取り込みの両方から呼ぶ。CSV 取り込みは
     step2 を通らず step3 へ進むため、ここを共通で通さないと CSV 経路だけ
-    部品コード（_master_section_code → NEO の PartsCode）が空のままになる。
+    部品コード（_master_ref_no → NEO の PartsCode）が空のままになる。
 
     照合が items に書き込むのは部品コードと照合レベル（未マッチ行の「※」判定に
     使う match_level）だけで、金額・品名・工数は見積の値のまま。
@@ -2853,12 +3125,11 @@ def apply_addata_matching(estimate_data, vehicle_data, progress=None):
     # でも True になる。実際に部品コードが入った行があるかで成功を判定しないと、
     # PartsCode が空のままなのに画面に「Addata照合済み」と出て気づけない。
     def _code_writable(it):
-        # 生成側（_update_ansmb_impl）は、枝番が数字でない行の大区分も空にする。
-        # ここで大区分の有無だけを見ると、実際には PartsCode が空になる行を
+        # 生成側（_update_ansmb_impl）は、4桁の数字でない参照番号を捨てる。
+        # ここで同じ条件を使わないと、実際には PartsCode が空になる行を
         # 「Addata照合済み」と数えてしまい、画面と生成物が食い違う。
-        _sec = str(it.get('_master_section_code') or '').strip()
-        _br = str(it.get('_master_branch_code') or '').strip()
-        return bool(_sec) and (not _br or _br.isdigit())
+        _ref = str(it.get('_master_ref_no') or '').strip()
+        return len(_ref) == 4 and _ref.isdigit()
 
     _hit = any(_code_writable(it) for it in matched_items)
     if not has_rev:
@@ -2866,12 +3137,13 @@ def apply_addata_matching(estimate_data, vehicle_data, progress=None):
         _clear_addata_codes(estimate_data)
         return False
     if not _hit:
-        # 照合自体は動いたが、.neo に書ける部品コードを持つ行が1つも無い
-        # （枝番が英字混じりで INTEGER 列に入らない、など）。
-        # 部品コードは落とすが、品番（db_parts_no）は価格の裏が取れた
-        # 照合結果なので捨てない。画面上は「照合済み」とは言わない。
+        # 照合自体は動いたが、.neo に書ける部品コード（4桁の参照番号）を
+        # 持つ行が1つも無い。部品コードは落とすが、品番（db_parts_no）は
+        # 価格の裏が取れた照合結果なので捨てない。
+        # 画面上は「照合済み」とは言わない。
         for _it in (estimate_data.get('items') or []):
             if isinstance(_it, dict):
+                _it['_master_ref_no'] = ''
                 _it['_master_section_code'] = ''
                 _it['_master_branch_code'] = ''
         estimate_data['_addata_matched'] = False
@@ -3191,14 +3463,28 @@ CORE_PROMPT = """<system_instruction>
   - 「Labor」「工賃」に相当する金額 → 「技術料」へ。
   - 「Parts」「部品」に相当する金額 → 「部品金額」へ。
   - 英数字・ハイフン混じりの品番は必ず「部品品番」へ。
-- 区分の判定ルール（作業内容から以下の優先順位で判定して文字列を割り当てる）:
+- 区分の判定ルール（**番号の小さいルールが優先**。複数当てはまるときは必ず上を採る）:
   1. 【重要】部品名称および部品金額の計上があるが、技術料（工賃）の計上がない行 → "取替"
-  2. 「取替」「交換」「取換」「取り替え」を含む → "取替"
-  3. 「脱着」「取外」「取付」「組付」を含む → "脱着"
-  4. 「鈑金」「板金」を含む → "鈑金"
-  5. 「塗装」「ペイント」「ワックス」「加算」「ブース」を含む → "塗装"
-  6. 「修理」「補修」「分解」「修正」「光軸」「フィッティング」「コーディング」「穴あけ」「シーリング」「点検」「消去」「設定」「調整」を含む → "修理"
-  7. 「研磨」「磨き」「写真代」「ショートパーツ」を含む → ""（空白）
+  ── ここから先は「2語以上の複合区分」を先に見る。単独の語より必ず優先すること ──
+  【重要】2〜4 と 8 は、**見積書に書かれていた語をそのまま**出すこと。
+          言い換えたり代表的な語にまとめたりしない。この文字列は帳票の
+          「修理方法」欄にそのまま印字されるので、原本と違う紙になる。
+  2. 「脱着修理」「脱着鈑金」「脱着板金」を含む → 当たった語をそのまま
+  3. 「点検調整」「点検清掃」を含む → 当たった語をそのまま
+  4. 「分解調整」「分解清掃」を含む → 当たった語をそのまま／単に「分解」なら "分解調整"
+  5. 「磨き調整」を含む → "磨き調整"
+  ── ここから単独の語 ──
+  6. 「取替」「交換」「取換」「取り替え」を含む → "取替"
+  7. 「脱着」「取外」「取付」「組付」を含む → "脱着"
+  8. 「鈑金」「板金」を含む → 当たった語をそのまま
+  9. 「塗装」「ペイント」「ワックス」「加算」「ブース」を含む → "塗装"
+  10. 「点検」「診断」を含む → "点検"
+  11. 「調整」「光軸」「フィッティング」「コーディング」「設定」「消去」を含む → "調整"
+  12. 「修理」「補修」「修正」「穴あけ」「シーリング」を含む → "修理"
+  13. 「研磨」「磨き」「写真代」「ショートパーツ」を含む → ""（空白）
+  ※ 例: 「ドア脱着板金」は 2 で "脱着板金"（"脱着修理" に言い換えず、7 の "脱着" にもしない）。
+        「エンジン分解清掃」は 4 で "分解清掃"（"分解調整" に言い換えない）。
+        「センサー磨き調整」は 5 で "磨き調整"（11 の "調整"、13 の空白にしない）。
 </extraction_logic>"""
 
 
@@ -6033,7 +6319,7 @@ def main():
 【出力形式（ヘッダー行必須）】 品名,区分,数量,部品金額,工賃,部品コード
 【各列の抽出・加工ルール】
 * 品名：元の記載から「取替」「脱着」「修理」「鈑金」「塗装」などの作業を示す文言（後述の区分ルールに該当する語）を削除した、純粋な部品名・対象名。
-* 区分：元の記載に含まれる以下のキーワードを1語のみ抽出（該当なしは空欄）。 ・取替：「取替」「交換」「取換」（※部品金額のみで工賃0の行も「取替」とする） ・脱着：「脱着」「取外」「取付」「組付」 ・鈑金：「鈑金」「板金」 ・塗装：「塗装」「ペイント」「ワックス」「加算」「ブース」 ・修理：「修理」「補修」「調整」「点検」「設定」「分解」「修正」
+* 区分：元の記載から下記のいずれか1語を割り当てる（該当なしは空欄）。**複合区分（2語以上のもの）を必ず優先する**。 【重要】次の語群は**見積書に書かれていた語をそのまま**出すこと（言い換えない）: 「脱着修理」「脱着鈑金」「脱着板金」／「点検調整」「点検清掃」／「分解調整」「分解清掃」／「鈑金」「板金」。この文字列は帳票の「修理方法」欄にそのまま印字されるため。 ・磨き調整：「磨き調整」 ・取替：「取替」「交換」「取換」（※部品金額のみで工賃0の行も「取替」とする） ・脱着：「脱着」「取外」「取付」「組付」 ・塗装：「塗装」「ペイント」「ワックス」「加算」「ブース」 ・分解調整：単に「分解」とだけ書かれている場合 ・点検：「点検」「診断」 ・調整：「調整」「光軸」「フィッティング」「コーディング」「設定」「消去」 ・修理：「修理」「補修」「修正」「穴あけ」「シーリング」 ・（空欄）：「研磨」「磨き」「写真代」「ショートパーツ」※ただし「磨き調整」は上の磨き調整を採る
 * 数量：半角整数（空欄や不明な場合は 1 を補完）
 * 部品金額：「部品、油脂」列の金額。半角整数・カンマなし（記載なしは 0）
 * 工賃：「技術料」列の金額。半角整数・カンマなし（記載なしは 0）
@@ -6416,7 +6702,7 @@ def main():
                 # 以前はここに `_current_mode == 'db'` の条件が入っていたが、
                 # step1 の冒頭で selected_mode は必ず 'beta' に固定されるため、
                 # この照合は一度も実行されず、Addata を読み込ませても
-                # NEO の部品コード（_master_section_code → PartsCode）が常に空だった。
+                # NEO の部品コード（_master_ref_no → PartsCode）が常に空だった。
                 apply_addata_matching(estimate_data, vehicle_data, progress)
                 
                 # --- 税区分 ユーザー選択値を常に適用（AI自動判定廃止）---
@@ -6887,6 +7173,7 @@ def main():
                         '_master_name': '', '_master_price': 0, '_master_part_no': '',
                         '_master_repair_code': '', '_master_branch_code': '',
                         '_master_part_code_r': '', '_master_part_code_l': '',
+                        '_master_ref_no': '',
                         '_master_section_code': '', 'match_level': '',
                         '_match_level': 0, '_original_name': '', '_original_parts_amount': 0,
                     }
@@ -7006,8 +7293,9 @@ def main():
                     '_master_part_code_l': _orig.get('_master_part_code_l', ''),
                     # 照合結果は明細タブを通っても落としてはいけない。
                     # 'match_level'(L1..L4) を落とすと未マッチ部品の ※ が消え、
-                    # '_master_section_code' を落とすと部品コードが空になる。
+                    # '_master_ref_no' を落とすと NEO の部品コードが空になる。
                     'match_level': _orig.get('match_level', ''),
+                    '_master_ref_no': _orig.get('_master_ref_no', ''),
                     '_master_section_code': _orig.get('_master_section_code', ''),
                     # 'db_parts_no' を落とすと、見積書に品番が無い行で
                     # Addata が引き当てた品番が生成前に消え、PartsNo が空になる。
@@ -7397,7 +7685,7 @@ def main():
                         'OCR 単価': f"¥{orig_p:,}",
                         'マスタ品名': d.get('_master_name', ''),
                         '部品コード': p_code,
-                        '枝番': d.get('_master_branch_code', ''),
+                        'NEOの部品コード': d.get('_master_ref_no', ''),
                         '修理': d.get('_master_repair_code', ''),
                         'マスタ単価': f"¥{mast_p:,}",
                         '数量': qty,
