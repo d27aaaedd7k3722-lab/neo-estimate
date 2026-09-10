@@ -2315,13 +2315,16 @@ def detect_and_reorder_pages(pages):
             page_numbers.append((idx, cur_page, int(m.group(2))))
             continue
         # パターン2: "1/2頁" "1／2頁" "1/2 頁" 形式
-        m = re.search(r'(\d+)\s*[/／]\s*(\d+)\s*[頁ページ]', text)
+        # [頁ページ] と書くと文字クラスになり「ー」「ペ」「ジ」1文字でも当たる。
+        # 「数量 1/2ー」「ﾊﾞﾝﾊﾟｰ 3/4ペ」のような明細行をページ番号と誤検出し、
+        # 見積のページ順を勝手に入れ替えてしまうため、交替（|）で書く。
+        m = re.search(r'(\d+)\s*[/／]\s*(\d+)\s*(?:頁|ページ|ﾍﾟｰｼﾞ)', text)
         if m:
             cur_page = int(m.group(1))
             page_numbers.append((idx, cur_page, int(m.group(2))))
             continue
-        # パターン3: "頁1/2" 逆形式
-        m = re.search(r'[頁ページ]\s*(\d+)\s*[/／]\s*(\d+)', text)
+        # パターン3: "頁1/2" 逆形式（ここも文字クラスではなく交替で書く）
+        m = re.search(r'(?:頁|ページ|ﾍﾟｰｼﾞ)\s*(\d+)\s*[/／]\s*(\d+)', text)
         if m:
             cur_page = int(m.group(1))
             page_numbers.append((idx, cur_page, int(m.group(2))))
@@ -2329,8 +2332,28 @@ def detect_and_reorder_pages(pages):
         # 検出できないページ
         page_numbers.append((idx, None, None))
 
-    # 全ページでページ番号が検出できた場合のみ並び替え
-    if page_numbers and all(pn[1] is not None for pn in page_numbers):
+    # 全ページでページ番号が検出でき、かつ番号の並びに矛盾が無いときだけ並び替える。
+    # 確かめないと、明細の中の分数表記を拾った誤検出でページ順を壊す。
+    #   - 総ページ数の表記が全ページで同じ（"1/2" と "2/3" が混ざるのは誤検出）
+    #   - ページ番号が重複しない
+    #   - 総ページ数が実際のページ数以上
+    # 「1..N がすべて揃うこと」は条件にしない。FAX送付状を除いたあとは
+    # 残りが 2/3・3/3 のようになり、正当な並べ替えができなくなるため。
+    _nums = [pn[1] for pn in page_numbers]
+    _totals = {pn[2] for pn in page_numbers}
+    _consistent = (
+        page_numbers
+        and all(pn[1] is not None for pn in page_numbers)
+        and len(_totals) == 1
+        and next(iter(_totals)) >= len(pages)
+        and len(set(_nums)) == len(_nums)
+        # 番号が総ページ数の範囲に収まり、かつ抜けの無い連続した並びであること。
+        # 「3/3 と 1/3 の2枚」（間が抜けている）や「4/3」（3ページ文書に4頁目）は
+        # 検出そのものが怪しいので、並べ替えずに人が気づけるようにする。
+        and all(1 <= n <= next(iter(_totals)) for n in _nums)
+        and (max(_nums) - min(_nums) + 1) == len(_nums)
+    )
+    if _consistent:
         original_order = [pn[0] for pn in page_numbers]
         page_numbers.sort(key=lambda x: x[1])
         new_order = [pn[0] for pn in page_numbers]
