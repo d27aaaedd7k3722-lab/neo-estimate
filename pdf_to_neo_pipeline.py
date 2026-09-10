@@ -24,6 +24,9 @@ import sqlite3
 import tempfile
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
+# 見積の読み取り規則のうち、3つの入口で同じでなければならないもの
+import neo_rules as _neo_rules
+
 logger = logging.getLogger(__name__)
 
 
@@ -906,7 +909,12 @@ def _normalize_items_for_neo(items: List[Dict[str, Any]]) -> List[Dict[str, Any]
         if "parts_amount" in nit:
             nit["parts_amount"] = _to_int(nit.get("parts_amount"))
         if "index_value" in nit:
-            iv = _to_float(nit.get("index_value"))
+            # 指数の括弧書きは金額と扱いが違う。金額の「(5,000)」は会計表記の
+            # マイナス（値引き）だが、指数の括弧はただの印字で、
+            # コグニセブンが印刷する見積書は「加算基礎数値 ( 1.50)」と出す。
+            # ここで外しておかないと _to_float が -1.50 にしてしまい、
+            # NEO には「指数なし」として書かれる。規則は neo_rules に1つだけ置く。
+            iv = _to_float(_neo_rules.strip_index_parens(nit.get("index_value")))
             nit["index_value"] = iv
         # カテゴリ（取替/脱着/修理）
         if not nit.get("category"):
@@ -1093,7 +1101,11 @@ def build_neo_mode_b(items: List[Dict[str, Any]],
             db_wi = it.get("db_work_index")
             if db_wi and isinstance(db_wi, (int, float)) and db_wi > 0:
                 try:
-                    _pdf_idx = _to_float(it.get("index_value"))
+                    # 指数の括弧書きを外してから数値にする。外さないと
+                    # 「( 1.50)」が -1.5 になり、下の「見積側に工数が無い行」の
+                    # 判定に入って、**原本の指数が ADDATA の値で上書きされる**。
+                    _pdf_idx = _to_float(
+                        _neo_rules.strip_index_parens(it.get("index_value")))
                     _db_idx = round(float(db_wi) / 100.0, 2)
                     if _pdf_idx <= 0:
                         # 見積側に工数が無い行だけ、ADDATAの指数で補う
@@ -1165,7 +1177,11 @@ def build_neo_mode_c(items: List[Dict[str, Any]],
             db_wi = it.get("db_work_index")
             if db_wi and isinstance(db_wi, (int, float)) and db_wi > 0:
                 try:
-                    _pdf_idx = _to_float(it.get("index_value"))
+                    # 指数の括弧書きを外してから数値にする。外さないと
+                    # 「( 1.50)」が -1.5 になり、下の「見積側に工数が無い行」の
+                    # 判定に入って、**原本の指数が ADDATA の値で上書きされる**。
+                    _pdf_idx = _to_float(
+                        _neo_rules.strip_index_parens(it.get("index_value")))
                     _db_idx = round(float(db_wi) / 100.0, 2)
                     if _pdf_idx <= 0:
                         # 見積側に工数が無い行だけ、ADDATAの指数で補う

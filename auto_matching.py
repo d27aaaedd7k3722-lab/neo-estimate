@@ -28,6 +28,10 @@ from datetime import datetime
 
 import fitz  # PyMuPDF
 import jaconv
+
+# 見積の読み取り規則のうち、3つの入口（CSV取り込み・PDF直接変換・Addata照合）で
+# 同じでなければならないもの。片方だけ直す取り残しを二度出したので1か所にまとめた。
+import neo_rules as _neo_rules
 try:
     from Levenshtein import distance as lev_distance
 except ImportError:
@@ -2021,13 +2025,14 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
 
     color_code = (vehicle_info or {}).get("color_code") or ""
 
-    # アクション → DisposalCode
-    _disposal_map = {
-        "取替": 0, "交換": 0, "取換": 0,
-        "脱着": 1, "取外": 1, "取付": 1, "組付": 1,
-        "修理": 2, "補修": 2, "板金": 2, "塗装": 2,
-        "調整": 2, "点検": 2,
-    }
+    # アクション → DisposalCode。実機の基本定義ファイル
+    # （Auda7/AudaData/Const/AnDefine.ini の [WorkSheet]）が定める対応。
+    # app.py の _disposal_map と同じ値でなければならない。
+    # 以前はここだけ古く、板金・点検・調整をまとめて 2 にしていた。
+    # この値は照合の内部判定（指数照合を走らせるかどうか）に使う。
+    # 区分の対応表と引き方は neo_rules に1つだけ置いてある。
+    # 以前はここに写しがあり、app.py だけ直して古いまま残っていた。
+    _disposal_of = _neo_rules.disposal_code
 
     # v11.0: pipeline の _to_int/_to_float ヘルパーを利用 (括弧書き等の OCR 異常吸収)
     try:
@@ -2048,9 +2053,14 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
         qty = max(_ti(it.get("quantity"), 1), 1)
         if unit_price <= 0 and amount > 0:
             unit_price = amount / qty
-        target_time = _tf(it.get("index_value"))
+        # 指数の括弧書きは金額と扱いが違う（neo_rules.strip_index_parens を参照）。
+        # 外さずに _tf を通すと「( 1.50)」が -1.5 になり、下の
+        # `target_time > 0` の関門で指数照合が丸ごと飛ばされる。
+        target_time = _tf(_neo_rules.strip_index_parens(it.get("index_value")))
         action = (it.get("category") or it.get("work_code") or "").strip()
-        disposal = _disposal_map.get(action)
+        disposal = _disposal_of(action)
+        if disposal == _neo_rules.NO_DISPOSAL:
+            disposal = None
 
         db_price = None
         db_pno = ""

@@ -3,7 +3,7 @@
 同じバグが二度出ないようにするのと、後の周で自分が壊したときに気づくため。"""
 import sys, os, sqlite3, tempfile
 R=os.environ.get('XROOT',os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); sys.path.insert(0,R); os.chdir(R)
-import app, neogen
+import app, neogen, neo_header
 
 TPL = open('template_toyota.neo', 'rb').read()
 FAIL = []
@@ -197,8 +197,15 @@ for t in ('TicketNo', 'Note2', 'Note3', 'ii_CustomerName', 'GradeName', 'Custome
 
 # 12. 指数は金額と同じ正規化を通す。全角・単位付きが落ちず、
 #     丸めて0になる値や inf が Time に入らないこと。
+#     ただし括弧書きは金額と扱いが違う。金額の「(5,000)」は会計表記の
+#     マイナス（値引き）だが、指数の括弧はただの印字で、
+#     コグニセブンが印刷する見積書は「加算基礎数値 ( 1.50) 11,000」
+#     「ブース加算 ( 0.50) 3,670」と括弧付きで指数を出す（実機の帳票PDFで確認）。
+#     金額と同じ正規化をそのまま通していたため、コグニ印刷の見積書を
+#     読み込むと指数のある行が全部 Time=-1（空欄）で出ていた。
 _cases = [('1.5', 1.5), ('１．５', 1.5), ('２．５', 2.5), ('1.5h', 1.5),
-          ('2.0時間', 2.0), ('(0.8)', -1), ('0.001', -1), ('-1.0', -1),
+          ('2.0時間', 2.0), ('(0.8)', 0.8), ('( 2.90)', 2.9), ('（1.5）', 1.5),
+          ('0.001', -1), ('-1.0', -1),
           ('inf', -1), ('nan', -1), ('', -1)]
 cur = gen([{'name': f'P{i}', 'method': '取替', 'parts_amount': 1000, 'wage': 0,
             'quantity': 1, 'index_value': c} for i, (c, _) in enumerate(_cases)])
@@ -673,6 +680,234 @@ for (_n35c, _wn35c, _wc35c), _r35c in zip(_CASE35c, _g35c):
     chk((_r35c[1] or '') == _wn35c and _r35c[2] == _wc35c,
         f'35c: 半角カナ「{_n35c}」→ 区分名 {_r35c[1]!r} コード {_r35c[2]}'
         f'（期待 {_wn35c!r} / {_wc35c}）')
+
+
+
+# 36. NEO のテキスト部に書く文字は、Windows（コグニセブン）と同じ
+#     IBM 拡張漢字（FA〜FC 行）で符号化すること。
+#     Python の cp932 は「﨑」「德」「髙」を NEC 選定の ED/EE 行に書くが、
+#     実機の .neo 202件のテキスト部を調べたところ ED/EE 行は1箇所も無く、
+#     FA〜FC 行だけだった（「濱﨑」「竹﨑」の﨑 = fa b1）。
+def _kanji_rows36(blob):
+    """cp932 の文字境界を追って、ED/EE 行と FA〜FC 行の文字を拾う"""
+    out = []
+    i, n = 0, len(blob)
+    while i < n - 1:
+        hi = blob[i]
+        if (0x81 <= hi <= 0x9F or 0xE0 <= hi <= 0xFC) \
+                and 0x40 <= blob[i + 1] <= 0xFC and blob[i + 1] != 0x7F:
+            try:
+                ch = bytes((hi, blob[i + 1])).decode('cp932')
+            except UnicodeDecodeError:
+                i += 1
+                continue
+            if 0xED <= hi <= 0xEE:
+                out.append(('NEC', ch))
+            elif 0xFA <= hi <= 0xFC:
+                out.append(('IBM', ch))
+            i += 2
+            continue
+        i += 1
+    return out
+
+
+_nb36 = app.generate_neo_file(
+    TPL, {'customer_name': '濱﨑　睦弥', 'car_name': 'ﾉｱ',
+          'car_reg_department': '品川', 'car_reg_division': '300',
+          'car_reg_business': 'あ', 'car_reg_serial': '1234'},
+    [{'name': '髙橋製ﾊﾞﾝﾊﾟｰ', 'method': '取替', 'parts_amount': 1000,
+      'wage': 0, 'quantity': 1}], 0, {}, {}, False, False, False)[0]
+_f36 = neogen.unpack(_nb36)
+for _nm36 in ('AnSvMail.ini', 'AnSvImge.ini', 'AnNote.ini'):
+    _r36 = _kanji_rows36(_f36[_nm36])
+    chk(not any(k == 'NEC' for k, _ in _r36),
+        f'36: {_nm36} に NEC 選定の ED/EE 行が入った {_r36}')
+chk(any(k == 'IBM' and c == '﨑' for k, c in _kanji_rows36(_f36['AnSvMail.ini'])),
+    '36b: ヘッダXML の「﨑」が IBM 拡張で書かれていない')
+chk(any(k == 'IBM' and c == '髙' for k, c in _kanji_rows36(_f36['AnNote.ini'])),
+    '36c: AnNote の「髙」が IBM 拡張で書かれていない')
+# 管理領域も同じ符号化
+chk(_nh31.decode(_nb36)['name1'] == '濱﨑　睦弥',
+    f'36d: 管理領域の顧客名 {_nh31.decode(_nb36)["name1"]!r}')
+
+# 36e. 見積本体DB（SQLite）は実機も UTF-8。cp932 にしてはいけない
+chk('﨑'.encode('utf-8') in _f36['AnSvEm0001Ex.db'],
+    '36e: 見積本体DB の顧客名が UTF-8 で入っていない')
+
+# 36f. 「㈱」は cp932 のまま（NEC特殊文字 87 8A）。実機もそう書いていた。
+#      IBM 行にも FA58 があるが、実機 04011406.neo の協定工場名は 87 8A だった。
+chk(neo_header.encode_cp932w('㈱')[:2] == bytes((0x87, 0x8a)),
+    f'36f: 「㈱」が {neo_header.encode_cp932w("㈱")[:2].hex()} で書かれた（期待 878a）')
+
+# 36g. 幅の切り詰めは cp932w でも2バイトなので変わらない
+chk(app.cp932_trim('髙' * 20, 24) == '髙' * 12,
+    f'36g: IBM拡張漢字の切り詰め {app.cp932_trim("髙" * 20, 24)!r}')
+
+
+
+# ============================================================
+# 配布パッケージ（pdf-to-neo_bundle_20260910.zip）の仕様書と
+# 突き合わせて直したぶん（2026-09-11）
+# ============================================================
+
+# 37. 前案件の .neo をテンプレートにしたとき、塗装オプションのチェックが残らないこと。
+#     実機の PaintingEtcetera は BSealing（ボデーシーリング）・ARWax（防錆ワックス）・
+#     TwoCSolidOther（2コートソリッドのルーフ以外の枚数）を持つ。
+#     金額だけ消してフラグを残すと、コグニで開いて再計算したときに
+#     前案件ぶんの塗装工賃が乗る（実機の例で 730+730+2,200 = 3,660円）。
+_prev37 = app.generate_neo_file(TPL, {}, [
+    {'name': 'A', 'method': '取替', 'parts_amount': 1000, 'wage': 0, 'quantity': 1}],
+    0, {}, {}, False, False, False)[0]
+# 前案件に塗装オプションが立っている状態を作る
+_f37 = neogen.unpack(_prev37)
+_c37 = neogen.opendb(_f37['AnSMB.txt'])
+_c37.execute('UPDATE PaintingEtcetera SET BSealing=1, ARWax=1, TwoCSolidOther=2,'
+             ' BSealingWageOutTax=730, ARWaxWageOutTax=730, TwoCSolidWageOutTax=2200')
+_c37.commit()
+_f37['AnSMB.txt'] = open(_c37.execute('PRAGMA database_list').fetchone()[2], 'rb').read()
+_c37.close()
+_ck37 = app.find_real_cks(_prev37)
+_m37, _e37 = app.parse_entries(_prev37, _ck37[0])
+_tpl37 = app.repack_neo(_prev37, _f37, _m37, _e37)
+# 確認: 前案件側にはフラグが立っている
+_chk37 = neogen.opendb(neogen.unpack(_tpl37)['AnSMB.txt']).cursor().execute(
+    'select BSealing, ARWax, TwoCSolidOther from PaintingEtcetera').fetchone()
+chk(_chk37 == (1, 1, 2), f'37: 検査の前提が作れていない {_chk37}')
+
+for _merge37 in (True, False):
+    _nb37 = app.generate_neo_file(_tpl37, {}, [
+        {'name': 'B', 'method': '取替', 'parts_amount': 2000, 'wage': 0, 'quantity': 1}],
+        0, {}, {}, False, False, _merge37)[0]
+    _g37 = neogen.opendb(neogen.unpack(_nb37)['AnSMB.txt']).cursor().execute(
+        'select BSealing, ARWax, TwoCSolidOther, TwoCSolidFlag, LCColorFlag,'
+        ' BSealingWageOutTax, ARWaxWageOutTax from PaintingEtcetera').fetchone()
+    chk(all(v in (0, -1) for v in _g37),
+        f'37: {"マージ" if _merge37 else "非マージ"}で塗装オプションが残った {_g37}')
+
+# 38. ファイル情報の作成日が今日になること。
+#     このアプリは今までここを触っておらず、生成物すべてが
+#     テンプレートの作成日（2026/03/11）のままだった。
+#     ※ このキー 'AnDBVersion.ini' の実体は AnFlInfo（内包ファイル名が
+#       実体より1つ前にずれている。app.py の update_file_info に対応表あり）
+import datetime as _dt38
+_nb38 = app.generate_neo_file(TPL, {}, [
+    {'name': 'A', 'method': '取替', 'parts_amount': 1000, 'wage': 0, 'quantity': 1}],
+    0, {}, {}, False, False, False)[0]
+_fi38 = neogen.unpack(_nb38)['AnDBVersion.ini']
+_today38 = _dt38.datetime.now(app.JST).strftime('%Y/%m/%d')
+chk(('NewCreate=' + _today38).encode('cp932') in _fi38,
+    f'38: 作成日が今日になっていない {_fi38[:60]!r}')
+# 改行が CRLF のまま・サイズが変わらないこと（固定長ではないが揃えておく）
+_ftpl38 = neogen.unpack(TPL)['AnDBVersion.ini']
+chk(_fi38.count(b'\n') == _fi38.count(b'\r\n'),
+    '38b: ファイル情報に単独 LF が混ざった')
+chk(len(_fi38) == len(_ftpl38),
+    f'38c: ファイル情報のサイズが変わった {len(_fi38)} != {len(_ftpl38)}')
+
+# 39. 見積の読み取り規則は neo_rules に1つだけ置き、3つの入口
+#     （CSV取り込み・PDF直接変換・Addata照合）がそこを使うこと。
+#     同じ規則を各所に写していたため、app.py だけ直して
+#     auto_matching / pdf_to_neo_pipeline が古いまま、という取り残しを
+#     二度出した（作業区分の対応表・指数の括弧書き）。
+import neo_rules as _nr39
+import auto_matching as _am39
+import pdf_to_neo_pipeline as _pp39
+
+# 実機の定義（AnDefine.ini [WorkSheet]）どおりのコードを返すこと
+for _w39, _c39 in (('取替', 0), ('脱着', 1), ('修理', 2), ('板金', 6), ('鈑金', 6),
+                   ('脱着修理', 3), ('脱着板金', 3), ('点検', 4), ('調整', 4),
+                   ('点検調整', 4), ('分解調整', 5), ('分解', 5), ('磨き調整', 2),
+                   ('光軸', 4), ('コーディング', 4), ('ペイント', 2)):
+    chk(_nr39.disposal_code(_w39) == _c39,
+        f'39: neo_rules の区分「{_w39}」→ {_nr39.disposal_code(_w39)}（期待 {_c39}）')
+chk(_nr39.disposal_code('') == -1, '39: 空欄が区分なし(-1)にならない')
+chk(_nr39.disposal_code('脱着（左）') == 1, '39: 括弧書きの補足で区分不明になる')
+chk(_nr39.disposal_code('取替 ') == 0, '39: 末尾の空白で区分不明になる')
+
+# 対応表の写しが他のファイルに残っていないこと（残ると片方だけ古くなる）
+for _f39 in (_am39.__file__, _pp39.__file__):
+    _src39 = open(_f39, encoding='utf-8').read()
+    chk('_disposal_map = {' not in _src39,
+        f'39b: {_f39} に区分マップの写しが残っている')
+
+# 指数の括弧外しも3つの入口で同じ結果になること
+for _v39, _w39 in (('(0.8)', 0.8), ('( 2.90)', 2.9), ('（1.5）', 1.5),
+                   ('1.5', 1.5), ('-0.8', -0.8)):
+    chk(float(_nr39.strip_index_parens(_v39)) == _w39,
+        f'39c: neo_rules の指数 {_v39!r} → {_nr39.strip_index_parens(_v39)!r}')
+    chk(_pp39._to_float(_nr39.strip_index_parens(_v39)) == _w39,
+        f'39d: PDF経路の指数 {_v39!r} が {_w39} にならない')
+# 文字の括弧は触らない（「(左)」を数字として読まない）
+chk(_nr39.strip_index_parens('(左)') == '(左)', '39e: 文字の括弧まで外している')
+
+# 3つの入口すべてが括弧外しを通ること。app.py だけ直して他が古いまま、を防ぐ。
+for _f39, _lab39 in ((_am39.__file__, 'Addata照合'),
+                     (_pp39.__file__, 'PDF直接変換'),
+                     (os.path.join(R, 'app.py'), 'CSV取り込み')):
+    chk('strip_index_parens' in open(_f39, encoding='utf-8').read(),
+        f'39f: {_lab39}（{os.path.basename(_f39)}）が指数の括弧外しを通っていない')
+
+
+# 39g. 指数を数値にしている行が、括弧外しを通さずに変換していないこと。
+#      同じ取りこぼしを4回続けて出したので、機械的に見張る。
+#      （index_value を数値化する行は、その前後2行以内に strip_index_parens が要る）
+_conv39 = _re.compile(r'(_to_float|_tf|_normalize_number_text|float)\s*\(')
+for _f39 in (os.path.join(R, 'app.py'), _am39.__file__, _pp39.__file__):
+    _lines39 = open(_f39, encoding='utf-8').read().splitlines()
+    for _i39, _ln39 in enumerate(_lines39):
+        if 'index_value' not in _ln39 or _ln39.lstrip().startswith('#'):
+            continue
+        if not _conv39.search(_ln39):
+            continue
+        _ctx39 = '\n'.join(_lines39[max(0, _i39 - 3):_i39 + 3])
+        chk('strip_index_parens' in _ctx39,
+            f'39g: {os.path.basename(_f39)}:{_i39 + 1} が指数を括弧外しなしで数値にしている'
+            f'  {_ln39.strip()[:70]}')
+
+# 39h. ソースの見た目ではなく、**実際に関数を呼んで**指数が保たれることを見る。
+#      39g のソース走査は、変換が複数行に分かれていると取りこぼす。
+#      PDF 直接変換の入口 `_normalize_items_for_neo` に括弧付きの指数を渡し、
+#      正の値のまま残ることを確かめる。
+for _v39h, _w39h in (('( 1.50)', 1.5), ('(0.8)', 0.8), ('（2.0）', 2.0),
+                     ('1.5', 1.5), ('', 0.0)):
+    _out39h = _pp39._normalize_items_for_neo(
+        [{'name': 'A', 'work_code': '脱着', 'wage': 1000, 'quantity': 1,
+          'index_value': _v39h}])
+    _got39h = _out39h[0].get('index_value')
+    chk(abs(float(_got39h or 0) - _w39h) < 0.001,
+        f'39h: PDF経路の指数 {_v39h!r} → {_got39h!r}（期待 {_w39h}）')
+
+# 39i. 欄に別の数字が混ざっているときは触らないこと。
+#      「(1) 0.80」の括弧だけ外すと「1 0.80」→ 空白が詰まって「10.80」に化ける。
+for _v39i in ('(1) 0.80', '1.50 (2)', '(1)(2)', '(左)0.8'):
+    chk(_nr39.strip_index_parens(_v39i) == _v39i,
+        f'39i: 混ざった欄 {_v39i!r} を触っている → {_nr39.strip_index_parens(_v39i)!r}')
+# 欄まるごとのときだけ外す
+for _v39i, _w39i in (('(0.8)', '0.8'), ('( 2.90)', '2.90'), ('（1.5）', '1.5')):
+    chk(_nr39.strip_index_parens(_v39i) == _w39i,
+        f'39i: 欄まるごとの {_v39i!r} を外していない')
+
+
+# 40. 数量が2以上の行の税額は「単価×0.1 を四捨五入して数量倍」。
+#     行合計に税率を掛けるのではない。実機の .neo 202件で、数量>1 の行のうち
+#     両者が食い違う 32 行はすべて後者だった（前者だけが正解になる行は 0 行）。
+#     仕様書の実例: 単価155×10個 → 税160・税込1710 / 185×9 → 税171。
+_c40 = gen([{'name': 'ｸﾘｯﾌﾟ', 'method': '取替', 'parts_amount': 1550, 'wage': 0, 'quantity': 10},
+            {'name': 'ﾎﾞﾙﾄ', 'method': '取替', 'parts_amount': 1665, 'wage': 0, 'quantity': 9},
+            {'name': 'ﾊﾞﾝﾊﾟｰ', 'method': '取替', 'parts_amount': 45000, 'wage': 0, 'quantity': 1},
+            {'name': 'ﾜﾘｷﾚﾅｲ', 'method': '取替', 'parts_amount': 1001, 'wage': 0, 'quantity': 3}])
+_g40 = _c40.execute('select PartsName, PartsCount, PartsPriceOutTax, PartsPriceTax,'
+                    ' PartsPriceInTax from ERParts where PartsName<>"" order by LineNo').fetchall()
+_W40 = [('ｸﾘｯﾌﾟ', 10, 1550, 160, 1710), ('ﾎﾞﾙﾄ', 9, 1665, 171, 1836),
+        ('ﾊﾞﾝﾊﾟｰ', 1, 45000, 4500, 49500), ('ﾜﾘｷﾚﾅｲ', 3, 1001, 100, 1101)]
+for _w40, _r40 in zip(_W40, _g40):
+    chk(tuple(_r40) == _w40, f'40: {_w40[0]} の税額 {tuple(_r40)}（期待 {_w40}）')
+
+# 40b. 帳票に出る「消費税」は課税額計×10% の一括四捨五入のまま
+#      （実機202件のうち 196 件が一括丸め。残り5件は税抜き表示の見積で税額0）。
+#      行ごとの丸め方を変えても、ここが変わってはいけない。
+_t40 = _c40.execute('select SubTotal, tx_TotalOutTax, Total from Total').fetchone()
+chk(_t40 == (49216, 4922, 54138), f'40b: 合計 {_t40}（期待 (49216, 4922, 54138)）')
 
 
 print('REG_NEOACC:', 'ALL PASS' if not FAIL else 'FAIL')

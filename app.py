@@ -54,6 +54,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 # コグニセブンの「既存見積」一覧が読む先頭424Bの管理領域を書くために使う
 import neo_header
+# 見積の読み取り規則のうち、3つの入口（CSV取り込み・PDF直接変換・Addata照合）で
+# 同じでなければならないもの。片方だけ直す取り残しを二度出したので1か所にまとめた。
+import neo_rules
 
 # ============================================================
 # 定数・設定
@@ -552,7 +555,11 @@ def cp932_trim(value, max_bytes: int) -> str:
     s = str(value if value is not None else '')
     if not s:
         return ''
-    b = s.encode('cp932', 'replace')[:max_bytes]
+    # 符号化は cp932w（Windows と同じ IBM 拡張漢字）。「﨑」「德」「髙」は
+    # Python の cp932 だと ED/EE 行、Windows は FA〜FC 行に書く。
+    # 実機の .neo 202件を調べたところ ED/EE 行は1箇所も無く、FA〜FC 行だけだった。
+    # バイト数は同じ2バイトなので、切り詰めの幅計算は変わらない。
+    b = neo_header.encode_cp932w(s)[:max_bytes]
     while b:
         try:
             return b.decode('cp932')
@@ -990,11 +997,28 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         pass
     # 塗装セクションの「あり」フラグも消す。工賃だけ -1 にすると
     # 「調色あり・工賃ブランク」という説明できない状態になる。
+    # 数え上げの列（TwoCSolidOther = ルーフ以外の枚数）も戻す。
+    # 前案件の .neo をテンプレートにしたとき、ボデーシーリング・防錆ワックス・
+    # 2コートソリッドのチェックが残り、コグニで開いて再計算すると
+    # 前案件ぶんの塗装工賃（実機の例で 730+730+2200 = 3,660円）が乗る。
+    #
+    # 列名を並べた1本の UPDATE にすると、テンプレートに1列でも無いものが
+    # あった時点で文まるごと失敗し、except で握りつぶされて
+    # **1つもクリアされない**。テンプレートは利用者が持ち込む .neo なので、
+    # 列構成が違うことがありうる。実際にある列だけで組み立てる。
     try:
-        cur.execute("""UPDATE PaintingEtcetera SET
-            LCColorFlag=0, LCColorRoof=0, TwoCSolidFlag=0, TwoCSolidRoof=0""")
+        _pe_cols = {c[1] for c in cur.execute('PRAGMA table_info(PaintingEtcetera)')}
     except sqlite3.Error:
-        pass
+        _pe_cols = set()
+    _pe_want = ('DSBlack', 'BStripe', 'BSealing', 'ARWax',
+                'LCColorFlag', 'LCColorRoof', 'LCColorOtherChange', 'LCColorOtherRepair',
+                'TwoCSolidFlag', 'TwoCSolidRoof', 'TwoCSolidOther', 'TwoTone')
+    _pe_set = [f'{c}=0' for c in _pe_want if c in _pe_cols]
+    if _pe_set:
+        try:
+            cur.execute('UPDATE PaintingEtcetera SET ' + ', '.join(_pe_set))
+        except sqlite3.Error:
+            pass
 
     # 全Expense行をクリア（LineNo=1〜8: 文字書き/内張り/配線/ショートパーツ/レッカー代１/レッカー代２/写真代他/その他控除）
     # LineNo 9 以降は自由入力の費用行。前案件の .neo をテンプレートに
@@ -1089,14 +1113,14 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             # 「左側」「右側」のように左右の後ろに1字続く形も拾う。
             _m_side = re.search(
                 r'[（(\[]?\s*(左|右|Ｌ|Ｒ|LH|RH|L|R)\s*(側|前|後)?\s*[)）\]]?$', name)
-            if _m_side and len(name.encode('cp932', 'replace')) > _avail:
+            if _m_side and len(neo_header.encode_cp932w(name)) > _avail:
                 # 正規表現の先頭が \s* なので、re.search は左右記号の直前の
                 # 空白の連なりからマッチする。そのまま温存すると22バイトの
                 # 持ち分を空白が食い、識別に必要な語尾から先に消える。
                 # 「…アウタ R」と「…インナ R」が両方「※フロントドアパネル  R」
                 # になり、別部品が同じ文字列で並ぶ。空白は落として詰める。
                 _side_txt = re.sub(r'\s+', '', name[_m_side.start():])
-                _side_len = len(_side_txt.encode('cp932', 'replace'))
+                _side_len = len(neo_header.encode_cp932w(_side_txt))
                 _body = re.sub(r'\s+', '', name[:_m_side.start()])
                 name = cp932_trim(_body, max(_avail - _side_len, 0)) + _side_txt
             name = '※' + cp932_trim(name, _avail)
@@ -1198,7 +1222,18 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         else:
             # 税抜: 従来通り
             parts_outtax = parts_total
-            parts_tax    = jpy_round(parts_total * TAX_RATE) if parts_total != 0 else 0
+            # 数量が2以上の行は、行合計に税率を掛けるのではなく
+            # 「単価に税率を掛けて四捨五入したものを数量倍」する。
+            # 実機の .neo 202件で、数量>1 の行のうち両者が食い違う 32 行は
+            # すべて後者だった（前者だけが正解になる行は 1 行も無い）。
+            # 例: 単価155×10個 → 四捨五入(15.5)×10 = 160（行合計1550の10%＝155 ではない）。
+            parts_tax = 0
+            if parts_total != 0:
+                _q_tax = qty if isinstance(qty, int) and qty > 1 else 0
+                if _q_tax and parts_total % _q_tax == 0:
+                    parts_tax = jpy_round((parts_total // _q_tax) * TAX_RATE) * _q_tax
+                else:
+                    parts_tax = jpy_round(parts_total * TAX_RATE)
             parts_intax  = parts_total + parts_tax if parts_total != 0 else 0
             wage_outtax  = wage_total
             wage_tax_abs = jpy_round(abs(wage_total) * TAX_RATE) if wage_total != 0 else 0
@@ -1246,56 +1281,22 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         # 変わらないが、コグニセブン側の再計算は区分コードで動く。
         # 並び順に意味がある。下の部分一致フォールバックは登録順に見るので、
         # 「脱着修理」を「脱着」より後ろに置くと 1（脱着）に取られる。
-        _disposal_map = {
-            # 複合区分（先に置く）
-            '脱着修理': 3, '脱着板金': 3, '脱着鈑金': 3,
-            '脱着取替': 1, '脱着清掃': 1,
-            '点検調整': 4, '点検清掃': 4,
-            '分解調整': 5, '分解清掃': 5,
-            '磨き調整': 2,
-            # 単独区分
-            '取替': 0, '交換': 0, '取換': 0, '取り替え': 0, '取替え': 0,
-            '脱着': 1, '取外': 1, '取付': 1, '組付': 1, '脱外': 1,
-            '板金': 6, '鈑金': 6,
-            # 点検・調整の同義語。CSV や手入力で「光軸」「コーディング」と
-            # 直接書かれても、抽出プロンプトが「調整」に寄せる語と
-            # 同じコード（4）になるようにしておく。
-            '点検': 4, '診断': 4,
-            '調整': 4, '光軸': 4, 'フィッティング': 4, 'コーディング': 4,
-            '設定': 4, '消去': 4,
-            '分解': 5, '清掃': 5,
-            # 区分として「磨き」が来たら 2。実機にも DisposalCode=2 の
-            # 「磨き調整」10行・「磨き」1行があった。
-            # 一方、区分が空欄で品名に「磨き」が入っているだけの行
-            # （「ﾎｲｰﾙ研磨」など）は区分なしのままにする。そちらは上の
-            # 品名からの推定側で扱っていて、ここには来ない。
-            '修理': 2, '補修': 2, '修正': 2, '磨き': 2,
-            '穴あけ': 2, 'シーリング': 2,
-            # 塗装まわりは AnDefine.ini に区分が無い（実機は塗装テーブルに入れる）。
-            # ERParts の1行として出す以上、いちばん近い 2（修理）に寄せる。
-            '塗装': 2, 'ペイント': 2, 'ワックス': 2, '加算': 2, 'ブース': 2,
-        }
-        # 区分は完全一致だけで引くと、末尾に空白が付いただけ、
-        # 「脱着（左）」のように補足が付いただけで -1（区分不明）になる。
-        # 記号や括弧書きを落として正規化し、それでも決まらなければ
-        # 部分一致に落とす。CSV取込では区分欄が埋まっているのが普通なので、
-        # ここで取りこぼすと全行が区分不明になる。
-        _m_key = unicodedata.normalize('NFKC', str(_method_full or ''))
-        _m_key = re.sub(r'[（(\[【][^）)\]】]*[）)\]】]?', '', _m_key)
-        _m_key = re.sub(r'[\s\u3000※*・/／,、]', '', _m_key).strip()
-        disposal_code = _disposal_map.get(_m_key, -1)
-        if disposal_code == -1 and _m_key:
-            for _kw, _cd in _disposal_map.items():
-                if _kw in _m_key:
-                    disposal_code = _cd
-                    break
+        # 対応表と引き方は neo_rules に置いてある（3つの入口で同じ規則を使うため）。
+        disposal_code = neo_rules.disposal_code(_method_full)
         # 指数（工数）。画面まで往復させておきながら NEO には書いていなかったため、
         # コグニセブン側では全行が指数ゼロの見積として開かれていた。
         # 単位は時間の小数（1.0 = 100WI, _addata_db_search.match_wage_by_time 参照）。
         # 素の float() だと全角「１．５」「(0.8)」「1.5h」を落とし、
         # 同じ行の全角金額は読めるのに指数だけ欠ける。金額と同じ正規化を通す。
         # （auto_matching も同じ index_value を正規化して工数照合に使っている）
-        _idx_raw = _normalize_number_text(item.get('index_value', ''))
+        # 括弧書きは金額なら会計表記のマイナス（値引きの「(5,000)」）だが、
+        # 指数の括弧は**ただの印字**。コグニセブンが印刷する見積書は
+        # 「加算基礎数値 ( 1.50) 11,000」「ブース加算 ( 0.50) 3,670」のように
+        # 指数を括弧付きで出す（実機の帳票 PDF で確認）。
+        # 金額と同じ正規化を通すと (0.8) が -0.8 になり、下の
+        # 「負値は -1（空欄）」に落ちて、指数のある行が指数ゼロで出ていた。
+        _idx_src = neo_rules.strip_index_parens(item.get('index_value', ''))
+        _idx_raw = _normalize_number_text(_idx_src)
         try:
             _idx = float(_idx_raw) if _idx_raw is not None else 0.0
         except (TypeError, ValueError):
@@ -2066,7 +2067,7 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
             continue  # マージモード: 空値はスキップ（テンプレートの既存値を保持）
         # 値に & や < が入るとXMLが壊れるためエスケープする（法人名の「＆」等）
         text = replace_xml_tag(text, tag_name, _xml_escape(value))
-    return text.encode('cp932', errors='replace')
+    return neo_header.encode_cp932w(text)
 
 
 # ============================================================
@@ -2102,7 +2103,7 @@ def update_imge_ini(orig_bytes, cust, insurance_info=None, merge_mode=False):
         if merge_mode and not value:
             continue  # マージモード: 空値はスキップ（テンプレートの既存値を保持）
         text = replace_ini_value(text, key, value)
-    return text.encode('cp932', errors='replace')
+    return neo_header.encode_cp932w(text)
 
 
 # ============================================================
@@ -2161,13 +2162,14 @@ def generate_annote(rows):
         # 見積書の部品名が2行に折り返された表をCSV化すると普通に起きる。
         # 品名欄は [14:38] の24バイト。ERParts.PartsName と同じ幅で切る。
         # ここを広く取ると、隣の標準品名欄（[38:62]）へはみ出す。
-        name_bytes = cp932_trim(_strip_control_chars(name),
-                                _ERPARTS_WIDTH['PartsName']).encode('cp932', errors='replace')
+        name_bytes = neo_header.encode_cp932w(
+            cp932_trim(_strip_control_chars(name), _ERPARTS_WIDTH['PartsName']))
         for j, b in enumerate(name_bytes):
             line[14 + j] = b
         # 品番欄は [62:80] の18バイト。
-        _pno = cp932_trim(_strip_control_chars(str(row.get('parts_no', '') or '')),
-                          _ERPARTS_WIDTH['PartsNo']).encode('cp932', errors='replace')
+        _pno = neo_header.encode_cp932w(
+            cp932_trim(_strip_control_chars(str(row.get('parts_no', '') or '')),
+                       _ERPARTS_WIDTH['PartsNo']))
         for j, b in enumerate(_pno):
             line[62 + j] = b
         # 注記の数量欄は2桁固定。3桁以上は入らないので丸めるしかないが、
@@ -2186,6 +2188,54 @@ def generate_annote(rows):
             line[127 + j] = ord(c)
         lines.append(bytes(line) + b'\r\n')
     return b''.join(lines)
+
+
+def update_file_info(orig_bytes):
+    """ファイル情報（作成日）を今日に更新する。
+
+    ※ ここで扱うキー 'AnDBVersion.ini' は**中身の実体とは違う名前**。
+      NEO のファイルテーブルは「名前の次に来る size/offset が、その名前の
+      ファイルのもの」ではなく **次のエントリのもの**という構造をしていて、
+      このアプリの parse_entries は当該エントリのものとして読んでいる。
+      そのため extract_files が返すキーは実体より1つ前にずれている:
+
+          このアプリのキー          実体
+          AnCooperate.txt      →  AnDBVersion.ini
+          AnDBVersion.ini      →  AnFlInfo         ← ここで扱うもの
+          AnFlInfo             →  AnNote.ini
+          AnNote.ini           →  AnSMB.txt（144B固定長の明細）
+          AnSMB.txt            →  AnSvEm0001.sld（明細・費用・合計のSQLite）
+          AnSvEm0001Ex.db      →  AnSvIf0001.sld（顧客・車両・保険のSQLite）
+          AnSvImge.ini         →  AnSvMail.ini（NEOMAIL2 の INI）
+          AnSvMail.ini         →  <見積名>.xml（ヘッダXML）
+
+      実機の .neo は各ファイルの先頭に「; ファイル名 : …(本当の名前)」と
+      書いてあり、それで確認した（2026-09-10）。
+      読み書きが同じずれ方をしているのでバイト列は往復で壊れない。
+      **名前を直すには読み・書き・呼び出しを同時に直す必要がある**ので、
+      ここでは直さず、取り違えないようにこの対応表を残す。
+
+    実体の AnFlInfo は `[General] NewCreate=<作成日>` を持つ。
+    このアプリは今までここを触っておらず、生成物すべてが
+    テンプレートの作成日（2026/03/11）のままだった。
+    """
+    if not orig_bytes:
+        return orig_bytes
+    try:
+        text = orig_bytes.decode('cp932', errors='replace')
+    except Exception:
+        return orig_bytes
+    if 'NewCreate' not in text:
+        return orig_bytes      # 想定と違う中身。触らない
+    # 車種データ版（AnVer.db）は書き換えない。このアプリは部品価格を
+    # 見積書から取っていて ADDATA の版を使っていないので、
+    # 使っていない版を名乗ることになる。
+    # `.*$` にすると行末の CR まで食べてしまい、この行だけ改行が LF になる。
+    # 他の行が CRLF なので、1 行だけ改行の違うファイルができる。
+    text = re.sub(r'^NewCreate[^\r\n]*',
+                  'NewCreate=' + now_jst().strftime('%Y/%m/%d'),
+                  text, count=1, flags=re.M)
+    return neo_header.encode_cp932w(text)
 
 
 # ============================================================
@@ -2279,6 +2329,7 @@ def generate_neo_file(template_data, customer_info, items, short_parts_wage, ins
                                             insurance_info=insurance_info, merge_mode=merge_mode)
     files['AnSvImge.ini'] = update_imge_ini(files['AnSvImge.ini'], customer_info,
                                             insurance_info=insurance_info, merge_mode=merge_mode)
+    files['AnDBVersion.ini'] = update_file_info(files.get('AnDBVersion.ini', b''))
     neo_data = repack_neo(template_data, files, mgmt, entries)
     # コグニセブンの「既存見積」一覧は、内包ファイルではなく
     # ファイル先頭 424 バイトの管理領域から 登録番号・顧客名・車名 を読む。
