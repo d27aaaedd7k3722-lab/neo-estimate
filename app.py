@@ -197,6 +197,17 @@ def _is_model_unavailable_error(err_msg: str) -> bool:
     return ('no longer available' in m) or ('NOT_FOUND' in m) or ('404' in m) or ('is not found' in m)
 
 
+def _is_quota_error(err_msg: str) -> bool:
+    """クォータ超過（429 RESOURCE_EXHAUSTED）かどうか。
+
+    同じ条件が3箇所に散らばっていたのでここにまとめた。
+    このエラーは待っても同じモデルでは通らず、投げ直すこと自体が
+    さらにクォータを食うので、リトライしてはいけない。
+    """
+    m = str(err_msg or '')
+    return ('429' in m) or ('RESOURCE_EXHAUSTED' in m) or ('クォータが上限' in m)
+
+
 def _mark_model_unavailable(api_key: str, model_name: str):
     """提供終了モデルを記録し、モデル一覧キャッシュを破棄する"""
     if model_name:
@@ -2402,8 +2413,15 @@ def call_gemini(api_key, file_bytes, mime_type, prompt_text, model_name=None, us
             raise
         except Exception as e:
             last_error = e
+            # モデルが無い（404）・クォータ切れ（429）は、1秒待って同じモデルに
+            # 投げ直しても絶対に通らない。とくに 429 はリトライ自体がクォータを
+            # さらに食う。ここで即座に諦めて、呼び出し側のモデル切り替えに任せる。
+            if _is_model_unavailable_error(str(e)) or _is_quota_error(str(e)):
+                raise ValueError(f"Gemini API呼び出しに失敗しました: {str(e)}")
             if attempt < 2:
-                import time; time.sleep(1)
+                # 一時的な障害（500 など）は待って再送する。
+                # 固定1秒だと復旧前に打ち切ることがあるので、少しずつ延ばす。
+                import time; time.sleep(1 + attempt)
                 continue
             raise ValueError(f"Gemini API呼び出しに失敗しました（{attempt+1}回試行）: {str(last_error)}")
 
@@ -3497,7 +3515,7 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
             _mark_model_unavailable(api_key, _model_used)
             _msg = f'モデル「{_model_used}」は利用できません（提供終了の可能性があります）'
             _switch = True
-        elif '429' in _msg or 'RESOURCE_EXHAUSTED' in _msg:
+        elif _is_quota_error(_msg):
             _quota_exhausted_set().add(_model_used)
             try:
                 _availability_cache().pop(_model_cache_key(api_key), None)
@@ -4116,7 +4134,7 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
                     + (f"代替モデル「{_alt}」に自動切り替えします。" if _alt else "サイドバーで別のモデルを選択してください。")
                 ) from e
             # クォータ超過エラー
-            if '429' in err_msg or 'RESOURCE_EXHAUSTED' in err_msg:
+            if _is_quota_error(err_msg):
                 _quota_exhausted_set().add(model_name)
                 cache_key = api_key[-8:] if api_key else ''
                 if cache_key in _availability_cache():
@@ -6444,7 +6462,7 @@ def main():
                         f"詳細: {err_str}"
                     )
             # クォータ超過エラーの場合、分かりやすいメッセージとリトライを促す
-            elif '429' in err_str or 'RESOURCE_EXHAUSTED' in err_str or 'クォータが上限' in err_str:
+            elif _is_quota_error(err_str):
                 _quota_exhausted_set().add(_cur_model)
                 # キャッシュクリア
                 _api_key_for_err = api_key
