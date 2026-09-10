@@ -218,6 +218,49 @@ def _walk_for_addata(root: str, max_depth: int = 5,
     return None
 
 
+def addata_version(path: Optional[str]) -> str:
+    """ADDATA のデータ版（例 '2026/08'）。取れなければ ''。
+
+    COM/AnVer.DB は XOR 0xFF の INI で、'Number=2026/08' の行を持つ。
+    PC ごとに版が違うと標準品番・標準指数が変わる。つまり古い版で照合すると、
+    協定見積に載る部品コードや指数が実機と食い違う。
+    （pdf-to-neo 配布パッケージ skill_env.py の考え方を採用）
+    """
+    if not path:
+        return ''
+    fp = os.path.join(path, 'COM', 'AnVer.DB')
+    try:
+        with open(fp, 'rb') as f:
+            text = bytes(x ^ 0xFF for x in f.read()).decode('cp932', 'replace')
+    except OSError:
+        return ''
+    for line in text.splitlines():
+        if line.lower().startswith('number='):
+            return line.split('=', 1)[1].strip()
+    return ''
+
+
+def addata_version_key(path: Optional[str]) -> tuple:
+    """候補が複数あるときの新しさ。データ版を優先し、無ければ更新日時。
+
+    フォルダごとコピーすると更新日時が当てにならないので、版そのものを先に見る。
+    """
+    v = addata_version(path)
+    num = 0.0
+    if v:
+        digits = ''.join(ch for ch in v if ch.isdigit())
+        if len(digits) >= 6:
+            num = float(digits[:6])          # 202608 のように年月で比べる
+    for name in ('AnVer.DB', 'COM.CAB'):
+        fp = os.path.join(path or '', 'COM', name)
+        try:
+            if os.path.isfile(fp):
+                return (num, os.path.getmtime(fp))
+        except OSError:
+            break
+    return (num, 0.0)
+
+
 def find_addata(force_refresh: bool = False) -> Optional[str]:
     """ADDATA ルートを自動検索して返す。見つからなければ None。
     結果はモジュールキャッシュ。force_refresh=True で再検索。"""
@@ -230,11 +273,24 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
         _cache[CACHE_KEY] = env_root
         return env_root
 
-    # 2. 標準位置 (v6.1: AdSeven含め拡張)
+    # 2. 標準位置と OneDrive の典型サブパスを「全部」見て、データ版が新しいものを選ぶ。
+    #    以前は最初に見つかったものをそのまま返していたため、古い C:\Addata を
+    #    残したまま新しい版を別の場所に置いている PC では、古い版で照合していた。
+    #    版が違うと標準品番・標準指数が変わり、協定見積の中身が変わる。
+    #    候補はどれも数個で、読むのは COM/AnVer.DB（小さい INI）だけなので速い。
+    _shallow = []
     for std in _STANDARD_PATHS:
         if _is_valid_addata(std):
-            _cache[CACHE_KEY] = std
-            return std
+            _shallow.append(std)
+    for od in _candidate_onedrive_roots():
+        for sub in _ONEDRIVE_SUBPATHS:
+            cand = os.path.join(od, sub)
+            if _is_valid_addata(cand):
+                _shallow.append(cand)
+    if _shallow:
+        best = max(_shallow, key=addata_version_key)
+        _cache[CACHE_KEY] = best
+        return best
 
     # 2b. OneDrive ルート × 業務典型サブパス の直積展開を O(1) 確認 (v10.4)
     # 再帰検索より速く、ユーザー指定パス「【※写真※】 2025\コグニ、アセス　データベース\Addata」を確実に当てる

@@ -2725,6 +2725,9 @@ def identify_vehicle(addata_base, vehicle_data):
     """車検証情報から Addata の車種コードを特定する。"""
     if not addata_base:
         return {'match_layer': 3, 'is_supported': False, 'reason': 'Addata未検出'}
+    # KA81（型式指定番号＋類別区分番号）での逆引きは
+    # auto_matching.identify_vehicle_wrapper の中でまとめて行う
+    # （PDF直接経路も同じ関数を通るため、そちらに置いてある）。
     try:
         from auto_matching import identify_vehicle_wrapper
     except Exception as e:
@@ -2833,8 +2836,14 @@ def apply_addata_matching(estimate_data, vehicle_data, progress=None):
         _clear_addata_codes(estimate_data)
         return False
 
+    # 特定できた車種を照合にも渡す。渡さないと照合側が車種を引き直し、
+    # KA81 で特定した車種と食い違って部品名が当たらなくなる。
+    _veh_for_match = dict(vehicle_data or {})
+    _vc = str(veh_match_result.get('vehicle_code') or '').strip()
+    if _vc:
+        _veh_for_match['vehicle_code'] = _vc
     matched_items, has_rev = match_parts_with_addata(
-        estimate_data['items'], addata_dir, vehicle_data)
+        estimate_data['items'], addata_dir, _veh_for_match)
     estimate_data['items'] = matched_items
     # has_rev は「照合器が結果を返したか」であって、PDF総額の突き合わせ
     # （_reverse_match）とは意味が違う。_reverse_match を上書きすると、
@@ -5514,6 +5523,16 @@ def main():
             _ka06 = find_ka06_path(addata_status)
             st.success("Addata検出済み")
             st.caption(addata_status)
+            # データ版（COM/AnVer.DB の Number）。版が違うと標準品番・標準指数が
+            # 変わるため、どの版で照合したかを見えるようにしておく。
+            # 社内で版が揃っているかの確認にも使う。
+            try:
+                from addata_locator import addata_version as _ad_ver
+                _ver = _ad_ver(addata_status)
+            except Exception:
+                _ver = ''
+            st.caption(f"データ版: {_ver}" if _ver
+                       else "データ版: 不明（COM/AnVer.DB が読めません）")
             st.caption(("車種マスタ KA06_ALL.DB あり" if _ka06
                         else "※ COM/KA06_ALL.DB が無いため車種の自動特定はできません"))
             if st.button("🗑️ Addataを解除", key='addata_clear_btn'):

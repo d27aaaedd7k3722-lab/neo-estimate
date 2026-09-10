@@ -1309,19 +1309,38 @@ def _get_all_parts_cached(vehicle_code: str, addata_root: str = ADDATA_ROOT):
     try:
         if not vehicle_code:
             return tuple()
-        # dict memo にもヒットさせる
-        if vehicle_code in _parts_cache_by_vcode:
-            return _parts_cache_by_vcode[vehicle_code]
+        # dict memo のキーは ADDATA ルート込みにする。車種コードだけを鍵にすると、
+        # Streamlit Cloud のように 1 プロセスを全利用者で共有する環境で、
+        # 別の人がアップロードした ADDATA（版が違う）の部品を再利用してしまう。
+        try:
+            _ck = (os.path.realpath(addata_root or ''), str(vehicle_code))
+        except Exception:
+            _ck = (str(addata_root), str(vehicle_code))
+        if _ck in _parts_cache_by_vcode:
+            return _parts_cache_by_vcode[_ck]
         eng = _get_engine(addata_root)
         # vehicle_code から folder 推定: AddataEngine 側の identify 経由で得る
         # ここでは外部呼出側が folder を知っている前提なので、
         # vehicle_code をそのまま folder とみなしてもよい簡易キャッシュ
+        # load_parts_master は '*12.DB' を glob するのでフォルダの「フルパス」が要る。
+        # ここに車種コード（'J87' など）だけを渡すと、カレントディレクトリの
+        # 'J87/*12.DB' を探して必ず空になり、照合が全行 L4（＝部品コードも
+        # 品番も1つも入らない）になっていた。
+        # 車種コードで来た場合は ADDATA 配下のフォルダに直す。
+        folder = str(vehicle_code)
         try:
-            parts = eng.load_parts_master(vehicle_code)
+            if not os.path.isdir(folder):
+                cand = os.path.join(addata_root, folder[:1], folder)
+                if os.path.isdir(cand):
+                    folder = cand
+        except Exception:
+            pass
+        try:
+            parts = eng.load_parts_master(folder)
         except Exception:
             parts = []
         result = tuple(parts) if parts else tuple()
-        _parts_cache_by_vcode[vehicle_code] = result
+        _parts_cache_by_vcode[_ck] = result
         return result
     except Exception:
         return tuple()
@@ -1387,8 +1406,31 @@ def match_pdf_items_to_addata(items, vehicle_info, addata_root=ADDATA_ROOT):
         cnm = str(vehicle_info.get('car_name') or '').strip()
         color_code = str(vehicle_info.get('color_code', '') or '').strip()
 
-        veh, err = engine.identify_vehicle(md, cn, mc,
-                                           reg_date=rd, maker=mk, car_name=cnm)
+        # 呼び出し側が既に車種を特定していれば、それを使う。
+        # ここで引き直すと、KA81（型式指定番号＋類別）で特定した車種と
+        # KA06（型式＋車台番号）で引いた車種が食い違い、部品名が当たらず
+        # 全行 L4 になる（＝部品コードが1つも入らない）。
+        _given = str((vehicle_info or {}).get('vehicle_code') or '').strip()
+        if _given:
+            # folder は後段で *13.DB（価格）や *15.DB（指数）を glob するのに使う。
+            # 車種コードのままにすると 'U40/*13.DB' を見に行って必ず空になり、
+            # 価格も指数も引けず L1/L2 に届かない（＝部品コードが入らない）。
+            # 絶対パスで渡ってきても、必ず「いま選んでいる ADDATA」配下に
+            # 解決し直す。そうしないと、版の違う別の ADDATA のフォルダを
+            # そのまま見に行き、部品マスタも価格も別物になる。
+            _code = os.path.basename(str(_given).rstrip('\/')) or str(_given)
+            _gfolder = os.path.join(addata_root, _code[:1], _code) if _code else ''
+            if _gfolder and os.path.isdir(_gfolder):
+                veh, err = {'vehicle_code': _code, 'folder': _gfolder,
+                            'match_layer': 1, 'is_template': False}, None
+            else:
+                # 解決できないなら従来どおり引き直す
+                _given = ''
+                veh, err = engine.identify_vehicle(md, cn, mc,
+                                                   reg_date=rd, maker=mk, car_name=cnm)
+        else:
+            veh, err = engine.identify_vehicle(md, cn, mc,
+                                               reg_date=rd, maker=mk, car_name=cnm)
         if err or not veh:
             for it in out:
                 it.setdefault('db_price', None)
@@ -2188,6 +2230,47 @@ def find_ka06_path(addata_base):
     return p if _os.path.exists(p) else None
 
 
+def identify_by_ka81(addata_base, vehicle_data):
+    """COM/KA81.DB（型式指定番号＋類別区分番号 → 車種）で引く。
+
+    コグニセブンの「車検証から検索」と同じ経路で、KA06_ALL（型式＋車台番号）より
+    車種を絞り込める。引けなければ None を返し、呼び出し側は従来経路に落ちる。
+    （pdf-to-neo 配布パッケージの addata_vehicle_resolver をそのまま使う）
+    """
+    desig = (vehicle_data or {}).get('model_designation') or             (vehicle_data or {}).get('car_model_designation') or ''
+    cat = (vehicle_data or {}).get('category_number') or           (vehicle_data or {}).get('car_category_number') or ''
+    if not str(desig).strip() or not str(cat).strip() or not addata_base:
+        return None
+    try:
+        from addata_vehicle_resolver import AddataVehicleResolver
+        hits = AddataVehicleResolver(addata_base).lookup_by_designation(
+            str(desig), str(cat))
+    except Exception:
+        return None
+    codes = sorted({h.get('car_code') for h in (hits or []) if h.get('car_code')})
+    if not codes:
+        return None
+    if len(codes) > 1:
+        # 車種が複数に割れたときは確定として返さない。
+        # 呼び出し側によっては match_layer 1 を「確定」として扱い、
+        # 先頭候補の部品をそのまま書いてしまう（PDF直接経路がそれ）。
+        # 別車種の部品が協定見積に載るくらいなら、従来経路に落として
+        # そちらの判断（あいまい警告つき）に任せる。
+        return None
+    folder = os.path.join(addata_base, codes[0][0], codes[0])
+    if not os.path.isdir(folder):
+        return None
+    return {
+        'match_layer': 1,
+        'is_supported': True,
+        'is_template': False,
+        'vehicle_code': codes[0],
+        'folder': folder,
+        'reason': f'KA81 逆引き（型式指定={desig} 類別={cat}）',
+        'ambiguous': [],
+    }
+
+
 def identify_vehicle_wrapper(addata_base, vehicle_data):
     """app.py / pipeline 用 identify_vehicle 実体。AddataEngine.identify_vehicle を呼ぶ。
 
@@ -2196,6 +2279,11 @@ def identify_vehicle_wrapper(addata_base, vehicle_data):
     """
     if not vehicle_data:
         vehicle_data = {}
+    # まず KA81（型式指定番号＋類別区分番号）で引く。実機と同じ経路なので
+    # 当たればこちらが確か。PDF直接経路もこの関数を通るため、ここに置く。
+    _ka81 = identify_by_ka81(addata_base, vehicle_data)
+    if _ka81:
+        return _ka81
     try:
         # addata_base 不在でも AddataEngine 内で layer 3 へ落ちる
         eng = AddataEngine(addata_base or '')
