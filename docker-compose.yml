@@ -1,0 +1,35 @@
+version: "3.9"
+
+# =====================================================================
+# SHOUCHIKU8 NEO System - Docker Compose
+# 使い方:
+#   起動: docker-compose up -d
+#   停止: docker-compose down
+#   ログ: docker-compose logs -f
+# =====================================================================
+
+services:
+  shouchiku8:
+    build: .
+    container_name: shouchiku8-neo
+    restart: unless-stopped
+    ports:
+      - "7860:7860"
+    environment:
+      # Gemini APIキー（.envファイルまたは直接設定）
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      # HuggingFace Token（Addata DBダウンロード用）
+      - HF_TOKEN=${HF_TOKEN}
+      # Addata DBパス（コンテナ内パス）
+      - ADDATA_PATH=/app/Addata
+    volumes:
+      # Addata DBをホストからマウント（DBモード使用時）
+      - ./Addata:/app/Addata:ro
+      # ログ保存
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

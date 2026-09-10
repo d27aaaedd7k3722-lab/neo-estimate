@@ -1,0 +1,24 @@
+# Streamlit Community Cloud 向けの設定。
+#
+# ここに Cloud Run / Docker 向けの設定を書かないこと。
+# 2d46105 で Cloud Run 対応として以下が追加され、アプリが
+# 「なんてこった。／Oh no. Error running app.」で起動しなくなった:
+#
+#   server.port / server.address / browser.serverAddress
+#     … Community Cloud はポートをプラットフォーム側で割り当てるため固定不可
+#   server.enableCORS = false / server.enableXsrfProtection = false
+#     … Community Cloud は自前のプロキシ越しに配信しており、
+#       既定の CORS / XSRF 設定を前提にしている
+#   server.enableWebsocketCompression = false / runner.fastReruns = true
+#     … Cloud Run の WebSocket 切断に対する回避策で、ここでは不要
+#
+# Cloud Run / Docker では start.py が --server.address と --server.port を
+# コマンドライン引数で明示的に渡しており、そちらが config.toml より優先される。
+# つまりこのファイルを Community Cloud 向けに保っても Cloud Run は動く。
+
+[server]
+headless = true
+maxUploadSize = 200
+
+[browser]
+gatherUsageStats = false

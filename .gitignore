@@ -1,5 +1,41 @@
+# 環境設定・秘密情報
 .env
+.streamlit/secrets.toml
+
+# 大容量DBファイル（除外）
+cogni_code_master.db
+partslink_items.db
+*.db
+
+# Pythonキャッシュ
 __pycache__/
-*.pyc
-.claude/
-テスト要/
+*.py[cod]
+*.pyo
+
+# 開発用一時ファイル
+tmp_*.py
+tmp_*.txt
+*.log
+dump*.py
+dump*.txt
+check_*.py
+debug_*.txt
+test_*.py
+step*.py
+fix_*.py
+search_*.py
+find_*.py
+extract_*.py
+analyze_*.py
+cogni_*.py
+full_analysis_*.py
+deploy_hf.py
+keys.txt
+result.json
+match_output*.txt
+
+# tests/ 直下の .py は上の一時ファイルパターンから除外する。
+# analyze_*.py に当たって tests/analyze_real_neo.py が commit されず、
+# 引き継ぎ書 §6 と tests/README.md が参照するスクリプトが
+# リポジトリから丸ごと消えていた（2026-09-10 発見）。
+!tests/*.py

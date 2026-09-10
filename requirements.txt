@@ -1,8 +1,38 @@
-streamlit
-google-genai
-pypdf
-pdf2image
-pypdfium2
-python-dotenv
-pandas
-Pillow
+# Streamlit Community Cloud 再ビルド時の依存関係変動によるアプリ停止を防ぐためバージョン固定。
+#
+# Cloud 側の Python が 3.9 / 3.10 だと、pandas 3.x（Python 3.11 以上が必須）や
+# streamlit 1.63（3.10 以上が必須）が入らず、ビルドが失敗して
+# 「Oh no. Error running app.（なんてこった。）」になる。
+# アプリの Python バージョン設定に依存しないよう、3.9〜3.14 のどれでも
+# 入る組み合わせを環境マーカーで指定する。
+# いずれの版でも実際にアプリが起動することを確認済み（3.9/3.10/3.11/3.12/3.13）。
+
+streamlit==1.63.0; python_version >= "3.10"
+streamlit==1.50.0; python_version < "3.10"
+
+pandas==3.0.5; python_version >= "3.11"
+pandas==2.3.3; python_version < "3.11"
+
+google-genai==2.22.0; python_version >= "3.10"
+google-genai==1.47.0; python_version < "3.10"
+
+Levenshtein==0.27.4; python_version >= "3.10"
+Levenshtein==0.27.1; python_version < "3.10"
+
+python-dotenv==1.2.3; python_version >= "3.10"
+python-dotenv==1.2.1; python_version < "3.10"
+
+Pillow==12.3.0; python_version >= "3.10"
+Pillow==11.3.0; python_version < "3.10"
+
+# PDF→NEO パイプライン（pdf_to_neo_pipeline / auto_matching）のPDFテキスト抽出に使用
+PyMuPDF==1.28.2; python_version >= "3.10"
+PyMuPDF==1.26.5; python_version < "3.10"
+
+reportlab==5.0.1
+jaconv==0.5.0
+pdf2image==1.17.0
+pypdfium2==5.13.0
+# ページ分割・ページ並べ替え・FAX送付状除去に使用
+# （未導入だとこれらの機能が例外を握り潰して黙って無効化される）
+pypdf==6.4.0
