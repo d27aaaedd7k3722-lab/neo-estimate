@@ -1022,6 +1022,20 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         # DBマッチなし（CSV取り込み等）の場合はCSVの部品コードをPartsNoに使用
         if not parts_no:
             parts_no = str(item.get('part_no', '') or '')
+        if not parts_no:
+            # 見積書に品番が無いとき、Addata 照合が引いた品番で補う。
+            # これまで db_parts_no はどこからも読まれず、照合しても
+            # 品番が空のままの .neo ができていた。
+            # 採用するのは L1/L2（品名が当たり、価格でも裏が取れた行）だけ。
+            # L3 は「品名は当たったが価格が合わない／DBに価格が無い」状態で、
+            # 部品そのものが違う可能性が残る。L4 は該当なし。
+            # PDF経路（pdf_to_neo_pipeline）も L1/L2 でしか品番を採用していない。
+            # ただし L2 には「見積側の金額が 0 で DB に価格がある」場合も含まれ
+            # （auto_matching の level 判定）、そのときは価格の裏が取れていない。
+            # 見積に金額のある行だけに絞る。
+            if (str(item.get('match_level', '') or '') in ('L1', 'L2')
+                    and safe_int(item.get('parts_amount', 0)) > 0):
+                parts_no = str(item.get('db_parts_no', '') or '')
         
         # 未マッチ（またはそれに準ずる低マッチレベル）部品には先頭に「※」を付与
         # ベタ打ちモードではDB照合を行わないため※を付けない
@@ -1206,12 +1220,21 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         _idx = round(_idx, 2)
         db_time = _idx if _idx > 0 else -1   # 未入力・負値は -1（空欄）
         parts_code = item.get('_master_section_code', '')  # 部品コード大区分（例: '01'）
-        _branch_raw = item.get('_master_branch_code', '')  # 枝番（例: '00101', '001AA'）
+        # 枝番（例: '00101', '001AA'）。Addata の部品マスタは '101' のような数字のほか
+        # '1AA' のような英字混じりも持つ。ERParts.PartsCodeSub は SQLite の INTEGER 列で
+        # 英字を格納できないため、英字混じりは -1（空欄）に落ちる。
+        # 実機がこの種の枝番をどう格納するかは未確認（引き継ぎ書 §6 E）。
+        _branch_raw = item.get('_master_branch_code', '')
         # PartsCodeSub は SQLite integer 型。数値変換できる枝番のみ整数で保存
         try:
             parts_code_sub = int(_branch_raw) if _branch_raw and _branch_raw.isdigit() else -1
         except Exception:
             parts_code_sub = -1
+        # 枝番が英字混じり（'1AA' など）だと INTEGER 列に入らず -1（空欄）になる。
+        # 大区分だけが入った部品コードは、コグニセブン上で別の部品を指しうる。
+        # 片側だけ埋まった状態で協定見積に出すより、両方空にして人に埋めてもらう。
+        if _branch_raw and parts_code_sub < 0:
+            parts_code = ''
         cur.execute("""INSERT INTO ERParts (
             RecordNo, LineNo, PartsCode, PartsCodeSub, DisposalCode,
             DisposalName, DisposalNameStandard, PartsName, PartsNameStandard,
@@ -2712,6 +2735,12 @@ def _clear_addata_codes(estimate_data):
             continue
         it['_master_section_code'] = ''
         it['_master_branch_code'] = ''
+        # 照合レベルと品番も一緒に捨てる。残すと、車両を直したあとに
+        # 前の車で引き当てた品番が ERParts.PartsNo に書かれてしまう。
+        it['match_level'] = ''
+        it['db_parts_no'] = ''
+        it['db_price'] = None
+        it['db_work_index'] = None
 
 
 def apply_addata_matching(estimate_data, vehicle_data, progress=None):
@@ -2773,10 +2802,29 @@ def apply_addata_matching(estimate_data, vehicle_data, progress=None):
     # has_rev は「照合器が非空のリストを返したか」でしかなく、全行 L4（該当なし）
     # でも True になる。実際に部品コードが入った行があるかで成功を判定しないと、
     # PartsCode が空のままなのに画面に「Addata照合済み」と出て気づけない。
-    _hit = any(str(it.get('_master_section_code') or '').strip() for it in matched_items)
-    if not (has_rev and _hit):
-        # 1行も当たらなかったときは、前回の結果が残らないように捨てる
+    def _code_writable(it):
+        # 生成側（_update_ansmb_impl）は、枝番が数字でない行の大区分も空にする。
+        # ここで大区分の有無だけを見ると、実際には PartsCode が空になる行を
+        # 「Addata照合済み」と数えてしまい、画面と生成物が食い違う。
+        _sec = str(it.get('_master_section_code') or '').strip()
+        _br = str(it.get('_master_branch_code') or '').strip()
+        return bool(_sec) and (not _br or _br.isdigit())
+
+    _hit = any(_code_writable(it) for it in matched_items)
+    if not has_rev:
+        # 照合器が結果を返せなかった。前回の照合結果を残さない。
         _clear_addata_codes(estimate_data)
+        return False
+    if not _hit:
+        # 照合自体は動いたが、.neo に書ける部品コードを持つ行が1つも無い
+        # （枝番が英字混じりで INTEGER 列に入らない、など）。
+        # 部品コードは落とすが、品番（db_parts_no）は価格の裏が取れた
+        # 照合結果なので捨てない。画面上は「照合済み」とは言わない。
+        for _it in (estimate_data.get('items') or []):
+            if isinstance(_it, dict):
+                _it['_master_section_code'] = ''
+                _it['_master_branch_code'] = ''
+        estimate_data['_addata_matched'] = False
         return False
     estimate_data['_addata_matched'] = True
     return True
@@ -6746,6 +6794,12 @@ def main():
             # 表示用DataFrame（7列）: No / 部品番号 / 品名 / 数量 / 部品金額 / 工数 / 工賃
             _edit_rows = []
             for _i, _item in enumerate(_items_src):
+                # この列は編集できて、編集後の値がそのまま part_no（見積書の品番）として
+                # 保存される。ここに Addata 由来の品番を出すと、それが「見積書に
+                # 書いてあった品番」に化けてしまい、L1/L2・金額ありの条件を迂回して
+                # .neo に入る。Addata を外したあとも残る。
+                # そのため画面には見積書の値だけを出し、補完が起きることは
+                # 表の下の注記で伝える。
                 _part_code   = str(_item.get('part_no', '') or _item.get('_master_part_no', '') or '')
                 _index_value = str(_item.get('index_value', '') or '')
                 _edit_rows.append({
@@ -6765,6 +6819,12 @@ def main():
             # 画面の No と「コピー」が指す行がずれ、別の行が複製される。
             # 行数が変わったときだけ作り直す（セル編集では行数は変わらない
             # ので、入力中の内容は捨てられない）。
+            # 生成側は、見積書に品番が無い行を Addata の品番で補うことがある
+            # （価格まで一致した L1/L2 の行だけ）。画面の「部品番号」は見積書の値
+            # そのままなので、補完が起きる行は空欄に見える。その旨を伝えておく。
+            if any(not str(_r.get('部品番号', '') or '') for _r in _edit_rows):
+                st.caption("※ 部品番号が空欄の行は、Addata で価格まで一致した部品が"
+                           "見つかればその品番を NEO に書きます（画面には出ません）。")
             _ed_ver = st.session_state.get('items_editor_ver', 0)
             if st.session_state.get('items_editor_rows') != len(_items_src):
                 st.session_state['items_editor_rows'] = len(_items_src)
@@ -6834,6 +6894,9 @@ def main():
                     # '_master_section_code' を落とすと部品コードが空になる。
                     'match_level': _orig.get('match_level', ''),
                     '_master_section_code': _orig.get('_master_section_code', ''),
+                    # 'db_parts_no' を落とすと、見積書に品番が無い行で
+                    # Addata が引き当てた品番が生成前に消え、PartsNo が空になる。
+                    'db_parts_no': _orig.get('db_parts_no', ''),
                     '_match_level': _orig.get('_match_level', 0),
                     '_original_name': _orig.get('name', _nv),
                     '_original_parts_amount': _orig.get('parts_amount', safe_int(_row.get('部品金額', 0))),

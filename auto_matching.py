@@ -1334,6 +1334,19 @@ AddataSearchEngine = AddataEngine
 # ============================================================
 # 8. app.py 連携用 公開ラッパ
 # ============================================================
+def _clear_master_codes(it):
+    """照合できなかった行から、前回の照合で入った部品コードを捨てる。
+
+    照合器は入力の dict をコピーして使うため、前の車両・前の照合で
+    `_master_section_code` / `_master_branch_code` が入っていると、
+    今回 L4（DBに該当なし）と判断した行にも古い部品コードが残る。
+    app.py はそれを ERParts の PartsCode / PartsCodeSub に書くので、
+    別の部品のコードが協定見積に載ってしまう。
+    """
+    it["_master_section_code"] = ""
+    it["_master_branch_code"] = ""
+
+
 def match_pdf_items_to_addata(items, vehicle_info, addata_root=ADDATA_ROOT):
     """app.py の items 形式を Addata DB と照合して L1-L4 マッチ情報を付与する薄いラッパ。
 
@@ -1385,6 +1398,7 @@ def match_pdf_items_to_addata(items, vehicle_info, addata_root=ADDATA_ROOT):
                 it['match_note'] = f'車種特定失敗: {err or "unknown"}'
                 it['price_diff_pct'] = None
                 it['price_alert'] = False
+                _clear_master_codes(it)
                 it['db_source'] = ''
             return out
 
@@ -1491,9 +1505,25 @@ def match_pdf_items_to_addata(items, vehicle_info, addata_root=ADDATA_ROOT):
             # 棄却した候補（level='L4'）でも matched は真になる。無条件に書くと
             # 「DBに無い」と ※ で宣言した行に別部品の大区分が入る（前後違いが典型）。
             # 採用した行だけに入れる。
+            # 部品コードは「この部品はこれだ」と断定する情報なので、
+            # 品名が当たっただけの L3（価格が合わない／DBに価格が無い）では入れない。
+            # 品番のフォールバックと同じ水準（L1/L2）に揃える。
+            # 以前は L4 以外に入れていたが、それは ※ 印の判定と同じ水準であり、
+            # 部品を断定する情報にはゆるすぎた。
+            # L2 には「見積側に金額が無く、DB にだけ価格がある」場合も含まれ、
+            # そのときは価格で裏が取れていない。部品コードは部品を断定する情報なので、
+            # 品番のフォールバックと同じく、見積に金額のある行だけに入れる。
+            _code_ok = level in ('L1', 'L2') and pdf_price > 0
             it['_master_section_code'] = (
                 str((matched or {}).get('section_code', '') or '')
-                if level != 'L4' else '')
+                if _code_ok else '')
+            # 枝番。app.py が ERParts.PartsCodeSub に書くために読むキーだが、
+            # これまでどこからも値が入らず、生成した .neo の枝番が常に空だった。
+            # コグニセブンは「部品コード大区分＋枝番」で部品を特定するので、
+            # 枝番が無いと部品が確定しない。大区分と同じく、採用した行だけに入れる。
+            it['_master_branch_code'] = (
+                str((matched or {}).get('line_no', '') or '')
+                if _code_ok else '')
             it['match_level'] = level
             it['match_note'] = note
             it['price_diff_pct'] = price_diff_pct
@@ -1514,12 +1544,18 @@ def match_pdf_items_to_addata(items, vehicle_info, addata_root=ADDATA_ROOT):
             safe = []
             for it in items or []:
                 d = dict(it)
-                d.setdefault('match_level', 'NA')
-                d.setdefault('db_price', None)
-                d.setdefault('db_parts_no', '')
+                # setdefault だと前の照合で入った値が残る。照合が例外で落ちた回の
+                # 結果を「当たった」ものとして .neo に書かないよう、上書きで捨てる。
+                d['match_level'] = 'NA'
+                d['db_price'] = None
+                d['db_parts_no'] = ''
                 d.setdefault('price_diff_pct', None)
                 d.setdefault('price_alert', False)
                 d.setdefault('db_source', '')
+                # setdefault だけだと、前の照合で入った部品コードがそのまま残る。
+                # 照合が例外で落ちた回の結果を「当たった」ものとして .neo に
+                # 書いてしまわないよう、ここでも捨てる。
+                _clear_master_codes(d)
                 safe.append(d)
             return safe
         except Exception:
@@ -1719,6 +1755,7 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
             it["match_level"] = "L4"
             it["match_note"] = "ADDATA未配備または車種未特定"
             it["parts_no_marked"] = _decorate_pno_v4(ocr_pno, MARK_NO_DB)
+            _clear_master_codes(it)
         return out
 
     try:
@@ -1729,6 +1766,7 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
             it["match_level"] = "L4"
             it["match_note"] = f"AddataSearchEngine import失敗: {e}"
             it["parts_no_marked"] = _decorate_pno_v4(ocr_pno, MARK_NO_DB)
+            _clear_master_codes(it)
         return out
 
     engine = AddataSearchEngine(addata_root)
@@ -1744,6 +1782,7 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
             it["match_level"] = "L4"
             it["match_note"] = f"車種フォルダ未配備: {model_code}"
             it["parts_no_marked"] = _decorate_pno_v4(ocr_pno, MARK_NO_DB)
+            _clear_master_codes(it)
         return out
 
     # グレード推定 (PDFGradeIdentifier) v5-Iter8: body_code 推定追加
@@ -1785,6 +1824,7 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
             it["match_level"] = "L4"
             it["match_note"] = "部品マスタ取得失敗"
             it["parts_no_marked"] = _decorate_pno_v4(ocr_pno, MARK_NO_DB)
+            _clear_master_codes(it)
         return out
 
     # 名称→マスタ entries の dict (v5-Iter3-4: 名称正規化 + キャッシュ)
@@ -1972,6 +2012,7 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
             it["match_level"] = "L4"
             it["match_note"] = "部品名空"
             it["parts_no_marked"] = _decorate_pno_v4(ocr_pno, MARK_NO_DB)
+            _clear_master_codes(it)
             continue
 
         # v5-Iter5: 高速ショートカット: OCR品番が DB pno_index にあれば即マッチ
@@ -2016,6 +2057,7 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
             it["match_level"] = "L4"
             it["match_note"] = "部品名fuzzy 0.7以下"
             it["parts_no_marked"] = _decorate_pno_v4(ocr_pno, MARK_NO_DB)
+            _clear_master_codes(it)
             continue
 
         entry = name_to_entry[cand[0]]
@@ -2104,6 +2146,17 @@ def _full_addata_match(items, vehicle_info, addata_root=ADDATA_ROOT):
         it["parts_no_marked"] = marked
         # v12 Phase C-1: addata_matched フラグ
         it["addata_matched"] = level in ("L1", "L2", "L3")
+        # app.py の generate_neo_file は ERParts.PartsCode / PartsCodeSub を
+        # `_master_section_code` / `_master_branch_code` から書く。
+        # ただしこの経路が使う _addata_db_search.AddataSearchEngine の部品レコードは
+        # name / ref_no / methods しか持たず、部品コード大区分（section_code）と
+        # 枝番（line_no）を露出していない。そのため PDF 直接経路（modes B/C）で
+        # 作った .neo は、照合が当たっていても部品コードが空のままになる。
+        # 【未対応】ここを埋めるには _addata_db_search 側の 12.DB 解析を拡張して
+        # section_code / line_no を返すようにする必要がある（次の周の課題）。
+        # 前の照合の値が残らないよう、いまは明示的に空にしておく。
+        it["_master_section_code"] = ""
+        it["_master_branch_code"] = ""
         # v13 Step B (iter_006/007): ADDATA 由来の name 上書きは N4 を逆に悪化させたためロールバック。
         # ADDATA マスタの全角カナ表記が正解 NEO の半角カナと記号差で乖離するケースが多く、
         # OCR の半角カナ寄りの値の方が一致しやすい。db_parts_name は参照用に保存のみ。
