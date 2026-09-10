@@ -29,8 +29,6 @@ AI-OCR連携 NEOファイル自動生成Webアプリ v3.2
 - 逆算一致時の誤警告抑制（reverse_match）
 """
 
-import warnings
-warnings.filterwarnings("ignore", message=".*use_container_width.*")
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -5045,7 +5043,13 @@ def generate_filename(cust, calc_parts, calc_wages, pdf_parts, pdf_wages,
     serial = safe_str(cust.get('car_reg_serial', ''))
     base   = f'{dept}{div}{biz}{serial}'
     if not base.strip():
-        base = '新規見積'
+        # 登録番号が読めていないときに固定の「新規見積」だけを返していたため、
+        # 車検証を読ませずに続けて作ると、何件でも「新規見積_見積.neo」になり、
+        # ダウンロード先で上書きされたり別案件と取り違えたりする。
+        # 協定見積として保険会社に出すファイルなので、車名と日時で見分けられるようにする。
+        _cname = re.sub(r'[\\/:*?"<>|\s\x00-\x1f]', '', safe_str(cust.get('car_name', '')))[:20]
+        _stamp = now_jst().strftime('%m%d_%H%M%S')
+        base = f'{_cname}_{_stamp}' if _cname else f'新規見積_{_stamp}'
     sp = safe_int(short_parts_wage)
     discrepancies = []
     if not reverse_match and has_estimate:
@@ -5648,8 +5652,11 @@ def main():
                     "サイドバーの「APIキー設定」でキーを入力してください。"
                 )
             elif st.button("🚀 PDFからNEOを生成", key='pdf2neo_run', type="primary",
-                           use_container_width=True):
+                           width='stretch'):
                 st.session_state.pop('pdf2neo_result', None)
+                # 前回の変換で決めたファイル名を残すと、別のPDFを変換したのに
+                # 前の車のファイル名でダウンロードされる。
+                st.session_state.pop('_pdf2neo_filename', None)
                 with st.spinner("PDFを解析してNEOを生成しています…（AI-OCRのため30〜90秒かかります）"):
                     st.session_state['pdf2neo_result'] = run_pdf_to_neo_pipeline(
                         _p2n_bytes,
@@ -5710,18 +5717,28 @@ def main():
                 _p2n_c1, _p2n_c2 = st.columns(2)
                 with _p2n_c1:
                     if _p2n_neo:
+                        # 固定名 "PDF変換_見積.neo" だったため、続けて何件変換しても
+                        # 同じファイル名になり、ダウンロード先で上書き・取り違えが起きた。
+                        # step4 と同じ規則（登録番号があればそれ、無ければ車名＋日時）で作る。
+                        # 一度決めた名前は session_state に置き、再描画で日時が変わらないようにする。
+                        _p2n_name = st.session_state.get('_pdf2neo_filename')
+                        if not _p2n_name:
+                            _p2n_name = generate_filename(
+                                _p2n_res.get('vehicle_info') or {},
+                                0, 0, 0, 0, False, reverse_match=True)
+                            st.session_state['_pdf2neo_filename'] = _p2n_name
                         st.download_button(
                             "📥 NEOファイルをダウンロード",
                             data=_p2n_neo,
-                            file_name="PDF変換_見積.neo",
+                            file_name=_p2n_name,
                             mime="application/octet-stream",
                             key='pdf2neo_dl',
-                            use_container_width=True,
+                            width='stretch',
                         )
                 with _p2n_c2:
                     if _p2n_items and st.button("📝 プレビューに取り込んで修正する",
                                                 key='pdf2neo_to_preview',
-                                                use_container_width=True):
+                                                width='stretch'):
                         st.session_state['csv_items'] = _p2n_items
                         st.session_state['csv_mode']  = True
                         # PDF側で選んだ税区分をプレビュー側にも引き継ぐ。
@@ -5875,13 +5892,13 @@ def main():
         # st.code は右上に標準のコピーボタンが付くので、コピー機能は保たれる。
         _btn_col1, _btn_col2 = st.columns(2)
         with _btn_col1:
-            with st.popover("📋 プロンプトをコピー", use_container_width=True):
+            with st.popover("📋 プロンプトをコピー", width='stretch'):
                 st.caption("右上のコピーアイコンで全文をコピーできます")
                 st.code(_CSV_PROMPT, language=None)
         with _btn_col2:
             st.link_button("🌐 Geminiを開く（別タブ）",
                            "https://gemini.google.com/",
-                           use_container_width=True)
+                           width='stretch')
 
         # ── CSV取り込みエリア ──
         st.markdown("")
@@ -5994,7 +6011,7 @@ def main():
         _has_input = vehicle_file or _csv_mode_active
         if _has_input:
             _btn_label = "🚀 NEO生成を開始 →"
-            if st.button(_btn_label, type="primary", use_container_width=True):
+            if st.button(_btn_label, type="primary", width='stretch'):
                 if vehicle_file:
                     st.session_state['vehicle_file_bytes'] = vehicle_file.read()
                     st.session_state['vehicle_file_name']  = vehicle_file.name
@@ -6758,7 +6775,7 @@ def main():
             _editor_height = min(600, max(200, len(_items_src) * 35 + 60))
             _edited_df = st.data_editor(
                 _df_edit,
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
                 num_rows="dynamic",
                 height=_editor_height,
@@ -7331,7 +7348,7 @@ def main():
 
         bcol1, bcol2 = st.columns(2)
         with bcol1:
-            if st.button("← ステップ①に戻る", use_container_width=True):
+            if st.button("← ステップ①に戻る", width='stretch'):
                 st.session_state['step'] = 1
                 st.session_state['vehicle_data']  = None
                 st.session_state['estimate_data'] = None
@@ -7339,7 +7356,7 @@ def main():
         with bcol2:
             # 金額差異未確認時のみボタンを無効化（分類エラーではブロックしない）
             gen_disabled = not amount_confirmed
-            if st.button("📦 NEOファイルを生成する →", type="primary", use_container_width=True, disabled=gen_disabled):
+            if st.button("📦 NEOファイルを生成する →", type="primary", width='stretch', disabled=gen_disabled):
                 st.session_state['updated_vehicle'] = updated_vehicle
                 st.session_state['calc_parts']      = calc_parts
                 st.session_state['calc_wages']      = calc_wages
@@ -7428,6 +7445,22 @@ def main():
                 updated_vehicle, calc_parts, calc_wages, pdf_parts, pdf_wages,
                 has_estimate, reverse_match, short_parts_wage
             )
+            # step4 は再描画のたびにこのブロックを通る。登録番号が無い案件は
+            # ファイル名に日時が入るため、そのままだと同じ見積なのに秒が変わって
+            # 名前がぶれ、画面の表示とダウンロードされる名前が食い違う。
+            # 中身（車両・明細数・金額）が同じ間は、最初に決めた名前を使い回す。
+            _name_key = (
+                safe_str(updated_vehicle.get('car_reg_department', '')),
+                safe_str(updated_vehicle.get('car_reg_division', '')),
+                safe_str(updated_vehicle.get('car_reg_business', '')),
+                safe_str(updated_vehicle.get('car_reg_serial', '')),
+                safe_str(updated_vehicle.get('car_name', '')),
+                len(items), calc_parts, calc_wages,
+            )
+            if (st.session_state.get('neo_filename')
+                    and st.session_state.get('_neo_name_key') == _name_key):
+                filename = st.session_state['neo_filename']
+            st.session_state['_neo_name_key'] = _name_key
             st.session_state['neo_bytes']    = neo_data
             st.session_state['neo_filename'] = filename
             progress.progress(100, text="✅ 生成完了！")
@@ -7503,7 +7536,7 @@ def main():
                     data=beta_pdf_bytes,
                     file_name=filename.replace('.neo', '_ベタ打ち差異レポート.pdf'),
                     mime="application/pdf",
-                    use_container_width=True,
+                    width='stretch',
                     type="primary",
                     key='beta_diff_report_dl'
                 )
@@ -7536,7 +7569,7 @@ def main():
                     file_name=filename,
                     mime="application/octet-stream",
                     type="primary",
-                    use_container_width=True
+                    width='stretch'
                 )
             with dcol2:
                 discrepancies_list = st.session_state.get('discrepancies', [])
@@ -7549,13 +7582,13 @@ def main():
                         data=pdf_bytes,
                         file_name=pdf_filename,
                         mime="application/pdf",
-                        use_container_width=True
+                        width='stretch'
                     )
                 else:
-                    st.button("📄 差額なし (PDF生成不要)", disabled=True, use_container_width=True)
+                    st.button("📄 差額なし (PDF生成不要)", disabled=True, width='stretch')
             
             st.markdown("")
-            if st.button("🔄 新しい見積を作成する", use_container_width=True):
+            if st.button("🔄 新しい見積を作成する", width='stretch'):
                 for key in [
                     'step', 'vehicle_data', 'estimate_data', 'neo_bytes', 'neo_filename',
                     'vehicle_file_bytes', 'vehicle_file_name', 'estimate_file_bytes',
@@ -7580,7 +7613,8 @@ def main():
                     # CSV取り込み関連
                     'csv_mode', 'csv_items', '_csv_paste_saved',
                     # PDF→NEO変換関連
-                    'pdf2neo_result', 'pdf2neo_vehicle_info',
+                    'pdf2neo_result', 'pdf2neo_vehicle_info', '_pdf2neo_filename',
+                    '_neo_name_key',
                     # その他の残留データ
                     'use_fax_filter', 'use_rasterize', 'use_enhance', 'selected_model',
                     'short_parts_wage',
