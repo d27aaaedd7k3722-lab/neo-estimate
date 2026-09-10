@@ -5532,7 +5532,7 @@ def main():
                                               st.session_state.get('tax_override', '税抜き（外税）'))
         _pdf_tax_idx = 1 if ('内税' in str(_saved_pdf_tax) or '税込' in str(_saved_pdf_tax)) else 0
         _pdf_tax_sel = st.radio(
-            "💴 添付する見積書の金額表記",
+            "💴 見積書の金額表記（この選択が下のCSV取り込みにも効きます）",
             options=_pdf_tax_options,
             index=_pdf_tax_idx,
             horizontal=True,
@@ -5541,6 +5541,10 @@ def main():
                  "取り違えると、NEOの合計が消費税ぶん（10%）ずれます。",
         )
         st.session_state['pdf_tax_override'] = _pdf_tax_sel
+        # 画面の税区分はこの1つだけにする。以前は下の CSV 取り込みにも同じ意味の
+        # ラジオがあり、利用者がどちらを操作すればよいか分からなかった。
+        # 取り違えると NEO の総額が消費税ぶん（10%）ずれる。
+        st.session_state['tax_override'] = _pdf_tax_sel
         _pdf_is_tax_incl = ('内税' in _pdf_tax_sel or '税込' in _pdf_tax_sel)
 
         _p2n_file = st.file_uploader(
@@ -5778,54 +5782,35 @@ def main():
 3. 不一致の場合のみ、CSVの末尾に改行して以下を出力（一致時は出力しない）。※金額には必ずカンマ（,）を含めること。 部品相違〇,〇〇〇円 工賃相違●,●●●円
 出力はCSVデータおよび相違確認結果のみ。説明文・コメントは一切不要。"""
 
-        _escaped = _CSV_PROMPT.replace('`', '\\`').replace('\\', '\\\\').replace('\n', '\\n')
-
         # ── ボタン行: プロンプトコピー ＋ Geminiを開く ──
+        # st.components.v1.html は 2026-06-01 で削除予定（起動時に警告が出る）。
+        # 代替の st.iframe は src しか受け取れず HTML を直接描けないため、
+        # Streamlit ネイティブの部品に置き換えてある。
+        # st.code は右上に標準のコピーボタンが付くので、コピー機能は保たれる。
         _btn_col1, _btn_col2 = st.columns(2)
         with _btn_col1:
-            st.components.v1.html(f"""
-<button onclick="navigator.clipboard.writeText(`{_escaped}`).then(()=>{{
-    this.textContent='✅ コピーしました！';
-    this.style.background='#16a34a';
-    setTimeout(()=>{{this.textContent='📋 プロンプトをコピー';this.style.background='#2563eb';}},2000);
-}})" style="
-    background:#2563eb;color:white;border:none;border-radius:8px;
-    padding:12px 14px;font-size:14px;cursor:pointer;font-weight:700;width:100%;height:52px;
-">📋 プロンプトをコピー</button>
-""", height=56)
+            with st.popover("📋 プロンプトをコピー", use_container_width=True):
+                st.caption("右上のコピーアイコンで全文をコピーできます")
+                st.code(_CSV_PROMPT, language=None)
         with _btn_col2:
-            st.components.v1.html("""
-<a href="https://gemini.google.com/" target="_blank" rel="noopener noreferrer" style="
-    display:flex;align-items:center;justify-content:center;gap:8px;
-    background:#ea4335;color:white;border:none;border-radius:8px;
-    padding:12px 14px;font-size:14px;cursor:pointer;font-weight:700;width:100%;height:52px;
-    text-decoration:none;
-">🌐 Geminiを開く（別タブ）</a>
-""", height=56)
+            st.link_button("🌐 Geminiを開く（別タブ）",
+                           "https://gemini.google.com/",
+                           use_container_width=True)
 
         # ── CSV取り込みエリア ──
         st.markdown("")
         st.markdown('<div class="section-title">📊 CSV取り込み（代替手段）</div>',
                     unsafe_allow_html=True)
 
-        # 税区分選択
-        _tax_options = ['税抜き（外税）', '税込み（内税）']
-        # PDF側から引き継いだ税区分を、ウィジェットを描画する前に反映する。
-        # 描画後に代入すると Streamlit が例外を投げる。
+        # 税区分はいちばん上の「見積書の金額表記」で選んだものを使う。
+        # ここに2つ目のラジオを置いていたため、利用者がどちらを操作すべきか分からず、
+        # 取り違えると NEO の総額が消費税ぶん（10%）ずれていた。
         _pending_tax = st.session_state.pop('_tax_carry_pending', None)
         if _pending_tax:
             st.session_state['tax_override'] = _pending_tax
-            st.session_state['csv_tax_radio'] = _pending_tax
-        _saved_tax_override = st.session_state.get('tax_override', '税抜き（外税）')
-        _tax_default_idx = 1 if '内税' in str(_saved_tax_override) or '税込' in str(_saved_tax_override) else 0
-        _tax_sel = st.radio(
-            "💴 見積書の金額表記",
-            options=_tax_options,
-            index=_tax_default_idx,
-            horizontal=True,
-            key='csv_tax_radio',
-        )
-        st.session_state['tax_override'] = _tax_sel
+        _tax_sel = st.session_state.get('tax_override', '税抜き（外税）')
+        st.caption(f"💴 金額表記: **{_tax_sel}** — 変えるときは、いちばん上の"
+                   "「見積書の金額表記」で切り替えてください")
 
         _csv_col1, _csv_col2 = st.columns([2, 1])
         with _csv_col1:
@@ -5939,8 +5924,11 @@ def main():
                 st.session_state['selected_model'] = selected_model
                 st.session_state['step'] = 2
                 st.rerun()
-        else:
-            st.info("📊 CSVを貼り付けるか、車検証をアップロードして「NEO生成を開始」を押してください")
+        elif _p2n_file is None:
+            # PDF が入っているときは、上の「PDFからNEOを生成」が主導線なので出さない。
+            st.info("📄 いちばん上で見積書PDFを入れて「PDFからNEOを生成」を押してください。"
+                    "／ CSVを貼り付けた場合や、車検証だけでNEOを作る場合は、"
+                    "この下の「NEO生成を開始」を使います")
 
     # =========================================
     # STEP 2: AI解析
