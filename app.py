@@ -4652,8 +4652,11 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
         print(f"[ANALYZE] {msg}", file=sys.stderr)
 
     # ── ファイルハッシュキャッシュ: 同一ファイルの再解析を防ぐ ──────────────
+    # mime も鍵に入れる。同じバイト列でも PDF として送るか画像として送るかで
+    # 読み取り結果が変わるため、入れないと前の mime での結果がそのまま返る。
     _cache_key = (hashlib.md5(file_bytes).hexdigest()
-                  + f"_{used_model}_{use_rasterize}_{use_fax_filter}_{use_enhance}_{enable_self_correction}")
+                  + f"_{used_model}_{use_rasterize}_{use_fax_filter}_{use_enhance}_{enable_self_correction}"
+                  + f"_{mime_type}")
     def _cb(pct, text):
         """進捗コールバック呼び出し（Noneなら何もしない）"""
         if progress_cb:
@@ -4735,7 +4738,10 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     _fut_detail = None
     try:
         _fut_detail = _detail_ex.submit(
-            analyze_estimate_single, api_key, file_bytes, 'application/pdf',
+            # 見積書は PDF とは限らない（スマホで撮った JPG/HEIC もある）。
+            # ここを 'application/pdf' で固定すると、画像を送っても Gemini が
+            # PDF として受け取り、読み取りに失敗する。
+            analyze_estimate_single, api_key, file_bytes, mime_type,
             used_model, 1, 1, bool(tax_inclusive))
     except Exception as _e_sub:
         _logw(f"③ 明細解析の先行実行に失敗（直列で続行）: {_e_sub}")
@@ -4868,7 +4874,7 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
             result = _fut_detail.result() or {}
         else:
             result = analyze_estimate_single(
-                api_key, file_bytes, 'application/pdf', used_model, 1, 1,
+                api_key, file_bytes, mime_type, used_model, 1, 1,
                 tax_inclusive=bool(tax_inclusive)
             ) or {}
     except BaseException:
@@ -5255,7 +5261,8 @@ def _session_cache_scope() -> str:
 
 
 def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=None,
-                           is_tax_inclusive=False, expenses=None):
+                           is_tax_inclusive=False, expenses=None,
+                           mime_type='application/pdf'):
     """見積書PDFから直接NEOファイルを生成する。
 
     pdf_to_neo_pipeline.process_pdf_to_neo をStreamlitから安全に呼ぶための薄いラッパ。
@@ -5273,7 +5280,13 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
         except Exception as e:
             return {'ok': False, 'error': f'PDF→NEO変換モジュールを読み込めません: {e}'}
 
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as _f:
+        # 画像で来ることもあるので、拡張子は mime に合わせる。
+        # 常に .pdf にすると、パイプライン側が PDF として開こうとして失敗する。
+        _suffix = {'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp',
+                   'image/bmp': '.bmp', 'image/tiff': '.tif',
+                   'image/heic': '.heic', 'image/heif': '.heif'}.get(
+            str(mime_type or ''), '.pdf')
+        with tempfile.NamedTemporaryFile(suffix=_suffix, delete=False) as _f:
             _f.write(pdf_bytes)
             tmp_pdf = _f.name
 
@@ -5292,6 +5305,9 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
         # 他の利用者のセッションからも読めてしまう（キーの流用・課金事故）。
         result = _pipe.process_pdf_to_neo(
             tmp_pdf,
+            # 見積書は写真（JPG/PNG/HEIC 等）で入れられることもある。
+            # PDF 固定で渡すと、画像を PDF として解析しようとして読み取れない。
+            source_mime=mime_type,
             addata_root=addata_root or '',
             template_path=template_path,
             mode_override=mode_override,
@@ -5753,9 +5769,10 @@ def main():
             '<div style="background:#eff6ff;border:2px dashed #60a5fa;'
             'border-radius:14px;padding:20px 22px;margin-bottom:14px;">'
             '<div style="font-size:18px;font-weight:800;color:#1d4ed8;'
-            'letter-spacing:.02em;">📄 見積書PDF をここに入れてください</div>'
+            'letter-spacing:.02em;">📄 見積書（PDF・写真）をここに入れてください</div>'
             '<div style="font-size:13px;color:#334155;margin-top:8px;line-height:1.7;">'
-            'PDF を入れて <b>「PDFからNEOを生成」</b> を押すだけで、'
+            'PDF でも、スマホで撮った写真（JPG・PNG・HEIC）でも構いません。'
+            '入れて <b>「見積書からNEOを生成」</b> を押すだけで、'
             '明細の読み取りから NEO ファイルの作成まで一気に終わります。'
             'Gemini へのコピペは要りません。</div>'
             '</div>', unsafe_allow_html=True)
@@ -5780,8 +5797,8 @@ def main():
         _pdf_is_tax_incl = ('内税' in _pdf_tax_sel or '税込' in _pdf_tax_sel)
 
         _p2n_file = st.file_uploader(
-            "📄 見積書PDF をここにドロップ、またはクリックして選択",
-            type=['pdf'],
+            "📄 見積書（PDF・写真）をここにドロップ、またはクリックして選択",
+            type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
             key='pdf2neo_upload',
         )
         if _p2n_file is not None:
@@ -5793,16 +5810,20 @@ def main():
                     "⚠️ この機能にはGemini APIキーが必要です。"
                     "サイドバーの「APIキー設定」でキーを入力してください。"
                 )
-            elif st.button("🚀 PDFからNEOを生成", key='pdf2neo_run', type="primary",
+            elif st.button("🚀 見積書からNEOを生成", key='pdf2neo_run', type="primary",
                            width='stretch'):
                 st.session_state.pop('pdf2neo_result', None)
                 # 前回の変換で決めたファイル名を残すと、別のPDFを変換したのに
                 # 前の車のファイル名でダウンロードされる。
                 st.session_state.pop('_pdf2neo_filename', None)
-                with st.spinner("PDFを解析してNEOを生成しています…（AI-OCRのため30〜90秒かかります）"):
+                with st.spinner("見積書を解析してNEOを生成しています…（AI-OCRのため30〜90秒かかります）"):
                     st.session_state['pdf2neo_result'] = run_pdf_to_neo_pipeline(
                         _p2n_bytes,
                         api_key,
+                        # 写真（JPG/PNG/HEIC 等）で入れられることもある。
+                        # 拡張子から mime を決めて渡さないと、画像を PDF として
+                        # 送ってしまい読み取りに失敗する。
+                        mime_type=get_mime_type(_p2n_file.name),
                         model_name=selected_model,
                         template_bytes=st.session_state.get('custom_neo_bytes'),
                         is_tax_inclusive=_pdf_is_tax_incl,
@@ -5820,7 +5841,7 @@ def main():
             if _p2n_res.get('error'):
                 st.error(f"❌ {_p2n_res['error']}")
             elif not _p2n_res.get('ok'):
-                st.error("❌ PDFからNEOを生成できませんでした。")
+                st.error("❌ 見積書からNEOを生成できませんでした。")
                 for _w in (_p2n_res.get('warnings') or [])[:5]:
                     st.caption(f"・{_w}")
             elif not (_p2n_res.get('items') or []):
@@ -5844,15 +5865,15 @@ def main():
                     st.warning(f"⚠️ {_w}")
                 _p2n_v = _p2n_res.get('verify') or {}
                 if _p2n_v.get('count_match') and _p2n_v.get('total_match'):
-                    st.caption("🔍 検証OK: 生成NEOの明細件数と部品金額（税抜）がPDFと一致しました。")
+                    st.caption("🔍 検証OK: 生成NEOの明細件数と部品金額（税抜）が原本と一致しました。")
                 elif _p2n_v.get('error'):
                     st.caption(f"🔍 検証スキップ: {_p2n_v['error']}")
                 else:
                     st.warning(
-                        "🔍 検証: PDFと生成NEOに差異があります。"
-                        f"件数 NEO {_p2n_v.get('neo_count')} / PDF {_p2n_v.get('pdf_count')}、"
+                        "🔍 検証: 原本と生成NEOに差異があります。"
+                        f"件数 NEO {_p2n_v.get('neo_count')} / 原本 {_p2n_v.get('pdf_count')}、"
                         f"部品金額(税抜) NEO ¥{safe_int(_p2n_v.get('neo_total')):,} / "
-                        f"PDF ¥{safe_int(_p2n_v.get('pdf_parts_total')):,}。"
+                        f"原本 ¥{safe_int(_p2n_v.get('pdf_parts_total')):,}。"
                         "「プレビューに取り込む」で内容を確認・修正してください。"
                     )
                 _p2n_neo = _p2n_res.get('neo_bytes')
@@ -6170,8 +6191,8 @@ def main():
                 st.session_state['step'] = 2
                 st.rerun()
         elif _p2n_file is None:
-            # PDF が入っているときは、上の「PDFからNEOを生成」が主導線なので出さない。
-            st.info("📄 いちばん上で見積書PDFを入れて「PDFからNEOを生成」を押してください。"
+            # 見積書が入っているときは、上の生成ボタンが主導線なので出さない。
+            st.info("📄 いちばん上で見積書（PDF・写真）を入れて「見積書からNEOを生成」を押してください。"
                     "／ CSVを貼り付けた場合や、車検証だけでNEOを作る場合は、"
                     "この下の「NEO生成を開始」を使います")
 

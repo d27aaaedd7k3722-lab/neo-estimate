@@ -1492,7 +1492,10 @@ def process_pdf_to_neo(pdf_path,
                        cache_scope: str = "",
                        is_tax_inclusive: bool = False,
                        merge_mode: bool = False,
-                       expenses: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                       expenses: Optional[Dict[str, Any]] = None,
+                       # 見積書は写真（JPG/PNG/HEIC 等）で来ることもある。
+                       # 既存の位置引数の並びを一切崩さないよう、必ず末尾に置く。
+                       source_mime: str = 'application/pdf') -> Dict[str, Any]:
     """E2E ディスパッチャ。
 
     - vehicle_info/items 未提供かつ skip_ocr=False かつ GEMINI_API_KEY あり → OCR
@@ -1555,6 +1558,9 @@ def process_pdf_to_neo(pdf_path,
             # 費用は生成物を変える。キーに入れないと費用を変えても前の結果が返る。
             repr(sorted((expenses or {}).items())),
             _pdf_md5((ocr_text or "").encode("utf-8", "ignore")),
+            # 同じバイト列でも、PDF として送るか画像として送るかで
+            # 読み取り結果が変わる。キーに入れないと前の結果が返る。
+            str(source_mime or ''),
         ])
         if cache_key in _PIPELINE_CACHE:
             cached = copy.deepcopy(_PIPELINE_CACHE[cache_key])
@@ -1581,7 +1587,10 @@ def process_pdf_to_neo(pdf_path,
                 _ex = _TPE(max_workers=2)
                 try:
                     from app import analyze_vehicle_registration  # type: ignore
-                    _vi_future = _ex.submit(analyze_vehicle_registration, api_key, pdf_bytes, "application/pdf")
+                    # ここも PDF 固定にすると、写真で入れた見積書を PDF として
+                    # 送ってしまい、この並列 OCR だけが失敗して警告が出る。
+                    _vi_future = _ex.submit(analyze_vehicle_registration, api_key,
+                                            pdf_bytes, source_mime or "application/pdf")
                 except Exception as e:
                     vehicle_info = {}
                     warnings.append(f"vehicle OCR submit失敗: {e}")
@@ -1614,7 +1623,9 @@ def process_pdf_to_neo(pdf_path,
                 try:
                     from app import analyze_estimate  # type: ignore
                     _ocr_model = model_name or os.environ.get('GEMINI_MODEL', '')
-                    res = analyze_estimate(api_key, pdf_bytes, "application/pdf",
+                    # 見積書は写真（JPG/PNG/HEIC 等）で来ることもある。
+                    # ここを PDF 固定にすると、画像を PDF として送って読み取れない。
+                    res = analyze_estimate(api_key, pdf_bytes, source_mime or "application/pdf",
                                            model_name=_ocr_model or None,
                                            # 税込表記であることをモデルに伝える
                                            tax_inclusive=bool(is_tax_inclusive))
