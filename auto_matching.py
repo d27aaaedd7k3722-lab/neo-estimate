@@ -1355,12 +1355,27 @@ def match_pdf_items_to_addata(items, vehicle_info, addata_root=ADDATA_ROOT):
 
         # spec_iter4 課題A (S4-1): singleton 利用で AddataEngine 再生成を避ける
         engine = _get_engine(addata_root)
-        md = str(vehicle_info.get('model_designation', '') or '').strip()
-        cn = str(vehicle_info.get('category_number', '') or '').strip()
-        mc = str(vehicle_info.get('model_code', '') or '').strip()
+        # identify_vehicle_wrapper と同じキー解決・同じ絞り込みで特定する。
+        # ここだけ model_designation / category_number / model_code の3つで
+        # 再特定していたため、(a) 車検証OCRが持つ car_ 接頭辞のキーを読めず、
+        # (b) 初度登録・メーカー・車名で候補を絞ったケースでは画面の車種特定結果と
+        # ずれて、別車種の部品マスタで引いた部品コードが NEO に入るおそれがあった。
+        md = str(vehicle_info.get('model_designation')
+                 or vehicle_info.get('car_model_designation') or '').strip()
+        cn = str(vehicle_info.get('category_number')
+                 or vehicle_info.get('car_category_number') or '').strip()
+        mc = str(vehicle_info.get('model_code')
+                 or vehicle_info.get('car_model') or '').strip()
+        rd = str(vehicle_info.get('reg_date')
+                 or vehicle_info.get('car_reg_date')
+                 or vehicle_info.get('first_reg_date') or '').strip()
+        mk = str(vehicle_info.get('maker')
+                 or vehicle_info.get('car_maker') or '').strip()
+        cnm = str(vehicle_info.get('car_name') or '').strip()
         color_code = str(vehicle_info.get('color_code', '') or '').strip()
 
-        veh, err = engine.identify_vehicle(md, cn, mc)
+        veh, err = engine.identify_vehicle(md, cn, mc,
+                                           reg_date=rd, maker=mk, car_name=cnm)
         if err or not veh:
             for it in out:
                 it.setdefault('db_price', None)

@@ -2698,6 +2698,92 @@ def match_parts_with_addata(items, addata_folder, vehicle_info=None):
     return (matched, True)
 
 
+def _clear_addata_codes(estimate_data):
+    """前回の Addata 照合で入った部品コードを捨てる。
+
+    生成直前の再照合が「車種が特定できない」等で見送られたとき、
+    前の車両で引いた部品コードが残っていると、車両情報を直したのに
+    部品コードだけ前の車種のもの、という .neo ができてしまう。
+    協定見積は「同じ車・同じ部品」が絶対条件なので、
+    間違ったコードを残すくらいなら空にする。
+    """
+    estimate_data['_addata_matched'] = False
+    estimate_data.pop('_addata_reverse', None)
+    for it in (estimate_data.get('items') or []):
+        if not isinstance(it, dict):
+            continue
+        it['_master_section_code'] = ''
+        it['_master_branch_code'] = ''
+
+
+def apply_addata_matching(estimate_data, vehicle_data, progress=None):
+    """Addata があれば車種を特定して部品照合を通す。照合したかどうかを返す。
+
+    step2（車検証＋見積書）と CSV 取り込みの両方から呼ぶ。CSV 取り込みは
+    step2 を通らず step3 へ進むため、ここを共通で通さないと CSV 経路だけ
+    部品コード（_master_section_code → NEO の PartsCode）が空のままになる。
+
+    照合が items に書き込むのは部品コードと照合レベル（未マッチ行の「※」判定に
+    使う match_level）だけで、金額・品名・工数は見積の値のまま。
+    app.py は db_price / db_parts_no / db_work_index を読まないので、
+    Addata の値で原本の金額が書き換わることはない。
+    """
+    def _tick(pct, text):
+        if progress is None:
+            return
+        try:
+            progress.progress(pct, text=text)
+        except Exception:
+            pass
+
+    addata_dir = find_addata_dir()
+    if not (addata_dir and vehicle_data):
+        estimate_data['_veh_match_result'] = {
+            'match_layer': 3, 'is_supported': False,
+            'reason': ('Addata未検出（そのまま転記）' if not addata_dir
+                       else '車両情報なし（そのまま転記）')}
+        _clear_addata_codes(estimate_data)
+        _tick(92, "✏️ Addata照合なし — 見積の内容をそのまま転記...")
+        return False
+
+    _tick(92, "Addata マスタとの照合を実行中...")
+    veh_match_result = identify_vehicle(addata_dir, vehicle_data)
+    estimate_data['_veh_match_result'] = veh_match_result
+
+    # is_template（TOYOTA_GENERIC 代用）は実車種が当たっていないので照合しない。
+    # PDF→NEO 側の decide_mode_from_identify がモードAへ落とすのと揃える。
+    if not veh_match_result.get('is_supported') or veh_match_result.get('is_template'):
+        _clear_addata_codes(estimate_data)
+        return False
+    # 候補が複数残ったまま先頭を採っている状態では照合しない。
+    # 別型式の部品マスタから引いた部品コードが協定見積に入るくらいなら、
+    # 空のまま人に埋めてもらうほうが安全（元見積と同じ車・同じ部品が絶対条件）。
+    if veh_match_result.get('ambiguous'):
+        _clear_addata_codes(estimate_data)
+        return False
+    if not estimate_data.get('items'):
+        _clear_addata_codes(estimate_data)
+        return False
+
+    matched_items, has_rev = match_parts_with_addata(
+        estimate_data['items'], addata_dir, vehicle_data)
+    estimate_data['items'] = matched_items
+    # has_rev は「照合器が結果を返したか」であって、PDF総額の突き合わせ
+    # （_reverse_match）とは意味が違う。_reverse_match を上書きすると、
+    # 金額が原本と合っていなくても step3/4 の不一致警告と確認欄が消える。
+    estimate_data['_addata_reverse'] = has_rev
+    # has_rev は「照合器が非空のリストを返したか」でしかなく、全行 L4（該当なし）
+    # でも True になる。実際に部品コードが入った行があるかで成功を判定しないと、
+    # PartsCode が空のままなのに画面に「Addata照合済み」と出て気づけない。
+    _hit = any(str(it.get('_master_section_code') or '').strip() for it in matched_items)
+    if not (has_rev and _hit):
+        # 1行も当たらなかったときは、前回の結果が残らないように捨てる
+        _clear_addata_codes(estimate_data)
+        return False
+    estimate_data['_addata_matched'] = True
+    return True
+
+
 def complement_vehicle_info_with_gemini(api_key, model_code, current_car_name, current_engine):
     """
     車両特定(KA06_ALL)に失敗した場合、型式(model_code)からGemini Web検索等で補完を試みる。
@@ -6008,6 +6094,10 @@ def main():
                 st.info("💴 税込モード: CSVの金額は税込みとして処理されます")
             else:
                 st.info("💴 税抜モード: CSVの金額は税抜きとして処理されます")
+            # CSV 取り込みは step2 を通らずに step3 へ進むため、ここで通さないと
+            # この経路だけ部品コードが入らない。車検証を読ませていない場合
+            # （vehicle_data が無い場合）は、中で何もせずそのまま転記になる。
+            apply_addata_matching(estimate_data, st.session_state.get('vehicle_data'))
             st.session_state['estimate_data'] = estimate_data
             st.session_state['_estimate_token'] = _make_estimate_token(
                 _csv_items_s2, vehicle_bytes, None)
@@ -6143,31 +6233,11 @@ def main():
                         "明細の内容が正しいかご確認ください。")
 
                 # --- 11. Addata 連携 (車両特定 & 部品マッチング) ---
-                _current_mode = st.session_state.get('selected_mode', 'db')
-                addata_dir = find_addata_dir()
-                if _current_mode == 'db' and addata_dir and vehicle_data:
-                    progress.progress(92, text="Addata マスタとの照合を実行中...")
-                    veh_match_result = identify_vehicle(addata_dir, vehicle_data)
-                    estimate_data['_veh_match_result'] = veh_match_result
-
-                    # is_template（TOYOTA_GENERIC 代用）は実車種が当たって
-                    # いないので照合しない。PDF→NEO 側の decide_mode_from_identify
-                    # がモードAへ落とすのと揃える。
-                    if (veh_match_result.get('is_supported')
-                            and not veh_match_result.get('is_template')):
-                        if 'items' in estimate_data and estimate_data['items']:
-                            # 渡すのは車種フォルダではなく Addata ルート。
-                            # 車両情報も渡さないと照合側が車種を引けない。
-                            # （以前は存在しないキー addata_folder を読んでおり、
-                            #   常に None になって照合が一度も動いていなかった）
-                            matched_items, has_rev = match_parts_with_addata(
-                                estimate_data['items'], addata_dir, vehicle_data)
-                            estimate_data['items'] = matched_items
-                            estimate_data['_reverse_match'] = has_rev
-                elif _current_mode == 'beta':
-                    # ベタ打ちモード: Addata照合をスキップし、PDF見積の内容をそのまま転記
-                    estimate_data['_veh_match_result'] = {'match_layer': 3, 'is_supported': False, 'reason': 'ベタ打ちモード（DB照合スキップ）'}
-                    progress.progress(92, text="✏️ ベタ打ちモード — PDF見積をそのまま転記...")
+                # 以前はここに `_current_mode == 'db'` の条件が入っていたが、
+                # step1 の冒頭で selected_mode は必ず 'beta' に固定されるため、
+                # この照合は一度も実行されず、Addata を読み込ませても
+                # NEO の部品コード（_master_section_code → PartsCode）が常に空だった。
+                apply_addata_matching(estimate_data, vehicle_data, progress)
                 
                 # --- 税区分 ユーザー選択値を常に適用（AI自動判定廃止）---
                 _tax_override = st.session_state.get('tax_override', '税抜き（外税）')
@@ -6187,8 +6257,8 @@ def main():
                 info_msgs = []
                 if not vehicle_bytes:
                     info_msgs.append("📋 車検証なしモード: 見積書から読み取れた車両情報のみでNEOを作成します。ステップ③で車両情報を確認・補完してください。")
-                if _current_mode == 'beta':
-                    info_msgs.append("✏️ ベタ打ちモード: PDF見積の全明細をそのままNEOファイルに転記します（DB照合なし）")
+                if not estimate_data.get('_addata_matched'):
+                    info_msgs.append("✏️ そのまま転記: 見積の全明細をそのままNEOファイルに転記します（Addata照合なし）")
                 elif estimate_data.get('_veh_match_result', {}).get('is_supported'):
                     v_res = estimate_data['_veh_match_result']
                     _amb = v_res.get('ambiguous') or []
@@ -7314,6 +7384,14 @@ def main():
         has_estimate     = False
         reverse_match    = False
         if estimate_data and estimate_data.get('items'):
+            items            = estimate_data['items']
+            # step3 で車両情報や明細を直していると、step2 で取った照合結果
+            # （部品コード・照合レベル）が修正前のままになる。修正後の車両で
+            # NEO を作るのに部品コードだけ修正前の車種のもの、という食い違いを
+            # 防ぐため、生成の直前にもう一度照合し直す。
+            # 二重に「※」が付くことは、品名側（startswith('※')）と
+            # 品番側（auto_matching の二重付与防止）の両方で防がれている。
+            apply_addata_matching(estimate_data, updated_vehicle)
             items            = estimate_data['items']
             short_parts_wage = safe_int(estimate_data.get('short_parts_wage', 0))
             has_estimate     = True
