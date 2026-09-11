@@ -241,12 +241,40 @@ else:
 # 統合は突き合わせより前に書かれていること（並べ替えで戻らないよう縛る）
 import inspect  # noqa: E402
 _src = inspect.getsource(P.process_pdf_to_neo)
-_i_dedup = _src.find('items = _final_dedup_items(items or [])')
+_i_dedup = _src.find('items = _final_dedup_items(items or [], freeze=True)')
 _i_match = _src.find('# v7: PDF表示総額と明細合算の差分')
 chk(_i_dedup > 0 and _i_match > 0, '9b: 目印の行が見つからない')
 chk(0 < _i_dedup < _i_match,
     '9c: 重複行の統合が総額の突き合わせより後ろにある'
     '（同じ金額が2回引かれる）')
+
+# ── 9d. 突き合わせの「後」に行が消えないこと（Codex 指摘） ──────────
+# パイプラインは 統合 → 総額の突き合わせ → ADDATA照合 → NEO生成 の順で、
+# NEO生成の中（_call_generate_neo）でもう1回統合が走る。照合が品番を
+# 埋めて2行の見分けが付かなくなると、**突き合わせの後で**行が消えて、
+# 差を埋めた調整行だけが残る（また二重に引かれる）。
+_a = {'name': 'Rrﾊﾞﾝﾊﾟ', 'part_no': '', 'parts_amount': 38600, 'wage': 0,
+      'page': 1}
+_b = {'name': 'Rrﾊﾞﾝﾊﾟ', 'part_no': '52159-52250', 'parts_amount': 38600,
+      'wage': 0, 'page': 2}
+# 品番が違うので、この時点では統合されない（残す、と判断する）
+_kept = P._final_dedup_items([_a, _b], freeze=True)
+chk(len(_kept) == 2, '9d: 品番の違う2行を統合してしまった')
+# このあと ADDATA 照合が品番を埋めて、2行が見分け付かなくなる
+_a['part_no'] = '52159-52250'
+chk(len(P._final_dedup_items(_kept)) == 2,
+    '9d: 突き合わせの後で行が消えた（調整行だけが残り二重に引かれる）')
+# 印の付いていない行は、これまでどおり統合される
+_c = {'name': 'ｸﾘﾂﾌﾟ', 'part_no': 'X', 'parts_amount': 100, 'wage': 0,
+      'page': 1}
+_d = {'name': 'ｸﾘﾂﾌﾟ', 'part_no': 'X', 'parts_amount': 100, 'wage': 0,
+      'page': 2}
+chk(len(P._final_dedup_items([_c, _d])) == 1,
+    '9e: ページ境界の重複行が統合されなくなった')
+# 内部用の印が生成側に漏れないこと
+chk(all('_dedup_frozen' not in x
+        for x in P._normalize_items_for_neo(_kept)),
+    '9f: 内部用の印 _dedup_frozen が生成側に漏れている')
 
 # ── 10. 総額を1桁誤読したら、行を捏造せず警告だけ ─────────────────
 _ITEMS = [{'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 38600,
@@ -278,6 +306,14 @@ else:
         '11: 読み落としの差を埋める調整行が入っていない')
     chk(any('※金額調整' in w for w in (_res.get('warnings') or [])),
         '11: 調整行を足したことを知らせていない')
+    # 調整行が入った .neo は「原本どおり」ではない。読み落としの疑いとして
+    # 印を付け、キャッシュにも残さないこと（次に同じPDFを出したときに
+    # 捏造行入りの .neo がそのまま返ると、確認の機会そのものが無くなる）。
+    chk(_res.get('ocr_incomplete'),
+        '11b: 調整行が入ったのに ocr_incomplete が立っていない'
+        '（捏造行入りの .neo がキャッシュに残る）')
+    chk(_res.get('adjustment_parts') or _res.get('adjustment_wage'),
+        '11c: 調整額が結果に入っていない（画面が大きさを出せない）')
 
 print('REG_E2ETOTAL:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:

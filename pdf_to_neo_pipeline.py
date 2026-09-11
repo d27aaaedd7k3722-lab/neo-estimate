@@ -636,7 +636,8 @@ def _fallback_parts_no_from_db(items: List[Dict[str, Any]],
     return out
 
 
-def _final_dedup_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _final_dedup_items(items: List[Dict[str, Any]],
+                       freeze: bool = False) -> List[Dict[str, Any]]:
     """ページ跨ぎで二重に読まれた明細だけを統合する。
 
     見積書には同じ部品が同じ金額で複数行並ぶこと（クリップ2個など）が
@@ -646,6 +647,13 @@ def _final_dedup_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
       - 直前の行と完全に一致（品名・品番・部品金額・工賃）し、かつ
       - ページ番号が異なる（＝ページ境界の二重読み取り）
     ものだけに限定する。
+
+    freeze=True を付けて呼ぶと、残した行に「判断済み」の印を付ける。
+    印の付いた行は、あとから呼ばれた統合では二度と消さない。
+    総額の突き合わせは統合の「後」の行数で差を出しているので、
+    突き合わせのあとで行が消えると、差を埋めた調整行だけが残って
+    同じ金額が2回引かれる。ADDATA照合が品番を埋めて2行の見分けが
+    付かなくなると、NEO生成の中の統合がまさにそれをやる。
     """
     if not items or len(items) <= 1:
         return items
@@ -662,6 +670,11 @@ def _final_dedup_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for it in items:
         if not isinstance(it, dict):
+            out.append(it)
+            continue
+        if it.get("_dedup_frozen"):
+            # 突き合わせより前に「残す」と判断済みの行。ここで消すと
+            # 総額の差を埋めた調整行だけが残り、二重に引かれる。
             out.append(it)
             continue
         try:
@@ -681,6 +694,10 @@ def _final_dedup_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         except Exception:
             pass
         out.append(it)
+    if freeze:
+        for it in out:
+            if isinstance(it, dict):
+                it["_dedup_frozen"] = True
     return out
 
 
@@ -887,6 +904,8 @@ def _normalize_items_for_neo(items: List[Dict[str, Any]]) -> List[Dict[str, Any]
         if not isinstance(it, dict):
             continue
         nit = dict(it)
+        # 統合の判断済みの印はパイプラインの内部用。生成側に渡さない。
+        nit.pop("_dedup_frozen", None)
         # 品番キー統一
         if not nit.get("parts_no"):
             nit["parts_no"] = nit.get("part_no") or nit.get("part_number") or ""
@@ -1845,7 +1864,9 @@ def process_pdf_to_neo(pdf_path,
     # 先に消せば合算が原本どおりになるので、調整行も警告も出ない。
     # 画面のプレビューは統合前の行数を出すので、統合したことは知らせる。
     _before = len(items or [])
-    items = _final_dedup_items(items or [])
+    # freeze=True: ここで残すと決めた行は、このあと ADDATA 照合が品番を
+    # 埋めても NEO 生成の中の統合で消さない。消すと調整行だけが残る。
+    items = _final_dedup_items(items or [], freeze=True)
     _merged = _before - len(items)
     if _merged > 0:
         out["items"] = items
