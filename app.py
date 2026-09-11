@@ -51,6 +51,8 @@ import math
 import unicodedata
 import traceback
 import pandas as pd
+import hashlib
+import contextlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 # コグニセブンの「既存見積」一覧が読む先頭424Bの管理領域を書くために使う
@@ -3274,89 +3276,279 @@ def _addata_from_url(url):
     url = safe_str(url).strip()
     if not url:
         return ''
-    import addata_settings as _as
-    # 使ってよい URL かを**取り込み済みのものを使う前に**見る。
-    # 後回しにすると、いま許されない宛先でも「前に取れているから」で
-    # 通ってしまう。ここで見れば通信もせずに理由を返せる。
-    #
-    # 検査は **書かれたそのままの URL に対して先に**行う。正規化は
-    # 共有リンクを組み立て直すので、たとえば Google ドライブの
-    # `https://利用者名:合言葉@drive.google.com/file/d/…` は
-    # 合言葉が落ちた形に化ける。後で検査すると「合言葉入りのURL」を
-    # 受け付けてしまい、そのURLがブックマークとして残り続ける。
-    for _cand in (safe_str(url).strip(), _as.normalize_share_url(url)):
-        _ok, _why = _as.validate_url(_cand)
-        if not _ok:
-            st.session_state['_addata_url_error'] = _why
+    # 取得の間はモジュールを差し替えさせない。最大120秒かかり、その最中に
+    # addata_settings を読み直されると、時間切れの見張り役が持ち場
+    # （繋いでいる口を控えた入れ物）を失う。
+    with _conversion_guard():
+        import addata_settings as _as
+        # 使ってよい URL かを**取り込み済みのものを使う前に**見る。
+        # 後回しにすると、いま許されない宛先でも「前に取れているから」で
+        # 通ってしまう。ここで見れば通信もせずに理由を返せる。
+        #
+        # 検査は **書かれたそのままの URL に対して先に**行う。正規化は
+        # 共有リンクを組み立て直すので、たとえば Google ドライブの
+        # `https://利用者名:合言葉@drive.google.com/file/d/…` は
+        # 合言葉が落ちた形に化ける。後で検査すると「合言葉入りのURL」を
+        # 受け付けてしまい、そのURLがブックマークとして残り続ける。
+        for _cand in (safe_str(url).strip(), _as.normalize_share_url(url)):
+            _ok, _why = _as.validate_url(_cand)
+            if not _ok:
+                st.session_state['_addata_url_error'] = _why
+                return ''
+        real = _as.normalize_share_url(url)
+        # さっき失敗したばかりなら、また取りに行かない（画面が止まるため）
+        _recent = _addata_url_recent_failure(real)
+        if _recent:
+            st.session_state['_addata_url_error'] = _recent
             return ''
-    real = _as.normalize_share_url(url)
-    # さっき失敗したばかりなら、また取りに行かない（画面が止まるため）
-    _recent = _addata_url_recent_failure(real)
-    if _recent:
-        st.session_state['_addata_url_error'] = _recent
-        return ''
-    cached = _as.cached_root(real, _addata_is_valid)
-    if cached:
-        _mark = (_as.read_marker(real) or {}).get('base') or cached
-        _addata_mark_in_use(_mark)
-        return cached
-    zip_path, why = _as.download_zip(real)
-    if not zip_path:
-        _addata_url_remember_failure(real, why)
-        return ''
-    _sweep_stale_addata_dirs()      # 時間で捨てる
-    _evict_addata_url_cache()       # 量で捨てる
-    # 空けたうえで、**いま置ける量**まで展開を許す。上限いっぱいを毎回許すと、
-    # 既に上限近くまで埋まっているときに新しいぶんが丸ごと乗って超えてしまう。
-    # 同じURLの古いぶんは、これから置き換わるので数に入れない。
-    #
-    # 取り込み直している最中だけは「古いぶん＋落とした ZIP＋新しいぶん」が
-    # 同時に載るので、一時的に上限を超える。これは承知のうえ。
-    # 先に古いぶんを消してしまうと、**それを使って生成している別のセッションの
-    # 足元が崩れる**（部品コードだけ静かに落ちる）。落ち着いた状態では、
-    # 展開のあとの回収で上限に戻る。
-    _old_base = (_as.read_marker(real) or {}).get('base') or ''
-    _room = _ADDATA_URL_CACHE_MAX_BYTES - _addata_url_cache_size(exclude=_old_base)
-    if _room < 16 * 1024 * 1024:
-        _addata_url_remember_failure(
-            real, 'サーバの一時領域に空きがありません。'
-                  'しばらく置いてからもう一度お試しください')
+        cached = _as.cached_root(real, _addata_is_valid)
+        if cached:
+            _mark = (_as.read_marker(real) or {}).get('base') or cached
+            _addata_mark_in_use(_mark)
+            return cached
+        zip_path, why = _as.download_zip(real)
+        if not zip_path:
+            _addata_url_remember_failure(real, why)
+            return ''
+        _sweep_stale_addata_dirs()      # 時間で捨てる
+        _evict_addata_url_cache()       # 量で捨てる
+        # 空けたうえで、**いま置ける量**まで展開を許す。上限いっぱいを毎回許すと、
+        # 既に上限近くまで埋まっているときに新しいぶんが丸ごと乗って超えてしまう。
+        # 同じURLの古いぶんは、これから置き換わるので数に入れない。
+        #
+        # 取り込み直している最中だけは「古いぶん＋落とした ZIP＋新しいぶん」が
+        # 同時に載るので、一時的に上限を超える。これは承知のうえ。
+        # 先に古いぶんを消してしまうと、**それを使って生成している別のセッションの
+        # 足元が崩れる**（部品コードだけ静かに落ちる）。落ち着いた状態では、
+        # 展開のあとの回収で上限に戻る。
+        _old_base = (_as.read_marker(real) or {}).get('base') or ''
+        _room = _ADDATA_URL_CACHE_MAX_BYTES - _addata_url_cache_size(exclude=_old_base)
+        if _room < 16 * 1024 * 1024:
+            _addata_url_remember_failure(
+                real, 'サーバの一時領域に空きがありません。'
+                      'しばらく置いてからもう一度お試しください')
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+            return ''
+        # 展開先は取り込みごとに新しく作る。同じ URL をブックマークした利用者が
+        # 同時に開くことがあるので、**使っている最中の展開先を消してはいけない**。
+        # 古くなったものは掃除が回収する。
+        dest = _as.new_payload_dir(real)
+        import shutil as _sh
         try:
-            os.remove(zip_path)
-        except OSError:
-            pass
-        return ''
-    # 展開先は取り込みごとに新しく作る。同じ URL をブックマークした利用者が
-    # 同時に開くことがあるので、**使っている最中の展開先を消してはいけない**。
-    # 古くなったものは掃除が回収する。
-    dest = _as.new_payload_dir(real)
-    import shutil as _sh
-    try:
-        os.makedirs(dest, exist_ok=True)
-        # 印は**展開を始める前**に打つ。展開先は `addata_url_*` なので、
-        # 展開している最中に別のセッションの回収に消されうる。
+            os.makedirs(dest, exist_ok=True)
+            # 印は**展開を始める前**に打つ。展開先は `addata_url_*` なので、
+            # 展開している最中に別のセッションの回収に消されうる。
+            _addata_mark_in_use(dest)
+            root, why = extract_addata_zip(
+                zip_path, dest,
+                max_total=min(_ADDATA_URL_CACHE_MAX_BYTES, _room))
+        except Exception as e:      # noqa: BLE001
+            root, why = None, '展開に失敗しました: %s' % str(e)[:100]
+        finally:
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+        if not root:
+            _sh.rmtree(dest, ignore_errors=True)
+            _addata_url_remember_failure(real, why)
+            return ''
+        # 展開したぶんも数に入れてもう一度均す。展開の前だけだと、
+        # いま入れたものが上限の外に置かれたままになる。
+        _evict_addata_url_cache(keep=dest)
         _addata_mark_in_use(dest)
-        root, why = extract_addata_zip(
-            zip_path, dest,
-            max_total=min(_ADDATA_URL_CACHE_MAX_BYTES, _room))
-    except Exception as e:      # noqa: BLE001
-        root, why = None, '展開に失敗しました: %s' % str(e)[:100]
+        _as.remember_root(real, dest, root)
+        _addata_url_forget_failure()
+        return root
+
+
+# ── 配布物としての版を揃える ─────────────────────────────────────────
+#
+# **本番で実際に起きた不具合への備え（2026-09-11）。**
+# Streamlit はメインスクリプト（app.py）を実行のたびに読み直すが、
+# `import` したモジュールは `sys.modules` に残ったままで、
+# **プロセスを再起動しない限り古い版がメモリに居座る**。
+# そのため「app.py は新しいのに pdf_to_neo_pipeline は古い」という
+# 食い違いが起き、`process_pdf_to_neo() got an unexpected keyword
+# argument 'source_mime'` で PDF→NEO 変換が丸ごと失敗していた。
+#
+# 引数が増えた場合は例外で止まるので気づけるが、**中身だけが変わった場合は
+# 黙って古い規則で .neo が出る**（たとえば neo_rules の作業区分の対応表）。
+# 協定見積として保険会社に出すファイルなので、こちらのほうが危ない。
+# そこで、ファイルの中身そのもの（sha256）でメモリとディスクを突き合わせ、
+# ずれていれば読み直す。**揃えられないときは、古いまま走らせずに断る。**
+#
+# 並びは依存の浅い順。先に読み直したものを、あとのものが取り込む。
+#
+# `app` が入っているのは、pipeline が `from app import generate_neo_file` と
+# **生成の本体を app から取っている**ため。`streamlit run app.py` では
+# 画面側は `__main__` として動くので、`sys.modules['app']` はそれとは
+# 別の二重読み込みであり、独立に古くなる。
+# 読み直しても画面の描画は走らない（描画は `if __name__ == '__main__':` の中）。
+#
+# `_pdfium_lock_mod` は**入れてはいけない**。pdfium のロックを
+# プロセス全体で1つにするためだけのモジュールで、読み直すと別のロックが
+# できて共有の意味が消える（Cヒープが壊れてプロセスごと落ちる）。
+_APP_MODULES = ('neo_rules', 'neo_header', 'addata_locator', 'addata_settings',
+                '_addata_db_search', '_grade_identifier',
+                'addata_vehicle_resolver', 'app', 'auto_matching',
+                'pdf_to_neo_pipeline')
+
+# 読み直してはいけないモジュール（上の理由）。
+_APP_MODULES_NEVER_RELOAD = ('_pdfium_lock_mod',)
+
+# 読み直しと変換の取り合いを避けるための錠。
+# 変換中に別のセッションがモジュールの中身を差し替えると、
+# 走っている変換の足元で規則が変わる。
+_module_lock = threading.RLock()
+_active_conversions = 0
+
+
+def _file_digest(path):
+    """ファイルの中身の指紋。更新時刻ではなく中身で見る
+    （配布のやり方によっては時刻が当てにならない）。"""
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 16), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _module_src_state(mod):
+    """(いま読み込まれている版の指紋, ディスク上の版の指紋)。分からなければ None。"""
+    path = getattr(mod, '__file__', '') or ''
+    if not path or not os.path.isfile(path):
+        return (None, None)
+    try:
+        return (getattr(mod, '__app_src_digest__', None), _file_digest(path))
+    except OSError:
+        return (None, None)
+
+
+def _stamp_module(mod):
+    """いま読み込んでいる版の指紋を、そのモジュールに控える。"""
+    try:
+        mod.__app_src_digest__ = _file_digest(mod.__file__)
+    except Exception:       # noqa: BLE001
+        pass
+
+
+def _stale_modules():
+    """メモリとディスクで中身が食い違っているモジュールの名前。"""
+    out = []
+    for name in _APP_MODULES:
+        mod = sys.modules.get(name)
+        if mod is None:
+            continue        # まだ読まれていない → 次の import で新しいものが載る
+        loaded, on_disk = _module_src_state(mod)
+        if on_disk is None:
+            continue        # 調べられないものには口を出さない
+        if loaded != on_disk:
+            out.append(name)
+    return out
+
+
+def sync_app_modules():
+    """メモリ上のコードをディスクに揃える。揃えられなかったものの名前を返す。
+
+    読み直しが起きるのはデプロイ直後の1回だけ（指紋が一致したら素通り）。
+    変換中は見送る — 走っている変換の足元でモジュールの中身を
+    差し替えると、途中で規則が変わってしまう。
+    """
+    import importlib
+    with _module_lock:
+        stale = _stale_modules()
+        if not stale:
+            return []
+        if _active_conversions:
+            return stale        # いま誰かが変換中。差し替えず、そのまま知らせる
+        for name in _APP_MODULES:
+            mod = sys.modules.get(name)
+            if mod is None:
+                continue
+            loaded, on_disk = _module_src_state(mod)
+            if on_disk is None or loaded == on_disk:
+                continue
+            try:
+                importlib.reload(mod)
+            except Exception:       # noqa: BLE001  下の再判定で拾う
+                continue
+            _stamp_module(mod)
+        return _stale_modules()
+
+
+@contextlib.contextmanager
+def _conversion_guard():
+    """変換中であることを示す（この間はモジュールを差し替えない）。"""
+    global _active_conversions
+    with _module_lock:
+        _active_conversions += 1
+    try:
+        yield
     finally:
-        try:
-            os.remove(zip_path)
-        except OSError:
-            pass
-    if not root:
-        _sh.rmtree(dest, ignore_errors=True)
-        _addata_url_remember_failure(real, why)
-        return ''
-    # 展開したぶんも数に入れてもう一度均す。展開の前だけだと、
-    # いま入れたものが上限の外に置かれたままになる。
-    _evict_addata_url_cache(keep=dest)
-    _addata_mark_in_use(dest)
-    _as.remember_root(real, dest, root)
-    _addata_url_forget_failure()
-    return root
+        with _module_lock:
+            _active_conversions -= 1
+
+
+# app.py が `process_pdf_to_neo` に渡すつもりの引数。
+# ここに無い引数を増やしたら、このリストにも足すこと
+# （足さないと、古い版の検出から漏れる）。
+_PIPE_ARGS_EXPECTED = (
+    'source_mime', 'addata_root', 'template_path', 'mode_override',
+    'model_name', 'api_key', 'cache_scope', 'is_tax_inclusive',
+    'merge_mode', 'expenses',
+)
+
+
+def _pipeline_accepts(fn, names):
+    """fn が names の引数を受けられるか。受けられないものを返す。"""
+    import inspect
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return ()       # 調べられないときは口を出さない
+    if any(p.kind == p.VAR_KEYWORD for p in params.values()):
+        return ()       # **kwargs があるなら何でも受けられる
+    return tuple(n for n in names if n not in params)
+
+
+def _version_skew_message(names):
+    return ('アプリの内部で新旧のコードが混ざっています（%s）。'
+            'お手数ですが、アプリを再起動してからもう一度お試しください。'
+            % '・'.join(names))
+
+
+def _load_pipeline():
+    """版を揃えたうえで `pdf_to_neo_pipeline` を返す。揃わなければ断る。
+
+    **古いコードで .neo を作らない**のがここの役目。
+    引数が増えた場合は例外で気づけるが、中身だけ変わった場合は
+    黙って古い規則で出てしまうので、実行の前に必ず揃える。
+    """
+    stale = sync_app_modules()
+    if stale:
+        raise RuntimeError(_version_skew_message(stale))
+    import pdf_to_neo_pipeline as _pipe
+    return _pipe
+
+
+def _call_pipeline(_pipe, pdf_path, **kwargs):
+    """`process_pdf_to_neo` を呼ぶ。受けられない引数が1つでもあれば断る。
+
+    ここは最後の砦。**引数を黙って落としてはいけない。**
+    `is_tax_inclusive` が落ちれば税込の見積が消費税ぶん膨らみ、
+    `expenses` が落ちればレッカー代が1円も入らない。`source_mime` が
+    落ちれば写真を PDF として読もうとして中身が拾えない。
+    協定見積として出すファイルなので、古い版で作るくらいなら断る。
+    """
+    missing = _pipeline_accepts(_pipe.process_pdf_to_neo, tuple(kwargs))
+    if missing:
+        raise RuntimeError(_version_skew_message(missing))
+    with _conversion_guard():
+        return _pipe.process_pdf_to_neo(pdf_path, **kwargs)
 
 
 def find_addata_dir():
@@ -6022,7 +6214,7 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
     tmp_tpl = None
     try:
         try:
-            import pdf_to_neo_pipeline as _pipe
+            _pipe = _load_pipeline()
         except Exception as e:
             return {'ok': False, 'error': f'PDF→NEO変換モジュールを読み込めません: {e}'}
 
@@ -6049,8 +6241,8 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
 
         # APIキーは引数で直接渡す。os.environ に書くと、プロセスを共有する
         # 他の利用者のセッションからも読めてしまう（キーの流用・課金事故）。
-        result = _pipe.process_pdf_to_neo(
-            tmp_pdf,
+        result = _call_pipeline(
+            _pipe, tmp_pdf,
             # 見積書は写真（JPG/PNG/HEIC 等）で入れられることもある。
             # PDF 固定で渡すと、画像を PDF として解析しようとして読み取れない。
             source_mime=mime_type,
