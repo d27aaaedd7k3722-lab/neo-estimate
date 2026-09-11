@@ -1413,26 +1413,35 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             ).fetchall()
             conn.close()
             neo_count = len(rows)
-            neo_total = 0
+            neo_total = 0.0
+            neo_minus = 0.0      # 値引きなどマイナスの行だけを別に持つ
+
+            def _amt(x):
+                """コグニセブンが「空欄」を表すのは -1 だけ。
+
+                値引き行の -4,000 は本物の金額なので 0 に潰してはいけない。
+                以前は「金額が 0 以下なら単価×数量で代替」という分岐が
+                先にあり、手入力行の単価欄（-1）を拾って -1 になり、
+                そこから 0 に潰されていた。総額を減らす方向の異常が
+                まるごと検証をすり抜けて「PDFと一致」と報告されていた。
+                """
+                v = _to_float(x)
+                return 0.0 if v == -1 else v
+
             for r in rows:
                 # PartsPriceInTax/OutTax のうち利用可能な値で総額算出 (v11.0: _to_float で安全化)
                 try:
-                    in_tax = _to_float(r[4])
-                    out_tax = _to_float(r[3])
+                    out_tax = _amt(r[3])
+                    in_tax = _amt(r[4])
                     # 税抜どうしで比較するため PartsPriceOutTax を優先する
-                    val = out_tax if out_tax > 0 else in_tax
-                    if val <= 0:
-                        # 単価×数量で代替
-                        up = _to_float(r[2]) or _to_float(r[1])
-                        qty = max(_to_int(r[5], 1), 1)
-                        val = up * qty
-                    # コグニセブンが「空欄」を表すのは -1 だけ。それ以外の
-                    # 負値（マイナスの調整行・値引き行）まで 0 に潰すと、
-                    # 総額を減らす方向の異常が検証をすり抜けて
-                    # 「PDFと一致」と報告されてしまう。
-                    if val == -1:
-                        val = 0
+                    val = out_tax if out_tax else in_tax
+                    if not val:
+                        # 金額欄が空の行だけ、単価×数量で代替する
+                        up = _amt(r[1]) or _amt(r[2])
+                        val = up * max(_to_int(r[5], 1), 1)
                     neo_total += val
+                    if val < 0:
+                        neo_minus += val
                 except (TypeError, ValueError):
                     pass
             # name_match_pct (Iter4改良): PartsNo+PartsName両方で総合一致率
@@ -1482,7 +1491,32 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             # 税込は行ごとに税抜を逆算するため数円ずれる。行数ぶんの
             # 許容を持たせないと、正しい .neo でも不一致と判定される。
             _tol = max(1.0, float(len(items or []))) if is_tax_inclusive else 1.0
-            res["total_match"] = abs(neo_total - pdf_parts_total) < _tol
+            # 見積書に印字された「部品計」は、値引き**前**の小計を出す帳票と
+            # 値引き**後**を出す帳票の両方がある。値引き行は .neo にも
+            # そのまま入るので、どちらに合っていてもよいことにする。
+            # 広がるのは印字された値引き額ぶんだけで、読み落としの検出は
+            # そのまま残る。
+            _neo_plus = neo_total - neo_minus
+            res["neo_minus_total"] = neo_minus
+            res["neo_plus_total"] = _neo_plus
+            res["total_match"] = (abs(neo_total - pdf_parts_total) < _tol
+                                  or abs(_neo_plus - pdf_parts_total) < _tol)
+            # 上の比較はマイナスの行を素通りさせるので、値引きが .neo に
+            # そのまま入っているかは別に見る。入っていなければ、総額だけ
+            # 合っていても原本とは違う見積になる。
+            _it_minus = 0
+            for it in (items or []):
+                _p = _to_int(it.get("parts_amount") or it.get("amount"))
+                if _p < 0:
+                    _it_minus += _p
+            if is_tax_inclusive and _it_minus:
+                _it_minus = -int(round(-_it_minus / (1 + tax_rate)))
+            res["items_minus_total"] = _it_minus
+            if abs(_it_minus - neo_minus) >= max(_tol, 1.0):
+                res["total_match"] = False
+                res["mismatches"].append(
+                    {"type": "minus", "neo": neo_minus, "pdf": _it_minus,
+                     "note": "値引きなどマイナスの行"})
             if res.get("has_adjustment_row"):
                 # 差額を埋めた結果として一致しているだけなので、
                 # 「一致」とは報告しない。

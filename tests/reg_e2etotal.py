@@ -315,6 +315,60 @@ else:
     chk(_res.get('adjustment_parts') or _res.get('adjustment_wage'),
         '11c: 調整額が結果に入っていない（画面が大きさを出せない）')
 
+# ── 12. 検証がマイナスの行を見落とさないこと ─────────────────────
+# 「金額が0以下なら単価×数量で代替」という分岐が、値引き行(-4,000)を
+# 手入力行の単価欄(-1)で置き換え、そこから 0 に潰していた。総額を
+# 減らす方向の異常がまるごと検証をすり抜け、「PDFと一致」と出ていた。
+_TPLB = open(TPL, 'rb').read()
+_base = [{'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 38600,
+          'wage': 0, 'quantity': 1},
+         {'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'parts_amount': 0,
+          'wage': 9800, 'quantity': 1}]
+_disc = _base + [{'name': 'お値引き', 'method': '', 'parts_amount': -4000,
+                  'wage': 0, 'quantity': 1}]
+
+_nb_disc = app.generate_neo_file(_TPLB, {'customer_name': 'ｹﾝｼｮｳ'},
+                                 [dict(i) for i in _disc], 0, {}, {},
+                                 False, False, False)[0]
+# (a) 値引き行が .neo にも明細にもある → 一致
+_v = P.verify_neo_against_pdf(_nb_disc, [dict(i) for i in _disc],
+                              pdf_parts_total=38600, pdf_wage_total=9800)
+chk(_v.get('total_match'),
+    '12a: 値引きのある正しい .neo で「差異あり」と出る（誤報）')
+chk(_v.get('neo_minus_total') == -4000,
+    '12b: 値引き行が %s として数えられている（-4000 のはず）'
+    % _v.get('neo_minus_total'))
+chk(_v.get('neo_total') == 38600 - 4000,
+    '12c: .neo の部品計 %s（38,600-4,000 のはず）' % _v.get('neo_total'))
+
+# (b) .neo にだけマイナスの行がある（原本に無い行が紛れた） → 見つかること
+_v2 = P.verify_neo_against_pdf(_nb_disc, [dict(i) for i in _base],
+                               pdf_parts_total=38600, pdf_wage_total=9800)
+chk(not _v2.get('total_match'),
+    '12d: .neo にだけ -4,000 の行があるのに「一致」と報告している'
+    '（総額を減らす方向の異常が検証をすり抜ける）')
+chk(any(m.get('type') == 'minus' for m in (_v2.get('mismatches') or [])),
+    '12e: マイナスの行の食い違いが mismatches に出ていない')
+
+# (c) 税込でも同じこと
+_nb_in = app.generate_neo_file(
+    _TPLB, {'customer_name': 'ｹﾝｼｮｳ'},
+    [{'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 42460, 'wage': 0,
+      'quantity': 1},
+     {'name': 'お値引き', 'method': '', 'parts_amount': -5000, 'wage': 0,
+      'quantity': 1}], 0, {}, {}, True, False, False)[0]
+_v3 = P.verify_neo_against_pdf(
+    _nb_in,
+    [{'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 42460, 'wage': 0,
+      'quantity': 1},
+     {'name': 'お値引き', 'method': '', 'parts_amount': -5000, 'wage': 0,
+      'quantity': 1}],
+    pdf_parts_total=42460, is_tax_inclusive=True)
+chk(_v3.get('total_match'),
+    '12f: 税込の値引きのある .neo で「差異あり」と出る（誤報）')
+chk(_v3.get('neo_minus_total') < 0,
+    '12g: 税込で値引き行が 0 に潰れている')
+
 print('REG_E2ETOTAL:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
     print('  -', f)
