@@ -157,6 +157,23 @@ try:
     with app._conversion_guard():
         chk(app.sync_app_modules() == ['_ver_probe'],
             '5b: 変換中にモジュールを差し替えている（足元で規則が変わる）')
+    # 別のセッション（別スレッド）が変換中でも差し替えないこと。
+    # ここが app.py の変数だと、スレッドが違えば 0 に見えて差し替わる。
+    _hold = threading.Event()
+    _done = threading.Event()
+
+    def _busy_worker():
+        with app._conversion_guard():
+            _hold.set()
+            _done.wait(5)
+
+    _bt = threading.Thread(target=_busy_worker)
+    _bt.start()
+    _hold.wait(5)
+    chk(app.sync_app_modules() == ['_ver_probe'],
+        '5b2: 別のセッションが変換中なのに差し替えている')
+    _done.set()
+    _bt.join(5)
     # 変換中でなければ揃うこと
     chk(app.sync_app_modules() == [], '5c: 揃えられていない')
     chk(getattr(sys.modules['_ver_probe'], 'X', None) == 2,
@@ -179,28 +196,43 @@ finally:
     except OSError:
         pass
 
-# ── 6. 変換中の数え方（後始末が漏れると以後ずっと差し替え不能になる） ──
-chk(app._active_conversions == 0, '6: 変換の数え方がずれている')
+# ── 6. 変換中の数え方 ───────────────────────────────────────────────
+# 数は**プロセスで1つの置き場**（_process_state）に持たせること。
+# app.py のモジュール変数だと、Streamlit の rerun ごとに作り直されて
+# 別のセッションからは「誰も変換していない」ように見え、走っている変換の
+# 足元でモジュールが差し替わる。
+import _process_state as _pstate  # noqa: E402
+chk(app._pstate is _pstate, '6: 数の置き場が app.py の中にある')
+chk('_process_state' in app._APP_MODULES_NEVER_RELOAD,
+    '6a: 数の置き場が読み直しの対象になっている（読み直すと数が 0 に戻る）')
+chk('_process_state' not in app._APP_MODULES,
+    '6a2: 数の置き場を読み直そうとしている')
+
+chk(_pstate.busy() == 0, '6b: 変換の数え方がずれている')
 _seen = []
 
 
 def _worker():
     with app._conversion_guard():
-        _seen.append(app._active_conversions)
+        _seen.append(_pstate.busy())
 
 
 _t = threading.Thread(target=_worker)
 _t.start()
 _t.join()
-chk(_seen == [1], f'6b: 変換中の数え方がおかしい {_seen}')
-chk(app._active_conversions == 0, '6c: 変換のあと数が戻っていない')
+chk(_seen == [1], f'6c: 変換中の数え方がおかしい {_seen}')
+chk(_pstate.busy() == 0, '6d: 変換のあと数が戻っていない')
 try:
     with app._conversion_guard():
         raise ValueError('ためし')
 except ValueError:
     pass
-chk(app._active_conversions == 0,
-    '6d: 例外のあと数が戻っていない（以後ずっと差し替えできなくなる）')
+chk(_pstate.busy() == 0,
+    '6e: 例外のあと数が戻っていない（以後ずっと差し替えできなくなる）')
+# 数が負に回り込まないこと（回り込むと「変換中ではない」と誤認し続ける）
+_pstate.leave()
+_pstate.leave()
+chk(_pstate.busy() == 0, '6f: 数が負に回り込んでいる')
 
 # ── 7. 実際の呼び出しと、渡すつもりの一覧が合っていること ────────────
 # ここがずれると、古い版の検出が効かなくなる（今回の不具合の再来）。

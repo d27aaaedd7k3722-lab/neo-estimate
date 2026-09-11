@@ -3397,14 +3397,21 @@ _APP_MODULES = ('neo_rules', 'neo_header', 'addata_locator', 'addata_settings',
                 'addata_vehicle_resolver', 'app', 'auto_matching',
                 'pdf_to_neo_pipeline')
 
-# 読み直してはいけないモジュール（上の理由）。
-_APP_MODULES_NEVER_RELOAD = ('_pdfium_lock_mod',)
+# 読み直してはいけないモジュール。
+# `_pdfium_lock_mod` は上の理由（共有ロック）。
+# `_process_state` は「いま変換中か」を数える場所で、読み直すと数が 0 に戻り、
+# 走っている変換の最中に差し替えが起きる穴が開く。
+_APP_MODULES_NEVER_RELOAD = ('_pdfium_lock_mod', '_process_state')
 
-# 読み直しと変換の取り合いを避けるための錠。
-# 変換中に別のセッションがモジュールの中身を差し替えると、
-# 走っている変換の足元で規則が変わる。
-_module_lock = threading.RLock()
-_active_conversions = 0
+# 読み直しと変換の取り合いを避けるための錠と数。
+#
+# **`app.py` のモジュール変数に置いてはいけない。** Streamlit は `app.py` を
+# rerun のたびに `__main__` として実行し直すので、ここに置くと
+# セッションごとに別物になり、**別のセッションからは「誰も変換していない」
+# ように見えて**、走っている変換の足元でモジュールが差し替わる。
+# プロセスで1つの置き場（`_process_state`）に持たせる。
+import _process_state as _pstate     # noqa: E402
+_module_lock = _pstate.module_lock
 
 
 def _file_digest(path):
@@ -3463,7 +3470,7 @@ def sync_app_modules():
         stale = _stale_modules()
         if not stale:
             return []
-        if _active_conversions:
+        if _pstate.busy():
             return stale        # いま誰かが変換中。差し替えず、そのまま知らせる
         for name in _APP_MODULES:
             mod = sys.modules.get(name)
@@ -3482,15 +3489,16 @@ def sync_app_modules():
 
 @contextlib.contextmanager
 def _conversion_guard():
-    """変換中であることを示す（この間はモジュールを差し替えない）。"""
-    global _active_conversions
-    with _module_lock:
-        _active_conversions += 1
+    """変換中であることを示す（この間はモジュールを差し替えない）。
+
+    数はプロセスで1つの置き場に持たせる（`_process_state`）。
+    `app.py` の変数だと、rerun ごとに作り直されて別のセッションから見えない。
+    """
+    _pstate.enter()
     try:
         yield
     finally:
-        with _module_lock:
-            _active_conversions -= 1
+        _pstate.leave()
 
 
 # app.py が `process_pdf_to_neo` に渡すつもりの引数。
