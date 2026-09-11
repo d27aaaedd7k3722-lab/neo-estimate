@@ -6993,7 +6993,7 @@ def main():
                 st.error(f"❌ {_p2n_res['error']}")
             elif not _p2n_res.get('ok'):
                 st.error("❌ 見積書からNEOを生成できませんでした。")
-                for _w in (_p2n_res.get('warnings') or [])[:5]:
+                for _w in (_p2n_res.get('warnings') or []):
                     st.caption(f"・{_w}")
             elif not (_p2n_res.get('items') or []):
                 st.error(
@@ -7001,7 +7001,7 @@ def main():
                     "スキャン画像で文字が読めない、APIのクォータ超過、"
                     "対応していない書式のいずれかが考えられます。"
                 )
-                for _w in (_p2n_res.get('warnings') or [])[:5]:
+                for _w in (_p2n_res.get('warnings') or []):
                     st.caption(f"・{_w}")
             else:
                 _p2n_items = _p2n_res.get('items') or []
@@ -7012,7 +7012,7 @@ def main():
                     f"部品 ¥{_p2n_parts:,} ／ 工賃 ¥{_p2n_wage:,}"
                 )
                 # 車検証OCRの失敗など、成功扱いでも伝えるべき警告がある
-                for _w in (_p2n_res.get('warnings') or [])[:5]:
+                for _w in (_p2n_res.get('warnings') or []):
                     st.warning(f"⚠️ {_w}")
                 # 注記(AnNote.ini)の数量欄は2桁固定で、100以上は99として
                 # 書かれる。明細欄には原本どおり入るので、同じ .neo の中で
@@ -7030,7 +7030,14 @@ def main():
                         "書かれます（明細欄には原本どおりの数量が入ります）。")
                 _p2n_v = _p2n_res.get('verify') or {}
                 if _p2n_v.get('count_match') and _p2n_v.get('total_match'):
-                    st.caption("🔍 検証OK: 生成NEOの明細件数と部品金額（税抜）が原本と一致しました。")
+                    # 工賃は長らく検証に入っておらず、部品計と行数だけで
+                    # 「一致」と出していた。工賃も見ているときはそう書く。
+                    _p2n_wm = _p2n_v.get('wage_match')
+                    st.caption(
+                        "🔍 検証OK: 生成NEOの明細件数と"
+                        + ("部品・工賃の金額（税抜）" if _p2n_wm
+                           else "部品金額（税抜）")
+                        + "が原本と一致しました。")
                 elif _p2n_v.get('error'):
                     st.caption(f"🔍 検証スキップ: {_p2n_v['error']}")
                 else:
@@ -7038,8 +7045,14 @@ def main():
                         "🔍 検証: 原本と生成NEOに差異があります。"
                         f"件数 NEO {_p2n_v.get('neo_count')} / 原本 {_p2n_v.get('pdf_count')}、"
                         f"部品金額(税抜) NEO ¥{safe_int(_p2n_v.get('neo_total')):,} / "
-                        f"原本 ¥{safe_int(_p2n_v.get('pdf_parts_total')):,}。"
-                        "「プレビューに取り込む」で内容を確認・修正してください。"
+                        f"原本 ¥{safe_int(_p2n_v.get('pdf_parts_total')):,}"
+                        # 工賃の食い違いは、以前は検証そのものに入っていなかった。
+                        # 差が工賃側にあるとき、どこが違うのか出さないと
+                        # 「部品は合っているのに差異あり」と読めてしまう。
+                        + (f"、工賃(税抜) NEO ¥{safe_int(_p2n_v.get('neo_wage_total')):,}"
+                           f" / 原本 ¥{safe_int(_p2n_v.get('pdf_wage_total')):,}"
+                           if _p2n_v.get('wage_match') is False else "")
+                        + "。「プレビューに取り込む」で内容を確認・修正してください。"
                     )
                 _p2n_neo = _p2n_res.get('neo_bytes')
                 _p2n_c1, _p2n_c2 = st.columns(2)

@@ -1407,14 +1407,25 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             tf.close()
             conn = sqlite3.connect(tf_name)
             cur = conn.cursor()
-            rows = cur.execute(
-                "SELECT PartsNo, PartsUnitPriceOutTax, PartsUnitPriceInTax, "
-                "PartsPriceOutTax, PartsPriceInTax, PartsCount FROM ERParts"
-            ).fetchall()
+            _SEL = ("SELECT PartsNo, PartsUnitPriceOutTax, PartsUnitPriceInTax, "
+                    "PartsPriceOutTax, PartsPriceInTax, PartsCount")
+            try:
+                # 工賃も読む。以前は部品しか読んでおらず、工賃がいくら
+                # 違っていても行数と部品計さえ合えば「検証OK」と出ていた。
+                # 協定見積では工賃も原本と1円も違ってはいけない。
+                rows = cur.execute(
+                    _SEL + ", WageOutTax, WageInTax FROM ERParts").fetchall()
+                _has_wage = True
+            except sqlite3.Error:
+                # 工賃の欄を持たないテンプレートでも落ちないようにする
+                rows = cur.execute(_SEL + " FROM ERParts").fetchall()
+                _has_wage = False
             conn.close()
             neo_count = len(rows)
             neo_total = 0.0
             neo_minus = 0.0      # 値引きなどマイナスの行だけを別に持つ
+            neo_wage = 0.0
+            neo_wage_minus = 0.0
 
             def _amt(x):
                 """コグニセブンが「空欄」を表すのは -1 だけ。
@@ -1442,7 +1453,14 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                     neo_total += val
                     if val < 0:
                         neo_minus += val
-                except (TypeError, ValueError):
+                    if _has_wage:
+                        w_out = _amt(r[6])
+                        w_in = _amt(r[7])
+                        wval = w_out if w_out else w_in
+                        neo_wage += wval
+                        if wval < 0:
+                            neo_wage_minus += wval
+                except (TypeError, ValueError, IndexError):
                     pass
             # name_match_pct (Iter4改良): PartsNo+PartsName両方で総合一致率
             try:
@@ -1491,32 +1509,69 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             # 税込は行ごとに税抜を逆算するため数円ずれる。行数ぶんの
             # 許容を持たせないと、正しい .neo でも不一致と判定される。
             _tol = max(1.0, float(len(items or []))) if is_tax_inclusive else 1.0
-            # 見積書に印字された「部品計」は、値引き**前**の小計を出す帳票と
-            # 値引き**後**を出す帳票の両方がある。値引き行は .neo にも
-            # そのまま入るので、どちらに合っていてもよいことにする。
-            # 広がるのは印字された値引き額ぶんだけで、読み落としの検出は
-            # そのまま残る。
+            # 見積書に印字された「部品計」「工賃計」は、値引き**前**の小計を
+            # 出す帳票と値引き**後**を出す帳票の両方がある。
+            # 「どちらかに合えばよい」にすると、値引き額ぶんの穴が開く
+            # （値引きと同額の正の行が丸ごと消えても一致と出る）。
+            # 帳票がどちらなのかを**先に決めて**、その基準だけで比べる。
+            # 基準の判定には読み取った明細を使うが、比べる相手は印字された
+            # 小計なので、読み落としの検出は薄まらない。
+            def _split(items_, key, alt=None):
+                """読み取った明細の 正の合計 と 全部の合計 を返す（税抜基準）。"""
+                plus = 0
+                allv = 0
+                for it_ in (items_ or []):
+                    v_ = _to_int(it_.get(key) or (it_.get(alt) if alt else 0))
+                    allv += v_
+                    if v_ > 0:
+                        plus += v_
+                if is_tax_inclusive:
+                    plus = int(round(plus / (1 + tax_rate)))
+                    allv = int(round(allv / (1 + tax_rate)))
+                return plus, allv
+
+            def _basis(printed, plus, allv):
+                """印字された小計が「値引き後」ならTrue。近いほうを採る。"""
+                return abs(allv - printed) <= abs(plus - printed)
+
             _neo_plus = neo_total - neo_minus
+            _neo_wage_plus = neo_wage - neo_wage_minus
             res["neo_minus_total"] = neo_minus
             res["neo_plus_total"] = _neo_plus
-            res["total_match"] = (abs(neo_total - pdf_parts_total) < _tol
-                                  or abs(_neo_plus - pdf_parts_total) < _tol)
-            # 上の比較はマイナスの行を素通りさせるので、値引きが .neo に
-            # そのまま入っているかは別に見る。入っていなければ、総額だけ
-            # 合っていても原本とは違う見積になる。
-            _it_minus = 0
-            for it in (items or []):
-                _p = _to_int(it.get("parts_amount") or it.get("amount"))
-                if _p < 0:
-                    _it_minus += _p
-            if is_tax_inclusive and _it_minus:
-                _it_minus = -int(round(-_it_minus / (1 + tax_rate)))
-            res["items_minus_total"] = _it_minus
-            if abs(_it_minus - neo_minus) >= max(_tol, 1.0):
+            res["neo_wage_total"] = neo_wage
+            res["neo_wage_minus_total"] = neo_wage_minus
+            _ip, _ia = _split(items, "parts_amount", "amount")
+            res["items_minus_total"] = _ia - _ip
+            _net_basis = _basis(pdf_parts_total, _ip, _ia)
+            res["parts_basis"] = "値引き後" if _net_basis else "値引き前"
+            res["total_match"] = abs(
+                (neo_total if _net_basis else _neo_plus) - pdf_parts_total) < _tol
+            # マイナスの行は上の比較では見えないことがあるので、読み取った
+            # 値引きがそのまま .neo に入っているかを別に見る。
+            if abs((_ia - _ip) - neo_minus) >= max(_tol, 1.0):
                 res["total_match"] = False
                 res["mismatches"].append(
-                    {"type": "minus", "neo": neo_minus, "pdf": _it_minus,
-                     "note": "値引きなどマイナスの行"})
+                    {"type": "minus", "neo": neo_minus, "pdf": _ia - _ip,
+                     "note": "値引きなどマイナスの行（部品側）"})
+            # 工賃も同じように比べる。印字された工賃計が取れているときだけ。
+            res["wage_match"] = None
+            if _has_wage and pdf_wage_total:
+                _wp, _wa = _split(items, "wage", "labor_fee")
+                _wbasis = _basis(pdf_wage_total, _wp, _wa)
+                res["wage_basis"] = "値引き後" if _wbasis else "値引き前"
+                res["wage_match"] = abs(
+                    (neo_wage if _wbasis else _neo_wage_plus) - pdf_wage_total) < _tol
+                if abs((_wa - _wp) - neo_wage_minus) >= max(_tol, 1.0):
+                    res["wage_match"] = False
+                    res["mismatches"].append(
+                        {"type": "minus", "neo": neo_wage_minus,
+                         "pdf": _wa - _wp,
+                         "note": "値引きなどマイナスの行（工賃側）"})
+                if not res["wage_match"]:
+                    res["mismatches"].append(
+                        {"type": "wage", "neo": neo_wage, "pdf": pdf_wage_total,
+                         "note": "工賃(税抜)どうしの比較"})
+                    res["total_match"] = False
             if res.get("has_adjustment_row"):
                 # 差額を埋めた結果として一致しているだけなので、
                 # 「一致」とは報告しない。
@@ -2366,6 +2421,14 @@ def process_pdf_to_neo(pdf_path,
         warnings.append(f"NEO生成失敗: {e}")
         out["neo_bytes"] = None
         out["ok"] = False
+
+    # 統合の判断済みの印はパイプラインの内部用。画面のプレビューにも
+    # キャッシュにも載せない（載せると、取り込んだ先で二度と統合されず、
+    # 見慣れない列が編集画面に出る）。
+    if isinstance(out.get("items"), list):
+        out["items"] = [{k: v for k, v in it.items() if k != "_dedup_frozen"}
+                        if isinstance(it, dict) else it
+                        for it in out["items"]]
 
     # Iter9: 成功結果をキャッシュ
     # OCRが途中で失敗した結果をキャッシュすると、クォータ回復後に

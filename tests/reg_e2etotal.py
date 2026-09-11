@@ -369,6 +369,74 @@ chk(_v3.get('total_match'),
 chk(_v3.get('neo_minus_total') < 0,
     '12g: 税込で値引き行が 0 に潰れている')
 
+# ── 13. 工賃も検証すること ─────────────────────────────────
+# 以前は ERParts の部品欄しか読んでおらず、工賃がいくら違っていても
+# 行数と部品計さえ合えば「検証OK」と出ていた。工賃は見積の半分の金額。
+_I = [{'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 38600,
+       'wage': 0, 'quantity': 1},
+      {'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'parts_amount': 0,
+       'wage': 9800, 'quantity': 1}]
+_nb = app.generate_neo_file(_TPLB, {'customer_name': 'ｹﾝｼｮｳ'},
+                            [dict(i) for i in _I], 0, {}, {},
+                            False, False, False)[0]
+# 原本の工賃計は 24,300（14,500 の行を読み落とした）
+_v = P.verify_neo_against_pdf(_nb, _I, pdf_parts_total=38600,
+                              pdf_wage_total=24300)
+chk(_v.get('wage_match') is False,
+    '13a: 工賃が 9,800 しか入っていないのに工賃の検証が通っている')
+chk(not _v.get('total_match'),
+    '13b: 工賃が 14,500 足りないのに「一致」と報告している')
+chk(any(m.get('type') == 'wage' for m in (_v.get('mismatches') or [])),
+    '13c: 工賃の食い違いが mismatches に出ていない')
+# 工賃が合っているときは通ること（誤報を出さない）
+_v = P.verify_neo_against_pdf(_nb, _I, pdf_parts_total=38600,
+                              pdf_wage_total=9800)
+chk(_v.get('ok'), '13d: 工賃が合っている正しい .neo で誤報が出る')
+
+# ── 14. 値引き後の小計を出す帳票でも穴が開かないこと ─────────────
+# 「値引き前・値引き後のどちらかに合えばよい」にすると、値引きと同額の
+# 正の行が丸ごと消えても一致と出る。基準を先に決めて1つだけで比べる。
+_good = [{'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 38600,
+          'wage': 0, 'quantity': 1},
+         {'name': 'お値引き', 'method': '', 'parts_amount': -4400,
+          'wage': 0, 'quantity': 1}]
+_bad = [dict(_good[0], parts_amount=34200), dict(_good[1])]
+
+
+def _mk(its):
+    return app.generate_neo_file(_TPLB, {'customer_name': 'ｹﾝｼｮｳ'},
+                                 [dict(i) for i in its], 0, {}, {},
+                                 False, False, False)[0]
+
+
+# 印字された部品計が値引き「後」の 34,200 の帳票
+_v = P.verify_neo_against_pdf(_mk(_good), _good, pdf_parts_total=34200)
+chk(_v.get('total_match'), '14a: 値引き後の小計の帳票で誤報が出る')
+chk(_v.get('parts_basis') == '値引き後',
+    '14b: 基準の判定が「%s」になっている' % _v.get('parts_basis'))
+_v = P.verify_neo_against_pdf(_mk(_bad), _good, pdf_parts_total=34200)
+chk(not _v.get('total_match'),
+    '14c: 値引きと同額(4,400円)の正の行が消えた .neo を「一致」と報告している')
+# 印字された部品計が値引き「前」の 38,600 の帳票（従来どおり通ること）
+_v = P.verify_neo_against_pdf(_mk(_good), _good, pdf_parts_total=38600)
+chk(_v.get('total_match'), '14d: 値引き前の小計の帳票で誤報が出る')
+chk(_v.get('parts_basis') == '値引き前',
+    '14e: 基準の判定が「%s」になっている' % _v.get('parts_basis'))
+
+# ── 15. 統合の印が画面まで漏れないこと ──────────────────────────
+_ITEMS = [
+    {'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 38600, 'wage': 0,
+     'quantity': 1, 'page': 1},
+    {'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'parts_amount': 0, 'wage': 9800,
+     'quantity': 1, 'page': 1},
+]
+_res = run(_ITEMS, {'pdf_parts_total': 38600, 'pdf_wage_total': 9800,
+                    'discount_amount': 0,
+                    'pdf_grand_total': jr(48400 * 1.10)}, False)
+chk(all('_dedup_frozen' not in it for it in (_res.get('items') or [])),
+    '15: 内部用の印 _dedup_frozen が画面に渡る items に載っている'
+    '（取り込んだ先で二度と統合されず、見慣れない列が編集画面に出る）')
+
 print('REG_E2ETOTAL:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
     print('  -', f)
