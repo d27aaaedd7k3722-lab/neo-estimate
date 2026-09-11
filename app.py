@@ -53,7 +53,6 @@ import traceback
 import pandas as pd
 import hashlib
 import contextlib
-import threading
 from concurrent.futures import ThreadPoolExecutor
 # コグニセブンの「既存見積」一覧が読む先頭424Bの管理領域を書くために使う
 import neo_header
@@ -8259,20 +8258,14 @@ def main():
                     tax   = jpy_round(sub * TAX_RATE)
                     total = sub + tax + exp_exm
                 st.metric("合計（税込）", f"¥{total:,}")
-                if is_tax_incl_s3:
-                    # 明細ぶんの税込額が「税抜＋消費税」で表せない場合、
-                    # .neo に入る総額はここに出している額と1円ずれる。
-                    # 画面が原本どおりの数字を出したままファイルだけ違うと、
-                    # 突き合わせでは絶対に見つからない。
-                    _items_intax = calc_parts + calc_wages
-                    _achievable = best_intax_for(_items_intax)
-                    if _achievable != _items_intax:
-                        _diff = _achievable - _items_intax
-                        st.caption(
-                            f"⚠️ コグニセブンは税抜で保存して消費税を計算するため、"
-                            f"この税込額（¥{_items_intax:,}）はそのままでは表せません。"
-                            f"生成される .neo の明細合計は ¥{_achievable:,}"
-                            f"（{_diff:+,}円）になります。")
+                # ここには以前、「この税込額は .neo では作れないので合計が
+                # 1円変わります」という断りを出していた。
+                # **その前提が実機データで否定されたので消した。**
+                # 実機が作った .neo 176件のうち10件（約6%）は税額が税抜の
+                # 10%ちょうどではなく、コグニは書かれた税額をそのまま持つ。
+                # いまは税込表記のとき税額を「原本の税込 − 逆算した税抜」で
+                # 書いており、**.neo の総額は原本とぴったり一致する**。
+                # 断りを残すと、ずれないものを「ずれる」と伝えることになる。
                 if rev_match:
                     st.markdown('<div class="success-box">✅ 逆算一致</div>', unsafe_allow_html=True)
 

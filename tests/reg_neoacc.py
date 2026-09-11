@@ -1017,6 +1017,14 @@ _doc47 = (_insp47.getdoc(app.best_intax_for) or '')
 chk('誤り' in _doc47 or '実機' in _doc47,
     '47: best_intax_for に「コグニが計算し直す」という誤った前提が残っている')
 chk(app.best_intax_for(110000) == 110000, '47b: 表せる額を変えている')
+# 画面に「.neo の合計は ¥… になります（＋1円）」という断りを出していたが、
+# いまは総額が原本と一致するので、出すと誤った案内になる。
+with open(os.path.join(R, 'app.py'), encoding='utf-8') as _f47:
+    _src47 = _f47.read()
+chk('はそのままでは表せません' not in _src47,
+    '47c: ずれない額を「ずれる」と伝える断りが画面に戻っている')
+chk('税抜で保存して消費税を計算するため' not in _src47,
+    '47d: 否定された前提の文言が画面に残っている')
 
 
 print('REG_NEOACC:', 'ALL PASS' if not FAIL else 'FAIL')
