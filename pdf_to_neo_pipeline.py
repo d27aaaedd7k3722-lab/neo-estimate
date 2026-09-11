@@ -1797,10 +1797,14 @@ def process_pdf_to_neo(pdf_path,
                             # 比率が0になり警告が一切出ない。
                             pdf_total = (_to_float(ocr_meta_first.get("pdf_parts_total"))
                                          + _to_float(ocr_meta_first.get("pdf_wage_total")))
+                        # ページの境目で二重に読まれた行を含んだまま
+                        # 比べると、正しく読めている見積でも合算が
+                        # 膨らんで「大きくずれている」と警告が出る。
+                        # 統合後の明細で比べる。
                         items_sum = sum(
                             _to_float(it.get("line_total"))
                             or (_to_float(it.get("parts_amount")) + _to_float(it.get("wage")))
-                            for it in items)
+                            for it in _final_dedup_items(items))
                         # 印字された総額は税込のことも税抜のこともあり、
                         # 明細合算とは基準が違う。基準を揃えずに比べると、
                         # 税抜表記の見積では明細が完全に正しくても必ず
@@ -1833,6 +1837,23 @@ def process_pdf_to_neo(pdf_path,
 
     vehicle_info = vehicle_info or {}
     items = items or []
+
+    # ページ境界の二重読み取りの統合は、**総額の突き合わせより先に**やる。
+    # 後ろに置くと、重複ぶんを打ち消すマイナスの「※金額調整」行を
+    # 作ってから重複行そのものを消すことになり、同じ金額が2回引かれる
+    # （実測: 38,600円の行が二重に読まれた見積で総額が42,460円不足した）。
+    # 先に消せば合算が原本どおりになるので、調整行も警告も出ない。
+    # 画面のプレビューは統合前の行数を出すので、統合したことは知らせる。
+    _before = len(items or [])
+    items = _final_dedup_items(items or [])
+    _merged = _before - len(items)
+    if _merged > 0:
+        out["items"] = items
+        out["dedup_merged"] = _merged
+        warnings.append(
+            f"ページの境目で二重に読み取られた明細を{_merged}行統合しました"
+            f"（{_before}行 → {len(items)}行）。同じ部品が原本にも複数行ある場合は"
+            "統合していませんが、生成前にプレビューで行数をご確認ください。")
 
     # v7: PDF表示総額と明細合算の差分を「※金額調整」行で吸収 (完全一致保証)
     hdr_parts_total = 0
@@ -2247,21 +2268,6 @@ def process_pdf_to_neo(pdf_path,
         mode = decide_mode_from_identify(ident, out["source"])
     out["mode"] = mode
     log.append(f"mode={mode}")
-
-    # ページ境界の二重読み取りの統合は、これまで NEO 生成の直前
-    # （_call_generate_neo の中）で黙って行われていた。画面のプレビューは
-    # 統合前の行数を出すので、画面の行数と .neo の行数が食い違ったまま
-    # 利用者に何も伝わらない。ここで先に済ませて、統合したことを知らせる。
-    _before = len(items or [])
-    items = _final_dedup_items(items or [])
-    _merged = _before - len(items)
-    if _merged > 0:
-        out["items"] = items
-        out["dedup_merged"] = _merged
-        warnings.append(
-            f"ページの境目で二重に読み取られた明細を{_merged}行統合しました"
-            f"（{_before}行 → {len(items)}行）。同じ部品が原本にも複数行ある場合は"
-            "統合していませんが、生成前にプレビューで行数をご確認ください。")
 
     # 5) NEO生成
     if not (vehicle_info or items):
