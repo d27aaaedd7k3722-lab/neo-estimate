@@ -221,6 +221,18 @@ for _k in ('accept_no', 'policy_no', 'contractor_name', 'agency_name',
            'adjuster_name'):
     chk(_k in _ui, f'4g: 画面が渡す事故・保険情報に {_k} が含まれていない')
 
+# ── 5. 保険情報を変えたら、作り直した .neo も変わること ────────────────
+# 同じ見積書の番号だけ直して出し直すのは普通にある。キャッシュのキーに
+# 保険情報が入っていないと、**前の保険情報のままの .neo** が返り、
+# 別案件の事故番号が入ったファイルをそのまま出してしまう。
+_ck = inspect.getsource(P.process_pdf_to_neo)
+_key = _ck.split('cache_key = "|".join([')[1].split('])')[0] if 'cache_key = "|".join([' in _ck else ''
+chk(bool(_key), '5: キャッシュのキーの組み立てが見つからない')
+chk('insurance_info' in _key,
+    '5b: キャッシュのキーに保険情報が入っていない'
+    '（番号を入れ直しても前の .neo が返る）')
+chk('expenses' in _key, '5c: キャッシュのキーに費用が入っていない')
+
 print('REG_INSURANCE:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
     print('  -', f)

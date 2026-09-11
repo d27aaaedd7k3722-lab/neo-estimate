@@ -1590,6 +1590,11 @@ def process_pdf_to_neo(pdf_path,
             str(bool(merge_mode)),
             # 費用は生成物を変える。キーに入れないと費用を変えても前の結果が返る。
             repr(sorted((expenses or {}).items())),
+            # 事故・保険情報も生成物を変える。入れないと、事故番号や証券番号を
+            # 入れ直して作り直しても**前の保険情報のままの .neo** が返る。
+            # 同じ見積書を番号だけ直して出し直すのは普通にあるので、
+            # 気づかないまま別案件の番号が入ったファイルを出すことになる。
+            repr(sorted((insurance_info or {}).items())),
             _pdf_md5((ocr_text or "").encode("utf-8", "ignore")),
             # 同じバイト列でも、PDF として送るか画像として送るかで
             # 読み取り結果が変わる。キーに入れないと前の結果が返る。
