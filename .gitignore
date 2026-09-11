@@ -16,6 +16,7 @@ __pycache__/
 tmp_*.py
 tmp_*.txt
 *.log
+*.log.*
 dump*.py
 dump*.txt
 check_*.py

@@ -39,6 +39,7 @@ import uuid as _uuid
 import zlib
 import sqlite3
 import tempfile
+import time
 import os
 import datetime
 import json
@@ -2873,6 +2874,10 @@ def guess_manufacturer_from_vin(vin):
 # 消すときは必ず展開先の方を消す（ルートの親を消すと /tmp を消しかねない）。
 _ADDATA_UPLOAD_KEY = '_addata_upload_root'
 _ADDATA_UPLOAD_BASE_KEY = '_addata_upload_base'
+# 画面で設定した Addata の場所を URL のクエリに残すときのキー。
+# ここに残しておくと、そのURLをブックマークして別のPCで開いても同じ設定になる。
+_QS_ADDATA_DIR = 'addata_dir'
+_QS_ADDATA_URL = 'addata_url'
 # ZIP 展開の上限。壊れた/悪意ある ZIP でディスクを埋めないための歯止め。
 ADDATA_ZIP_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024   # 展開後 合計2GB
 ADDATA_ZIP_MAX_MEMBERS     = 200_000                   # ファイル数
@@ -2889,19 +2894,90 @@ def _addata_is_valid(path) -> bool:
         return False
 
 
-def extract_addata_zip(zip_bytes: bytes, dest_dir: str) -> tuple:
+# 目録1本ぶんの最小の長さ（中央ディレクトリの見出し）。
+# 本数の上限とかけ合わせて「目録の大きさ」の上限にする。
+_ZIP_CD_ENTRY_MIN = 46
+
+
+def _zip_declared_index(zip_src):
+    """ZIP の目録が「何本・何バイト」と言っているかを、**開く前に**読む。
+
+    `zipfile.ZipFile()` は組み立ての時点で目録を丸ごとメモリに載せる。
+    しかも読み進める条件は**本数ではなく目録のバイト数**なので、
+    「本数は小さく、バイト数は巨大」と書いておけば、
+    本数の検査に辿り着く前にメモリを使い切らせられる。
+    だから本数とバイト数の**両方**を先に見る。
+    (本数, バイト数) を返す。分からないものは None
+    （その場合は従来どおり開いてから数える）。
+    """
+    TAIL = 66 * 1024        # 目録の末尾はコメント込みで最大 64KB + 22B
+    try:
+        if isinstance(zip_src, (str, os.PathLike)):
+            size = os.path.getsize(zip_src)
+            with open(zip_src, 'rb') as f:
+                f.seek(max(0, size - TAIL))
+                tail = f.read()
+        else:
+            tail = bytes(zip_src)[-TAIL:]
+    except OSError:
+        return (None, None)
+    i = tail.rfind(bytes.fromhex('504b0506'))       # EOCD
+    if i < 0 or len(tail) - i < 22:
+        return (None, None)
+    n = int.from_bytes(tail[i + 10:i + 12], 'little')
+    sz = int.from_bytes(tail[i + 12:i + 16], 'little')
+    if n != 0xFFFF and sz != 0xFFFFFFFF:
+        return (n, sz)
+    # ZIP64。本数もバイト数も 8 バイトで別の場所に書いてある
+    j = tail.rfind(bytes.fromhex('504b0606'))       # EOCD64
+    if j >= 0 and len(tail) - j >= 48:
+        return (int.from_bytes(tail[j + 32:j + 40], 'little'),
+                int.from_bytes(tail[j + 40:j + 48], 'little'))
+    return (None if n == 0xFFFF else n, None if sz == 0xFFFFFFFF else sz)
+
+
+def _zip_declared_members(zip_src):
+    """目録が言っている本数だけ返す（古い呼び出し向け）。"""
+    return _zip_declared_index(zip_src)[0]
+
+
+def extract_addata_zip(zip_src, dest_dir: str, max_total=None) -> tuple:
     """Addata の ZIP を dest_dir に安全に展開し、(ルートパス, 説明) を返す。
 
     ルートが見つからない場合は (None, 理由) を返す。
     ZIP の中身は利用者が持ち込む外部データなので、
     パス抜け（zip slip）・容量爆弾・シンボリックリンクを弾く。
+
+    zip_src は**バイト列でもファイルの場所でもよい**。URL からの取り込みは
+    300MB まで許すので、丸ごとメモリに置かずファイルのまま渡してもらう。
     """
     import zipfile
     dest_real = os.path.realpath(dest_dir)
+    # max_total は「この1本で展開してよい量」。URL からの取り込みでは
+    # 置いておける合計（_ADDATA_URL_CACHE_MAX_BYTES）に合わせる。
+    # ここを緩くしておくと、1本で上限を超えたまま居座って回収できない。
+    if isinstance(max_total, int) and max_total > 0:
+        _cap = max_total
+    else:
+        _cap = ADDATA_ZIP_MAX_TOTAL_BYTES
     total = 0
     count = 0
+    # 目録の大きさを**開く前に**見る。zipfile は組み立ての時点で目録を丸ごと
+    # メモリに載せるので、下の本数の検査では間に合わない。
+    # しかも読み進める条件は本数ではなく**目録のバイト数**なので、
+    # 「本数は小さく、バイト数は巨大」と書かれた ZIP はバイト数で弾くしかない。
+    _declared, _cd_size = _zip_declared_index(zip_src)
+    if _declared is not None and _declared > ADDATA_ZIP_MAX_MEMBERS:
+        return (None, f'ZIP内のファイル数が多すぎます（{_declared:,}件）')
+    if _cd_size is not None and _cd_size > ADDATA_ZIP_MAX_MEMBERS * _ZIP_CD_ENTRY_MIN:
+        return (None, 'ZIPの目録が大きすぎます（%d MB）'
+                % (_cd_size // (1024 * 1024)))
+    if isinstance(zip_src, (str, os.PathLike)):
+        _src = zip_src              # ファイルの場所（URL からの取り込み）
+    else:
+        _src = io.BytesIO(zip_src)  # バイト列（画面からのアップロード）
     try:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        with zipfile.ZipFile(_src) as zf:
             for info in zf.infolist():
                 count += 1
                 if count > ADDATA_ZIP_MAX_MEMBERS:
@@ -2912,8 +2988,9 @@ def extract_addata_zip(zip_bytes: bytes, dest_dir: str) -> tuple:
                 if info.is_dir():
                     continue
                 total += info.file_size
-                if total > ADDATA_ZIP_MAX_TOTAL_BYTES:
-                    return (None, 'ZIPの展開後サイズが大きすぎます（2GBを超過）')
+                if total > _cap:
+                    return (None, 'ZIPの展開後サイズが大きすぎます（上限 %d MB）'
+                            % (_cap // (1024 * 1024)))
                 # 展開先が dest_dir の外に出ないことを実パスで確認する
                 target = os.path.realpath(os.path.join(dest_real, info.filename))
                 if not (target == dest_real or target.startswith(dest_real + os.sep)):
@@ -2978,6 +3055,147 @@ def _sweep_stale_addata_dirs():
                     and os.path.isdir(rd) and rd != keep
                     and now - os.path.getmtime(rd) > _ADDATA_TMP_TTL_SEC):
                 _sh.rmtree(rd, ignore_errors=True)
+        # 取得の途中で落ちた（プロセスごと止められた等）ぶんの ZIP も拾う。
+        # ふだんは download_zip / _addata_from_url が自分で消している。
+        for f in _glob.glob(os.path.join(base, 'addata_dl_*.zip')):
+            rf = os.path.realpath(f)
+            try:
+                if (os.path.dirname(rf) == base and os.path.isfile(rf)
+                        and now - os.path.getmtime(rf) > _ADDATA_TMP_TTL_SEC):
+                    os.remove(rf)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+# URL から取り込んだ Addata を置いておける合計。
+# URL は誰でも仕込める（`?addata_url=…` を踏ませるだけ）ので、違う URL を
+# 並べられると際限なく貯まって一時領域が尽き、**アプリごと止まる**。
+# 本番のクラウドは一時領域が狭いので、合計で頭打ちにして古いものから捨てる。
+_ADDATA_URL_CACHE_MAX_BYTES = 1536 * 1024 * 1024      # 1.5GB
+
+
+def _dir_size(path):
+    total = 0
+    for base, _d, files in os.walk(path):
+        for fn in files:
+            try:
+                total += os.path.getsize(os.path.join(base, fn))
+            except OSError:
+                pass
+    return total
+
+
+# 「いまこのセッションが使っている」と印を置いておく時間。
+# 印は Addata の場所を渡すときに打つが、そのあと OCR・解析・照合と続き、
+# 大きなPDFだと数分かかる。**生成が終わる前に印が切れると、
+# その最中に展開先を回収されうる**（部品コードだけ静かに落ちる）。
+# 余裕を見て30分。掃除の側は6時間なので、残っても長くは居座らない。
+_ADDATA_LEASE_SEC = 30 * 60
+_ADDATA_LEASE_DIR = '.inuse'
+
+
+def _addata_session_token():
+    """このセッションを表す短い名前（印のファイル名に使う）。"""
+    tok = st.session_state.get('_addata_session_token')
+    if not tok:
+        import uuid as _uuid
+        tok = _uuid.uuid4().hex[:12]
+        st.session_state['_addata_session_token'] = tok
+    return tok
+
+
+def _addata_mark_in_use(path):
+    """「いま使っている」印を置く／打ち直す。
+
+    Streamlit Cloud では複数の利用者が同じプロセス・同じ一時領域を使う。
+    量による回収が、**別のセッションが生成に使っている最中の展開先**を
+    消してしまうと、その場で照合が崩れる。印を見て避ける。
+    """
+    try:
+        d = os.path.join(path, _ADDATA_LEASE_DIR)
+        os.makedirs(d, exist_ok=True)
+        f = os.path.join(d, _addata_session_token())
+        with open(f, 'w', encoding='utf-8') as fp:
+            fp.write('')
+        os.utime(f, None)
+    except Exception:
+        pass
+
+
+def _addata_in_use(path):
+    """まだ新しい「使っている」印があるか。"""
+    d = os.path.join(path, _ADDATA_LEASE_DIR)
+    try:
+        now = time.time()
+        for fn in os.listdir(d):
+            try:
+                if now - os.path.getmtime(os.path.join(d, fn)) <= _ADDATA_LEASE_SEC:
+                    return True
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return False
+
+
+def _addata_url_cache_size(exclude=None):
+    """URL から取り込んだぶんの合計。exclude はこれから置き換えるぶん。"""
+    import glob as _glob
+    total = 0
+    try:
+        base = os.path.realpath(tempfile.gettempdir())
+        skip = os.path.realpath(exclude) if exclude else None
+        for d in _glob.glob(os.path.join(base, 'addata_url_*')):
+            rd = os.path.realpath(d)
+            if os.path.dirname(rd) != base or not os.path.isdir(rd) or rd == skip:
+                continue
+            total += _dir_size(rd)
+    except Exception:
+        pass
+    return total
+
+
+def _evict_addata_url_cache(keep=None):
+    """URL から取り込んだぶんの合計が上限を超えていたら、古いものから捨てる。
+
+    捨てる順は「最後に使った時刻」が古いものから（`cached_root` が使うたびに
+    更新時刻を打ち直している）。掃除（`_sweep_stale_addata_dirs`）は時間で
+    消す係、こちらは量で消す係。
+
+    **使っている最中のものは後回しにする。** 同じプロセスを複数の利用者が
+    使うので、生成の最中に展開先を消されると照合がその場で崩れる。
+    印（`.inuse`）が新しいものは、印の無いものを全部捨ててもまだ上限を
+    超えている場合にだけ捨てる（一時領域が尽きるとアプリごと止まるため、
+    最後は量を優先する）。
+    """
+    import glob as _glob, shutil as _sh
+    try:
+        base = os.path.realpath(tempfile.gettempdir())
+        keep_real = os.path.realpath(keep) if keep else None
+        free, busy = [], []     # 捨ててよいもの／使っている最中のもの
+        total = 0               # 合計は keep も使用中も数える
+        for d in _glob.glob(os.path.join(base, 'addata_url_*')):
+            rd = os.path.realpath(d)
+            if os.path.dirname(rd) != base or not os.path.isdir(rd):
+                continue
+            try:
+                size = _dir_size(rd)
+                mt = os.path.getmtime(rd)
+            except OSError:
+                continue
+            total += size
+            if rd == keep_real:
+                continue
+            (busy if _addata_in_use(rd) else free).append((mt, rd, size))
+        if total <= _ADDATA_URL_CACHE_MAX_BYTES:
+            return
+        for _mt, rd, size in sorted(free) + sorted(busy):
+            _sh.rmtree(rd, ignore_errors=True)
+            total -= size
+            if total <= _ADDATA_URL_CACHE_MAX_BYTES:
+                break
     except Exception:
         pass
 
@@ -2997,8 +3215,163 @@ def _discard_uploaded_addata():
         _sh.rmtree(base, ignore_errors=True)
 
 
+def addata_setting(key):
+    """画面で設定した Addata の場所を読む（URLのクエリ → セッションの順）。
+
+    URL に残しておけば、**どのPCでもその URL を開くだけで同じ設定になる**。
+    本番はクラウドで動いていて利用者のPCが見えないので、
+    「設定を持ち歩ける」ことが実用上いちばん効く。
+    """
+    try:
+        v = st.query_params.get(key)
+        if isinstance(v, (list, tuple)):
+            v = v[0] if v else ''
+        if v:
+            return str(v).strip()
+    except Exception:
+        pass
+    return safe_str(st.session_state.get('_setting_' + key, '')).strip()
+
+
+# 取得に失敗した URL を、これだけの間は叩き直さない。
+# `find_addata_dir()` は1回の描き直しの中で何度も呼ばれ、描き直しのたびに
+# また呼ばれる。失敗するURLをそのつど取りに行くと、上限120秒 × 呼ばれた回数だけ
+# 画面が止まり、**設定を消すことすらできなくなる**。
+_ADDATA_URL_FAIL_SEC = 60
+
+
+def _addata_url_remember_failure(url, why):
+    """取得に失敗したことを覚える（理由は画面に出す）。"""
+    st.session_state['_addata_url_error'] = why
+    st.session_state['_addata_url_failed'] = {
+        'url': url, 'at': time.time(), 'why': why}
+
+
+def _addata_url_recent_failure(url):
+    """さっき失敗したばかりの URL か。そうなら理由を返す。"""
+    rec = st.session_state.get('_addata_url_failed')
+    if not isinstance(rec, dict) or rec.get('url') != url:
+        return ''
+    try:
+        if time.time() - float(rec.get('at') or 0) > _ADDATA_URL_FAIL_SEC:
+            return ''
+    except (TypeError, ValueError):
+        return ''
+    return str(rec.get('why') or '取得できませんでした')
+
+
+def _addata_url_forget_failure():
+    st.session_state.pop('_addata_url_failed', None)
+    st.session_state.pop('_addata_url_error', None)
+
+
+def _addata_from_url(url):
+    """設定された URL から Addata を取り込む。ルートを返す（失敗なら空）。
+
+    同じ URL なら展開済みのものを使い回す。毎回落とし直すと数十MBを
+    そのたびに転送することになり、画面が固まる。
+    """
+    url = safe_str(url).strip()
+    if not url:
+        return ''
+    import addata_settings as _as
+    # 使ってよい URL かを**取り込み済みのものを使う前に**見る。
+    # 後回しにすると、いま許されない宛先でも「前に取れているから」で
+    # 通ってしまう。ここで見れば通信もせずに理由を返せる。
+    #
+    # 検査は **書かれたそのままの URL に対して先に**行う。正規化は
+    # 共有リンクを組み立て直すので、たとえば Google ドライブの
+    # `https://利用者名:合言葉@drive.google.com/file/d/…` は
+    # 合言葉が落ちた形に化ける。後で検査すると「合言葉入りのURL」を
+    # 受け付けてしまい、そのURLがブックマークとして残り続ける。
+    for _cand in (safe_str(url).strip(), _as.normalize_share_url(url)):
+        _ok, _why = _as.validate_url(_cand)
+        if not _ok:
+            st.session_state['_addata_url_error'] = _why
+            return ''
+    real = _as.normalize_share_url(url)
+    # さっき失敗したばかりなら、また取りに行かない（画面が止まるため）
+    _recent = _addata_url_recent_failure(real)
+    if _recent:
+        st.session_state['_addata_url_error'] = _recent
+        return ''
+    cached = _as.cached_root(real, _addata_is_valid)
+    if cached:
+        _mark = (_as.read_marker(real) or {}).get('base') or cached
+        _addata_mark_in_use(_mark)
+        return cached
+    zip_path, why = _as.download_zip(real)
+    if not zip_path:
+        _addata_url_remember_failure(real, why)
+        return ''
+    _sweep_stale_addata_dirs()      # 時間で捨てる
+    _evict_addata_url_cache()       # 量で捨てる
+    # 空けたうえで、**いま置ける量**まで展開を許す。上限いっぱいを毎回許すと、
+    # 既に上限近くまで埋まっているときに新しいぶんが丸ごと乗って超えてしまう。
+    # 同じURLの古いぶんは、これから置き換わるので数に入れない。
+    #
+    # 取り込み直している最中だけは「古いぶん＋落とした ZIP＋新しいぶん」が
+    # 同時に載るので、一時的に上限を超える。これは承知のうえ。
+    # 先に古いぶんを消してしまうと、**それを使って生成している別のセッションの
+    # 足元が崩れる**（部品コードだけ静かに落ちる）。落ち着いた状態では、
+    # 展開のあとの回収で上限に戻る。
+    _old_base = (_as.read_marker(real) or {}).get('base') or ''
+    _room = _ADDATA_URL_CACHE_MAX_BYTES - _addata_url_cache_size(exclude=_old_base)
+    if _room < 16 * 1024 * 1024:
+        _addata_url_remember_failure(
+            real, 'サーバの一時領域に空きがありません。'
+                  'しばらく置いてからもう一度お試しください')
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        return ''
+    # 展開先は取り込みごとに新しく作る。同じ URL をブックマークした利用者が
+    # 同時に開くことがあるので、**使っている最中の展開先を消してはいけない**。
+    # 古くなったものは掃除が回収する。
+    dest = _as.new_payload_dir(real)
+    import shutil as _sh
+    try:
+        os.makedirs(dest, exist_ok=True)
+        # 印は**展開を始める前**に打つ。展開先は `addata_url_*` なので、
+        # 展開している最中に別のセッションの回収に消されうる。
+        _addata_mark_in_use(dest)
+        root, why = extract_addata_zip(
+            zip_path, dest,
+            max_total=min(_ADDATA_URL_CACHE_MAX_BYTES, _room))
+    except Exception as e:      # noqa: BLE001
+        root, why = None, '展開に失敗しました: %s' % str(e)[:100]
+    finally:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+    if not root:
+        _sh.rmtree(dest, ignore_errors=True)
+        _addata_url_remember_failure(real, why)
+        return ''
+    # 展開したぶんも数に入れてもう一度均す。展開の前だけだと、
+    # いま入れたものが上限の外に置かれたままになる。
+    _evict_addata_url_cache(keep=dest)
+    _addata_mark_in_use(dest)
+    _as.remember_root(real, dest, root)
+    _addata_url_forget_failure()
+    return root
+
+
 def find_addata_dir():
-    """Addata ルートを返す。見つからなければ None。"""
+    """Addata ルートを返す。見つからなければ None。
+
+    探す順番（上が優先）:
+      1. この画面でアップロードされた ZIP
+      2. 設定した「フォルダのパス」（アプリが動いているマシンから見える場所）
+      3. 設定した「取得URL」（クラウドでも効く。一度設定すればどのPCでも）
+         ※ これが設定されていて取りに行けなかった場合は **None を返す**。
+            黙って別の Addata に落ちると、同じ設定なのに違うデータベースで
+            照合した見積が出てしまう。
+      4. 環境変数 / secrets
+      5. ローカルの標準的な設置場所（自動検出）
+    """
     # 1. この画面でアップロードされたもの
     try:
         up = st.session_state.get(_ADDATA_UPLOAD_KEY)
@@ -3012,11 +3385,43 @@ def find_addata_dir():
             return up
     except Exception:
         pass
-    # 2. 環境変数 / secrets（Docker・Cloud Run で外部ボリュームを渡す場合）
+    # 2. 設定したフォルダのパス
+    try:
+        _dir = addata_setting(_QS_ADDATA_DIR)
+        if _dir and _addata_is_valid(_dir):
+            return _dir
+    except Exception:
+        pass
+    # 3. 設定した取得URL
+    #
+    # **ここで失敗したら、下は見ずに諦める。** 取得URLは「どのPCでも同じ
+    # データベースを使う」ための設定なので、取りに行けなかったときに黙って
+    # そのマシンにあった別の Addata を使うと、**同じブックマークから開いた
+    # のに違うデータベースで照合した見積**が出る。版が違えば標準品番も
+    # 標準指数も変わるのに、画面はいつもどおりで気づけない。
+    # 諦めればベタ打ち（モードA）になり、理由は設定画面に出る。
+    try:
+        _url = addata_setting(_QS_ADDATA_URL)
+    except Exception:
+        _url = ''
+    if _url:
+        try:
+            _root = _addata_from_url(_url)
+        except Exception as _e:     # noqa: BLE001
+            _root = ''
+            try:
+                _addata_url_remember_failure(
+                    _url, '取得できませんでした: %s' % str(_e)[:120])
+            except Exception:
+                pass
+        if _root and _addata_is_valid(_root):
+            return _root
+        return None
+    # 4. 環境変数 / secrets（Docker・Cloud Run で外部ボリュームを渡す場合）
     for _env in (os.environ.get('ADDATA_ROOT'), _secret_addata_root()):
         if _env and _addata_is_valid(_env):
             return _env
-    # 3. ローカルの標準的な設置場所
+    # 5. ローカルの標準的な設置場所
     try:
         import addata_locator as _loc
         found = _loc.find_addata()
@@ -5897,18 +6302,148 @@ def main():
                 st.rerun()
         else:
             st.warning("Addataフォルダ未検出（ベタ打ちモードで生成します）")
+            # 取得URLが設定されていて失敗している場合は理由をここにも出す。
+            # 設定画面をたたまれていると気づけないため。
+            _url_err = st.session_state.get('_addata_url_error')
+            if _url_err and addata_setting(_QS_ADDATA_URL):
+                st.error('取得URL: %s' % _url_err)
 
-        with st.expander("Addataを読み込む", expanded=not addata_status):
+        with st.expander("⚙️ Addata の場所を設定する", expanded=not addata_status):
             st.caption(
                 "Addata があると、部品名・品番・価格をコグニセブンのマスタと"
-                "突き合わせて部品コードや損害コードを引き当てます。"
-                "無い場合はベタ打ち（モードA）で生成します。"
+                "突き合わせて部品コードを引き当てます。無い場合は"
+                "ベタ打ち（モードA）で生成します。金額・明細・品名は"
+                "どちらでも見積書のとおりです。"
             )
-            st.caption(
-                "このアプリはクラウド上で動いているため、お使いのPCの "
-                "C:\\Addata を直接読むことはできません。ZIPにして"
-                "アップロードしてください。"
+            st.info(
+                "**このアプリはクラウド（Linuxサーバ）で動いています。**\n\n"
+                "そのため、お使いのPCの `C:\\Addata` をサーバから読むことはできません。"
+                "パスを入れて効くのは、**このアプリをそのPCで直接起動している場合**か、"
+                "社内サーバ・Docker でフォルダを渡している場合です。\n\n"
+                "クラウドから使うときは **② 取得URL** を設定してください。"
+                "一度設定すれば、**どのPCでもそのURLを開くだけ**で使えます。"
             )
+
+            _cur_dir = addata_setting(_QS_ADDATA_DIR)
+            _cur_url = addata_setting(_QS_ADDATA_URL)
+            # 入力欄の名前に番号を付けて、「設定を消す」で番号を進める。
+            # Streamlit は key を付けた入力の値を持ち続け、描き直しでは
+            # value= より持っている方を使う。**確定したあとに
+            # session_state から消そうとしても拒まれる**ので、
+            # 名前ごと変えて別の入力として作り直すのが確実。
+            _w = int(st.session_state.get('_addata_widget_nonce', 0) or 0)
+
+            st.markdown("**① フォルダのパス**（このアプリが動いているマシンから見える場所）")
+            _in_dir = st.text_input(
+                "Addata フォルダ", value=_cur_dir, key='addata_dir_input_%d' % _w,
+                placeholder=r'例: C:\Addata',
+                label_visibility='collapsed',
+                help='「A〜Zの1文字フォルダ」と「COM」を含むフォルダを指定します。'
+                     'ZIP に固める必要はありません。',
+            )
+
+            st.markdown("**② 取得URL**（ZIP の置き場所。クラウドでも効きます）")
+            _in_url = st.text_input(
+                "Addata の ZIP の URL", value=_cur_url, key='addata_url_input_%d' % _w,
+                placeholder='例: https://…/Addata.zip',
+                label_visibility='collapsed',
+                help='OneDrive・SharePoint・Google ドライブの共有リンクも使えます'
+                     '（ダウンロード用の形に自動で直します）。'
+                     '社内の HTTP サーバでも構いません。',
+            )
+
+            _keep_in_url = st.checkbox(
+                "設定をURLに残す（ブックマークすれば別のPCでもそのまま使えます）",
+                value=True, key='addata_keep_in_url',
+                help='ブラウザのアドレス欄に設定が入ります。'
+                     'そのURLをブックマーク・共有すれば、開いた人は設定済みの状態で始められます。',
+            )
+
+            _c1, _c2 = st.columns(2)
+            with _c1:
+                _save = st.button("💾 保存して使う", key='addata_save_btn',
+                                  type='primary', width='stretch')
+            with _c2:
+                _clear = st.button("↩️ 設定を消す", key='addata_reset_btn',
+                                   width='stretch')
+
+            if _clear:
+                for _k in (_QS_ADDATA_DIR, _QS_ADDATA_URL):
+                    st.session_state.pop('_setting_' + _k, None)
+                    try:
+                        if _k in st.query_params:
+                            del st.query_params[_k]
+                    except Exception:
+                        pass
+                # 入力欄そのものの中身も消す。番号を進めると別の入力として
+                # 作り直されるので、持ち越された値が付いてこない。
+                # （確定後に session_state から消す手は Streamlit に拒まれる）
+                st.session_state['_addata_widget_nonce'] = _w + 1
+                _addata_url_forget_failure()
+                st.session_state.pop('_addata_dir_warn', None)
+                st.rerun()
+
+            if _save:
+                _d = safe_str(_in_dir).strip()
+                _u = safe_str(_in_url).strip()
+                _problems = []
+                # フォルダのパスが見えないのは**保存を止める理由にしない**。
+                # そもそもパスはマシン依存で、クラウドでは必ず見えない。
+                # 「自分のPC用にパスを入れ、クラウド用に取得URLも入れる」は
+                # 正しい使い方なので、止めると取得URLを保存できなくなる。
+                # 見えないパスは探す順番の中で黙って飛ばされる（下の取得URLへ進む）。
+                _dir_warn = ''
+                if _d and not _addata_is_valid(_d):
+                    _dir_warn = (
+                        'フォルダ「%s」は、このアプリが動いているマシンからは見えません'
+                        '（クラウドで動いている場合、お使いのPCのフォルダは指定できません）。'
+                        % _d) + ('そのまま保存しますが、実際に使われるのは下の取得URLです。'
+                                 if _u else '取得URLも設定してください。')
+                if _u:
+                    import addata_settings as _as
+                    _ok_u, _why_u = _as.validate_url(_u)
+                    if not _ok_u:
+                        _problems.append('取得URL: %s' % _why_u)
+                # 注意書きは保存のあとの画面の描き直しで消えてしまうので、
+                # セッションに置いて描き直したあとに出す。
+                if _dir_warn:
+                    st.session_state['_addata_dir_warn'] = _dir_warn
+                else:
+                    st.session_state.pop('_addata_dir_warn', None)
+                if _problems:
+                    for _pb in _problems:
+                        st.error('❌ ' + _pb)
+                else:
+                    # セッションに覚える（URLに残さない選択でも今回は効くように）
+                    st.session_state['_setting_' + _QS_ADDATA_DIR] = _d
+                    st.session_state['_setting_' + _QS_ADDATA_URL] = _u
+                    try:
+                        for _k, _v in ((_QS_ADDATA_DIR, _d), (_QS_ADDATA_URL, _u)):
+                            if _keep_in_url and _v:
+                                st.query_params[_k] = _v
+                            elif _k in st.query_params:
+                                del st.query_params[_k]
+                    except Exception:
+                        pass
+                    _addata_url_forget_failure()
+                    if _u:
+                        with st.spinner('Addata を取得しています…'):
+                            _got = _addata_from_url(_u)
+                        if not _got:
+                            st.error('❌ %s' % st.session_state.get(
+                                '_addata_url_error', '取得できませんでした'))
+                        else:
+                            st.rerun()
+                    else:
+                        st.rerun()
+
+            if st.session_state.get('_addata_dir_warn'):
+                st.warning('⚠️ ' + st.session_state['_addata_dir_warn'])
+            if st.session_state.get('_addata_url_error'):
+                st.error('❌ 取得URL: %s' % st.session_state['_addata_url_error'])
+
+            st.markdown("---")
+            st.markdown("**③ ZIP をアップロード**（その場かぎり。設定は残りません）")
             st.caption(
                 "ZIPの中身は「A〜Zの1文字フォルダ ／ 車種コード ／ *.DB」の構造。"
                 "車種の自動特定には COM/KA06_ALL.DB も必要です。"
