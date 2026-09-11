@@ -109,14 +109,19 @@ def normalized_reg_date(raw) -> str:
 
 
 def best_intax_for(intax_total):
-    """税込総額に最も近い「実現できる税込総額」を返す。
+    """税抜＋消費税（10%の四捨五入）で表せる、いちばん近い税込総額を返す。
 
-    コグニセブンは税抜で保存して消費税を計算するので、実際に .neo に
-    入る総額は必ず S + round(S*0.1) の形になる。見積書に印字された
-    税込総額がこの形で表せない場合（およそ11件に1件）、生成される
-    .neo は原本と1円ずれる。画面とファイルで別々に計算すると、
-    画面が「完全一致」と出したまま1円違うファイルが出るので、
-    両方でこの関数を使う。
+    **これは「原本と1円ずれてもよい」という意味ではない。**
+    以前ここには「コグニセブンは税抜で保存して消費税を計算し直すので
+    .neo の総額は必ず S + round(S*0.1) になる」と書いてあったが、
+    **実機が作った .neo 176件を調べたところ誤りだった**。
+    10件（約6%）で税額が税抜の10%ちょうどでなく（例: 税抜295,455 に対し
+    税額29,545。10%なら29,546）、コグニは書かれた税額をそのまま持っている。
+
+    そのため生成側は、税込表記のとき税額を「原本の税込 − 逆算した税抜」で
+    書き、**総額を原本にぴったり合わせている**（`_update_ansmb_body`）。
+    この関数は「10%ちょうどで表すとどうなるか」を知りたい場面
+    （画面の目安表示）にだけ使う。金額の正解として使ってはいけない。
     """
     if not intax_total:
         return 0
@@ -871,7 +876,22 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
 
 def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
                        is_tax_inclusive, is_beta_mode):
+    # 途中で落ちても必ず閉じる。閉じないまま抜けると、Windows では
+    # SQLite がファイルを掴んだままで呼び出し元の unlink が失敗し、
+    # **顧客情報の入った一時DBが消えずに残る**。
     conn = sqlite3.connect(_tmp_db_path)
+    try:
+        return _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage,
+                                  expenses, is_tax_inclusive, is_beta_mode)
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
+def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
+                       is_tax_inclusive, is_beta_mode):
     cur  = conn.cursor()
     cur.execute('DELETE FROM ERParts')
     # ── 塗装セクション・その他テーブルをリセット ──
@@ -1209,7 +1229,17 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         if is_tax_inclusive:
             # 税込: 金額は既に税込値 → OutTax=税抜逆算, InTax=そのまま, Tax=差額
             if parts_total != 0:
-                parts_outtax = jpy_round(parts_total / (1 + TAX_RATE))
+                # 数量が2以上の行は、行合計から一気に逆算するのではなく
+                # 「単価から逆算して数量倍」する。税抜表記のとき（下の else）と
+                # 同じ実機の規則。入力が税抜か税込かで .neo の中身が変わっては
+                # いけない。以前はここだけ一気に逆算していて、
+                # 単価171×10個で税抜が 1,555（正しくは 1,550）と 5円ずれた。
+                _q_in = qty if isinstance(qty, int) and qty > 1 else 0
+                if _q_in and parts_total % _q_in == 0:
+                    _unit_in = parts_total // _q_in
+                    parts_outtax = jpy_round(_unit_in / (1 + TAX_RATE)) * _q_in
+                else:
+                    parts_outtax = jpy_round(parts_total / (1 + TAX_RATE))
                 parts_intax  = parts_total
                 parts_tax    = parts_total - parts_outtax
             else:
@@ -1498,19 +1528,25 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
         # 1行だけ単価が違う見積になり、協定の場で説明できない。
         # 税込額の大きい行から順に1円ずつ配れば、どの行も自然な逆算値から
         # ±1円以内に収まり、合計は厳密に一致する（最大剰余法と同じ考え方）。
-        for _target, _cur, _col_out, _col_in, _col_tax in (
+        for _target, _cur, _col_out, _col_in, _col_tax, _skip_qty in (
             (_target_parts, total_parts,
-             'PartsPriceOutTax', 'PartsPriceInTax', 'PartsPriceTax'),
+             'PartsPriceOutTax', 'PartsPriceInTax', 'PartsPriceTax', True),
             (_target_wages, total_wages,
-             'WageOutTax', 'WageInTax', 'WageTax'),
+             'WageOutTax', 'WageInTax', 'WageTax', False),
         ):
             _delta = _target - _cur
             if _delta == 0:
                 continue
-            # 金額の入っている行を、税込額の大きい順に並べる
+            # 金額の入っている行を、税込額の大きい順に並べる。
+            # **数量が2以上の部品行は外す。** その行の税抜額は
+            # 「単価から逆算して数量倍」という実機の規則で決まっていて、
+            # 1円動かすと規則から外れる（数量10の行なら本来10円刻み）。
+            # 調整は数量1の行だけで吸収する。全部が数量2以上なら調整しない
+            # ——総額は下で税額を差額にして合わせるので、ずれない。
+            _qty_cond = ' AND (PartsCount IS NULL OR PartsCount <= 1)' if _skip_qty else ''
             _rows = cur.execute(
                 f'SELECT LineNo, {_col_out}, {_col_in} FROM ERParts'
-                f' WHERE {_col_out} IS NOT NULL AND {_col_out} != -1'
+                f' WHERE {_col_out} IS NOT NULL AND {_col_out} != -1{_qty_cond}'
                 f' ORDER BY ABS({_col_in}) DESC, LineNo ASC').fetchall()
             if not _rows:
                 continue
@@ -1546,8 +1582,24 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
     # わざわざ探索しているので、明細ぶんと費用ぶんを分けて丸めないと
     # その探索の成果が壊れる。
     if is_tax_inclusive:
-        tax_total = (jpy_round((total_parts + total_wages) * TAX_RATE)
-                     + expenses_tax_total)
+        # **税は「原本の税込 − 逆算した税抜」で決める。区分ごとに。**
+        #
+        # 10% を掛け直すと、原本の税込総額が「税抜＋消費税」で表せない場合に
+        # 1円ずれる。表せない額は 11円ごとに1つあり（1〜3000円で273個）、
+        # 以前は「いちばん近い税抜額」を採って**警告も出さずに1円ずれた
+        # 協定見積**を出していた。原本に書いてある総額こそが正。
+        #
+        # 実機（コグニセブン）が作った .neo 176件を調べたところ、
+        # **10件（約6%）で税額が税抜の10%ちょうどではなかった**
+        # （例: 税抜295,455 に対し税額29,545。10%なら29,546）。
+        # つまりコグニは書かれた税額をそのまま持つ。差額で書いてよい。
+        #
+        # 部品と工賃は**別々に**差額で確定させる。まとめて差額にすると、
+        # 部品側で出た端数が「いちばん金額の大きい欄」に寄せられ、
+        # 総額は合っていても部品計・工賃計の税込内訳が原本からずれる。
+        parts_tax_total = total_parts_intax - total_parts
+        wages_tax_total = total_wages_intax - total_wages
+        tax_total = parts_tax_total + wages_tax_total + expenses_tax_total
     else:
         tax_total = jpy_round(sub_total * TAX_RATE)
     # 内訳の税額欄（部品計・工賃計・諸経費計）の合計は tx_Total と
@@ -2442,7 +2494,11 @@ def _apply_neo_header(neo_data, em_db_bytes, ansmb_bytes):
             name1=src['name1'],
             car_name=src['car_name'],
             created=_now.date(),
-            totals=_summary_totals(ansmb_bytes),
+            # 読めなかったときに None を渡すと、`neo_header.build` は金額欄に
+            # 触らず、**テンプレート（＝前案件）の金額がそのまま残る**。
+            # 顧客名だけ新しくて金額は前案件、という .neo は出してはいけない。
+            # ゼロで埋めれば一覧に空欄で出るだけで、間違った金額は出ない。
+            totals=_summary_totals(ansmb_bytes) or [0, 0, 0, 0, 0],
             carno=src['carno'],
             saved=_now.replace(tzinfo=None),
         )
@@ -6939,6 +6995,20 @@ def main():
                 # 車検証OCRの失敗など、成功扱いでも伝えるべき警告がある
                 for _w in (_p2n_res.get('warnings') or [])[:5]:
                     st.warning(f"⚠️ {_w}")
+                # 注記(AnNote.ini)の数量欄は2桁固定で、100以上は99として
+                # 書かれる。明細欄には原本どおり入るので、同じ .neo の中で
+                # 数量が食い違う。プレビュー経由では知らせていたが、
+                # この一発生成の経路では何も出ていなかった。
+                _p2n_qty_over = [str(_it.get('name', '') or '')
+                                 for _it in (_p2n_items or [])
+                                 if safe_int(_it.get('quantity', 1), 1) > 99]
+                if _p2n_qty_over:
+                    st.warning(
+                        f"⚠️ 数量が100以上の行が{len(_p2n_qty_over)}件あります"
+                        f"（{'、'.join(_p2n_qty_over[:3])}"
+                        f"{'ほか' if len(_p2n_qty_over) > 3 else ''}）。"
+                        "コグニセブンの注記欄は数量が2桁までのため、注記側は99として"
+                        "書かれます（明細欄には原本どおりの数量が入ります）。")
                 _p2n_v = _p2n_res.get('verify') or {}
                 if _p2n_v.get('count_match') and _p2n_v.get('total_match'):
                     st.caption("🔍 検証OK: 生成NEOの明細件数と部品金額（税抜）が原本と一致しました。")

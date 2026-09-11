@@ -910,6 +910,115 @@ _t40 = _c40.execute('select SubTotal, tx_TotalOutTax, Total from Total').fetchon
 chk(_t40 == (49216, 4922, 54138), f'40b: 合計 {_t40}（期待 (49216, 4922, 54138)）')
 
 
+# 41. 税込表記の見積でも、数量が2以上の行は「単価で丸めてから数量倍」。
+#     40 は税抜表記のときの話。税込表記では行合計から一気に逆算していて、
+#     実機の規則が効いていなかった（税抜額が最大5円ずれた）。
+#     .neo に入る値は、入力が税抜でも税込でも同じ規則で決まらなければならない。
+_C41 = [(10, 171, 1550), (10, 155, 1410), (2, 105, 190), (5, 333, 1515),
+        (3, 1111, 3030), (10, 1001, 9100)]
+for _q41, _u41, _w41 in _C41:
+    _cur41 = gen([{'name': 'ｸﾘｯﾌﾟ', 'method': '取替',
+                   'parts_amount': _u41 * _q41, 'wage': 0, 'quantity': _q41}],
+                 tax_in=True)
+    _r41 = _cur41.execute('select PartsPriceOutTax, PartsPriceInTax, PartsPriceTax'
+                          ' from ERParts where PartsName<>"" order by LineNo').fetchone()
+    chk(_r41[0] == _w41,
+        f'41: 税込 単価{_u41}×{_q41}個 の税抜が {_r41[0]}（期待 {_w41}）')
+    chk(_r41[1] == _u41 * _q41,
+        f'41b: 税込 単価{_u41}×{_q41}個 の税込が {_r41[1]}（期待 {_u41 * _q41}）')
+    chk(_r41[0] + _r41[2] == _r41[1],
+        f'41c: 税抜＋税 が税込に一致しない {_r41}')
+
+# 42. 税込表記のとき、生成物の総額は**必ず**原本の税込総額と一致すること。
+#     税抜合計 S に対し S + 四捨五入(S×0.1) で表せない税込総額が
+#     11円ごとに1つある（1〜3000円で273個）。そこで「いちばん近い S」を
+#     採って進むと、**警告も出さずに1円ずれた協定見積**が出ていた。
+#     原本に書いてある総額こそが正。税額はその差額で書く。
+for _t42 in (100006, 100017, 100028, 5, 16, 27):
+    _cur42 = gen([{'name': 'ﾊﾞﾝﾊﾟｰ', 'method': '取替',
+                   'parts_amount': _t42, 'wage': 0, 'quantity': 1}], tax_in=True)
+    _g42 = _cur42.execute('select SubTotal, tx_TotalOutTax, Total from Total').fetchone()
+    chk(_g42[2] == _t42,
+        f'42: 原本の税込 {_t42:,} が生成物では {_g42[2]:,}（{_g42[2] - _t42:+d} 円）')
+    chk(_g42[0] + _g42[1] == _g42[2],
+        f'42b: 税抜{_g42[0]}＋税{_g42[1]} が総額{_g42[2]} に合わない')
+
+# 42c. 表せる総額では、税額は従来どおり 10% の四捨五入のままであること
+#      （42 の直しで、普通の見積の税額まで変わってしまっては困る）。
+_cur42c = gen([{'name': 'ﾊﾞﾝﾊﾟｰ', 'method': '取替',
+                'parts_amount': 110000, 'wage': 0, 'quantity': 1}], tax_in=True)
+_g42c = _cur42c.execute('select SubTotal, tx_TotalOutTax, Total from Total').fetchone()
+chk(_g42c == (100000, 10000, 110000), f'42c: 普通の税込見積で {_g42c}（期待 (100000, 10000, 110000)）')
+
+# 43. 生成の途中で落ちても、顧客情報の入った一時DBを残さないこと。
+#     _update_ansmb_impl が例外で抜けると SQLite が掴んだままになり、
+#     Windows では unlink が失敗して消えずに残っていた。
+_tmpdir43 = tempfile.gettempdir()
+_before43 = set(f for f in os.listdir(_tmpdir43) if f.startswith('tmp') and f.endswith('.db'))
+try:
+    app.update_ansmb(b'this is not a sqlite database', [{'name': 'x'}], 0)
+except Exception:       # noqa: BLE001  落ちること自体は正しい
+    pass
+_after43 = set(f for f in os.listdir(_tmpdir43) if f.startswith('tmp') and f.endswith('.db'))
+_left43 = _after43 - _before43
+chk(not _left43, f'43: 落ちたあとに一時DBが残っている {sorted(_left43)[:3]}')
+
+# 44. 管理領域の金額を読めなかったとき、テンプレート（＝前案件）の金額を
+#     残さないこと。`neo_header.build` は totals が None だと金額欄に触らない
+#     ので、顧客名だけ新しく金額は前案件、という .neo が出来ていた。
+import inspect as _insp44
+_src44 = _insp44.getsource(app._apply_neo_header)
+chk('_summary_totals(ansmb_bytes) or' in _src44 or '[0, 0, 0, 0, 0]' in _src44,
+    '44: 金額を読めなかったときに前案件の金額が残る')
+_hdr44 = neo_header.build(TPL, agreed='X', name1='ﾃｽﾄ', car_name='ﾃｽﾄ',
+                          totals=[0, 0, 0, 0, 0])
+chk(neo_header.decode(_hdr44 + TPL[424:])['totals'] == [0, 0, 0, 0, 0],
+    '44b: ゼロで埋められない')
+
+# 45. 数量が100以上の行は、注記側が99に丸められて同じ .neo の中で食い違う。
+#     プレビュー経由なら画面で知らせていたが、**一発生成の経路では
+#     何も出なかった**。どちらの経路でも知らせること。
+with open(os.path.join(R, 'app.py'), encoding='utf-8') as _f45:
+    _app45 = _f45.read()
+chk(_app45.count('数量が100以上の行が') >= 2,
+    '45: 数量100以上の知らせが1か所しかない（一発生成の経路で出ない）')
+
+# 46. 税込表記で、部品計・工賃計の**内訳**も原本と一致すること。
+#     税額をまとめて差額にすると、数量2以上の部品で出た端数が
+#     「いちばん金額の大きい欄」に寄せられ、総額は合っているのに
+#     部品計と工賃計の税込内訳が原本からずれる（工賃のほうが大きいと
+#     部品の5円が工賃側に乗る）。部品と工賃は別々に差額で確定させる。
+_P46, _W46 = 171 * 10, 99999      # 部品は数量10（端数が出る）、工賃は部品より大きい
+_cur46 = gen([{'name': 'ｸﾘｯﾌﾟ', 'method': '取替', 'parts_amount': _P46,
+               'wage': 0, 'quantity': 10},
+              {'name': 'ｺｳｺﾞ', 'method': '脱着', 'parts_amount': 0,
+               'wage': _W46, 'quantity': 1}], tax_in=True)
+_g46 = _cur46.execute(
+    'select ms_PartsTotalOutTax, ms_PartsTotalInTax, ms_PartsTotalTax,'
+    ' ms_WageTotalOutTax, ms_WageTotalInTax, ms_WageTotalTax, Total'
+    ' from Total').fetchone()
+chk(_g46[1] == _P46, f'46: 部品計の税込が {_g46[1]:,}（原本 {_P46:,}）')
+chk(_g46[4] == _W46, f'46b: 工賃計の税込が {_g46[4]:,}（原本 {_W46:,}）')
+chk(_g46[0] + _g46[2] == _g46[1], f'46c: 部品 税抜＋税 ≠ 税込 {_g46[:3]}')
+chk(_g46[3] + _g46[5] == _g46[4], f'46d: 工賃 税抜＋税 ≠ 税込 {_g46[3:6]}')
+chk(_g46[6] == _P46 + _W46, f'46e: 総額が {_g46[6]:,}（原本 {_P46 + _W46:,}）')
+# 数量2以上の部品行は実機の規則どおり（単価で丸めて数量倍）のままであること
+_r46 = _cur46.execute('select PartsPriceOutTax from ERParts'
+                      ' where PartsName="ｸﾘｯﾌﾟ"').fetchone()
+chk(_r46[0] == 1550, f'46f: 数量10の行の税抜が {_r46[0]}（期待 1550）')
+
+# 47. 実機が作った .neo でも、税額は税抜の10%ちょうどとは限らない。
+#     「コグニは税抜から計算し直すので必ず10%になる」は誤り
+#     （実機176件中10件が10%でなかった。例: 税抜295,455 に税額29,545）。
+#     この事実を根拠に、税込表記では税額を差額で書いて総額を原本に合わせている。
+#     best_intax_for は「10%で表すとどうなるか」の目安であって、金額の正解ではない。
+import inspect as _insp47
+_doc47 = (_insp47.getdoc(app.best_intax_for) or '')
+chk('誤り' in _doc47 or '実機' in _doc47,
+    '47: best_intax_for に「コグニが計算し直す」という誤った前提が残っている')
+chk(app.best_intax_for(110000) == 110000, '47b: 表せる額を変えている')
+
+
 print('REG_NEOACC:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL: print('  -', f)
 sys.exit(1 if FAIL else 0)
