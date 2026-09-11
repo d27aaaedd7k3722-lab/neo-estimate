@@ -3562,7 +3562,7 @@ def _conversion_guard():
 _PIPE_ARGS_EXPECTED = (
     'source_mime', 'addata_root', 'template_path', 'mode_override',
     'model_name', 'api_key', 'cache_scope', 'is_tax_inclusive',
-    'merge_mode', 'expenses',
+    'merge_mode', 'expenses', 'insurance_info',
 )
 
 
@@ -6263,7 +6263,7 @@ def _session_cache_scope() -> str:
 
 def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=None,
                            is_tax_inclusive=False, expenses=None,
-                           mime_type='application/pdf'):
+                           mime_type='application/pdf', insurance_info=None):
     """見積書PDFから直接NEOファイルを生成する。
 
     pdf_to_neo_pipeline.process_pdf_to_neo をStreamlitから安全に呼ぶための薄いラッパ。
@@ -6327,6 +6327,12 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
             # サイドバーの費用欄。渡さないと、この経路で作った .neo に
             # レッカー代・代車費用・非課税費用が1円も入らない。
             expenses=expenses or None,
+            # サイドバーの事故・保険欄。渡していなかったため、この経路で
+            # 作った .neo には事故受付番号・証券番号・契約者名・保険会社・
+            # アジャスター名が1つも入らなかった（2026-09-11）。
+            # プレビュー経由では入っていたので、同じ見積でも入口によって
+            # 中身が違う .neo が出ていた。
+            insurance_info=insurance_info or None,
         )
         if not isinstance(result, dict):
             return {'ok': False, 'error': 'PDF→NEO変換が想定外の値を返しました'}
@@ -6962,6 +6968,20 @@ def main():
                             'towing':     st.session_state.get('exp_towing', 0),
                             'rental_car': st.session_state.get('exp_rental', 0),
                             'tax_exempt': st.session_state.get('exp_exempt', 0),
+                        },
+                        # サイドバーの「🛡️ 事故・保険情報」。渡さないと
+                        # この経路の .neo には保険欄が1つも入らない。
+                        insurance_info={
+                            'policy_no':       st.session_state.get('policy_no', ''),
+                            'contractor_name': st.session_state.get('contractor_name', ''),
+                            'accept_no':       st.session_state.get('accept_no', ''),
+                            'accident_date':   st.session_state.get('accident_date', ''),
+                            'agency_name':     st.session_state.get('agency_name', ''),
+                            'adjuster_name':   st.session_state.get('adjuster_name', ''),
+                            'garage_in_date':  st.session_state.get('garage_in_date', ''),
+                            'garage_out_date': st.session_state.get('garage_out_date', ''),
+                            'repair_days':     st.session_state.get('repair_days', 0),
+                            'note1':           st.session_state.get('note1', ''),
                         },
                     )
                 st.session_state['pdf2neo_tax_inclusive'] = _pdf_is_tax_incl

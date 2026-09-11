@@ -932,7 +932,8 @@ def _call_generate_neo(template_bytes: bytes,
                        is_beta_mode: bool = False,
                        is_tax_inclusive: bool = False,
                        merge_mode: bool = False,
-                       expenses: Optional[Dict[str, Any]] = None) -> bytes:
+                       expenses: Optional[Dict[str, Any]] = None,
+                       insurance_info: Optional[Dict[str, Any]] = None) -> bytes:
     """app.generate_neo_file の薄ラッパ。lazy import + items正規化(Iter6)"""
     try:
         from app import generate_neo_file  # type: ignore
@@ -945,7 +946,10 @@ def _call_generate_neo(template_bytes: bytes,
         customer_info=customer_info or {},
         items=norm_items,
         short_parts_wage=0,
-        insurance_info={},
+        # 空の辞書を固定で渡していたため、事故受付番号・証券番号・契約者名・
+        # 保険会社・アジャスター名が .neo に1つも入らなかった。
+        # 画面のサイドバーで入れた値をそのまま通す。
+        insurance_info=insurance_info or {},
         # 画面のサイドバーで入れたレッカー代・代車費用・非課税費用。
         # None 固定だったため、この経路で作った .neo には費用が1円も
         # 入らず、警告も出なかった（入力した費用の全額とその消費税が消える）。
@@ -1058,7 +1062,8 @@ def build_neo_mode_a(items: List[Dict[str, Any]],
                      customer_info: Optional[Dict[str, Any]] = None,
                      is_tax_inclusive: bool = False,
                      merge_mode: bool = False,
-                     expenses: Optional[Dict[str, Any]] = None) -> bytes:
+                     expenses: Optional[Dict[str, Any]] = None,
+                     insurance_info: Optional[Dict[str, Any]] = None) -> bytes:
     """モードA: ベタ打ち (収録外)。OCR項目をそのまま転写。"""
     tpl = _load_template_bytes(template_path)
     cust = _merge_vehicle_into_customer(vehicle_info or {}, customer_info)
@@ -1066,7 +1071,8 @@ def build_neo_mode_a(items: List[Dict[str, Any]],
     return _call_generate_neo(tpl, cust, items or [], is_beta_mode=True,
                               is_tax_inclusive=is_tax_inclusive,
                               merge_mode=merge_mode,
-                              expenses=expenses)
+                              expenses=expenses,
+                              insurance_info=insurance_info)
 
 
 def build_neo_mode_b(items: List[Dict[str, Any]],
@@ -1076,7 +1082,8 @@ def build_neo_mode_b(items: List[Dict[str, Any]],
                      customer_info: Optional[Dict[str, Any]] = None,
                      is_tax_inclusive: bool = False,
                      merge_mode: bool = False,
-                     expenses: Optional[Dict[str, Any]] = None) -> bytes:
+                     expenses: Optional[Dict[str, Any]] = None,
+                     insurance_info: Optional[Dict[str, Any]] = None) -> bytes:
     """モードB: 完全複製 (cogni判定)。価格不一致マーカー付与。"""
     matched = items or []
     # Iter13: 品番空 → DB逆引き補完
@@ -1144,7 +1151,8 @@ def build_neo_mode_b(items: List[Dict[str, Any]],
     return _call_generate_neo(tpl, cust, matched,
                               is_tax_inclusive=is_tax_inclusive,
                               merge_mode=merge_mode,
-                              expenses=expenses)
+                              expenses=expenses,
+                              insurance_info=insurance_info)
 
 
 def build_neo_mode_c(items: List[Dict[str, Any]],
@@ -1154,7 +1162,8 @@ def build_neo_mode_c(items: List[Dict[str, Any]],
                      customer_info: Optional[Dict[str, Any]] = None,
                      is_tax_inclusive: bool = False,
                      merge_mode: bool = False,
-                     expenses: Optional[Dict[str, Any]] = None) -> bytes:
+                     expenses: Optional[Dict[str, Any]] = None,
+                     insurance_info: Optional[Dict[str, Any]] = None) -> bytes:
     """モードC: あいまい複製。L4 or db_parts_no 空 → ※ADDATA該当なし マーカー。"""
     matched = items or []
     vcode = (vehicle_info or {}).get("model_code") or (vehicle_info or {}).get("vehicle_code")
@@ -1200,7 +1209,8 @@ def build_neo_mode_c(items: List[Dict[str, Any]],
         return _call_generate_neo(tpl, cust, matched,
                               is_tax_inclusive=is_tax_inclusive,
                               merge_mode=merge_mode,
-                              expenses=expenses)
+                              expenses=expenses,
+                              insurance_info=insurance_info)
     try:
         from auto_matching import match_pdf_items_to_addata  # type: ignore
         matched = match_pdf_items_to_addata(matched, vehicle_info or {}, addata_root)
@@ -1221,7 +1231,8 @@ def build_neo_mode_c(items: List[Dict[str, Any]],
     return _call_generate_neo(tpl, cust, matched,
                               is_tax_inclusive=is_tax_inclusive,
                               merge_mode=merge_mode,
-                              expenses=expenses)
+                              expenses=expenses,
+                              insurance_info=insurance_info)
 
 
 # ============================================================
@@ -1511,7 +1522,13 @@ def process_pdf_to_neo(pdf_path,
                        expenses: Optional[Dict[str, Any]] = None,
                        # 見積書は写真（JPG/PNG/HEIC 等）で来ることもある。
                        # 既存の位置引数の並びを一切崩さないよう、必ず末尾に置く。
-                       source_mime: str = 'application/pdf') -> Dict[str, Any]:
+                       source_mime: str = 'application/pdf',
+                       # 画面のサイドバーで入れた事故受付番号・証券番号・
+                       # 契約者名・保険会社・アジャスター名・入出庫日。
+                       # 受け取っていなかったため、この経路で作った .neo には
+                       # 保険欄が1つも入らなかった（2026-09-11）。
+                       insurance_info: Optional[Dict[str, Any]] = None
+                       ) -> Dict[str, Any]:
     """E2E ディスパッチャ。
 
     - vehicle_info/items 未提供かつ skip_ocr=False かつ GEMINI_API_KEY あり → OCR
@@ -2252,17 +2269,20 @@ def process_pdf_to_neo(pdf_path,
             neo = build_neo_mode_a(items, vehicle_info, template_path, customer_info,
                                    is_tax_inclusive=is_tax_inclusive,
                                    merge_mode=merge_mode,
-                              expenses=expenses)
+                              expenses=expenses,
+                              insurance_info=insurance_info)
         elif mode == "B":
             neo = build_neo_mode_b(items, vehicle_info, template_path, addata_root, customer_info,
                                    is_tax_inclusive=is_tax_inclusive,
                                    merge_mode=merge_mode,
-                              expenses=expenses)
+                              expenses=expenses,
+                              insurance_info=insurance_info)
         else:
             neo = build_neo_mode_c(items, vehicle_info, template_path, addata_root, customer_info,
                                    is_tax_inclusive=is_tax_inclusive,
                                    merge_mode=merge_mode,
-                              expenses=expenses)
+                              expenses=expenses,
+                              insurance_info=insurance_info)
         out["neo_bytes"] = neo
         log.append(f"NEO生成成功 size={len(neo) if neo else 0}")
         # verify
