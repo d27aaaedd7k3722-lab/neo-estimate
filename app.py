@@ -7040,8 +7040,10 @@ def main():
                         f"🔍 検証できませんでした（{_p2n_v['error']}）。"
                         "生成NEOと原本を突き合わせていません。"
                         "「プレビューに取り込む」で1行ずつご確認ください。")
-                elif (_p2n_v.get('count_match') and _p2n_v.get('total_match')
-                      and _p2n_v.get('verified_against_pdf')):
+                elif _p2n_v.get('ok'):
+                    # verify の ok は、行数・合計・行ごとの金額・工賃・
+                    # 総額をすべて見た結果。個別の項目だけを見ていると、
+                    # 行ごとの検証が落ちても「検証OK」と出てしまう。
                     # 工賃は長らく検証に入っておらず、部品計と行数だけで
                     # 「一致」と出していた。工賃も見ているときはそう書く。
                     _p2n_wm = _p2n_v.get('wage_match')
@@ -7072,6 +7074,14 @@ def main():
                         + (f"、工賃(税抜) NEO ¥{safe_int(_p2n_v.get('neo_wage_total')):,}"
                            f" / 原本 ¥{safe_int(_p2n_v.get('pdf_wage_total')):,}"
                            if _p2n_v.get('wage_match') is False else "")
+                        # どの行が違うのかまで出さないと、突き合わせの起点が分からない。
+                        + (('、' + '／'.join(
+                            "%d行目「%s」の%s NEO %s / 原本 %s"
+                            % (_b.get('line'), _b.get('name'), _b.get('kind'),
+                               format(safe_int(_b.get('neo')), ','),
+                               format(safe_int(_b.get('pdf')), ','))
+                            for _b in (_p2n_v.get('bad_lines') or [])[:3]))
+                           if _p2n_v.get('line_match') is False else '')
                         + "。「プレビューに取り込む」で内容を確認・修正してください。"
                     )
                 _p2n_neo = _p2n_res.get('neo_bytes')

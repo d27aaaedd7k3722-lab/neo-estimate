@@ -603,6 +603,51 @@ _v = P.verify_neo_against_pdf(b'not a neo', _good, pdf_parts_total=58600,
                               pdf_grand_total=_GT2)
 chk(not _v.get('ok'), '24: 壊れた .neo で検証が通っている')
 
+# ── 25. 画面が verify の ok を見ていること（Codex 8周目） ─────────────
+# 行ごとの検証を足しても、画面が count_match と total_match しか見て
+# いなければ「検証OK」と出てしまい、足した意味が無くなる。
+with open(os.path.join(R, 'app.py'), encoding='utf-8') as _f:
+    _appsrc = _f.read()
+chk("elif _p2n_v.get('ok'):" in _appsrc,
+    '25a: 画面が verify の ok を見ていない'
+    '（行ごとの検証が落ちても「検証OK」と出る）')
+chk("_p2n_v.get('count_match') and _p2n_v.get('total_match')" not in _appsrc,
+    '25b: 画面がまだ個別の項目だけで「検証OK」を出している')
+
+# ── 26. 単価×数量しか持たない明細で誤報を出さないこと ────────────────
+_UP = [{'name': 'ｸﾘﾂﾌﾟ', 'method': '取替', 'unit_price': 155,
+        'quantity': 10, 'wage': 0},
+       {'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'unit_price': 0,
+        'quantity': 1, 'wage': 9800}]
+_nb = app.generate_neo_file(_TPLB, {'customer_name': 'ｹﾝｼｮｳ'},
+                            [dict(i) for i in _UP], 0, {}, {},
+                            False, False, False)[0]
+_v = P.verify_neo_against_pdf(_nb, _UP, pdf_parts_total=1550,
+                              pdf_wage_total=9800,
+                              pdf_grand_total=jr(11350 * 1.10),
+                              grand_is_intax=True)
+chk(_v.get('line_match') is not False,
+    '26a: 単価×数量しか持たない明細で行ごとの検証が誤報を出す')
+chk(_v.get('ok'), '26b: 単価×数量しか持たない正しい .neo で検証が落ちる')
+
+# ── 27. 明細に工賃があるのに工賃計も総額も無いとき合格にしないこと ──────
+_IW = [{'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 38600,
+        'wage': 0, 'quantity': 1},
+       {'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'parts_amount': 0,
+        'wage': 9800, 'quantity': 1}]
+_nb = app.generate_neo_file(_TPLB, {'customer_name': 'ｹﾝｼｮｳ'},
+                            [dict(i) for i in _IW], 0, {}, {},
+                            False, False, False)[0]
+_v = P.verify_neo_against_pdf(_nb, _IW, pdf_parts_total=38600)
+chk(not _v.get('ok'),
+    '27: 工賃があるのに工賃計も総額も無い見積で、部品だけ見て合格にしている')
+
+# ── 28. ERParts を並び順の指定なしで読まないこと ────────────────────
+# SQLite は ORDER BY 無しの順番を約束しない。行ごとの突き合わせがずれる。
+_src = inspect.getsource(P.verify_neo_against_pdf)
+chk('ORDER BY LineNo' in _src,
+    '28: ERParts を並び順の指定なしで読んでいる（行の突き合わせがずれる）')
+
 print('REG_E2ETOTAL:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
     print('  -', f)

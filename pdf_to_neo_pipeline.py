@@ -1433,17 +1433,29 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             # 金額が入れ替わっていても「一致」と出てしまう。協定見積は
             # 同じ明細行・同じ金額であることが条件なので、行で見る。
             neo_lines = []
-            try:
-                # 工賃も読む。以前は部品しか読んでおらず、工賃がいくら
-                # 違っていても行数と部品計さえ合えば「検証OK」と出ていた。
-                # 協定見積では工賃も原本と1円も違ってはいけない。
-                rows = cur.execute(
-                    _SEL + ", WageOutTax, WageInTax FROM ERParts").fetchall()
-                _has_wage = True
-            except sqlite3.Error:
-                # 工賃の欄を持たないテンプレートでも落ちないようにする
-                rows = cur.execute(_SEL + " FROM ERParts").fetchall()
-                _has_wage = False
+            # 工賃も読む。以前は部品しか読んでおらず、工賃がいくら
+            # 違っていても行数と部品計さえ合えば「検証OK」と出ていた。
+            # 協定見積では工賃も原本と1円も違ってはいけない。
+            # 並び順は必ず LineNo で指定する。SQLite は指定しないと
+            # 順番を約束しないので、行ごとの突き合わせがずれる。
+            rows = None
+            _has_wage = False
+            for _sql, _hw in (
+                    (_SEL + ", WageOutTax, WageInTax FROM ERParts"
+                     " ORDER BY LineNo", True),
+                    (_SEL + ", WageOutTax, WageInTax FROM ERParts", True),
+                    (_SEL + " FROM ERParts ORDER BY LineNo", False),
+                    (_SEL + " FROM ERParts", False)):
+                try:
+                    rows = cur.execute(_sql).fetchall()
+                    _has_wage = _hw
+                    break
+                except sqlite3.Error:
+                    continue
+            if rows is None:
+                conn.close()
+                res["error"] = "NEO内のERPartsを読み出せません"
+                return res
             conn.close()
             neo_count = len(rows)
             # 税抜と税込を両方ためる。印字された小計と同じ基準のほうを使う。
@@ -1689,12 +1701,25 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             # 行ごとの金額が原本どおりか。合計だけ見ていると、
             # 2行のあいだで金額が入れ替わっていても「一致」と出る。
             # .neo は印字と同じ基準の欄を持っているので、ぴったり比べられる。
+            def _item_parts(it_):
+                """明細1行の部品金額。単価×数量しか無い明細にも合わせる。
+
+                合計の計算（_sum_items_outtax）と同じ拾い方をしないと、
+                単価×数量で書かれた明細で行ごとの検証だけが誤報を出す。
+                """
+                v_ = _to_int(it_.get("parts_amount") or it_.get("amount"))
+                if v_:
+                    return v_
+                up_ = _to_float(it_.get("unit_price") or it_.get("part_price"))
+                if up_ > 0:
+                    return int(up_ * max(_to_int(it_.get("quantity"), 1), 1))
+                return 0
+
             res["line_match"] = None
             if items and neo_count == len(items):
                 _bad_lines = []
                 for _i, _it in enumerate(items):
-                    _p_want = _to_int(_it.get("parts_amount")
-                                      or _it.get("amount"))
+                    _p_want = _item_parts(_it)
                     _w_want = _to_int(_it.get("wage") or _it.get("labor_fee"))
                     _p_got = neo_lines[_i][1 if _B else 0]
                     _w_got = neo_lines[_i][3 if _B else 2]
@@ -1746,7 +1771,14 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                 # 差引後の合計で見ると、工賃の行とマイナスの行が
                 # 打ち消し合って 0 になったときに素通りする。
                 # 部品側と同じく「行があるかどうか」で見る。
-                if (_neo_wage_plus or neo_wage_minus) and not _cmp_wage:
+                # .neo 側に工賃が無くても、見積書や明細に工賃があるなら
+                # 比べないまま合格にはできない（工賃の欄を持たない
+                # テンプレートだと .neo 側はいつも 0 になる）。
+                _wage_expected = bool(
+                    _neo_wage_plus or neo_wage_minus
+                    or _to_int(pdf_wage_total_arg)
+                    or items_wage_total)
+                if _wage_expected and not _cmp_wage:
                     # 工賃が入っている .neo なのに、印字された工賃計も
                     # 総額も無い。工賃を1円も確かめないまま
                     # 「一致」と出していた。
