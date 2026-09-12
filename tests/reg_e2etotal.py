@@ -437,6 +437,55 @@ chk(all('_dedup_frozen' not in it for it in (_res.get('items') or [])),
     '15: 内部用の印 _dedup_frozen が画面に渡る items に載っている'
     '（取り込んだ先で二度と統合されず、見慣れない列が編集画面に出る）')
 
+# ── 16. 「比べていない」を「一致」と言わないこと（Codex 3周目） ────────
+# 印字された小計が読めていないと、突き合わせる相手が自分の読み取り結果に
+# なる。それで一致しても何も確かめたことにならないのに、画面は
+# 「検証OK」と出していた。
+_I2 = [{'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 38600,
+        'wage': 0, 'quantity': 1},
+       {'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'parts_amount': 0,
+        'wage': 9800, 'quantity': 1}]
+_GT = jr(48400 * 1.10)
+_res = run(_I2, {'pdf_parts_total': 0, 'pdf_wage_total': 0,
+                 'discount_amount': 0, 'pdf_grand_total': _GT}, False)
+_v = _res.get('verify') or {}
+chk(_v.get('verified_against_pdf') is False,
+    '16a: 部品計を読めていないのに「原本と突き合わせた」ことになっている')
+chk(not _v.get('ok'),
+    '16b: 突き合わせていないのに検証が「一致」になっている')
+
+# 工賃計が印字されていない見積で、工賃の行を読み落とした
+# （A-4 が明細合算で工賃計を埋めるが、それは印字された値ではない）
+_res = run(_I2, {'pdf_parts_total': 38600, 'pdf_wage_total': 0,
+                 'discount_amount': 0,
+                 'pdf_grand_total': jr((38600 + 24300) * 1.10)}, False)
+_v = _res.get('verify') or {}
+chk(_v.get('wage_match') is None,
+    '16c: 明細から作った工賃計を「印字された値」として検証に使っている'
+    '（工賃を丸ごと読み落としても一致してしまう）')
+chk(not _v.get('ok'), '16d: 工賃が 14,500 足りないのに検証が通っている')
+chk(_v.get('grand_match') is False,
+    '16e: 印字された総額との突き合わせで捕まっていない')
+
+# ── 17. 印字された総額と .neo の合計を直接くらべること ─────────────
+# 部品計・工賃計が値引き前か後かに左右されない、いちばん強い検査。
+_res = run(_I2, {'pdf_parts_total': 38600, 'pdf_wage_total': 9800,
+                 'discount_amount': 0, 'pdf_grand_total': _GT}, False)
+_v = _res.get('verify') or {}
+chk(_v.get('grand_match') is True,
+    '17a: 正しい .neo で総額の突き合わせが通らない（誤報）')
+chk(_v.get('neo_grand_total') == _GT,
+    '17b: .neo の合計 %s（原本 %s）' % (_v.get('neo_grand_total'), _GT))
+chk(_v.get('ok'), '17c: 正しい .neo で検証が通らない')
+# 費用を足した .neo は総額が増えるのが正しいので、突き合わせを外す
+_res = run(_I2, {'pdf_parts_total': 38600, 'pdf_wage_total': 9800,
+                 'discount_amount': 0, 'pdf_grand_total': _GT}, False,
+           expenses={'towing': 12000})
+_v = _res.get('verify') or {}
+chk(_v.get('grand_match') is None,
+    '17d: 費用を足した .neo で総額の突き合わせをして誤報を出している')
+chk(_v.get('ok'), '17e: 費用を足しただけで検証が落ちている')
+
 print('REG_E2ETOTAL:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
     print('  -', f)

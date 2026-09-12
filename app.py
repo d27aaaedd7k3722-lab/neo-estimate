@@ -7029,17 +7029,32 @@ def main():
                         "コグニセブンの注記欄は数量が2桁までのため、注記側は99として"
                         "書かれます（明細欄には原本どおりの数量が入ります）。")
                 _p2n_v = _p2n_res.get('verify') or {}
-                if _p2n_v.get('count_match') and _p2n_v.get('total_match'):
+                # 「比べていない」を「一致」と言ってはいけない。
+                # 見積書の小計が読み取れていないと、突き合わせる相手が
+                # 自分の読み取り結果そのものになり、明細を丸ごと
+                # 読み落としても「一致」と出てしまう。
+                if _p2n_v.get('error'):
+                    st.caption(f"🔍 検証スキップ: {_p2n_v['error']}")
+                elif (_p2n_v.get('count_match') and _p2n_v.get('total_match')
+                      and _p2n_v.get('verified_against_pdf')):
                     # 工賃は長らく検証に入っておらず、部品計と行数だけで
                     # 「一致」と出していた。工賃も見ているときはそう書く。
                     _p2n_wm = _p2n_v.get('wage_match')
+                    _p2n_gm = _p2n_v.get('grand_match')
                     st.caption(
                         "🔍 検証OK: 生成NEOの明細件数と"
                         + ("部品・工賃の金額（税抜）" if _p2n_wm
                            else "部品金額（税抜）")
-                        + "が原本と一致しました。")
-                elif _p2n_v.get('error'):
-                    st.caption(f"🔍 検証スキップ: {_p2n_v['error']}")
+                        + ("、および総額" if _p2n_gm else "")
+                        + "が原本と一致しました。"
+                        + ("" if _p2n_wm else
+                           "（見積書に工賃計が印字されていないため、工賃は"
+                           "突き合わせていません）"))
+                elif not _p2n_v.get('verified_against_pdf'):
+                    st.warning(
+                        "🔍 検証できていません: 見積書に印字された部品計が読み取れなかったため、"
+                        "生成NEOと突き合わせていません。明細を丸ごと読み落としていても気づけない状態です。"
+                        "「プレビューに取り込む」で原本と1行ずつご確認ください。")
                 else:
                     st.warning(
                         "🔍 検証: 原本と生成NEOに差異があります。"

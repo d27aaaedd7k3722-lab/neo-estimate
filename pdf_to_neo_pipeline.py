@@ -1307,13 +1307,24 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                            pdf_parts_total: Optional[int] = None,
                            pdf_wage_total: Optional[int] = None,
                            is_tax_inclusive: bool = False,
-                           tax_rate: float = 0.10) -> Dict[str, Any]:
+                           tax_rate: float = 0.10,
+                           pdf_grand_total: Optional[int] = None,
+                           grand_is_intax: bool = True) -> Dict[str, Any]:
     """生成したNEOの明細を、見積書PDFの金額と突き合わせる。
 
     pdf_parts_total / pdf_wage_total には、見積書に「印字されている」合計
     （OCRのヘッダ解析結果）を渡す。渡された場合はそちらを正とする。
     渡さない場合は items の合計と比べるが、それは「入れたものが入っている」
     ことを確認するだけの自明な検証にしかならず、明細の取りこぼしを見逃す。
+    そのため、印字された小計が渡されなかった側は **突き合わせていない**
+    （match を None にする）。「比べていない」を「一致」と言ってはいけない。
+
+    pdf_grand_total には見積書に印字された総額を渡す。これと .neo の合計を
+    直接くらべるのがいちばん強い検査で、部品計・工賃計が値引き前なのか
+    後なのかといった帳票ごとの違いに左右されない。
+    grand_is_intax は「印字された総額が明細の 1.1 倍の基準か」。
+    画面から足したレッカー代などの費用がある .neo は総額が増えるので、
+    呼び出し側が pdf_grand_total を渡さないこと。
     """
     pdf_parts_total_arg = pdf_parts_total
     pdf_wage_total_arg = pdf_wage_total
@@ -1356,8 +1367,13 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             res["total_source"] = "pdf_header"
         else:
             res["total_source"] = "items_sum"
+        res["wage_source"] = "items_sum"
         if pdf_wage_total_arg is not None and _to_int(pdf_wage_total_arg) > 0:
             pdf_wage_total = _to_int(pdf_wage_total_arg)
+            res["wage_source"] = "pdf_header"
+        # 印字された小計と突き合わせたのか、自分の読み取り結果と
+        # 突き合わせただけなのか。後者は「検証した」とは言えない。
+        res["verified_against_pdf"] = (res["total_source"] == "pdf_header")
         # NEO の ERParts は常に税抜。見積書が税込表記なら、比較する前に
         # PDF 側を税抜へ換算する。換算しないと税込を選ぶたびに必ず
         # 「差異あり」と警告が出て、正しい .neo を疑わせてしまう。
@@ -1546,6 +1562,13 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             res["parts_basis"] = "値引き後" if _net_basis else "値引き前"
             res["total_match"] = abs(
                 (neo_total if _net_basis else _neo_plus) - pdf_parts_total) < _tol
+            if res.get("total_source") != "pdf_header":
+                # 印字された部品計が読めていない。比べた相手は自分の
+                # 読み取り結果なので、一致しても何も確かめたことにならない。
+                res["total_match"] = False
+                res["mismatches"].append(
+                    {"type": "no_pdf_total", "neo": neo_total, "pdf": None,
+                     "note": "見積書の部品計が読み取れず、突き合わせていない"})
             # マイナスの行は上の比較では見えないことがあるので、読み取った
             # 値引きがそのまま .neo に入っているかを別に見る。
             if abs((_ia - _ip) - neo_minus) >= max(_tol, 1.0):
@@ -1555,7 +1578,10 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                      "note": "値引きなどマイナスの行（部品側）"})
             # 工賃も同じように比べる。印字された工賃計が取れているときだけ。
             res["wage_match"] = None
-            if _has_wage and pdf_wage_total:
+            # 印字された工賃計が読めていないときの pdf_wage_total は
+            # 明細合算そのもの。それと比べても「入れたものが入っている」
+            # ことしか分からず、工賃を丸ごと読み落としても一致してしまう。
+            if _has_wage and pdf_wage_total and res.get("wage_source") == "pdf_header":
                 _wp, _wa = _split(items, "wage", "labor_fee")
                 _wbasis = _basis(pdf_wage_total, _wp, _wa)
                 res["wage_basis"] = "値引き後" if _wbasis else "値引き前"
@@ -1588,7 +1614,38 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             # 明細が1行も無いのに「一致」と言ってはいけない。
             # OCRがクォータ超過等で失敗すると 0件 対 0件 で一致してしまい、
             # 空のNEOに緑の「検証OK」が付いてしまう。
-            res["ok"] = bool(res["count_match"] and res["total_match"] and neo_count > 0)
+            # いちばん強い検査: 見積書に印字された総額と .neo の合計。
+            # 部品計・工賃計が値引き前なのか後なのかに左右されない。
+            res["grand_match"] = None
+            _g = _to_int(pdf_grand_total) if pdf_grand_total else 0
+            if _g > 0:
+                try:
+                    conn3 = sqlite3.connect(tf_name)
+                    try:
+                        _nt = conn3.execute(
+                            "SELECT Total FROM Total").fetchone()
+                    finally:
+                        conn3.close()
+                    if _nt is not None:
+                        _neo_grand = _to_int(_nt[0])
+                        # 印字された総額が明細の 1.1 倍の基準なら、それが
+                        # そのまま .neo の税込合計。そうでなければ 1.1 倍する。
+                        _want = (_g if (is_tax_inclusive or grand_is_intax)
+                                 else int(round(_g * (1 + tax_rate))))
+                        res["neo_grand_total"] = _neo_grand
+                        res["pdf_grand_total"] = _g
+                        res["grand_match"] = abs(_neo_grand - _want) <= 1
+                        if not res["grand_match"]:
+                            res["mismatches"].append(
+                                {"type": "grand", "neo": _neo_grand,
+                                 "pdf": _want,
+                                 "note": "見積書の総額と .neo の合計"})
+                except sqlite3.Error as e:
+                    logger.debug("Total テーブルの読み出しをとばす: %s", e)
+            res["ok"] = bool(res["count_match"] and res["total_match"]
+                             and neo_count > 0
+                             and res.get("grand_match") is not False
+                             and res.get("wage_match") is not False)
             return res
         finally:
             try:
@@ -1968,6 +2025,13 @@ def process_pdf_to_neo(pdf_path,
     # v7: PDF表示総額と明細合算の差分を「※金額調整」行で吸収 (完全一致保証)
     hdr_parts_total = 0
     hdr_wage_total = 0
+    # 工賃計が印字されていない見積では、下の A-4 が明細合算で埋める。
+    # それを「印字された値」として検証に渡すと、工賃を丸ごと読み落としても
+    # 自分の読み取り結果と一致して「工賃OK」と出てしまう。
+    _wage_from_items = False
+    # 印字された総額が明細の 1.1 倍の基準か。下の突き合わせで決め直すが、
+    # ocr_meta が無い経路でも verify に渡すので、ここで用意しておく。
+    _grand_is_intax = not is_tax_inclusive
     if items and out.get("ocr_meta"):
         try:
             _meta = out["ocr_meta"]
@@ -1981,6 +2045,7 @@ def process_pdf_to_neo(pdf_path,
                 if pdf_w == 0 and items_wage_sum > 1000:
                     log.append(f"[A-4] header工賃計=0 だが items合計={items_wage_sum} → items側採用")
                     pdf_w = items_wage_sum
+                    _wage_from_items = True
             except Exception:
                 pass
             # 総合計が明細合算と一致しているなら、明細は取りこぼしていない。
@@ -2408,10 +2473,20 @@ def process_pdf_to_neo(pdf_path,
         log.append(f"NEO生成成功 size={len(neo) if neo else 0}")
         # verify
         try:
+            # 画面から足したレッカー代などの費用がある .neo は、
+            # 見積書の総額より増えるのが正しい。総額の突き合わせは外す。
+            _v_grand = None
+            if not expenses:
+                _v_grand = _to_int((out.get("ocr_meta") or {}).get(
+                    "pdf_grand_total")) or None
             v = verify_neo_against_pdf(neo, items,
                                        pdf_parts_total=hdr_parts_total or None,
-                                       pdf_wage_total=hdr_wage_total or None,
-                                       is_tax_inclusive=is_tax_inclusive)
+                                       pdf_wage_total=(
+                                           None if _wage_from_items
+                                           else (hdr_wage_total or None)),
+                                       is_tax_inclusive=is_tax_inclusive,
+                                       pdf_grand_total=_v_grand,
+                                       grand_is_intax=_grand_is_intax)
             out["verify"] = v
             log.append(f"verify ok={v.get('ok')} count={v.get('count_match')} total={v.get('total_match')}")
         except Exception as e:
