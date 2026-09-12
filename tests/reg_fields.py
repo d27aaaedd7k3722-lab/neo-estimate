@@ -1,0 +1,169 @@
+# -*- coding: utf-8 -*-
+""".neo の欄の値が、実機（コグニセブン）が書くものと同じかの回帰テスト。
+
+pdf-to-neo スキル（claude_neo_pipeline）とアプリで、同じ欄に別の値を
+書いている箇所があった。実機が作った .neo を数えて白黒つけた結果を固定する。
+
+実測（2026-09-12、実機 150 件 6,024 行）:
+
+  ERParts.OrderFlag と AnSMB の [100] バイトは **同じ欄**。
+  120 件 4,875 行で1行も食い違わなかった。値の分布は
+      '0'（マスタ由来）87.2% ／ ' '（手入力）9.2% ／ '9' 2.3%
+  アプリは ERParts に '9' を固定で書き、AnSMB には '0'/' ' を書いていた。
+  **同じ .neo の中で矛盾した値**を持っていたことになる。
+
+  部品代の無い行（工賃だけの行）の ERParts.PartsCount は -1 が 85.1%。
+  アプリは常に数量を書いていた。なお AnSMB 側の数量欄は実機でも '01' で、
+  PartsCount=-1 の行の 100% が '01' だった（そちらは変えない）。
+
+**検証用のダミー値だけを使う。実在の人物の情報は扱わない。**
+"""
+import os
+import sqlite3
+import sys
+import tempfile
+
+R = os.environ.get('XROOT',
+                   os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, R)
+os.chdir(R)
+sys.stdout.reconfigure(encoding='utf-8')
+
+import addata_locator  # noqa: E402
+addata_locator.find_addata = lambda *a, **kw: None
+import app  # noqa: E402
+
+FAIL = []
+
+
+def chk(cond, msg):
+    if not cond:
+        FAIL.append(msg)
+
+
+def dec(v):
+    if isinstance(v, bytes):
+        return v.decode('cp932', 'replace')
+    return '' if v is None else str(v)
+
+
+def build(items, intax=False):
+    tpl = open(os.path.join(R, 'template_toyota.neo'), 'rb').read()
+    nb = app.generate_neo_file(tpl, {'customer_name': 'ｹﾝｼｮｳ'},
+                               [dict(i) for i in items], 0, {}, {},
+                               intax, False, False)[0]
+    ck = app.find_real_cks(nb)
+    fs = app.extract_files(app.decompress_neo(nb, ck),
+                           app.parse_entries(nb, ck[0])[1])
+    tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    try:
+        tf.write(fs['AnSMB.txt'])
+        tf.close()
+        con = sqlite3.connect(tf.name)
+        con.text_factory = bytes
+        try:
+            rows = list(con.execute(
+                'select LineNo, PartsName, PartsCode, OrderFlag, PartsCount,'
+                ' PartsPriceOutTax, WageOutTax from ERParts'
+                ' where PartsName is not null and PartsName<>""'
+                ' order by LineNo'))
+        finally:
+            con.close()
+    finally:
+        try:
+            os.unlink(tf.name)
+        except OSError:
+            pass
+    note = fs.get('AnNote.ini', b'')       # 実体は 144B 固定長の明細
+    by = {}
+    for i in range(0, len(note) - 143, 144):
+        rec = note[i:i + 144]
+        try:
+            ln = int(rec[0:8].decode('ascii').strip() or 0)
+        except ValueError:
+            continue
+        by[ln] = (rec[100:101].decode('cp932', 'replace'),
+                  rec[98:100].decode('cp932', 'replace'))
+    return rows, by
+
+
+ITEMS = [
+    # マスタ由来（部品コードあり）
+    {'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 38600, 'wage': 0,
+     'quantity': 1, '_master_ref_no': '1234'},
+    # 手入力・工賃だけの行
+    {'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'parts_amount': 0, 'wage': 9800,
+     'quantity': 1},
+    # 手入力・数量10
+    {'name': 'ｸﾘﾂﾌﾟ', 'method': '取替', 'parts_amount': 1550, 'wage': 0,
+     'quantity': 10},
+]
+
+rows, by = build(ITEMS)
+chk(len(rows) == 3, '0: 行数 %d（3のはず）' % len(rows))
+
+for r in rows:
+    ln = app.safe_int(r[0])
+    name = dec(r[1])
+    code = dec(r[2]).strip()
+    of = dec(r[3])
+    pc = app.safe_int(r[4])
+    pp = app.safe_int(r[5])
+    b100, qcol = by.get(ln, ('?', '?'))
+
+    # ── 1. OrderFlag と AnSMB[100] は同じ欄。値がそろっていること ──
+    chk(of == b100,
+        '1: %s の OrderFlag が %r、AnSMB[100] が %r。'
+        '実機ではこの2つは同じ欄で、1行も食い違わない'
+        '（同じ .neo の中で矛盾した値を持っている）' % (name, of, b100))
+    chk(of != '9',
+        '1b: %s の OrderFlag が %r。実機 6,024 行のうち 2.3%% しか無い'
+        '少数派で、アプリが固定で書いてよい値ではない' % (name, of))
+
+    # ── 2. 由来の規則: 部品コードがあれば '0'、無ければ ' ' ──────
+    want = '0' if code else ' '
+    chk(of == want,
+        '2: %s（コード %r）の由来が %r（%r のはず）' % (name, code, of, want))
+
+    # ── 3. 部品代の無い行の PartsCount は -1（空欄） ──────────────
+    if pp <= 0:
+        chk(pc == -1,
+            '3: %s は部品代が無い行なのに PartsCount が %d。'
+            '実機は -1（空欄）が 85%%。部品が無いのに「1個」と読める'
+            % (name, pc))
+    else:
+        chk(pc >= 1,
+            '3b: %s は部品代のある行なのに PartsCount が %d' % (name, pc))
+
+    # ── 4. AnSMB の数量欄は実機どおり数量のまま ─────────────────
+    #     PartsCount=-1 の行でも、実機は数量欄 '01' を書いていた（100%）。
+    if pp <= 0:
+        chk(qcol == '01',
+            '4: %s の AnSMB 数量欄が %r（実機は -1 の行でも "01"）'
+            % (name, qcol))
+
+# ── 5. 税込表記でも同じであること ────────────────────────────
+rows2, by2 = build([
+    {'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 42460, 'wage': 0,
+     'quantity': 1, '_master_ref_no': '5678'},
+    {'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'parts_amount': 0, 'wage': 10780,
+     'quantity': 1},
+], intax=True)
+for r in rows2:
+    ln = app.safe_int(r[0])
+    of = dec(r[3])
+    b100 = by2.get(ln, ('?', '?'))[0]
+    chk(of == b100,
+        '5: 税込でも OrderFlag %r と AnSMB[100] %r が食い違う' % (of, b100))
+    chk(of != '9', '5b: 税込で OrderFlag に %r を書いている' % of)
+
+# ── 6. 固定値に戻されないようソースでも縛る ─────────────────────
+import inspect  # noqa: E402
+_src = inspect.getsource(app.generate_neo_file)
+chk("'9', '', 0, 0," not in _src,
+    "6: ERParts の OrderFlag に '9' を固定で書く記述が戻っている")
+
+print('REG_FIELDS:', 'ALL PASS' if not FAIL else 'FAIL')
+for f in FAIL:
+    print('  -', f)
+sys.exit(1 if FAIL else 0)

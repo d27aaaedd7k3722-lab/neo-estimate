@@ -1398,7 +1398,7 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
             '*', ?,
             -1, -1, -1,
             '', '', '',
-            '9', '', 0, 0,
+            ?, '', 0, 0,
             '', '', '',
             '', '',
             0, 0, 0,
@@ -1417,7 +1417,17 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
             db_parts_total, db_parts_intax, db_parts_tax,
             db_time,
             db_wage_total, db_wage_intax, db_wage_tax,
-            db_qty
+            # 部品代の無い行（工賃だけの行）の数量欄は、実機では -1（空欄）が
+            # 85%。常に数量を書くと、部品が無いのに「1個」と読める。
+            # AnSMB 側の数量欄は実機でも '01' のままなので、そちらは変えない。
+            db_qty if db_parts_total > 0 else -1,
+            # 行の由来。実機では ERParts.OrderFlag と AnSMB の [100] バイトが
+            # **同じ欄**で、実機 120 件 4,875 行で1行も食い違わなかった。
+            # ここに '9' を固定で書いていたため、同じ .neo の中で
+            # ERParts は '9'、AnSMB は '0'/' ' という矛盾した値を持っていた。
+            # '9' は実機 6,024 行のうち 2.3% しか無い少数派で、
+            # 多数派は '0'（マスタ由来）と ' '（手入力）。AnSMB 側と同じ規則にする。
+            '0' if parts_code else ' ',
         ))
         # AnNote.ini は ERParts と同じ値でなければならない。生の items から
         # 別に組み立てると、マスタ名への置換・「※」付与・数量ブランクが
