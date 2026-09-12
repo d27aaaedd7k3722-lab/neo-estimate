@@ -1010,11 +1010,20 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
     except sqlite3.Error:
         pass
     try:
+        # 加算基礎（Base* / BumperBase*）も消す。消し忘れると、前案件の
+        # .neo をテンプレートにしたとき、塗装計を 0 にしていても
+        # コグニで塗装ページを開いた瞬間に前案件の加算基礎が生き返り、
+        # 金額に乗る。FramePlan・PaintingEtcetera は同じ理由で消している。
         cur.execute("""UPDATE PaintingPlan SET
             BoothFlag=0, BoothTime=-1, BoothWageOutTax=-1,
             BoothWageInTax=-1, BoothWageTax=-1, BoothWageByManual='',
             PaintingType=0, PaintingTypeName='', MaterialRate=0,
-            TwoToneFlag=0""")
+            TwoToneFlag=0,
+            BaseTime=-1, BaseWageOutTax=-1, BaseWageInTax=-1,
+            BaseWageTax=-1, BaseWageByManual='', BaseByManual=0,
+            BumperBaseTime=-1, BumperBaseWageOutTax=-1,
+            BumperBaseWageInTax=-1, BumperBaseWageTax=-1,
+            BumperBaseWageByManual='', BumperBaseManual=0""")
     except sqlite3.Error:
         pass
     # 塗装セクションの「あり」フラグも消す。工賃だけ -1 にすると
@@ -1065,6 +1074,8 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
     # 税込モードの丸め調整用
     total_parts_intax = 0
     total_wages_intax = 0
+    total_parts_rowtax = 0      # 行ごとの部品税の合計（内訳の税額欄に使う）
+    total_wages_rowtax = 0      # 行ごとの工賃税の合計
     _adj_parts_line = None
     _adj_wage_line  = None
     _adj_parts_amount = 0
@@ -1273,6 +1284,13 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
             wage_intax   = wage_total + wage_tax if wage_total != 0 else 0
         total_parts += parts_outtax
         total_wages += wage_outtax
+        # 部品計・工賃計の税額欄は「行ごとの税の合計」。仕様書 §6・§4 が
+        # そう書いており、実機 200 件でも部品計は行ごとの合計と 100% 一致
+        # （合計×10% の一括丸めは 82% しか合わない）。
+        if parts_total != 0:
+            total_parts_rowtax += parts_tax
+        if wage_total != 0:
+            total_wages_rowtax += wage_tax
         # 税込モードでは行ごとに税抜を逆算するため、丸め誤差が積み上がって
         # 見積書に書かれた税込総額と生成NEOの合計がずれる。合計から1回で
         # 逆算し直せるよう、税込の合計と、差額を寄せる行を覚えておく。
@@ -1417,10 +1435,16 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
             db_parts_total, db_parts_intax, db_parts_tax,
             db_time,
             db_wage_total, db_wage_intax, db_wage_tax,
-            # 部品代の無い行（工賃だけの行）の数量欄は、実機では -1（空欄）が
-            # 85%。常に数量を書くと、部品が無いのに「1個」と読める。
-            # AnSMB 側の数量欄は実機でも '01' のままなので、そちらは変えない。
-            db_qty if db_parts_total > 0 else -1,
+            # 部品代の無い行（工賃だけの行）の数量。実機 150 件では
+            # **-1 が 90.3% ／ 1 が 9.7% ／ 2以上は 1 行も無い**（AnSMB の
+            # 数量欄は全部 '01'）。数量1のときに 1 を書くと「部品が無いのに
+            # 1個」と読めるので -1（空欄）にする。
+            # ただし数量2以上はそのまま残す。消すと ERParts=-1 なのに
+            # AnSMB='03'・画面=3 となり、同じ行の数量が3通りになる
+            # （その食い違いは過去に直してある）。実機は2以上を作らないので、
+            # 実機との食い違いは生まれない。
+            (db_qty if (db_parts_total > 0 or (isinstance(db_qty, int)
+                                               and db_qty > 1)) else -1),
             # 行の由来。実機では ERParts.OrderFlag と AnSMB の [100] バイトが
             # **同じ欄**で、実機 120 件 4,875 行で1行も食い違わなかった。
             # ここに '9' を固定で書いていたため、同じ .neo の中で
@@ -1580,8 +1604,10 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
     # total_parts / total_wages は既に税抜値（is_tax_inclusive時は逆算済み）
     taxable_expenses = sp_out + tow_out + rent_out
     sub_total         = total_parts + total_wages + taxable_expenses
-    parts_tax_total   = jpy_round(total_parts * TAX_RATE)
-    wages_tax_total   = jpy_round(total_wages * TAX_RATE)
+    # 行ごとの税の合計を使う（上で足してある）。以前は「合計×10%」を
+    # 1回丸めていたため、実機と 18% の見積で部品計の税額欄が食い違った。
+    parts_tax_total   = total_parts_rowtax
+    wages_tax_total   = total_wages_rowtax
     sp_tax_total      = jpy_round(sp_out * TAX_RATE)
     expenses_tax_total = jpy_round(taxable_expenses * TAX_RATE)
     # 消費税は請求書単位で1回だけ丸める。これが見積書に印字された税込総額の
@@ -1611,10 +1637,17 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
         tax_total = parts_tax_total + wages_tax_total + expenses_tax_total
     else:
         tax_total = jpy_round(sub_total * TAX_RATE)
-    # 内訳の税額欄（部品計・工賃計・諸経費計）の合計は tx_Total と
-    # 一致していなければならない。まとめ丸めとの差を、いちばん金額の
-    # 大きい欄に寄せて整合を保つ。
-    _tax_resid = tax_total - (parts_tax_total + wages_tax_total + expenses_tax_total)
+    # 内訳の税額欄の合計と総額の税は、**実機でも必ずしも一致しない**。
+    # 塗装も内板骨格も無い実機 25 件のうち 19 件（86.4%）は一致するが、
+    # 残りは +2 / +5 / +8 円ずれていた。総額の税は課税額計の一括丸め、
+    # 内訳は行ごとの税の合計で、別々に作られているためと考えられる。
+    # 税抜のときに無理やり寄せると、せっかく行ごとに合わせた内訳が
+    # また一括丸めの値に戻ってしまう（245/195/295 の例で 75 → 74）。
+    #
+    # 税込のときは、内訳を「原本の税込 − 逆算した税抜」で確定させており、
+    # tax_total もその合計なので差は出ない（この寄せは実質なにもしない）。
+    _tax_resid = (tax_total - (parts_tax_total + wages_tax_total
+                               + expenses_tax_total)) if is_tax_inclusive else 0
     if _tax_resid:
         _biggest = max((abs(total_parts), 'p'), (abs(total_wages), 'w'),
                        (abs(taxable_expenses), 'e'))[1]
@@ -5185,6 +5218,17 @@ def validate_and_correct_items(items):
     - 修理/板金等:    parts_amount = 0 強制。wage==0 のとき parts_amt を wage へ移動
                       （AIが工賃を parts 列に誤分類したケースを救済）
     - 空白method:     parts_amount > 0 ならそのまま（取替とみなす）
+
+    **品名では判断しない。** 以前は品名に「取付」「組付」「板金」「塗装」
+    「修理」「研磨」があると部品代を消していたが、ADDATA の正式な部品名
+    49,432 語のうち 182 語がこれらの語を含む:
+        Rﾊﾞﾝﾊﾟ(塗装済) / Fﾊﾞﾝﾊﾟ(未塗装) / ｸﾛｽﾒﾝﾊﾞ(修理) / ｻｰﾄﾞｼｰﾄ（脱着・修理）
+    「Rﾊﾞﾝﾊﾟ(塗装済)」は取替の定番部品で数万円。区分の欄に「取替」以外の語
+    （日産系の「部品」など）が入っていると、この部品代が黙って消えていた。
+    品名は「その部品が何か」であって「作業か部品か」ではない。
+
+    戻り値: (直した明細, 何をしたかの記録) の組。原本の金額を変えたことは
+    黙って済ませず、画面で知らせる。
     """
     # 部品代計上が有効な作業区分
     PARTS_OK_METHODS = {'取替', '交換', '脱着組替', '取外組付'}
@@ -5197,6 +5241,7 @@ def validate_and_correct_items(items):
                         '清掃', '点検', '作業', '修正', '施工', '補修'}
 
     corrected = []
+    notes = []
     for item in items:
         item      = dict(item)
         method    = str(item.get('method', '')).strip()
@@ -5215,24 +5260,35 @@ def validate_and_correct_items(items):
             continue
 
         # ケース3: 脱着/取外系 → parts_amount を強制ゼロ（wage は触らない）
-        is_removal = any(kw in method for kw in REMOVAL_METHODS)
-        is_removal_name = any(kw in name for kw in {'脱着', '取外', '取付', '組付'})
-        if is_removal or is_removal_name:
-            item['parts_amount'] = 0
+        #   判断は**見積書に印字された作業区分だけ**で行う。品名で判断すると
+        #   「Rﾊﾞﾝﾊﾟ(塗装済)」のような正式な部品名の数万円が消える。
+        if any(kw in method for kw in REMOVAL_METHODS):
+            if parts_amt:
+                notes.append(
+                    f"「{name}」（{method}）の部品代 {parts_amt:,}円 を 0 に"
+                    "しました。脱着の行に部品代が付いているのは、"
+                    "読み取りが1行ずれた可能性があります。原本をご確認ください。")
+                item['parts_amount'] = 0
             corrected.append(item)
             continue
 
         # ケース4: 修理・塗装等 → parts_amount = 0 強制。wage==0 なら wage へ救済移動
-        is_repair = any(kw in method for kw in REPAIR_METHODS)
-        is_repair_name = any(kw in name for kw in {'板金', '塗装', 'ペイント', '修理', '研磨'})
-        if (is_repair or is_repair_name) and parts_amt > 0:
+        if any(kw in method for kw in REPAIR_METHODS) and parts_amt > 0:
             if wage == 0:
                 # AIが工賃を parts 列に誤分類したとみなして wage へ移動
                 item['wage']  = parts_amt
+                notes.append(
+                    f"「{name}」（{method}）の {parts_amt:,}円 を部品代から"
+                    "工賃へ移しました。原本で部品・工賃のどちらの欄か"
+                    "ご確認ください。")
+            else:
+                notes.append(
+                    f"「{name}」（{method}）の部品代 {parts_amt:,}円 を 0 に"
+                    "しました。原本をご確認ください。")
             item['parts_amount'] = 0
 
         corrected.append(item)
-    return corrected
+    return corrected, notes
 
 
 def check_parts_labor_classification(items):
@@ -5939,7 +5995,10 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
         _logw("⑥ 全体重複除去: 分割解析ではないためスキップ（正当な重複明細を保持）")
 
     # ⑥-b 辞書ベースバリデーション
-    result['items'] = validate_and_correct_items(result['items'])
+    result['items'], _vc_notes = validate_and_correct_items(result['items'])
+    if _vc_notes:
+        # 原本の金額を動かしたことは黙って済ませない
+        result.setdefault('_amount_changes', []).extend(_vc_notes)
 
     # ⑥-c 品名空白フォールバック（AIが名称を読み取れなかった行を保護）
     # work_code が非空なら品名の代替として使用し、それもなければ「不明」を設定
@@ -6030,7 +6089,9 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
             )
             if retry and retry.get('items'):
                 # retry['items'] は _self_correction_retry 内で正規化済み
-                result['items']            = validate_and_correct_items(retry['items'])
+                result['items'], _vc_notes2 = validate_and_correct_items(retry['items'])
+                if _vc_notes2:
+                    result.setdefault('_amount_changes', []).extend(_vc_notes2)
                 result['short_parts_wage'] = safe_int(retry.get('short_parts_wage', result.get('short_parts_wage', 0)))
                 _correction_rounds += 1
             else:
@@ -7707,6 +7768,12 @@ def main():
 
                 # 精度処理の結果を表示
                 info_msgs = []
+                # 原本の金額を動かしたことは必ず伝える。作業区分が
+                # 「脱着」「板金」等の行に部品代が付いていると、読み取りが
+                # 1行ずれている疑いがあるので消す／工賃へ移す作りだが、
+                # 黙ってやると原本と違う見積が気づかれずに出る。
+                for _ac in (estimate_data.get('_amount_changes') or []):
+                    info_msgs.append("⚠️ 原本の金額を動かしました: " + _ac)
                 if not vehicle_bytes:
                     info_msgs.append("📋 車検証なしモード: 見積書から読み取れた車両情報のみでNEOを作成します。ステップ③で車両情報を確認・補完してください。")
                 if not estimate_data.get('_addata_matched'):

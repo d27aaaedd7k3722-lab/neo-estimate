@@ -163,6 +163,103 @@ _src = inspect.getsource(app.generate_neo_file)
 chk("'9', '', 0, 0," not in _src,
     "6: ERParts の OrderFlag に '9' を固定で書く記述が戻っている")
 
+# ── 7. 品名だけで部品代を消さないこと ─────────────────────────
+# ADDATA の正式な部品名 49,432 語のうち 182 語が「取付/組付/板金/塗装/
+# 修理/研磨」を含む（Rﾊﾞﾝﾊﾟ(塗装済) / ｸﾛｽﾒﾝﾊﾞ(修理) など）。
+# 「Rﾊﾞﾝﾊﾟ(塗装済)」は取替の定番部品で数万円。品名で判断していたため、
+# 区分に「取替」以外の語（日産系の「部品」など）が入ると黙って消えていた。
+_KEEP = [
+    ('Rﾊﾞﾝﾊﾟ(塗装済)', '部品', 38600),
+    ('Fﾊﾞﾝﾊﾟ(未塗装)', '', 42000),
+    ('ｸﾛｽﾒﾝﾊﾞ(修理)', '取替', 15000),
+    ('ﾊﾞﾝﾊﾟ取付ｸﾘﾂﾌﾟ', '部品', 1550),
+    ('Rｼｰﾄ(脱着･修理)', '部品', 88000),
+]
+_items = [{'name': n, 'method': m, 'parts_amount': p, 'wage': 0,
+           'quantity': 1} for n, m, p in _KEEP]
+_out, _notes = app.validate_and_correct_items(_items)
+for (n, m, p), o in zip(_KEEP, _out):
+    chk(o['parts_amount'] == p,
+        '7: 「%s」（区分 %s）の部品代 %s円 が %s円 にされた。'
+        'ADDATA の正式な部品名に「塗装」「修理」等が含まれるのは普通で、'
+        '品名で作業か部品かを決めてはいけない'
+        % (n, m or '空欄', format(p, ','), format(o['parts_amount'], ',')))
+chk(not _notes, '7b: 何も動かしていないのに「動かした」と記録している')
+
+# 作業区分がはっきり作業の行は、これまでどおり動かす。ただし**黙ってやらない**
+_work = [{'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'parts_amount': 5000,
+          'wage': 9800, 'quantity': 1},
+         {'name': 'ﾊﾞﾝﾊﾟ板金', 'method': '板金', 'parts_amount': 12000,
+          'wage': 0, 'quantity': 1}]
+_out2, _notes2 = app.validate_and_correct_items(_work)
+chk(_out2[0]['parts_amount'] == 0, '7c: 脱着の行の部品代が残っている')
+chk(_out2[1]['parts_amount'] == 0 and _out2[1]['wage'] == 12000,
+    '7d: 板金の行の金額が工賃へ移っていない')
+chk(len(_notes2) == 2,
+    '7e: 原本の金額を動かしたのに知らせていない（%d件）' % len(_notes2))
+# 画面に出る道があること
+with open(os.path.join(R, 'app.py'), encoding='utf-8') as _f:
+    _appsrc = _f.read()
+chk("_amount_changes" in _appsrc and "原本の金額を動かしました" in _appsrc,
+    '7f: 金額を動かしたことが画面に出ない')
+
+# ── 8. 部品代の無い行の数量 ────────────────────────────────
+# 実機 150 件では -1 が 90.3% ／ 1 が 9.7% ／ 2以上は 1 行も無い。
+# 数量1なら -1（空欄）、2以上はそのまま（画面・AnSMB と食い違わせない）。
+_rows, _by = build([
+    {'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'parts_amount': 0, 'wage': 9800,
+     'quantity': 1},
+    {'name': 'ｸﾘﾂﾌﾟ脱着', 'method': '脱着', 'parts_amount': 0, 'wage': 3000,
+     'quantity': 3},
+])
+_pc = [app.safe_int(r[4]) for r in _rows]
+chk(_pc[0] == -1,
+    '8a: 部品代の無い行（数量1）の PartsCount が %s（実機は -1）' % _pc[0])
+chk(_pc[1] == 3,
+    '8b: 部品代の無い行（数量3）の PartsCount が %s。消すと ERParts=-1 /'
+    ' AnSMB=03 / 画面=3 で数量が3通りになる' % _pc[1])
+
+# ── 9. 部品計・工賃計の税額欄は行ごとの税の合計 ────────────────
+# 仕様書 §6・§4 がそう書いており、実機 200 件でも部品計は行ごとの合計と
+# 100% 一致（合計×10% の一括丸めは 82% しか合わない）。
+_tpl = open(os.path.join(R, 'template_toyota.neo'), 'rb').read()
+_nb = app.generate_neo_file(
+    _tpl, {'customer_name': 'ｹﾝｼｮｳ'},
+    [{'name': 'A', 'method': '取替', 'parts_amount': 245, 'wage': 0,
+      'quantity': 1},
+     {'name': 'B', 'method': '取替', 'parts_amount': 195, 'wage': 0,
+      'quantity': 1},
+     {'name': 'C', 'method': '取替', 'parts_amount': 295, 'wage': 0,
+      'quantity': 1}], 0, {}, {}, False, False, False)[0]
+_ck = app.find_real_cks(_nb)
+_fs = app.extract_files(app.decompress_neo(_nb, _ck),
+                        app.parse_entries(_nb, _ck[0])[1])
+_tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+try:
+    _tf.write(_fs['AnSMB.txt'])
+    _tf.close()
+    _con = sqlite3.connect(_tf.name)
+    try:
+        _rt = sum(app.safe_int(x[0]) for x in _con.execute(
+            'select PartsPriceTax from ERParts where PartsName is not null'
+            ' and PartsName<>""') if app.safe_int(x[0]) > 0)
+        _mt, _tx, _sub, _gt = _con.execute(
+            'select ms_PartsTotalTax, tx_TotalOutTax, SubTotal, Total'
+            ' from Total').fetchone()
+    finally:
+        _con.close()
+finally:
+    try:
+        os.unlink(_tf.name)
+    except OSError:
+        pass
+chk(app.safe_int(_mt) == _rt == 75,
+    '9a: 部品計の税額欄が %s（行ごとの合計 %s／25+20+30=75 のはず）'
+    % (_mt, _rt))
+chk(app.safe_int(_tx) == 74,
+    '9b: 総額の税が %s（課税額計 735 の一括丸め 74 のはず）' % _tx)
+chk(app.safe_int(_gt) == 809, '9c: 合計が %s（809 のはず）' % _gt)
+
 print('REG_FIELDS:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
     print('  -', f)
