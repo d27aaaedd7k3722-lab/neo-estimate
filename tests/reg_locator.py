@@ -206,6 +206,47 @@ try:
         L.config_addata_root = _cfg2
         L._cache.clear()
 
+    # ── 10. 版を読めなかったら、順位を付けたふりをしないこと ────────
+    # 締切を理由に版の読み取りを諦めると、全候補が同じ点数になって
+    # 「並び順で選ぶ」ことになり、古い Addata を静かに掴む。
+    _orig_key = L.addata_version_key
+    try:
+        def _hang(path):
+            time.sleep(30)
+            return (0.0, 0.0)
+        L.addata_version_key = _hang
+        L._STANDARD_PATHS = (old_v, new_v)
+        L._ONEDRIVE_SUBPATHS = ()
+        L._candidate_onedrive_roots = lambda: []
+        L.config_addata_root = lambda: None
+        os.environ.pop('ADDATA_ROOT', None)
+        L._cache.clear()
+        t0 = time.time()
+        L.find_addata(force_refresh=True)
+        el = time.time() - t0
+        chk(el < 15.0, '10a: 版が読めないときに %.1f 秒待っている' % el)
+        chk(L.rank_incomplete(),
+            '10b: 版を読めなかったのに「順位を付けられなかった」ことが'
+            '外から分からない（古い Addata を掴んでいても気づけない）')
+    finally:
+        L.addata_version_key = _orig_key
+        L._STANDARD_PATHS, L._ONEDRIVE_SUBPATHS = _std2, _sub2
+        L._candidate_onedrive_roots = _od2
+        L.config_addata_root = _cfg2
+        L._cache.clear()
+
+    # ── 11. 締切を迂回する重複の段が残っていないこと ─────────────────
+    import inspect
+    _src = inspect.getsource(L.find_addata)
+    # _valid() の中の1回だけが正しい姿。条件式で直に呼ぶ形（旧 2b の段）は
+    # 時間の上限が効かず、画面が固まるうえ版も比べない。
+    chk('if _is_valid_addata(' not in _src,
+        '11: find_addata が時間の上限なしで _is_valid_addata を呼んでいる'
+        '（旧 2b の段が戻っている）')
+    chk(_src.count('_is_valid_addata(') == 1,
+        '11b: _is_valid_addata の呼び出しが %d か所ある'
+        '（_valid() の中の1か所だけのはず）' % _src.count('_is_valid_addata('))
+
     # ── 6. 実機の設定が今どうなっているか（参考・失敗にはしない） ──
     _live = L.config_addata_root()
     print('  参考: この PC の設定ファイルの ADDATA =', _live or '(未設定)')

@@ -6575,9 +6575,21 @@ def main():
             # pdf-to-neo スキルの env_check.py と同じ確認を画面でも出す。
             try:
                 from addata_locator import newer_addata_candidates as _newer
+                from addata_locator import rank_incomplete as _rankbad
                 _nw = _newer(addata_status, budget=8.0)
+                _rb = _rankbad()
             except Exception:
-                _nw = []
+                _nw, _rb = [], []
+            if _rb:
+                # データ版を読めなかった候補があると、順位を付けられず
+                # 「並び順で選ぶ」ことになる。古い Addata を掴んでいても
+                # 気づけないので、そのことを伝える。
+                st.warning(
+                    "⚠️ データ版を読めなかった Addata の候補が"
+                    f"{len(_rb)} 件あります。いちばん新しい版を選べて"
+                    "いない可能性があります（応答しない共有や未同期の"
+                    "OneDrive が原因のことが多い）。使いたい Addata を"
+                    "設定で指定してください。")
             if _nw:
                 st.warning(
                     "⚠️ この PC には、もっと新しい版の Addata があります"

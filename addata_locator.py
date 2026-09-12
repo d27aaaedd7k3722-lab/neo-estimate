@@ -72,6 +72,9 @@ def config_addata_root() -> Optional[str]:
 
 CACHE_KEY = "_ADDATA_LOCATOR_CACHE"
 ALL_CACHE_KEY = "_ADDATA_LOCATOR_ALL_CACHE"
+# 版（COM/AnVer.DB）を読めなかった候補。読めないまま順位を付けると
+# 「並び順で選ぶ」ことになり、古い ADDATA を静かに掴む。画面で知らせる。
+RANK_KEY = "_ADDATA_LOCATOR_RANK_FAILED"
 _cache: dict = {}
 
 # v6.1: 標準位置リスト (優先度順)
@@ -334,6 +337,7 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
 
     import time as _time
     _deadline = _time.time() + _SEARCH_SECONDS
+    _rank_failed: List[str] = []      # 版を読めなかった候補
 
     def _left(cap: float) -> float:
         # 残り時間。0 以下なら「もう触らない」。下限を置くと、締切を過ぎて
@@ -349,11 +353,19 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
         return bool(_bounded(lambda: _is_valid_addata(p), t, False))
 
     def _vkey(p):
-        """版の新しさ。締切を過ぎていたら読みに行かない。"""
-        t = _left(3.0)
-        if t <= 0:
+        """版の新しさ。
+
+        読むのは COM/AnVer.DB（小さい INI）1つだけなので、フォルダ探索の
+        締切とは**別枠**にする。ここで締切を理由に諦めると、全部の候補が
+        同じ点数になって「並び順で選ぶ」ことになり、古い ADDATA を静かに
+        掴む。読めなかった候補は控えておき、画面で知らせる。
+        """
+        got = _bounded(lambda: addata_version_key(p), 3.0, None)
+        if got is None:
+            if p not in _rank_failed:
+                _rank_failed.append(p)
             return (0.0, 0.0)
-        return _bounded(lambda: addata_version_key(p), t, (0.0, 0.0))
+        return got
 
     # 1. 環境変数
     env_root = os.environ.get("ADDATA_ROOT")
@@ -385,17 +397,14 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
                 _shallow.append(cand)
     if _shallow:
         best = max(_shallow, key=_vkey)
+        _cache[RANK_KEY] = list(_rank_failed)
         _cache[CACHE_KEY] = best
         return best
 
-    # 2b. OneDrive ルート × 業務典型サブパス の直積展開を O(1) 確認 (v10.4)
-    # 再帰検索より速く、ユーザー指定パス「【※写真※】 2025\コグニ、アセス　データベース\Addata」を確実に当てる
-    for od in _candidate_onedrive_roots():
-        for sub in _ONEDRIVE_SUBPATHS:
-            cand = os.path.join(od, sub)
-            if _is_valid_addata(cand):
-                _cache[CACHE_KEY] = cand
-                return cand
+    # （以前ここに、同じ OneDrive のサブパスをもう一度「締切なしで」見る
+    #   2b の段があった。上の 2 とまったく同じ候補を同じ関数で見ており、
+    #   違いは時間の上限が効かないことだけ。応答しない共有を指していると
+    #   画面が止まり、しかも版を比べずに最初に当たったものを返していた。）
 
     # 3. OneDrive配下を並列検索（複数候補を同時走査で最大3倍速）
     #    見つかった順ではなく**データ版の新しい順**で選ぶ。最初に返ったものを
@@ -435,6 +444,7 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
     deep = (_bounded(_deep_all, _deep_left, []) or []) if _deep_left > 0 else []
     if deep:
         best = max(deep, key=_vkey)
+        _cache[RANK_KEY] = list(_rank_failed)
         _cache[CACHE_KEY] = best
         return best
 
@@ -504,6 +514,14 @@ def find_all_addata(force_refresh: bool = False) -> List[str]:
     found.sort(key=addata_version_key, reverse=True)
     _cache[ALL_CACHE_KEY] = list(found)
     return found
+
+
+def rank_incomplete() -> List[str]:
+    """直前の find_addata で、データ版を読めなかった候補。
+
+    空でなければ「いちばん新しい版を選べていないかもしれない」という意味。
+    """
+    return list(_cache.get(RANK_KEY) or [])
 
 
 def newer_addata_candidates(current: Optional[str],
