@@ -1693,7 +1693,10 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                         {"type": "no_pdf_total", "neo": neo_total, "pdf": None,
                          "note": "見積書の部品計・総額が読み取れず、"
                                  "突き合わせていない"})
-                if neo_wage and not _cmp_wage:
+                # 差引後の合計で見ると、工賃の行とマイナスの行が
+                # 打ち消し合って 0 になったときに素通りする。
+                # 部品側と同じく「行があるかどうか」で見る。
+                if (_neo_wage_plus or neo_wage_minus) and not _cmp_wage:
                     # 工賃が入っている .neo なのに、印字された工賃計も
                     # 総額も無い。工賃を1円も確かめないまま
                     # 「一致」と出していた。

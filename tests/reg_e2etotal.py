@@ -545,6 +545,28 @@ _src = inspect.getsource(P.verify_neo_against_pdf)
 chk('int(round(_g * (1 + tax_rate)))' not in _src,
     '21: 総額の丸めに Python の round()（偶数丸め）を使っている')
 
+# ── 22. 工賃が差引0になる見積で素通りしないこと（Codex 6周目） ────────
+# 工賃の行とマイナスの行が打ち消し合って 0 になると、差引後の合計では
+# 「工賃が入っていない」ように見え、突き合わせの網羅チェックを
+# すり抜けていた。部品側と同じく「行があるかどうか」で見る。
+_IZ = [{'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 38600,
+        'wage': 0, 'quantity': 1},
+       {'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'parts_amount': 0,
+        'wage': 9800, 'quantity': 1},
+       {'name': '工賃サービス', 'method': '', 'parts_amount': 0,
+        'wage': -9800, 'quantity': 1}]
+_nb = app.generate_neo_file(_TPLB, {'customer_name': 'ｹﾝｼｮｳ'},
+                            [dict(i) for i in _IZ], 0, {}, {},
+                            False, False, False)[0]
+# 工賃計も総額も印字されていない見積
+_v = P.verify_neo_against_pdf(_nb, _IZ, pdf_parts_total=38600)
+chk(not _v.get('ok'),
+    '22a: 工賃が差引0の見積で、工賃を一度も比べずに検証が通っている')
+chk(any(m.get('type') == 'no_pdf_wage'
+        for m in (_v.get('mismatches') or [])),
+    '22b: 工賃を比べていないことが mismatches に出ていない'
+    '（差引後の合計で見ているため打ち消し合うと素通りする）')
+
 print('REG_E2ETOTAL:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
     print('  -', f)
