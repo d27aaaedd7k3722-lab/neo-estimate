@@ -446,13 +446,20 @@ _I2 = [{'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 38600,
        {'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'parts_amount': 0,
         'wage': 9800, 'quantity': 1}]
 _GT = jr(48400 * 1.10)
+# 小計も総額も印字されていない見積。突き合わせる相手が1つも無い。
+_res = run(_I2, {'pdf_parts_total': 0, 'pdf_wage_total': 0,
+                 'discount_amount': 0, 'pdf_grand_total': 0}, False)
+_v = _res.get('verify') or {}
+chk(_v.get('verified_against_pdf') is False,
+    '16a: 何も読めていないのに「原本と突き合わせた」ことになっている')
+chk(not _v.get('ok'),
+    '16b: 突き合わせていないのに検証が「一致」になっている')
+# 総額だけは印字されている見積は、総額と突き合わせられる
 _res = run(_I2, {'pdf_parts_total': 0, 'pdf_wage_total': 0,
                  'discount_amount': 0, 'pdf_grand_total': _GT}, False)
 _v = _res.get('verify') or {}
-chk(_v.get('verified_against_pdf') is False,
-    '16a: 部品計を読めていないのに「原本と突き合わせた」ことになっている')
-chk(not _v.get('ok'),
-    '16b: 突き合わせていないのに検証が「一致」になっている')
+chk(_v.get('grand_match') is True and _v.get('ok'),
+    '16a2: 総額が印字されているのに突き合わせていない')
 
 # 工賃計が印字されていない見積で、工賃の行を読み落とした
 # （A-4 が明細合算で工賃計を埋めるが、それは印字された値ではない）
@@ -464,6 +471,8 @@ chk(_v.get('wage_match') is None,
     '16c: 明細から作った工賃計を「印字された値」として検証に使っている'
     '（工賃を丸ごと読み落としても一致してしまう）')
 chk(not _v.get('ok'), '16d: 工賃が 14,500 足りないのに検証が通っている')
+# 印字と同じ基準で比べるので、丸めのための許容は要らない
+chk(P.verify_neo_against_pdf.__defaults__ is not None, '16d2: 署名が読めない')
 chk(_v.get('grand_match') is False,
     '16e: 印字された総額との突き合わせで捕まっていない')
 
@@ -485,6 +494,37 @@ _v = _res.get('verify') or {}
 chk(_v.get('grand_match') is None,
     '17d: 費用を足した .neo で総額の突き合わせをして誤報を出している')
 chk(_v.get('ok'), '17e: 費用を足しただけで検証が落ちている')
+
+# ── 18. 税込は税込どうしで比べること ─────────────────────────────
+# 以前は税込表記でも .neo の税抜どうしで比べていた。数量2以上の行は
+# 「単価で丸めて数量倍」（実機と同じ数え方）なので、印字1,710÷1.1=1,555 と
+# .neo の1,550 が5円ずれ、正しい .neo が「差異あり」と報告されていた。
+_res = run([{'name': 'ｸﾘﾂﾌﾟ', 'method': '取替', 'parts_amount': 1710,
+             'wage': 0, 'quantity': 10},
+            {'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'parts_amount': 0,
+             'wage': 99999, 'quantity': 1}],
+           {'pdf_parts_total': 1710, 'pdf_wage_total': 99999,
+            'discount_amount': 0, 'pdf_grand_total': 101709}, True)
+_v = _res.get('verify') or {}
+chk(_v.get('total_match'),
+    '18a: 税込・数量10 の正しい .neo で「差異あり」と出る'
+    '（税抜に割り戻して比べているため）')
+chk(_v.get('ok'), '18b: 税込・数量10 の正しい .neo で検証が通らない')
+chk(_v.get('neo_total') == 1710,
+    '18c: .neo の部品計を税込で %s と数えている（1,710 のはず）'
+    % _v.get('neo_total'))
+
+# ── 19. 工賃だけの見積（印字された部品計 0 は正しい値） ────────────
+_res = run([{'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'parts_amount': 0,
+             'wage': 9800, 'quantity': 1},
+            {'name': 'ﾊﾞｯｸﾄﾞｱ板金', 'method': '板金', 'parts_amount': 0,
+             'wage': 24500, 'quantity': 1}],
+           {'pdf_parts_total': 0, 'pdf_wage_total': 34300,
+            'discount_amount': 0, 'pdf_grand_total': jr(34300 * 1.10)}, False)
+_v = _res.get('verify') or {}
+chk(_v.get('ok'),
+    '19: 工賃だけの見積が「検証できていません」になる'
+    '（印字された部品計 0 を「読めなかった」と取り違えている）')
 
 print('REG_E2ETOTAL:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
