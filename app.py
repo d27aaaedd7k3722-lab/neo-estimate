@@ -6576,10 +6576,21 @@ def main():
             try:
                 from addata_locator import newer_addata_candidates as _newer
                 from addata_locator import rank_incomplete as _rankbad
+                from addata_locator import search_skipped as _skipbad
                 _nw = _newer(addata_status, budget=8.0)
                 _rb = _rankbad()
+                _sk0 = _skipbad()
             except Exception:
-                _nw, _rb = [], []
+                _nw, _rb, _sk0 = [], [], []
+            if _sk0:
+                # 見つかったからといって、それが一番新しいとは限らない。
+                # 時間切れで見ていない候補があると、古い Addata を
+                # 使ったまま「検出済み」と表示されることになる。
+                st.warning(
+                    f"⚠️ 探索の制限時間内に見きれなかった候補が{len(_sk0)}件"
+                    "あります。ここに表示している Addata より新しい版が"
+                    "見落とされている可能性があります。"
+                    "使いたい Addata は設定で指定してください。")
             if _rb:
                 # データ版を読めなかった候補があると、順位を付けられず
                 # 「並び順で選ぶ」ことになる。古い Addata を掴んでいても

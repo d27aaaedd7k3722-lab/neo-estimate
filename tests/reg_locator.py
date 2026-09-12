@@ -270,9 +270,22 @@ try:
         chk(L.search_skipped(),
             '12b: 締切で見送った候補があることが外から分からない'
             '（Addata が手元にあるのにベタ打ちモードに落ちたまま気づけない）')
-        chk(L._cache.get(L.CACHE_KEY, '未設定') == '未設定',
-            '12c: 時間切れの未検出をキャッシュしている'
-            '（以後ずっと未検出のままになる）')
+        # 毎回の画面更新で全部を探し直すと、遅い PC では操作のたびに
+        # 固まる。しばらく（既定60秒）は未検出のまま返し、そのあと
+        # 探し直せるようにしておく。
+        chk(L._cache.get(L.RETRY_KEY),
+            '12c: 時間切れの未検出に「探し直す時刻」が付いていない'
+            '（永久に未検出のまま、または毎回の画面更新で全部探し直す）')
+        t1 = time.time()
+        chk(L.find_addata() is None and time.time() - t1 < 1.0,
+            '12d: 探し直す時刻の前なのに、毎回フォルダを探し直している')
+        L._cache[L.RETRY_KEY] = 0          # 時間が経ったことにする
+        L._SEARCH_SECONDS = 0.2
+        t1 = time.time()
+        L.find_addata()
+        chk(time.time() - t1 > 0.05,
+            '12e: 探し直す時刻を過ぎても探し直していない'
+            '（Addata が手元にあってもベタ打ちモードから戻れない）')
     finally:
         L._is_valid_addata = _orig_valid2
         L._SEARCH_SECONDS = _orig_sec2

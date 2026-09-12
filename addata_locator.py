@@ -79,6 +79,11 @@ RANK_KEY = "_ADDATA_LOCATOR_RANK_FAILED"
 # 見ていない」。未検出と区別しないと、応答の遅い PC で Addata があるのに
 # ベタ打ちモードに落ちる。
 SKIPPED_KEY = "_ADDATA_LOCATOR_SKIPPED"
+# 時間切れの未検出を、いつまで信じるか。毎回の画面更新で全部を探し直すと
+# 遅い PC では操作のたびに固まる。かといって永久に未検出のままにすると、
+# Addata が手元にあるのにベタ打ちモードから戻れない。
+RETRY_KEY = "_ADDATA_LOCATOR_RETRY_AFTER"
+_RETRY_SECONDS = 60.0
 _cache: dict = {}
 
 # v6.1: 標準位置リスト (優先度順)
@@ -336,10 +341,16 @@ def addata_version_key(path: Optional[str]) -> tuple:
 def find_addata(force_refresh: bool = False) -> Optional[str]:
     """ADDATA ルートを自動検索して返す。見つからなければ None。
     結果はモジュールキャッシュ。force_refresh=True で再検索。"""
-    if not force_refresh and CACHE_KEY in _cache:
-        return _cache[CACHE_KEY]
-
     import time as _time
+    if not force_refresh and CACHE_KEY in _cache:
+        _hit = _cache[CACHE_KEY]
+        if _hit is not None:
+            return _hit
+        # 時間切れの未検出はしばらくしたら探し直す。毎回の画面更新で
+        # 全部を探し直すと、遅い PC では操作のたびに固まる。
+        if _time.time() < (_cache.get(RETRY_KEY) or 0):
+            return None
+
     _deadline = _time.time() + _SEARCH_SECONDS
     _rank_failed: List[str] = []      # 版を読めなかった候補
     _skipped: List[str] = []          # 締切で見ていない候補
@@ -355,10 +366,12 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
         _cache[SKIPPED_KEY] = list(_skipped)
         # 締切で見送った候補が残っているときの未検出は「無い」ではなく
         # 「見ていない」。キャッシュに残すと、以後ずっと未検出になる。
+        _cache[CACHE_KEY] = value
         if value is None and _skipped:
-            _cache.pop(CACHE_KEY, None)
+            # 「無い」と決まったわけではないので、しばらくしたら探し直す
+            _cache[RETRY_KEY] = _time.time() + _RETRY_SECONDS
         else:
-            _cache[CACHE_KEY] = value
+            _cache.pop(RETRY_KEY, None)
         return value
 
     def _left(cap: float) -> float:
