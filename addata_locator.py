@@ -75,6 +75,10 @@ ALL_CACHE_KEY = "_ADDATA_LOCATOR_ALL_CACHE"
 # 版（COM/AnVer.DB）を読めなかった候補。読めないまま順位を付けると
 # 「並び順で選ぶ」ことになり、古い ADDATA を静かに掴む。画面で知らせる。
 RANK_KEY = "_ADDATA_LOCATOR_RANK_FAILED"
+# 締切で見送った候補。「無効と分かった」のではなく「時間が足りなくて
+# 見ていない」。未検出と区別しないと、応答の遅い PC で Addata があるのに
+# ベタ打ちモードに落ちる。
+SKIPPED_KEY = "_ADDATA_LOCATOR_SKIPPED"
 _cache: dict = {}
 
 # v6.1: 標準位置リスト (優先度順)
@@ -338,6 +342,24 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
     import time as _time
     _deadline = _time.time() + _SEARCH_SECONDS
     _rank_failed: List[str] = []      # 版を読めなかった候補
+    _skipped: List[str] = []          # 締切で見ていない候補
+
+    def _done(value):
+        """どの返り道でも、今回の探索の状態を残す。
+
+        前は順位を付けた2か所でしか控えを書いていなかったので、
+        環境変数で決まったときや未検出のときに**前回の探索の控え**が
+        そのまま画面に出ていた。
+        """
+        _cache[RANK_KEY] = list(_rank_failed)
+        _cache[SKIPPED_KEY] = list(_skipped)
+        # 締切で見送った候補が残っているときの未検出は「無い」ではなく
+        # 「見ていない」。キャッシュに残すと、以後ずっと未検出になる。
+        if value is None and _skipped:
+            _cache.pop(CACHE_KEY, None)
+        else:
+            _cache[CACHE_KEY] = value
+        return value
 
     def _left(cap: float) -> float:
         # 残り時間。0 以下なら「もう触らない」。下限を置くと、締切を過ぎて
@@ -347,10 +369,16 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
     def _valid(p, cap=3.0) -> bool:
         # 応答しない共有を指していると os.listdir が返らない。
         # 呼び出し側（画面）を止めないよう、1 候補ずつ上限をかける。
+        # 時間切れは「無効」ではなく「見ていない」なので、控えておく。
         t = _left(cap)
         if t <= 0:
+            _skipped.append(p)
             return False
-        return bool(_bounded(lambda: _is_valid_addata(p), t, False))
+        got = _bounded(lambda: _is_valid_addata(p), t, None)
+        if got is None:
+            _skipped.append(p)
+            return False
+        return bool(got)
 
     def _vkey(p):
         """版の新しさ。
@@ -360,26 +388,31 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
         同じ点数になって「並び順で選ぶ」ことになり、古い ADDATA を静かに
         掴む。読めなかった候補は控えておき、画面で知らせる。
         """
-        got = _bounded(lambda: addata_version_key(p), 3.0, None)
-        if got is None:
+        def _probe():
+            # 版そのものと、順位に使う組を1回で取る
+            return (addata_version(p), addata_version_key(p))
+
+        got = _bounded(_probe, 3.0, None)
+        if got is None or not got[0]:
+            # 読めない、または AnVer.DB に Number= が無い。
+            # 更新日時で代用した順位は「版で比べた」ことにならないので、
+            # 黙って順位を付けず、読めなかった候補として控える。
             if p not in _rank_failed:
                 _rank_failed.append(p)
-            return (0.0, 0.0)
-        return got
+            return got[1] if got else (0.0, 0.0)
+        return got[1]
 
     # 1. 環境変数
     env_root = os.environ.get("ADDATA_ROOT")
     if env_root and _valid(env_root):
-        _cache[CACHE_KEY] = env_root
-        return env_root
+        return _done(env_root)
 
     # 1b. pdf-to-neo スキルの設定（env_check.py --save の結果）
     #     同じ PC で 2 つの実装が別々の ADDATA を掴むと、標準品番・
     #     標準指数が変わって協定見積の中身が変わる。
     cfg_root = config_addata_root()
     if cfg_root and _valid(cfg_root):
-        _cache[CACHE_KEY] = cfg_root
-        return cfg_root
+        return _done(cfg_root)
 
     # 2. 標準位置と OneDrive の典型サブパスを「全部」見て、データ版が新しいものを選ぶ。
     #    以前は最初に見つかったものをそのまま返していたため、古い C:\Addata を
@@ -396,10 +429,7 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
             if _valid(cand):
                 _shallow.append(cand)
     if _shallow:
-        best = max(_shallow, key=_vkey)
-        _cache[RANK_KEY] = list(_rank_failed)
-        _cache[CACHE_KEY] = best
-        return best
+        return _done(max(_shallow, key=_vkey))
 
     # （以前ここに、同じ OneDrive のサブパスをもう一度「締切なしで」見る
     #   2b の段があった。上の 2 とまったく同じ候補を同じ関数で見ており、
@@ -441,15 +471,18 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
         return out
 
     _deep_left = _left(_SEARCH_SECONDS)
-    deep = (_bounded(_deep_all, _deep_left, []) or []) if _deep_left > 0 else []
+    if _deep_left > 0:
+        deep = _bounded(_deep_all, _deep_left, None)
+        if deep is None:          # 時間切れ。走査しきっていない
+            _skipped.append('(OneDrive 配下の探索)')
+            deep = []
+    else:
+        _skipped.append('(OneDrive 配下の探索)')
+        deep = []
     if deep:
-        best = max(deep, key=_vkey)
-        _cache[RANK_KEY] = list(_rank_failed)
-        _cache[CACHE_KEY] = best
-        return best
+        return _done(max(deep, key=_vkey))
 
-    _cache[CACHE_KEY] = None
-    return None
+    return _done(None)
 
 
 def find_all_addata(force_refresh: bool = False) -> List[str]:
@@ -522,6 +555,16 @@ def rank_incomplete() -> List[str]:
     空でなければ「いちばん新しい版を選べていないかもしれない」という意味。
     """
     return list(_cache.get(RANK_KEY) or [])
+
+
+def search_skipped() -> List[str]:
+    """直前の find_addata で、締切のため見ていない候補。
+
+    空でなければ「無いと分かった」のではなく「探しきれていない」。
+    未検出と同じ顔で扱うと、応答の遅い PC で Addata があるのに
+    ベタ打ちモードに落ちたまま気づけない。
+    """
+    return list(_cache.get(SKIPPED_KEY) or [])
 
 
 def newer_addata_candidates(current: Optional[str],

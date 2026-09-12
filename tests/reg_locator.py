@@ -247,6 +247,86 @@ try:
         '11b: _is_valid_addata の呼び出しが %d か所ある'
         '（_valid() の中の1か所だけのはず）' % _src.count('_is_valid_addata('))
 
+    # ── 12. 締切で見送った候補は「無効」と同じ扱いにしないこと ────────
+    # 時間切れで見ていないだけなのに未検出にすると、Addata が手元に
+    # あるのにベタ打ちモードに落ちる。しかも None をキャッシュすると、
+    # 以後ずっと未検出のままになる。
+    _orig_valid2 = L._is_valid_addata
+    _orig_sec2 = L._SEARCH_SECONDS
+    try:
+        def _slow2(path, max_check=3):
+            time.sleep(5.0)
+            return True          # 本当は有効な Addata
+        L._is_valid_addata = _slow2
+        L._SEARCH_SECONDS = 1.0
+        L._STANDARD_PATHS = (new_v,)
+        L._ONEDRIVE_SUBPATHS = ()
+        L._candidate_onedrive_roots = lambda: []
+        L.config_addata_root = lambda: None
+        os.environ.pop('ADDATA_ROOT', None)
+        L._cache.clear()
+        got = L.find_addata(force_refresh=True)
+        chk(got is None, '12a: 時間切れなのに何かを返している')
+        chk(L.search_skipped(),
+            '12b: 締切で見送った候補があることが外から分からない'
+            '（Addata が手元にあるのにベタ打ちモードに落ちたまま気づけない）')
+        chk(L._cache.get(L.CACHE_KEY, '未設定') == '未設定',
+            '12c: 時間切れの未検出をキャッシュしている'
+            '（以後ずっと未検出のままになる）')
+    finally:
+        L._is_valid_addata = _orig_valid2
+        L._SEARCH_SECONDS = _orig_sec2
+        L._STANDARD_PATHS, L._ONEDRIVE_SUBPATHS = _std2, _sub2
+        L._candidate_onedrive_roots = _od2
+        L.config_addata_root = _cfg2
+        L._cache.clear()
+
+    # ── 13. 控えは毎回の探索のものであること（前回の値を残さない） ──────
+    try:
+        L._STANDARD_PATHS = (new_v,)
+        L._ONEDRIVE_SUBPATHS = ()
+        L._candidate_onedrive_roots = lambda: []
+        L.config_addata_root = lambda: None
+        os.environ['ADDATA_ROOT'] = new_v
+        L._cache[L.RANK_KEY] = ['前回の残り']
+        L._cache[L.SKIPPED_KEY] = ['前回の残り']
+        L.find_addata(force_refresh=True)
+        chk(L.rank_incomplete() == [],
+            '13a: 環境変数で決まったのに前回の「版を読めなかった候補」が残る')
+        chk(L.search_skipped() == [],
+            '13b: 環境変数で決まったのに前回の「見ていない候補」が残る')
+    finally:
+        os.environ.pop('ADDATA_ROOT', None)
+        L._STANDARD_PATHS, L._ONEDRIVE_SUBPATHS = _std2, _sub2
+        L._candidate_onedrive_roots = _od2
+        L.config_addata_root = _cfg2
+        L._cache.clear()
+
+    # ── 14. AnVer.DB が無い候補は「版で比べた」ことにしないこと ──────
+    nover = os.path.join(TMP, 'nover')
+    os.makedirs(os.path.join(nover, 'A', 'ZZZ'), exist_ok=True)
+    with open(os.path.join(nover, 'A', 'ZZZ', 'ZZZ01.DB'), 'wb') as f:
+        f.write(b'dummy')
+    try:
+        L._STANDARD_PATHS = (nover, new_v)
+        L._ONEDRIVE_SUBPATHS = ()
+        L._candidate_onedrive_roots = lambda: []
+        L.config_addata_root = lambda: None
+        os.environ.pop('ADDATA_ROOT', None)
+        L._cache.clear()
+        got = L.find_addata(force_refresh=True)
+        chk(got == new_v, '14a: 版のある方(%s)ではなく %s を選んだ'
+            % (os.path.basename(new_v), got))
+        chk(any(os.path.normcase(x) == os.path.normcase(nover)
+                for x in L.rank_incomplete()),
+            '14b: AnVer.DB の無い候補を「版で比べた」ことにしている'
+            '（更新日時で順位が付くだけなのに警告が出ない）')
+    finally:
+        L._STANDARD_PATHS, L._ONEDRIVE_SUBPATHS = _std2, _sub2
+        L._candidate_onedrive_roots = _od2
+        L.config_addata_root = _cfg2
+        L._cache.clear()
+
     # ── 6. 実機の設定が今どうなっているか（参考・失敗にはしない） ──
     _live = L.config_addata_root()
     print('  参考: この PC の設定ファイルの ADDATA =', _live or '(未設定)')

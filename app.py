@@ -6602,6 +6602,20 @@ def main():
                 st.rerun()
         else:
             st.warning("Addataフォルダ未検出（ベタ打ちモードで生成します）")
+            # 「無いと分かった」のか「時間切れで探しきれていない」のかは
+            # 別の話。応答しない共有や未同期の OneDrive があると、Addata が
+            # 手元にあるのにベタ打ちモードに落ちたまま気づけない。
+            try:
+                from addata_locator import search_skipped as _skipped
+                _sk = _skipped()
+            except Exception:
+                _sk = []
+            if _sk:
+                st.info(
+                    f"※ 探索の制限時間内に見きれなかった候補が{len(_sk)}件"
+                    "あります（応答しない共有や未同期の OneDrive が"
+                    "原因のことが多い）。Addata が手元にある場合は、"
+                    "設定で場所を直接指定してください。")
             # 取得URLが設定されていて失敗している場合は理由をここにも出す。
             # 設定画面をたたまれていると気づけないため。
             _url_err = st.session_state.get('_addata_url_error')
