@@ -14,10 +14,61 @@
      さらにその下に *01.DB / *11.DB / *12.DB が存在する。
 """
 from __future__ import annotations
+import io
+import json
 import os
 import sys
 import re
+import threading
 from typing import List, Optional
+
+# ファイル探索の壁時計の上限（秒）。応答しない共有・未同期の OneDrive では
+# os.listdir / open がそのまま返らないことがあり、件数の上限では止まらない。
+# pdf-to-neo スキルの skill_env.py と同じ考え方。
+try:
+    _SEARCH_SECONDS = float(os.environ.get('ADDATA_SCAN_SECONDS') or 20)
+except ValueError:
+    _SEARCH_SECONDS = 20.0
+
+# env_check.py --save が書く、この PC の設定
+_SKILL_CONFIG = os.path.join(os.path.expanduser('~'), '.claude',
+                             'pdf-to-neo.local.json')
+
+
+def _bounded(fn, seconds: float, default):
+    """fn() を壁時計で打ち切る。返らなければ default。
+
+    応答しない共有フォルダでは os.listdir が返らないので、時間の上限は
+    スレッド境界でしか作れない（中のスレッドは daemon なので置き去りでよい）。
+    """
+    box = {}
+
+    def _run():
+        try:
+            box['v'] = fn()
+        except BaseException:      # noqa: BLE001  探索の失敗で呼び出し側を止めない
+            pass
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(max(0.1, seconds))
+    return box.get('v', default)
+
+
+def config_addata_root() -> Optional[str]:
+    """pdf-to-neo スキルの env_check --save が決めた ADDATA。
+
+    同じ PC で 2 つの実装が別々の ADDATA を掴むと、標準品番・標準指数が
+    変わって協定見積の中身が変わる。env_check を通した PC では、
+    そこで決めた場所をアプリでも使う。
+    Streamlit Cloud のように設定ファイルが無い環境では単に None。
+    """
+    try:
+        with io.open(_SKILL_CONFIG, encoding='utf-8') as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    root = cfg.get('ADDATA_ROOT') if isinstance(cfg, dict) else None
+    return root if isinstance(root, str) and root else None
 
 CACHE_KEY = "_ADDATA_LOCATOR_CACHE"
 ALL_CACHE_KEY = "_ADDATA_LOCATOR_ALL_CACHE"
@@ -267,11 +318,30 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
     if not force_refresh and CACHE_KEY in _cache:
         return _cache[CACHE_KEY]
 
+    import time as _time
+    _deadline = _time.time() + _SEARCH_SECONDS
+
+    def _left(cap: float) -> float:
+        return max(0.5, min(cap, _deadline - _time.time()))
+
+    def _valid(p, cap=3.0) -> bool:
+        # 応答しない共有を指していると os.listdir が返らない。
+        # 呼び出し側（画面）を止めないよう、1 候補ずつ上限をかける。
+        return bool(_bounded(lambda: _is_valid_addata(p), _left(cap), False))
+
     # 1. 環境変数
     env_root = os.environ.get("ADDATA_ROOT")
-    if env_root and _is_valid_addata(env_root):
+    if env_root and _valid(env_root):
         _cache[CACHE_KEY] = env_root
         return env_root
+
+    # 1b. pdf-to-neo スキルの設定（env_check.py --save の結果）
+    #     同じ PC で 2 つの実装が別々の ADDATA を掴むと、標準品番・
+    #     標準指数が変わって協定見積の中身が変わる。
+    cfg_root = config_addata_root()
+    if cfg_root and _valid(cfg_root):
+        _cache[CACHE_KEY] = cfg_root
+        return cfg_root
 
     # 2. 標準位置と OneDrive の典型サブパスを「全部」見て、データ版が新しいものを選ぶ。
     #    以前は最初に見つかったものをそのまま返していたため、古い C:\Addata を
@@ -280,15 +350,16 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
     #    候補はどれも数個で、読むのは COM/AnVer.DB（小さい INI）だけなので速い。
     _shallow = []
     for std in _STANDARD_PATHS:
-        if _is_valid_addata(std):
+        if _valid(std):
             _shallow.append(std)
     for od in _candidate_onedrive_roots():
         for sub in _ONEDRIVE_SUBPATHS:
             cand = os.path.join(od, sub)
-            if _is_valid_addata(cand):
+            if _valid(cand):
                 _shallow.append(cand)
     if _shallow:
-        best = max(_shallow, key=addata_version_key)
+        best = max(_shallow, key=lambda p: _bounded(
+            lambda: addata_version_key(p), _left(3.0), (0.0, 0.0)))
         _cache[CACHE_KEY] = best
         return best
 
@@ -302,31 +373,43 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
                 return cand
 
     # 3. OneDrive配下を並列検索（複数候補を同時走査で最大3倍速）
-    try:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        roots = _candidate_onedrive_roots()
-        if roots:
+    #    見つかった順ではなく**データ版の新しい順**で選ぶ。最初に返ったものを
+    #    採ると、古い ADDATA が置いてある OneDrive を先に読み終えただけで
+    #    古い版を掴み、標準品番・標準指数が実機と食い違う。
+    #    全体の残り時間で打ち切る（walk は件数の上限では止まらない）。
+    def _deep_all() -> List[str]:
+        out: List[str] = []
+        try:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            roots = _candidate_onedrive_roots()
+            if not roots:
+                return out
             with ThreadPoolExecutor(max_workers=min(len(roots), 4)) as ex:
-                futures = {ex.submit(_walk_for_addata, r, 5, 30000): r for r in roots}
+                futures = [ex.submit(_walk_for_addata, r, 5, 30000)
+                           for r in roots]
                 for fu in as_completed(futures):
                     try:
-                        found = fu.result()
-                    except Exception:
-                        found = None
-                    if found:
-                        # 残りのfutureはcancel
-                        for f in futures:
-                            if f is not fu:
-                                f.cancel()
-                        _cache[CACHE_KEY] = found
-                        return found
-    except Exception:
-        # フォールバック: 直列
-        for od in _candidate_onedrive_roots():
-            found = _walk_for_addata(od, max_depth=5, max_dirs=30000)
-            if found:
-                _cache[CACHE_KEY] = found
-                return found
+                        got = fu.result()
+                    except Exception:      # noqa: BLE001
+                        got = None
+                    if got:
+                        out.append(got)
+        except Exception:      # noqa: BLE001  フォールバック: 直列
+            for od in _candidate_onedrive_roots():
+                try:
+                    got = _walk_for_addata(od, max_depth=5, max_dirs=30000)
+                except Exception:      # noqa: BLE001
+                    got = None
+                if got:
+                    out.append(got)
+        return out
+
+    deep = _bounded(_deep_all, _left(_SEARCH_SECONDS), []) or []
+    if deep:
+        best = max(deep, key=lambda p: _bounded(
+            lambda: addata_version_key(p), _left(3.0), (0.0, 0.0)))
+        _cache[CACHE_KEY] = best
+        return best
 
     _cache[CACHE_KEY] = None
     return None
@@ -381,8 +464,37 @@ def find_all_addata(force_refresh: bool = False) -> List[str]:
             except Exception:
                 pass
 
+    # 版の新しい順に並べる。優先度順のまま返すと、画面に出したときに
+    # 「いちばん上が最新」と読めてしまい、古い版を選ばせることになる。
+    found.sort(key=addata_version_key, reverse=True)
     _cache[ALL_CACHE_KEY] = list(found)
     return found
+
+
+def newer_addata_candidates(current: Optional[str],
+                            budget: float = 8.0) -> List[tuple]:
+    """いま使っている ADDATA より新しい版の候補を [(場所, 版), ...] で返す。
+
+    古い C:\\Addata を残したまま新しい版を別の場所に置いている PC では、
+    気づかないまま古い版で照合してしまう。版が違うと標準品番・標準指数が
+    変わるので、協定見積に載る部品コードや指数が実機と食い違う。
+    （pdf-to-neo スキルの env_check.py がしている確認と同じ）
+
+    画面から呼ぶので、探索は budget 秒で打ち切る。
+    """
+    cur_v = addata_version(current) if current else ''
+    if not cur_v:
+        return []
+    cur_n = os.path.normcase(os.path.abspath(current))
+    others = _bounded(lambda: find_all_addata(force_refresh=False), budget, [])
+    out = []
+    for q in (others or []):
+        if os.path.normcase(os.path.abspath(q)) == cur_n:
+            continue
+        v = addata_version(q)
+        if v and addata_version_key(q) > addata_version_key(current):
+            out.append((q, v))
+    return out
 
 
 def list_candidate_paths() -> List[str]:

@@ -6558,6 +6558,23 @@ def main():
                        else "データ版: 不明（COM/AnVer.DB が読めません）")
             st.caption(("車種マスタ KA06_ALL.DB あり" if _ka06
                         else "※ COM/KA06_ALL.DB が無いため車種の自動特定はできません"))
+            # この PC に、いま使っているものより**新しい版**の Addata が
+            # 置いてあることがある（古い C:\Addata を残したまま新しい版を
+            # 別の場所に入れた PC）。版が違うと標準品番・標準指数が変わり、
+            # 協定見積に載る部品コードや指数が実機と食い違う。
+            # pdf-to-neo スキルの env_check.py と同じ確認を画面でも出す。
+            try:
+                from addata_locator import newer_addata_candidates as _newer
+                _nw = _newer(addata_status, budget=8.0)
+            except Exception:
+                _nw = []
+            if _nw:
+                st.warning(
+                    "⚠️ この PC には、もっと新しい版の Addata があります"
+                    + "（" + "／".join(f"{_p}（{_v}）" for _p, _v in _nw[:2]) + "）。"
+                    "版が違うと標準品番・標準指数が変わるため、"
+                    "協定見積の部品コードや指数が実機と食い違います。"
+                    "使いたい方を指定するか、古い方を消してください。")
             if st.button("🗑️ Addataを解除", key='addata_clear_btn'):
                 _discard_uploaded_addata()
                 st.rerun()
