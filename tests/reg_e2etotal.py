@@ -648,6 +648,28 @@ _src = inspect.getsource(P.verify_neo_against_pdf)
 chk('ORDER BY LineNo' in _src,
     '28: ERParts を並び順の指定なしで読んでいる（行の突き合わせがずれる）')
 
+# ── 29. 工賃の「あるなし」は差引後ではなく行で見る（Codex 9周目） ──────
+# 明細の工賃が打ち消し合って 0 になると「工賃が無い見積」に見え、
+# 工賃を一度も比べずに合格していた。
+_IZ2 = [{'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 38600,
+         'wage': 0, 'quantity': 1},
+        {'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'parts_amount': 0,
+         'wage': 9800, 'quantity': 1},
+        {'name': '工賃サービス', 'method': '', 'parts_amount': 0,
+         'wage': -9800, 'quantity': 1}]
+_nb = app.generate_neo_file(_TPLB, {'customer_name': 'ｹﾝｼｮｳ'},
+                            [dict(i) for i in _IZ2], 0, {}, {},
+                            False, False, False)[0]
+_v = P.verify_neo_against_pdf(_nb, _IZ2, pdf_parts_total=38600)
+chk(not _v.get('ok'),
+    '29: 明細の工賃が差引0の見積で、工賃を比べずに合格している')
+
+# ── 30. 並び順を保証できないときは行ごとの検証をしたと言わないこと ──────
+_src = inspect.getsource(P.verify_neo_against_pdf)
+chk('_ordered' in _src and 'and _ordered' in _src,
+    '30: 並び順を指定できないまま行ごとに突き合わせている'
+    '（SQLite の返す順しだいで正しい .neo が「行が違う」になる）')
+
 print('REG_E2ETOTAL:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
     print('  -', f)

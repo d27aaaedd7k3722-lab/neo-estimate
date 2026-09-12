@@ -1440,15 +1440,20 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             # 順番を約束しないので、行ごとの突き合わせがずれる。
             rows = None
             _has_wage = False
-            for _sql, _hw in (
+            # 並び順を指定できたかどうか。指定できないまま行ごとに
+            # 突き合わせると、SQLite の返す順しだいで正しい .neo が
+            # 「行が違う」と報告されうる。指定できなければ行ごとの検証は
+            # 「していない」にする（合計の検証はそのまま効く）。
+            _ordered = False
+            for _sql, _hw, _od in (
                     (_SEL + ", WageOutTax, WageInTax FROM ERParts"
-                     " ORDER BY LineNo", True),
-                    (_SEL + ", WageOutTax, WageInTax FROM ERParts", True),
-                    (_SEL + " FROM ERParts ORDER BY LineNo", False),
-                    (_SEL + " FROM ERParts", False)):
+                     " ORDER BY LineNo", True, True),
+                    (_SEL + ", WageOutTax, WageInTax FROM ERParts", True, False),
+                    (_SEL + " FROM ERParts ORDER BY LineNo", False, True),
+                    (_SEL + " FROM ERParts", False, False)):
                 try:
                     rows = cur.execute(_sql).fetchall()
-                    _has_wage = _hw
+                    _has_wage, _ordered = _hw, _od
                     break
                 except sqlite3.Error:
                     continue
@@ -1716,7 +1721,7 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                 return 0
 
             res["line_match"] = None
-            if items and neo_count == len(items):
+            if items and neo_count == len(items) and _ordered:
                 _bad_lines = []
                 for _i, _it in enumerate(items):
                     _p_want = _item_parts(_it)
@@ -1774,10 +1779,16 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                 # .neo 側に工賃が無くても、見積書や明細に工賃があるなら
                 # 比べないまま合格にはできない（工賃の欄を持たない
                 # テンプレートだと .neo 側はいつも 0 になる）。
+                # 差引後の合計で見ると、工賃の行とマイナスの行が
+                # 打ち消し合って 0 になったときに素通りする。
+                # 「工賃の入った行が1つでもあるか」で見る。
+                _items_have_wage = any(
+                    _to_int(it_.get("wage") or it_.get("labor_fee"))
+                    for it_ in (items or []))
                 _wage_expected = bool(
                     _neo_wage_plus or neo_wage_minus
                     or _to_int(pdf_wage_total_arg)
-                    or items_wage_total)
+                    or _items_have_wage)
                 if _wage_expected and not _cmp_wage:
                     # 工賃が入っている .neo なのに、印字された工賃計も
                     # 総額も無い。工賃を1円も確かめないまま
