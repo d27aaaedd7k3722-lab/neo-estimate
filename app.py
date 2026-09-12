@@ -1014,16 +1014,27 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
         # .neo をテンプレートにしたとき、塗装計を 0 にしていても
         # コグニで塗装ページを開いた瞬間に前案件の加算基礎が生き返り、
         # 金額に乗る。FramePlan・PaintingEtcetera は同じ理由で消している。
-        cur.execute("""UPDATE PaintingPlan SET
-            BoothFlag=0, BoothTime=-1, BoothWageOutTax=-1,
-            BoothWageInTax=-1, BoothWageTax=-1, BoothWageByManual='',
-            PaintingType=0, PaintingTypeName='', MaterialRate=0,
-            TwoToneFlag=0,
-            BaseTime=-1, BaseWageOutTax=-1, BaseWageInTax=-1,
-            BaseWageTax=-1, BaseWageByManual='', BaseByManual=0,
-            BumperBaseTime=-1, BumperBaseWageOutTax=-1,
-            BumperBaseWageInTax=-1, BumperBaseWageTax=-1,
-            BumperBaseWageByManual='', BumperBaseManual=0""")
+        #
+        # 文は**実在する欄だけ**で組み立てる。1つでも欄を持たない
+        # テンプレートを渡されると UPDATE 全体が失敗し、例外が握り潰されて
+        # もともと消していた Booth 系まで前案件の値が残るため。
+        _pp_cols = {c[1] for c in cur.execute('PRAGMA table_info(PaintingPlan)')}
+        _pp_want = (
+            ('BoothFlag', 0), ('BoothTime', -1), ('BoothWageOutTax', -1),
+            ('BoothWageInTax', -1), ('BoothWageTax', -1),
+            ('BoothWageByManual', "''"),
+            ('PaintingType', 0), ('PaintingTypeName', "''"),
+            ('MaterialRate', 0), ('TwoToneFlag', 0),
+            ('BaseTime', -1), ('BaseWageOutTax', -1), ('BaseWageInTax', -1),
+            ('BaseWageTax', -1), ('BaseWageByManual', "''"),
+            ('BaseByManual', 0),
+            ('BumperBaseTime', -1), ('BumperBaseWageOutTax', -1),
+            ('BumperBaseWageInTax', -1), ('BumperBaseWageTax', -1),
+            ('BumperBaseWageByManual', "''"), ('BumperBaseManual', 0),
+        )
+        _pp_set = ['%s=%s' % (c, v) for c, v in _pp_want if c in _pp_cols]
+        if _pp_set:
+            cur.execute('UPDATE PaintingPlan SET ' + ', '.join(_pp_set))
     except sqlite3.Error:
         pass
     # 塗装セクションの「あり」フラグも消す。工賃だけ -1 にすると
@@ -6090,8 +6101,10 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
             if retry and retry.get('items'):
                 # retry['items'] は _self_correction_retry 内で正規化済み
                 result['items'], _vc_notes2 = validate_and_correct_items(retry['items'])
-                if _vc_notes2:
-                    result.setdefault('_amount_changes', []).extend(_vc_notes2)
+                # 作り直した明細のぶんだけを残す。足すと、捨てたほうの
+                # 読み取りで動かした行の警告が出続ける（直った行なのに
+                # 「金額を動かした」と表示される）。
+                result['_amount_changes'] = list(_vc_notes2)
                 result['short_parts_wage'] = safe_int(retry.get('short_parts_wage', result.get('short_parts_wage', 0)))
                 _correction_rounds += 1
             else:

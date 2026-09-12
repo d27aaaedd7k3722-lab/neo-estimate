@@ -274,6 +274,51 @@ chk(app.safe_int(_mt) + app.safe_int(_wt) == app.safe_int(_tx),
 chk(app.safe_int(_gt) == 110809,
     '9e: 合計が %s（100,735 + 10,074 = 110,809 のはず）' % _gt)
 
+# ── 10. 塗装の加算基礎が残らないこと ──────────────────────────
+# 前案件の .neo をテンプレートにすると、塗装計を 0 にしていても
+# コグニで塗装ページを開いた瞬間に前案件の加算基礎が生き返って
+# 金額に乗る。FramePlan・PaintingEtcetera は同じ理由で消している。
+_nb = app.generate_neo_file(
+    open(os.path.join(R, 'template_toyota.neo'), 'rb').read(),
+    {'customer_name': 'ｹﾝｼｮｳ'},
+    [{'name': 'A', 'method': '取替', 'parts_amount': 1000, 'wage': 0,
+      'quantity': 1}], 0, {}, {}, False, False, False)[0]
+_ck = app.find_real_cks(_nb)
+_fs = app.extract_files(app.decompress_neo(_nb, _ck),
+                        app.parse_entries(_nb, _ck[0])[1])
+_tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+try:
+    _tf.write(_fs['AnSMB.txt'])
+    _tf.close()
+    _con = sqlite3.connect(_tf.name)
+    try:
+        _pp = _con.execute(
+            'select BaseTime, BaseWageOutTax, BaseWageInTax, BaseWageTax,'
+            ' BumperBaseTime, BumperBaseWageOutTax, BoothFlag, PaintingType'
+            ' from PaintingPlan').fetchone()
+    finally:
+        _con.close()
+finally:
+    try:
+        os.unlink(_tf.name)
+    except OSError:
+        pass
+for _i, _nm in enumerate(('BaseTime', 'BaseWageOutTax', 'BaseWageInTax',
+                          'BaseWageTax', 'BumperBaseTime',
+                          'BumperBaseWageOutTax')):
+    chk(app.safe_int(_pp[_i]) == -1,
+        '10: PaintingPlan.%s が %s（-1 のはず）。前案件の .neo を'
+        'テンプレートにすると塗装の加算基礎が残って金額に乗る'
+        % (_nm, _pp[_i]))
+chk(app.safe_int(_pp[6]) == 0 and app.safe_int(_pp[7]) == 0,
+    '10b: Booth / PaintingType が消えていない')
+# 欄を持たないテンプレートでも、あるぶんは消えること（文を組み立てている）
+import inspect  # noqa: E402  （上でも import 済み）
+_gsrc = inspect.getsource(app._update_ansmb_body)
+chk('PRAGMA table_info(PaintingPlan)' in _gsrc,
+    '10c: PaintingPlan のリセットを固定文で書いている。欄を1つでも'
+    '持たないテンプレートでは UPDATE 全体が失敗し、Booth 系まで残る')
+
 print('REG_FIELDS:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
     print('  -', f)
