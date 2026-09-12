@@ -200,9 +200,15 @@ def _candidate_onedrive_roots() -> List[str]:
 
 def _walk_for_addata(root: str, max_depth: int = 5,
                     max_dirs: int = 5000,
-                    stats: Optional[dict] = None) -> Optional[str]:
+                    stats: Optional[dict] = None,
+                    collect: Optional[List[str]] = None) -> Optional[str]:
     """root から再帰検索して 'Addata' フォルダかつ妥当判定で見つける。
-    stats に dict を渡すと {visited:N, hit_path:str|None} が書き戻される。"""
+    stats に dict を渡すと {visited:N, hit_path:str|None} が書き戻される。
+
+    collect に list を渡すと、最初の1件で止めずに**見つかったもの全部**を
+    そこに入れて走査を続ける。1つのルートの下に版の違う Addata が並んで
+    いることがあり、最初に当たったものを採ると古い版を掴む。
+    """
     if not os.path.isdir(root):
         return None
     visited = 0
@@ -215,7 +221,7 @@ def _walk_for_addata(root: str, max_depth: int = 5,
                 stats["visited"] = visited
                 stats["hit_path"] = None
                 stats["truncated"] = True
-            return None
+            return None if collect is None else (collect[0] if collect else None)
         # 深さ判定
         rel = os.path.relpath(cur, root)
         depth = 0 if rel == "." else rel.count(os.sep) + 1
@@ -227,6 +233,10 @@ def _walk_for_addata(root: str, max_depth: int = 5,
             if d.lower() == "addata":
                 cand = os.path.join(cur, d)
                 if _is_valid_addata(cand):
+                    if collect is not None:
+                        if cand not in collect:
+                            collect.append(cand)
+                        continue
                     if stats is not None:
                         stats["visited"] = visited
                         stats["hit_path"] = cand
@@ -248,6 +258,10 @@ def _walk_for_addata(root: str, max_depth: int = 5,
                             if hd_name.lower() == "addata":
                                 cand = os.path.join(h_cur, hd_name)
                                 if _is_valid_addata(cand):
+                                    if collect is not None:
+                                        if cand not in collect:
+                                            collect.append(cand)
+                                        continue
                                     if stats is not None:
                                         stats["visited"] = visited
                                         stats["hit_path"] = cand
@@ -322,12 +336,24 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
     _deadline = _time.time() + _SEARCH_SECONDS
 
     def _left(cap: float) -> float:
-        return max(0.5, min(cap, _deadline - _time.time()))
+        # 残り時間。0 以下なら「もう触らない」。下限を置くと、締切を過ぎて
+        # からも候補の数だけ待ち直すことになり、約束した上限を超える。
+        return min(cap, _deadline - _time.time())
 
     def _valid(p, cap=3.0) -> bool:
         # 応答しない共有を指していると os.listdir が返らない。
         # 呼び出し側（画面）を止めないよう、1 候補ずつ上限をかける。
-        return bool(_bounded(lambda: _is_valid_addata(p), _left(cap), False))
+        t = _left(cap)
+        if t <= 0:
+            return False
+        return bool(_bounded(lambda: _is_valid_addata(p), t, False))
+
+    def _vkey(p):
+        """版の新しさ。締切を過ぎていたら読みに行かない。"""
+        t = _left(3.0)
+        if t <= 0:
+            return (0.0, 0.0)
+        return _bounded(lambda: addata_version_key(p), t, (0.0, 0.0))
 
     # 1. 環境変数
     env_root = os.environ.get("ADDATA_ROOT")
@@ -358,8 +384,7 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
             if _valid(cand):
                 _shallow.append(cand)
     if _shallow:
-        best = max(_shallow, key=lambda p: _bounded(
-            lambda: addata_version_key(p), _left(3.0), (0.0, 0.0)))
+        best = max(_shallow, key=_vkey)
         _cache[CACHE_KEY] = best
         return best
 
@@ -384,30 +409,32 @@ def find_addata(force_refresh: bool = False) -> Optional[str]:
             roots = _candidate_onedrive_roots()
             if not roots:
                 return out
+            bags = {r: [] for r in roots}
             with ThreadPoolExecutor(max_workers=min(len(roots), 4)) as ex:
-                futures = [ex.submit(_walk_for_addata, r, 5, 30000)
-                           for r in roots]
+                futures = [ex.submit(_walk_for_addata, r, 5, 30000, None,
+                                     bags[r]) for r in roots]
                 for fu in as_completed(futures):
                     try:
-                        got = fu.result()
+                        fu.result()
                     except Exception:      # noqa: BLE001
-                        got = None
-                    if got:
-                        out.append(got)
+                        pass
+            for r in roots:
+                out.extend(bags[r])
         except Exception:      # noqa: BLE001  フォールバック: 直列
             for od in _candidate_onedrive_roots():
+                bag = []
                 try:
-                    got = _walk_for_addata(od, max_depth=5, max_dirs=30000)
+                    _walk_for_addata(od, max_depth=5, max_dirs=30000,
+                                     collect=bag)
                 except Exception:      # noqa: BLE001
-                    got = None
-                if got:
-                    out.append(got)
+                    pass
+                out.extend(bag)
         return out
 
-    deep = _bounded(_deep_all, _left(_SEARCH_SECONDS), []) or []
+    _deep_left = _left(_SEARCH_SECONDS)
+    deep = (_bounded(_deep_all, _deep_left, []) or []) if _deep_left > 0 else []
     if deep:
-        best = max(deep, key=lambda p: _bounded(
-            lambda: addata_version_key(p), _left(3.0), (0.0, 0.0)))
+        best = max(deep, key=_vkey)
         _cache[CACHE_KEY] = best
         return best
 
@@ -450,19 +477,27 @@ def find_all_addata(force_refresh: bool = False) -> List[str]:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         roots = _candidate_onedrive_roots()
         if roots:
+            bags2 = {r: [] for r in roots}
             with ThreadPoolExecutor(max_workers=min(len(roots), 4)) as ex:
-                futures = {ex.submit(_walk_for_addata, r, 5, 30000): r for r in roots}
+                futures = [ex.submit(_walk_for_addata, r, 5, 30000, None,
+                                     bags2[r]) for r in roots]
                 for fu in as_completed(futures):
                     try:
-                        _add(fu.result())
+                        fu.result()
                     except Exception:
                         pass
+            for r in roots:
+                for q in bags2[r]:
+                    _add(q)
     except Exception:
         for od in _candidate_onedrive_roots():
+            bag2 = []
             try:
-                _add(_walk_for_addata(od, max_depth=5, max_dirs=30000))
+                _walk_for_addata(od, max_depth=5, max_dirs=30000, collect=bag2)
             except Exception:
                 pass
+            for q in bag2:
+                _add(q)
 
     # 版の新しい順に並べる。優先度順のまま返すと、画面に出したときに
     # 「いちばん上が最新」と読めてしまい、古い版を選ばせることになる。

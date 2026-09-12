@@ -146,6 +146,66 @@ try:
     chk(L._bounded(lambda: 1 / 0, 2.0, 'ok') == 'ok',
         '7b: 例外のときに既定値を返さない')
 
+    # ── 8. 同じルートの下に版違いが並んでいたら、新しい方を選ぶ ──────
+    # 深い探索は「ルートごとに最初に見つけた1つ」しか候補にしていなかった。
+    # 1つの OneDrive の下に古い Addata と新しい Addata が並んでいると、
+    # 走査順しだいで古い方を掴む。
+    od = os.path.join(TMP, 'od')
+    make_addata(os.path.join(od, 'aaa_furui', 'Addata'), '2019/03')
+    make_addata(os.path.join(od, 'zzz_atarashii', 'Addata'), '2026/08')
+    bag = []
+    L._walk_for_addata(od, max_depth=5, max_dirs=30000, collect=bag)
+    chk(len(bag) >= 2,
+        '8a: 深い探索が %d 個しか拾っていない（同じルートに2つあるのに）'
+        % len(bag))
+    _std2, _sub2 = L._STANDARD_PATHS, L._ONEDRIVE_SUBPATHS
+    _od2, _cfg2 = L._candidate_onedrive_roots, L.config_addata_root
+    try:
+        L._STANDARD_PATHS = ()
+        L._ONEDRIVE_SUBPATHS = ()
+        L._candidate_onedrive_roots = lambda: [od]
+        L.config_addata_root = lambda: None
+        os.environ.pop('ADDATA_ROOT', None)
+        L._cache.clear()
+        got = L.find_addata(force_refresh=True)
+        chk(got and os.path.basename(os.path.dirname(got)) == 'zzz_atarashii',
+            '8b: 同じルートの下で古い版(2019/03)を選んだ → %s' % got)
+    finally:
+        L._STANDARD_PATHS, L._ONEDRIVE_SUBPATHS = _std2, _sub2
+        L._candidate_onedrive_roots = _od2
+        L.config_addata_root = _cfg2
+        L._cache.clear()
+
+    # ── 9. 締切を過ぎたらフォルダに触らないこと ─────────────────────
+    # 「最低0.5秒は待つ」にしていたため、締切を過ぎてからも候補の数だけ
+    # 待ち直し、約束した上限（既定20秒）を超えていた。
+    _orig_valid = L._is_valid_addata
+    _orig_sec = L._SEARCH_SECONDS
+    try:
+        def _slow(path, max_check=3):
+            time.sleep(2.0)          # 応答しない共有のつもり
+            return False
+        L._is_valid_addata = _slow
+        L._SEARCH_SECONDS = 3.0
+        L._STANDARD_PATHS = tuple('Z:\dummy%d' % i for i in range(20))
+        L._ONEDRIVE_SUBPATHS = ()
+        L._candidate_onedrive_roots = lambda: []
+        L.config_addata_root = lambda: None
+        L._cache.clear()
+        t0 = time.time()
+        L.find_addata(force_refresh=True)
+        el = time.time() - t0
+        chk(el < 10.0,
+            '9: 20 個の応答しない候補で %.1f 秒かかった'
+            '（上限 3 秒と決めたのに守られていない。画面が固まる）' % el)
+    finally:
+        L._is_valid_addata = _orig_valid
+        L._SEARCH_SECONDS = _orig_sec
+        L._STANDARD_PATHS, L._ONEDRIVE_SUBPATHS = _std2, _sub2
+        L._candidate_onedrive_roots = _od2
+        L.config_addata_root = _cfg2
+        L._cache.clear()
+
     # ── 6. 実機の設定が今どうなっているか（参考・失敗にはしない） ──
     _live = L.config_addata_root()
     print('  参考: この PC の設定ファイルの ADDATA =', _live or '(未設定)')
