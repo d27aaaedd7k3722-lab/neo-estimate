@@ -567,6 +567,42 @@ chk(any(m.get('type') == 'no_pdf_wage'
     '22b: 工賃を比べていないことが mismatches に出ていない'
     '（差引後の合計で見ているため打ち消し合うと素通りする）')
 
+# ── 23. 行ごとの金額を比べること（Codex 7周目） ────────────────────
+# 合計と行数しか見ていなかったので、2行のあいだで金額が入れ替わって
+# いても「一致」と出ていた。協定見積は「同じ明細行・同じ金額」が条件。
+_good = [{'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 38600,
+          'wage': 0, 'quantity': 1},
+         {'name': 'Fﾊﾞﾝﾊﾟ', 'method': '取替', 'parts_amount': 20000,
+          'wage': 0, 'quantity': 1}]
+_swap = [dict(_good[0], parts_amount=39600), dict(_good[1], parts_amount=19000)]
+_GT2 = jr(58600 * 1.10)
+_v = P.verify_neo_against_pdf(
+    app.generate_neo_file(_TPLB, {'customer_name': 'ｹﾝｼｮｳ'},
+                          [dict(i) for i in _swap], 0, {}, {},
+                          False, False, False)[0],
+    _good, pdf_parts_total=58600, pdf_grand_total=_GT2, grand_is_intax=True)
+chk(_v.get('line_match') is False,
+    '23a: 2行のあいだで金額が入れ替わっているのに行ごとの検証が通っている')
+chk(not _v.get('ok'),
+    '23b: 合計と行数が合っていれば、行の金額が違っても「一致」と出る')
+chk(any(m.get('type') == 'line' for m in (_v.get('mismatches') or [])),
+    '23c: どの行が違うのかが mismatches に出ていない')
+# 正しい .neo では行ごとの検証も通ること
+_v = P.verify_neo_against_pdf(
+    app.generate_neo_file(_TPLB, {'customer_name': 'ｹﾝｼｮｳ'},
+                          [dict(i) for i in _good], 0, {}, {},
+                          False, False, False)[0],
+    _good, pdf_parts_total=58600, pdf_grand_total=_GT2, grand_is_intax=True)
+chk(_v.get('line_match') is True and _v.get('ok'),
+    '23d: 正しい .neo で行ごとの検証が落ちる（誤報）')
+
+# ── 24. 総額を渡されたのに読めなかったら素通りさせないこと ──────────
+# .neo の Total が読めなかったときに grand_match が None のままだと、
+# 「いちばん強い検査を外した」まま合格になる。
+_v = P.verify_neo_against_pdf(b'not a neo', _good, pdf_parts_total=58600,
+                              pdf_grand_total=_GT2)
+chk(not _v.get('ok'), '24: 壊れた .neo で検証が通っている')
+
 print('REG_E2ETOTAL:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
     print('  -', f)

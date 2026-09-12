@@ -1429,6 +1429,10 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             cur = conn.cursor()
             _SEL = ("SELECT PartsNo, PartsUnitPriceOutTax, PartsUnitPriceInTax, "
                     "PartsPriceOutTax, PartsPriceInTax, PartsCount")
+            # 行ごとの金額をためる。合計だけ見ていると、2行のあいだで
+            # 金額が入れ替わっていても「一致」と出てしまう。協定見積は
+            # 同じ明細行・同じ金額であることが条件なので、行で見る。
+            neo_lines = []
             try:
                 # 工賃も読む。以前は部品しか読んでおらず、工賃がいくら
                 # 違っていても行数と部品計さえ合えば「検証OK」と出ていた。
@@ -1487,6 +1491,7 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                         _u_out, _u_in = _pair(r[1], r[2])
                         _q = max(_to_int(r[5], 1), 1)
                         p_out, p_in = _u_out * _q, _u_in * _q
+                    neo_lines.append((p_out, p_in, None, None))
                     neo_p[False] += p_out
                     neo_p[True] += p_in
                     if p_out < 0 or p_in < 0:
@@ -1494,6 +1499,7 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                         neo_p_minus[True] += p_in
                     if _has_wage:
                         w_out, w_in = _pair(r[6], r[7])
+                        neo_lines[-1] = (p_out, p_in, w_out, w_in)
                         neo_w[False] += w_out
                         neo_w[True] += w_in
                         if w_out < 0 or w_in < 0:
@@ -1672,12 +1678,56 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                                  "note": "見積書の総額と .neo の合計"})
                 except sqlite3.Error as e:
                     logger.debug("Total テーブルの読み出しをとばす: %s", e)
+                if res["grand_match"] is None:
+                    # 総額を渡されたのに .neo の合計が読めなかった。
+                    # 「比べていない」を素通りさせない。
+                    res["grand_match"] = False
+                    res["mismatches"].append(
+                        {"type": "grand", "neo": None, "pdf": _g,
+                         "note": ".neo の合計が読み取れず、総額を"
+                                 "突き合わせられなかった"})
+            # 行ごとの金額が原本どおりか。合計だけ見ていると、
+            # 2行のあいだで金額が入れ替わっていても「一致」と出る。
+            # .neo は印字と同じ基準の欄を持っているので、ぴったり比べられる。
+            res["line_match"] = None
+            if items and neo_count == len(items):
+                _bad_lines = []
+                for _i, _it in enumerate(items):
+                    _p_want = _to_int(_it.get("parts_amount")
+                                      or _it.get("amount"))
+                    _w_want = _to_int(_it.get("wage") or _it.get("labor_fee"))
+                    _p_got = neo_lines[_i][1 if _B else 0]
+                    _w_got = neo_lines[_i][3 if _B else 2]
+                    if _p_got != _p_want:
+                        _bad_lines.append(
+                            {"line": _i + 1,
+                             "name": str(_it.get("name")
+                                         or _it.get("parts_name") or ""),
+                             "kind": "部品", "neo": _p_got, "pdf": _p_want})
+                    if _has_wage and _w_got is not None and _w_got != _w_want:
+                        _bad_lines.append(
+                            {"line": _i + 1,
+                             "name": str(_it.get("name")
+                                         or _it.get("parts_name") or ""),
+                             "kind": "工賃", "neo": _w_got, "pdf": _w_want})
+                res["line_match"] = not _bad_lines
+                res["bad_lines"] = _bad_lines[:10]
+                if _bad_lines:
+                    _b0 = _bad_lines[0]
+                    res["mismatches"].append(
+                        {"type": "line", "neo": _b0["neo"], "pdf": _b0["pdf"],
+                         "note": "%d行目「%s」の%s（ほか%d件）"
+                                 % (_b0["line"], _b0["name"], _b0["kind"],
+                                    len(_bad_lines) - 1)})
             # 何と突き合わせたのか。「比べていない」を「一致」と
             # 言ってはいけないが、「比べる必要が無かった」まで
             # 不合格にすると、工賃だけの見積が毎回「検証できていません」に
             # なってしまう（印字された部品計 0 は正しい値）。
             _cmp_parts = res.get("total_source") == "pdf_header"
-            _cmp_wage = res.get("wage_source") == "pdf_header"
+            # 「印字された工賃計が読めた」だけでは比べたことにならない。
+            # ERParts に工賃の欄が無いテンプレートでは比較そのものが
+            # 走らないのに、以前は「比べた」ことになっていた。
+            _cmp_wage = res.get("wage_match") is not None
             _cmp_grand = res.get("grand_match") is not None
             res["parts_checked"] = _cmp_parts
             res["verified_against_pdf"] = bool(_cmp_parts or _cmp_wage
@@ -1722,7 +1772,8 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                              and neo_count > 0
                              and res.get("verified_against_pdf")
                              and res.get("grand_match") is not False
-                             and res.get("wage_match") is not False)
+                             and res.get("wage_match") is not False
+                             and res.get("line_match") is not False)
             return res
         finally:
             try:
@@ -2175,10 +2226,14 @@ def process_pdf_to_neo(pdf_path,
                 _decided = False
                 if _pw_net > 0:
                     _e = max(int(_pw_net * 0.01), 100)
-                    if abs(pdf_g - _pw_net) <= _e:
-                        _grand_is_intax, _decided = False, True
-                    elif abs(pdf_g - int(round(_pw_net * 1.10))) <= _e:
-                        _grand_is_intax, _decided = True, True
+                    # 税抜のほうを先に見て「収まっていれば採用」にすると、
+                    # 総額が小さい見積で 100円 の下限が両方の解釈を飲み込み、
+                    # 税込のほうがぴったり合っていても税抜と判定してしまう。
+                    # 近いほうを採る。
+                    _d_ex = abs(pdf_g - _pw_net)
+                    _d_in = abs(pdf_g - int(round(_pw_net * 1.10)))
+                    if min(_d_ex, _d_in) <= _e:
+                        _grand_is_intax, _decided = (_d_in < _d_ex), True
                 # 部品計・工賃計が両方そろっているときだけ使える判定。片方しか
                 # 無い形式では、A-4 が欠けた側を明細合算で補うため、証拠が
                 # 明細合算に汚染されていて使えない。

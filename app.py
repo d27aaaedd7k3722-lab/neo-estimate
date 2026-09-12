@@ -7034,7 +7034,12 @@ def main():
                 # 自分の読み取り結果そのものになり、明細を丸ごと
                 # 読み落としても「一致」と出てしまう。
                 if _p2n_v.get('error'):
-                    st.caption(f"🔍 検証スキップ: {_p2n_v['error']}")
+                    # 保険会社に出すファイルなので、検証できなかったことは
+                    # 小さな文字ではなく警告として出す。
+                    st.warning(
+                        f"🔍 検証できませんでした（{_p2n_v['error']}）。"
+                        "生成NEOと原本を突き合わせていません。"
+                        "「プレビューに取り込む」で1行ずつご確認ください。")
                 elif (_p2n_v.get('count_match') and _p2n_v.get('total_match')
                       and _p2n_v.get('verified_against_pdf')):
                     # 工賃は長らく検証に入っておらず、部品計と行数だけで
