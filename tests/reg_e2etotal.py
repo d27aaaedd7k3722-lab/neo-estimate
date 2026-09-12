@@ -526,6 +526,25 @@ chk(_v.get('ok'),
     '19: 工賃だけの見積が「検証できていません」になる'
     '（印字された部品計 0 を「読めなかった」と取り違えている）')
 
+# ── 20. 金額の入っている側を比べ残さないこと（Codex 5周目） ──────────
+# 部品計だけ印字され、工賃計も総額も印字されていない見積では、
+# 工賃を1円も比べないまま「一致」と出ていた。
+_res = run(_I2, {'pdf_parts_total': 38600, 'pdf_wage_total': 0,
+                 'discount_amount': 0, 'pdf_grand_total': 0}, False)
+_v = _res.get('verify') or {}
+chk(not _v.get('ok'),
+    '20a: 工賃を一度も突き合わせていないのに検証が通っている')
+chk(any(m.get('type') == 'no_pdf_wage'
+        for m in (_v.get('mismatches') or [])),
+    '20b: 工賃を比べていないことが mismatches に出ていない')
+
+# ── 21. 総額の丸めは生成側と同じ規則を使うこと ──────────────────
+# Python の round() は偶数丸め。生成側は四捨五入（.5 切り上げ）なので、
+# .5 になる見積で正しい .neo が「差異あり」になる。
+_src = inspect.getsource(P.verify_neo_against_pdf)
+chk('int(round(_g * (1 + tax_rate)))' not in _src,
+    '21: 総額の丸めに Python の round()（偶数丸め）を使っている')
+
 print('REG_E2ETOTAL:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
     print('  -', f)

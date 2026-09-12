@@ -1326,6 +1326,14 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
     画面から足したレッカー代などの費用がある .neo は総額が増えるので、
     呼び出し側が pdf_grand_total を渡さないこと。
     """
+    def _yen2(x):
+        """日本円の丸め（四捨五入・.5 は切り上げ）。生成側と同じ規則。"""
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return 0
+        return int(v + 0.5) if v >= 0 else -int(-v + 0.5)
+
     pdf_parts_total_arg = pdf_parts_total
     pdf_wage_total_arg = pdf_wage_total
     res = {
@@ -1452,14 +1460,23 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                 v = _to_float(x)
                 return 0.0 if v == -1 else v
 
+            def _yen(x):
+                """日本円の丸め（四捨五入・.5 は切り上げ）。
+
+                Python の round() は偶数丸めなので、生成側（jpy_round）と
+                食い違い、.5 になる見積で誤報が出る。
+                """
+                v = float(x)
+                return int(v + 0.5) if v >= 0 else -int(-v + 0.5)
+
             def _pair(a, b):
                 """(税抜, 税込)。片方しか無い行は、有るほうから換算する。"""
                 o = _amt(a)
                 i = _amt(b)
                 if o and not i:
-                    i = int(round(o * (1 + tax_rate)))
+                    i = _yen(o * (1 + tax_rate))
                 elif i and not o:
-                    o = int(round(i / (1 + tax_rate)))
+                    o = _yen(i / (1 + tax_rate))
                 return o, i
 
             for r in rows:
@@ -1638,8 +1655,10 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                         _neo_grand = _to_int(_nt[0])
                         # 印字された総額が明細の 1.1 倍の基準なら、それが
                         # そのまま .neo の税込合計。そうでなければ 1.1 倍する。
+                        # 生成側は四捨五入（.5 切り上げ）。Python の round() は
+                        # 偶数丸めなので、ここで使うと .5 になる見積で誤報が出る。
                         _want = (_g if (is_tax_inclusive or grand_is_intax)
-                                 else int(round(_g * (1 + tax_rate))))
+                                 else _yen2(_g * (1 + tax_rate)))
                         res["neo_grand_total"] = _neo_grand
                         res["pdf_grand_total"] = _g
                         # 協定見積は1円でも違えば使えない。許容は置かない。
@@ -1663,14 +1682,39 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
             res["parts_checked"] = _cmp_parts
             res["verified_against_pdf"] = bool(_cmp_parts or _cmp_wage
                                                or _cmp_grand)
-            if not _cmp_parts and not _cmp_grand and _neo_plus:
-                # 部品が入っている .neo なのに、印字された部品計とも
-                # 総額とも突き合わせていない。比べた相手は自分の読み取り
-                # 結果だけなので、一致しても何も確かめたことにならない。
-                res["total_match"] = False
-                res["mismatches"].append(
-                    {"type": "no_pdf_total", "neo": neo_total, "pdf": None,
-                     "note": "見積書の部品計・総額が読み取れず、突き合わせていない"})
+            # 金額の入っている側を1つでも比べ残していたら「一致」と言わない。
+            # 総額を突き合わせていれば部品も工賃もまとめて確かめられるが、
+            # 総額が印字されていない見積では、印字された小計が無い側は
+            # 誰も見ていないことになる。
+            if not _cmp_grand:
+                if _neo_plus and not _cmp_parts:
+                    res["total_match"] = False
+                    res["mismatches"].append(
+                        {"type": "no_pdf_total", "neo": neo_total, "pdf": None,
+                         "note": "見積書の部品計・総額が読み取れず、"
+                                 "突き合わせていない"})
+                if neo_wage and not _cmp_wage:
+                    # 工賃が入っている .neo なのに、印字された工賃計も
+                    # 総額も無い。工賃を1円も確かめないまま
+                    # 「一致」と出していた。
+                    res["total_match"] = False
+                    res["mismatches"].append(
+                        {"type": "no_pdf_wage", "neo": neo_wage, "pdf": None,
+                         "note": "見積書の工賃計・総額が読み取れず、"
+                                 "突き合わせていない"})
+            # 税区分の取り違えに気づけるようにする。画面のラジオで選んだ
+            # 基準では合わないのに、反対の基準ならぴったり合うときは、
+            # 税込／税抜の選び間違いが疑わしい。
+            if _cmp_parts and not res["total_match"]:
+                _other = neo_p[not _B] - neo_p_minus[not _B]
+                _other_all = neo_p[not _B]
+                if (abs(_other - pdf_parts_total) < _tol
+                        or abs(_other_all - pdf_parts_total) < _tol):
+                    res["tax_basis_suspect"] = True
+                    res["mismatches"].append(
+                        {"type": "tax_basis", "neo": neo_total,
+                         "pdf": pdf_parts_total,
+                         "note": "税込／税抜の選び方が見積書と逆の可能性"})
             res["ok"] = bool(res["count_match"] and res["total_match"]
                              and neo_count > 0
                              and res.get("verified_against_pdf")
