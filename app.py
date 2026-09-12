@@ -1637,17 +1637,17 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
         tax_total = parts_tax_total + wages_tax_total + expenses_tax_total
     else:
         tax_total = jpy_round(sub_total * TAX_RATE)
-    # 内訳の税額欄の合計と総額の税は、**実機でも必ずしも一致しない**。
-    # 塗装も内板骨格も無い実機 25 件のうち 19 件（86.4%）は一致するが、
-    # 残りは +2 / +5 / +8 円ずれていた。総額の税は課税額計の一括丸め、
-    # 内訳は行ごとの税の合計で、別々に作られているためと考えられる。
-    # 税抜のときに無理やり寄せると、せっかく行ごとに合わせた内訳が
-    # また一括丸めの値に戻ってしまう（245/195/295 の例で 75 → 74）。
+    # 内訳の税額欄（部品計・工賃計・諸経費計）の合計は tx_Total と
+    # 一致させる。同じ .neo の中で「内訳の和 ≠ 合計」になっていると、
+    # コグニの画面でも紙でも説明がつかない（この不一致は過去に
+    # tests/reg_expense.py で固めてある）。
     #
-    # 税込のときは、内訳を「原本の税込 − 逆算した税抜」で確定させており、
-    # tax_total もその合計なので差は出ない（この寄せは実質なにもしない）。
-    _tax_resid = (tax_total - (parts_tax_total + wages_tax_total
-                               + expenses_tax_total)) if is_tax_inclusive else 0
+    # 実機は必ずしも一致させていない（塗装の無い 25 件中 19 件が一致、
+    # 残りは +2/+5/+8 円）が、一致していない .neo を出す理由は無い。
+    # 内訳の出発点を「行ごとの税の合計」にしたので、寄せる端数は
+    # ±1円程度で済み、いちばん大きい欄に乗らない区分は行ごとの値が残る。
+    _tax_resid = tax_total - (parts_tax_total + wages_tax_total
+                              + expenses_tax_total)
     if _tax_resid:
         _biggest = max((abs(total_parts), 'p'), (abs(total_wages), 'w'),
                        (abs(taxable_expenses), 'e'))[1]

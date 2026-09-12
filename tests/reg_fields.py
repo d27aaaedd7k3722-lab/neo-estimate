@@ -219,9 +219,14 @@ chk(_pc[1] == 3,
     '8b: 部品代の無い行（数量3）の PartsCount が %s。消すと ERParts=-1 /'
     ' AnSMB=03 / 画面=3 で数量が3通りになる' % _pc[1])
 
-# ── 9. 部品計・工賃計の税額欄は行ごとの税の合計 ────────────────
-# 仕様書 §6・§4 がそう書いており、実機 200 件でも部品計は行ごとの合計と
-# 100% 一致（合計×10% の一括丸めは 82% しか合わない）。
+# ── 9. 部品計・工賃計の税額欄は「行ごとの税の合計」から作る ──────────
+# 仕様書 §6・§4 が「行ごと税の合計」と書いており、実機 200 件でも部品計は
+# 行ごとの合計と 100% 一致（合計×10% の一括丸めは 82% しか合わない）。
+# ただし同じ .neo の中で「内訳の和 ≠ 合計」にはしない（reg_expense.py）。
+# 端数はいちばん大きい欄に寄せるので、そこに乗らない区分は行ごとの値が残る。
+#
+# 部品 245/195/295 → 行ごと 25+20+30=75、一括だと 74。
+# 工賃を大きくして端数が工賃側に寄るようにすると、部品計は 75 のまま。
 _tpl = open(os.path.join(R, 'template_toyota.neo'), 'rb').read()
 _nb = app.generate_neo_file(
     _tpl, {'customer_name': 'ｹﾝｼｮｳ'},
@@ -230,6 +235,8 @@ _nb = app.generate_neo_file(
      {'name': 'B', 'method': '取替', 'parts_amount': 195, 'wage': 0,
       'quantity': 1},
      {'name': 'C', 'method': '取替', 'parts_amount': 295, 'wage': 0,
+      'quantity': 1},
+     {'name': 'D', 'method': '脱着', 'parts_amount': 0, 'wage': 100000,
       'quantity': 1}], 0, {}, {}, False, False, False)[0]
 _ck = app.find_real_cks(_nb)
 _fs = app.extract_files(app.decompress_neo(_nb, _ck),
@@ -243,9 +250,9 @@ try:
         _rt = sum(app.safe_int(x[0]) for x in _con.execute(
             'select PartsPriceTax from ERParts where PartsName is not null'
             ' and PartsName<>""') if app.safe_int(x[0]) > 0)
-        _mt, _tx, _sub, _gt = _con.execute(
-            'select ms_PartsTotalTax, tx_TotalOutTax, SubTotal, Total'
-            ' from Total').fetchone()
+        _mt, _wt, _tx, _sub, _gt = _con.execute(
+            'select ms_PartsTotalTax, ms_WageTotalTax, tx_TotalOutTax,'
+            ' SubTotal, Total from Total').fetchone()
     finally:
         _con.close()
 finally:
@@ -253,12 +260,19 @@ finally:
         os.unlink(_tf.name)
     except OSError:
         pass
-chk(app.safe_int(_mt) == _rt == 75,
-    '9a: 部品計の税額欄が %s（行ごとの合計 %s／25+20+30=75 のはず）'
-    % (_mt, _rt))
-chk(app.safe_int(_tx) == 74,
-    '9b: 総額の税が %s（課税額計 735 の一括丸め 74 のはず）' % _tx)
-chk(app.safe_int(_gt) == 809, '9c: 合計が %s（809 のはず）' % _gt)
+chk(_rt == 75, '9: 行ごとの部品税の合計が %s（25+20+30=75 のはず）' % _rt)
+chk(app.safe_int(_mt) == 75,
+    '9a: 部品計の税額欄が %s。行ごとの合計 75 から作るべきところを、'
+    '合計×10%% の一括丸め（74）にしている' % _mt)
+chk(app.safe_int(_sub) == 100735, '9b: 課税額計が %s（100,735 のはず）' % _sub)
+chk(app.safe_int(_tx) == 10074,
+    '9c: 総額の税が %s（課税額計の一括丸め 10,074 のはず）' % _tx)
+chk(app.safe_int(_mt) + app.safe_int(_wt) == app.safe_int(_tx),
+    '9d: 内訳の税の合計 %s と総額の税 %s が食い違う'
+    '（同じ .neo の中で説明がつかない）'
+    % (app.safe_int(_mt) + app.safe_int(_wt), _tx))
+chk(app.safe_int(_gt) == 110809,
+    '9e: 合計が %s（100,735 + 10,074 = 110,809 のはず）' % _gt)
 
 print('REG_FIELDS:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
