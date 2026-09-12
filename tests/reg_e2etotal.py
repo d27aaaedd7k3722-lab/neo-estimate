@@ -670,6 +670,22 @@ chk('_ordered' in _src and 'and _ordered' in _src,
     '30: 並び順を指定できないまま行ごとに突き合わせている'
     '（SQLite の返す順しだいで正しい .neo が「行が違う」になる）')
 
+# ── 31. 行ごとの金額は「比べていない」も不合格にすること（Codex 10周目） ──
+# 並び順を保証できないときに行ごとの検証をとばすようにしたら、
+# 「比べなかった」が素通りするようになっていた。行数と合計が同じで
+# 2行のあいだで金額が入れ替わっただけの .neo が合格してしまう。
+_src = inspect.getsource(P.verify_neo_against_pdf)
+chk('res.get("line_match") is True' in _src,
+    '31: 行ごとの金額を「比べていない」まま合格にしている')
+# 正しい .neo では行ごとの検証が True になり、合格すること
+_v = P.verify_neo_against_pdf(
+    app.generate_neo_file(_TPLB, {'customer_name': 'ｹﾝｼｮｳ'},
+                          [dict(i) for i in _good], 0, {}, {},
+                          False, False, False)[0],
+    _good, pdf_parts_total=58600, pdf_grand_total=_GT2, grand_is_intax=True)
+chk(_v.get('line_match') is True and _v.get('ok'),
+    '31b: 正しい .neo で行ごとの検証が True にならない')
+
 print('REG_E2ETOTAL:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
     print('  -', f)

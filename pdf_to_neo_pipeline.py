@@ -1721,6 +1721,14 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                 return 0
 
             res["line_match"] = None
+            if items and neo_count == len(items) and not _ordered:
+                # 並び順を保証できないので行ごとに比べられない。
+                # 「比べなかった」を素通りさせると、行数と合計が同じで
+                # 行ごとの金額だけ入れ替わった .neo が合格してしまう。
+                res["mismatches"].append(
+                    {"type": "line", "neo": None, "pdf": None,
+                     "note": ".neo の明細が行番号順に読めず、"
+                             "行ごとの金額を突き合わせられなかった"})
             if items and neo_count == len(items) and _ordered:
                 _bad_lines = []
                 for _i, _it in enumerate(items):
@@ -1816,7 +1824,10 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                              and res.get("verified_against_pdf")
                              and res.get("grand_match") is not False
                              and res.get("wage_match") is not False
-                             and res.get("line_match") is not False)
+                             # 行ごとの金額は「比べていない」も不合格にする。
+                             # 行数と合計が同じで、2行のあいだで金額が
+                             # 入れ替わっただけの .neo を通さないため。
+                             and res.get("line_match") is True)
             return res
         finally:
             try:
