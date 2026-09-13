@@ -28,15 +28,30 @@
 - **見積書PDF を投げ込むのが主導線**。step1 の一番上に置く
 - **Gemini に読ませて CSV 化するのは、PDF の読み取り精度が出ないときの代替手段**。下に置き、そう分かる文言にする
 
+## 見積 PDF → NEO は pdf-to-neo スキル経由（2026-09-13〜）
+
+判断・生成・検算は files リポジトリ（`pdf-to-neo` ブランチ）のスキルを `vendor/pdf_to_neo/` に
+**コミット固定で取り込んで**そのまま呼ぶ（`neo_skill/`）。アプリが持つのは「見積書を Claude API に読ませ、
+ページごとに検算し、落ちたページだけ読み直す」ところだけ。**`vendor/` 配下は書き換えない**（規則は files で直して取り直す）。
+
+- 取り込んでいるコミット: `vendor/pdf_to_neo/VENDOR_COMMIT.json`（いま `9136473db9c6`）
+- 取り直し: `python tools/vendor_sync.py --source "<files>" --commit <ID>`／改変チェック `--check`
+- 見積書を読む LLM は Claude API（`.env` の `ANTHROPIC_API_KEY`。Gemini は CSV 取り込み・車検証 OCR 用）
+- 合格の条件は vendor の `make_neo.py` と同じ。NEO と確認箇所シート（xlsx）は必ず組で出す
+- 旧経路（`pdf_to_neo_pipeline` / `auto_matching`）は UI から外した。関数は残してある
+- 詳細は `docs/引き継ぎ書.md` §12、方針は files の `docs/pdf-to-neo_アプリ移植ガイド.md`
+
 ## 変更するときの手順
 
 1. 実装する
-2. 回帰テスト6本を通す（このPCでも動く）
+2. 回帰テストを通す（このPCでも動く）
 
 ```
 cd tests
 python reg_neoacc.py && python reg_misread.py && python reg_cache.py
 python reg_expense.py && python reg_pipeline.py && python suite.py
+python reg_reader.py      # 読む段のループ（LLM 差し替え・課金なし）
+python reg_vendor.py      # 受け入れ §5-2: NEO_check の案件で files と vendor の NEO が全列一致
 ```
 
 3. `codex-loop` スキルで Codex レビュー（gpt-5.5 / xhigh）を通す

@@ -36,3 +36,12 @@ pypdfium2==5.13.0
 # ページ分割・ページ並べ替え・FAX送付状除去に使用
 # （未導入だとこれらの機能が例外を握り潰して黙って無効化される）
 pypdf==6.4.0
+
+# pdf-to-neo スキル（vendor/pdf_to_neo）を呼ぶ新経路
+# 見積 PDF を読む LLM（Claude API）。1.x は Python 3.10 以上
+anthropic==1.5.0; python_version >= "3.10"
+anthropic==0.125.0; python_version < "3.10"
+# 確認箇所シート（xlsx）。無い環境では vendor 側が CSV に落とす
+openpyxl==3.1.5
+# iPhone の HEIC/HEIF 写真を pdf-to-neo 経路で使うときだけ（任意。Cloud ではこの経路自体が動かないので固定しない）
+# pillow-heif==1.7.0

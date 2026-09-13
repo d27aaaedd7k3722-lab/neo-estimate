@@ -40,3 +40,13 @@ match_output*.txt
 # 引き継ぎ書 §6 と tests/README.md が参照するスクリプトが
 # リポジトリから丸ごと消えていた（2026-09-10 発見）。
 !tests/*.py
+
+# tools/vendor_sync.py の一時フォルダ（取り込み中・失敗時の残骸）
+vendor/pdf_to_neo.tmp/
+vendor/pdf_to_neo.old/
+vendor/pdf_to_neo.failed/
+
+# vendor/pdf_to_neo は files のコミットの写し（tools/vendor_sync.py）。上の一時ファイル・*.db のパターンに関わらず全部追跡する
+# （*.DB の参照表・tests/test_*.py・find_*.py が落ちると clone 先でハッシュ照合に落ちて経路が止まる）
+!vendor/pdf_to_neo/**
+vendor/pdf_to_neo/**/__pycache__/

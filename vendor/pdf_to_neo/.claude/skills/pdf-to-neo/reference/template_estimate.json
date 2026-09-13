@@ -1,0 +1,133 @@
+{
+ "source": "Z:/2026年/MM月/DD日/<損保>_<顧客>_<番号>_<車名>_<地域>/工場最終.pdf（<工場名> 概算見積書 RX.M.D、N ページ、書式 A〜E、Claude Vision 読取）＋ 車検証記録事項 <ファイル名>.pdf",
+ "issuer": "<工場名（住所）>",
+ "est_date": "YYYYMMDD",
+ "vehicle": {
+  "model_code": "",
+  "serial_no": "",
+  "desig": "",
+  "category": "",
+  "reg_date": "R4.3",
+  "color_code": "",
+  "engine": "",
+  "cc": ""
+ },
+ "customer": {
+  "name": "",
+  "reg_no": "",
+  "postal": "",
+  "address": "",
+  "kilometer": 0,
+  "term_date": "",
+  "owner": ""
+ },
+ "insurance": {
+  "company": "",
+  "policy_no": "",
+  "contractor": "",
+  "accident_date": "",
+  "presence_date": "",
+  "factory": "<工場名> <電話>"
+ },
+ "labor_rate": 0,
+ "index_policy": "auto",
+ "hints": {
+  "eva_codes": [],
+  "note": "装備を付けた根拠"
+ },
+ "items": [
+  {
+   "code": "0010",
+   "name": "Fﾊﾞﾝﾊﾟｶﾊﾞｰ",
+   "method": "取替",
+   "parts_no": "",
+   "qty": 1,
+   "price": 0,
+   "wage": 0,
+   "index": 0.0
+  },
+  {
+   "code": "1000",
+   "name": "右Fﾌｪﾝﾀﾞ",
+   "method": "板金",
+   "parts_no": "",
+   "qty": 1,
+   "price": 0,
+   "wage": 0,
+   "index": 0.0,
+   "bankin": {
+    "area": 0,
+    "yes": [
+     1,
+     0,
+     0
+    ]
+   }
+  },
+  {
+   "code": "",
+   "name": "<ADDATA に無い品目>",
+   "method": "取替",
+   "parts_no": "",
+   "qty": 1,
+   "price": 0,
+   "wage": 0,
+   "manual": true
+  }
+ ],
+ "paint": {
+  "total": 0,
+  "material": 0,
+  "material_rate": 0.0,
+  "paint": "２Ｋ",
+  "coat": "２コートパール",
+  "hf": "しない",
+  "panels": [
+   {
+    "code": "1000",
+    "name": "右Fﾌｪﾝﾀﾞ",
+    "method": "修理",
+    "area": 0,
+    "ratio": "1/3",
+    "index": 0.0,
+    "wage": 0
+   }
+  ],
+  "base": {
+   "index": 0.0,
+   "wage": 0
+  },
+  "bumper_front": {
+   "name": "フロント樹脂バンパ",
+   "method": "新品",
+   "color": "一色",
+   "index": 0.0,
+   "wage": 0
+  }
+ },
+ "expenses": [
+  {
+   "name": "ショートパーツ",
+   "amount": 0,
+   "kind": "parts"
+  },
+  {
+   "name": "コーティング",
+   "amount": 0,
+   "kind": "wage"
+  }
+ ],
+ "totals": {
+  "parts": 0,
+  "wage": 0,
+  "paint": 0,
+  "material": 0,
+  "paint_total": 0,
+  "expense_parts": 0,
+  "expense_wage": 0,
+  "expense": 0,
+  "taxable": 0,
+  "tax": 0,
+  "total": 0
+ }
+}

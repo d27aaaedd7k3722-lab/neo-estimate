@@ -141,6 +141,11 @@ try:
     GEMINI_API_KEY = st.secrets.get('GEMINI_API_KEY', os.environ.get('GEMINI_API_KEY', ''))
 except Exception:
     GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+# 見積書を読む Claude API（pdf-to-neo スキル経路）。Gemini は CSV 取り込み・車検証 OCR で使う
+try:
+    ANTHROPIC_API_KEY = st.secrets.get('ANTHROPIC_API_KEY', os.environ.get('ANTHROPIC_API_KEY', ''))
+except Exception:
+    ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 GEMINI_MODEL      = "gemini-3.5-flash"          # フォールバック（動的に上書きされる）
 CONFIDENCE_THRESHOLD = 0.6
 
@@ -6345,6 +6350,125 @@ def _session_cache_scope() -> str:
         return _uuid.uuid4().hex
 
 
+def run_pdf_to_neo_skill(pdf_bytes, file_name, claude_api_key, mime_type='application/pdf',
+                         vehicle_hint=None, insurance_hint=None, progress=None, record_profile=False,
+                         addata_root=None):
+    """見積書 PDF → pdf-to-neo スキル（vendor/pdf_to_neo）で NEO と確認箇所シートを作る。
+
+    読む段だけ Claude API（neo_skill.reader）。判断・生成・検算・合否は vendor の make_neo.py そのもの
+    （docs/pdf-to-neo_アプリ移植ガイド.md）。合計を合わせるための調整はどこにも無い。
+    戻り値 dict:
+      ok / stage('read' | 'make' | 'done' | 'error') / error
+      read: {ok, n_pages, stats, usage, fails[], traces[], warn[]}
+      make: {ok, match_line, reasons[], tail}
+      neo_bytes / review_bytes / review_ext / report_md / download_name / vendor_commit / cleanup_warning
+      repair_zip: 不合格のとき、人が直して続きをするための一式（pages/*.json・reading.json・report.md 等。NEO は入れない）
+    insurance_hint: サイドバーの保険情報（policy_no / contractor / accident_date(8桁) / company）。
+      見積書に印字が無い項目にだけ補う（reading の insurance → 生成器の Insurance テーブル）。
+    record_profile: 合格時に工場の設定を NEO_check/_profiles に記録する（vendor の既定動作）。
+      作業フォルダの外に取引先名が残るので、共有プロセスのアプリでは既定で記録しない。
+    addata_root: アプリで決めた ADDATA（サイドバー / URL / ZIP。find_addata_dir()）。vendor の生成器と検算ランナーに
+      環境変数 ADDATA_ROOT として渡し、アプリと同じ版を使わせる。**無ければ止める**（vendor の設定ファイル→自動検出に
+      落とすと、Addata の URL 取得に失敗したときなどに別の版で「それらしい NEO」ができてしまう）。
+    作業フォルダは要求ごとに作り、終わったら消す（見積書・NEO・シートには顧客情報が入る）。
+    消せなかったときは cleanup_warning に残ったパスを入れて知らせる（黙って残さない）。
+    """
+    import shutil
+    from neo_skill import llm as _nsk_llm
+    from neo_skill import maker as _nsk_maker
+    from neo_skill import reader as _nsk_reader
+    from neo_skill import vendor as _nsk_vendor
+    out = {'ok': False, 'stage': 'error', 'error': '', 'vendor_commit': _nsk_vendor.commit_short()}
+    _why = _nsk_vendor.readiness_error()
+    if _why:
+        out['error'] = 'pdf-to-neo スキル（vendor）が使えません: ' + _why
+        return out
+    if not addata_root or not os.path.isdir(str(addata_root)):
+        out['error'] = ('Addata（コグニの車種データ）が決まっていないので生成しません。'
+                        'サイドバーの「Addata の場所を設定する」で確かめてください'
+                        '（別の版の Addata で作らないよう、自動検出には落としません）')
+        return out
+    case_dir = None
+    try:
+        if str(mime_type or '').startswith('image/'):
+            pdf_bytes = _nsk_llm.image_to_pdf(pdf_bytes)
+        try:
+            reader = _nsk_llm.ClaudeReader(api_key=claude_api_key or None)
+        except Exception as e:
+            out['error'] = f'Claude API を使えません（anthropic パッケージ／キー）: {e}'
+            return out
+        case_dir = _nsk_maker.new_case_dir()
+        rd = _nsk_reader.read_estimate(pdf_bytes, reader=reader, case_dir=case_dir,
+                                       source_name=os.path.basename(str(file_name or 'estimate.pdf')),
+                                       vehicle_hint=vehicle_hint, insurance_hint=insurance_hint, progress=progress,
+                                       addata_root=addata_root)
+        out['read'] = {
+            'ok': rd.ok, 'n_pages': rd.n_pages, 'stats': rd.stats, 'usage': rd.usage,
+            'fails': rd.fails(), 'warn': list((rd.check or {}).get('warn') or []),
+            'traces': [{'page': t.page, 'attempts': t.attempts, 'ok': t.ok, 'rows': t.rows,
+                        'fail': list(t.fail), 'warn': list(t.warn)} for t in rd.traces],
+            'settings': dict((rd.check or {}).get('settings') or {}),
+        }
+        out['stage'] = 'read'
+        if rd.error or not rd.ok:
+            # 読み取りが検算に通らない。NEO は作らない（人が該当ページと差額を見る）。
+            # 作業フォルダは消すので、直すための pages/ と merge 結果を zip で渡す
+            out['error'] = rd.error
+            out['repair_zip'] = _nsk_maker.repair_bundle(case_dir, rd.reading)
+            return out
+        if progress:
+            progress('下書き → ADDATA 突合せ → NEO 生成 → 検算（pdf-to-neo スキル make_neo.py）')
+        mk = _nsk_maker.make_neo(case_dir, 'estimate', no_profile=not record_profile, addata_root=addata_root)
+        out['stage'] = 'make'
+        out['make'] = {'ok': mk.ok, 'match_line': mk.match_line, 'reasons': list(mk.reasons),
+                       'error': mk.error, 'tail': '\n'.join(mk.stdout.splitlines()[-40:])}
+        out['report_md'] = _nsk_maker.read_text(mk.report_path)
+        if not mk.ok:
+            out['error'] = mk.error
+            out['repair_zip'] = _nsk_maker.repair_bundle(case_dir, rd.reading)
+            return out
+        out['neo_bytes'] = _nsk_maker.read_bytes(mk.neo_path)
+        out['review_bytes'] = _nsk_maker.read_bytes(mk.review_path)
+        out['review_ext'] = os.path.splitext(mk.review_path or '')[1] or '.xlsx'
+        # ダウンロード名は <顧客>_<車名>_claude（HANDOFF §4 段 8 の規則）。読めなければ 見積_claude
+        cust = ''
+        car = ''
+        try:
+            est = json.load(open(mk.estimate_path, encoding='utf-8-sig')) if mk.estimate_path else {}
+            cust = str(((est.get('customer') or {}).get('name')) or '').strip()
+        except Exception:
+            est = {}
+        m = re.search(r'^- 車両: (.+?) /', out['report_md'] or '', re.M)
+        if m:
+            car = m.group(1).strip()
+        stem = '_'.join(x for x in (cust, car) if x) or '見積'
+        out['download_name'] = re.sub(r'[\\/:*?"<>|\r\n\t\s]+', '_', stem) + '_claude'
+        out['ok'] = bool(out['neo_bytes'] and out['review_bytes'])
+        out['stage'] = 'done' if out['ok'] else 'make'
+        if not out['ok']:
+            out['error'] = 'NEO と確認箇所シートが組で作られなかった'
+        return out
+    except Exception as e:
+        out['error'] = f'{type(e).__name__}: {e}'
+        return out
+    finally:
+        _left = _nsk_maker.remove_case_dir(case_dir)
+        if _left:
+            out['cleanup_warning'] = ('作業フォルダを消せませんでした。見積書・NEO・確認箇所シートが残っているので'
+                                      f'手で削除してください: {_left}')
+
+
+def _sidebar_insurance_hint():
+    """サイドバーの「事故・保険情報」のうち、pdf-to-neo の生成器が読む項目だけを reading の insurance の形にする。
+    受付番号・代理店・アジャスター・入出庫日は生成器が読まない（files 側の課題）ので渡さない"""
+    _h = {
+        'policy_no': str(st.session_state.get('policy_no', '') or '').strip(),
+        'contractor': str(st.session_state.get('contractor_name', '') or '').strip(),
+        'accident_date': _normalize_date8(st.session_state.get('accident_date', '')),
+    }
+    return {k: v for k, v in _h.items() if v}
+
+
 def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=None,
                            is_tax_inclusive=False, expenses=None,
                            mime_type='application/pdf', insurance_info=None):
@@ -6594,12 +6718,24 @@ def main():
         # ── 設定 ──
         st.markdown('<div style="font-size:10px;font-weight:700;color:#94a3b8;letter-spacing:.08em;text-transform:uppercase;padding:4px 0">設定</div>', unsafe_allow_html=True)
         st.header("🔑 APIキー設定")
+        # 見積書 PDF → NEO は Claude API で読む（pdf-to-neo スキル経路）。
+        # Gemini は CSV 取り込み・車検証 OCR・旧経路で使う。
+        if ANTHROPIC_API_KEY:
+            claude_api_key = ANTHROPIC_API_KEY
+            st.success("Claude APIキー: 設定済み (.env)")
+        else:
+            claude_api_key = st.text_input(
+                "Claude APIキー（見積書の読み取り）",
+                type="password",
+                key='claude_api_key_input',
+                help=".envファイルの ANTHROPIC_API_KEY にキーを設定すれば毎回入力不要"
+            )
         if GEMINI_API_KEY:
             api_key = GEMINI_API_KEY
-            st.success("APIキー: 設定済み (.env)")
+            st.success("Gemini APIキー: 設定済み (.env)")
         else:
             api_key = st.text_input(
-                "Gemini APIキー",
+                "Gemini APIキー（CSV取り込み・車検証OCR）",
                 type="password",
                 help=".envファイルの GEMINI_API_KEY にキーを設定すれば毎回入力不要"
             )
@@ -7038,38 +7174,47 @@ def main():
         st.session_state['selected_mode'] = 'beta'
 
         # ================================================================
-        # STEP 1-A: 見積書PDF → NEO（これが主導線）
+        # STEP 1-A: 見積書PDF → NEO（pdf-to-neo スキル。これが主導線）
         # ================================================================
+        # 判断・生成・検算・合否は files の pdf-to-neo スキル（vendor/pdf_to_neo、コミット固定）を
+        # そのまま呼ぶ。アプリが持つのは「見積書を Claude に読ませ、ページごとに検算し、
+        # 落ちたページだけ読み直す」ところだけ（docs/pdf-to-neo_アプリ移植ガイド.md）。
+        # 旧経路（run_pdf_to_neo_pipeline）は規則を別に実装していて食い違うため UI から外した。
+        try:
+            from neo_skill import vendor as _nsk_vendor
+            _nsk_why = _nsk_vendor.readiness_error()
+            _nsk_commit = _nsk_vendor.commit_short()
+        except Exception as _e:
+            _nsk_why, _nsk_commit = f'neo_skill を読み込めない: {_e}', ''
+        _nsk_ready = not _nsk_why
         st.markdown(
             '<div style="background:#eff6ff;border:2px dashed #60a5fa;'
             'border-radius:14px;padding:20px 22px;margin-bottom:14px;">'
             '<div style="font-size:18px;font-weight:800;color:#1d4ed8;'
             'letter-spacing:.02em;">📄 見積書（PDF・写真）をここに入れてください</div>'
             '<div style="font-size:13px;color:#334155;margin-top:8px;line-height:1.7;">'
-            'PDF でも、スマホで撮った写真（JPG・PNG・HEIC）でも構いません。'
-            '入れて <b>「見積書からNEOを生成」</b> を押すだけで、'
-            '明細の読み取りから NEO ファイルの作成まで一気に終わります。'
-            'Gemini へのコピペは要りません。</div>'
-            '</div>', unsafe_allow_html=True)
+            '見積書を Claude が<b>印字どおり</b>に写し、ページごとに機械検算して落ちたページだけ読み直します。'
+            '部品コード・標準品番・指数・塗装・費用の判断とNEOの生成・検算は '
+            '<b>pdf-to-neo スキル</b>（コグニ実機で確かめた判断規則）がそのまま行います。'
+            '合格したときだけ、NEO と<b>確認箇所シート（xlsx）</b>を組でお渡しします。'
+            '合計を合わせるための金額調整はしません。</div>'
+            + (f'<div style="font-size:11px;color:#64748b;margin-top:6px;">スキル: commit {_nsk_commit}</div>' if _nsk_commit else '')
+            + '</div>', unsafe_allow_html=True)
+        # 税区分のラジオは下の CSV 取り込みが session_state['tax_override'] を読むので残す。
+        # この経路（PDF→NEO）は見積書の合計欄から税込印字を見分ける（reading_schema.md）ので使わない。
         _pdf_tax_options = ['税抜き（外税）', '税込み（内税）']
         _saved_pdf_tax = st.session_state.get('pdf_tax_override',
                                               st.session_state.get('tax_override', '税抜き（外税）'))
         _pdf_tax_idx = 1 if ('内税' in str(_saved_pdf_tax) or '税込' in str(_saved_pdf_tax)) else 0
         _pdf_tax_sel = st.radio(
-            "💴 見積書の金額表記（この選択が下のCSV取り込みにも効きます）",
+            "💴 見積書の金額表記（下の CSV 取り込みで使います。PDF→NEO は見積書の合計欄から自動判定）",
             options=_pdf_tax_options,
             index=_pdf_tax_idx,
             horizontal=True,
             key='pdf_tax_radio',
-            help="明細の金額が税込みで書かれている見積書は「税込み（内税）」を選んでください。"
-                 "取り違えると、NEOの合計が消費税ぶん（10%）ずれます。",
         )
         st.session_state['pdf_tax_override'] = _pdf_tax_sel
-        # 画面の税区分はこの1つだけにする。以前は下の CSV 取り込みにも同じ意味の
-        # ラジオがあり、利用者がどちらを操作すればよいか分からなかった。
-        # 取り違えると NEO の総額が消費税ぶん（10%）ずれる。
         st.session_state['tax_override'] = _pdf_tax_sel
-        _pdf_is_tax_incl = ('内税' in _pdf_tax_sel or '税込' in _pdf_tax_sel)
 
         _p2n_file = st.file_uploader(
             "📄 見積書（PDF・写真）をここにドロップ、またはクリックして選択",
@@ -7080,196 +7225,139 @@ def main():
             _p2n_bytes = _p2n_file.read()
             _p2n_file.seek(0)
             st.caption(f"📄 {_p2n_file.name}（{len(_p2n_bytes):,} bytes）")
-            if not api_key:
-                st.warning(
-                    "⚠️ この機能にはGemini APIキーが必要です。"
-                    "サイドバーの「APIキー設定」でキーを入力してください。"
-                )
+            st.caption("サイドバーの「事故・保険情報」（証券番号・契約者名・事故日）は、見積書に印字が無ければ NEO に補われます。"
+                       "「費用（Expense）」欄はこの経路では使いません — 見積書に印字された費用だけを写します"
+                       "（印字に無い費用を足すと、原本との照合が崩れるため）。")
+            if not _nsk_ready:
+                st.error("❌ pdf-to-neo スキル（vendor/pdf_to_neo）が使えません: " + _nsk_why
+                         + "  → `python tools/vendor_sync.py --source <files> --commit <ID>` で取り込み、"
+                         "アプリを再起動してください。")
+            elif not claude_api_key:
+                st.warning("⚠️ 見積書の読み取りには Claude APIキーが必要です。"
+                           "サイドバーの「APIキー設定」で入力するか、.env の ANTHROPIC_API_KEY に設定してください。")
+            elif not (_p2n_addata := find_addata_dir()):
+                # Addata が決まらないときは vendor の自動検出に落とさず止める（別の版で作らない）。
+                # 取得 URL を設定していて失敗しているなら、その理由を出す
+                _p2n_url_err = st.session_state.get('_addata_url_error')
+                st.error("❌ Addata（コグニの車種データ）が決まっていないので生成できません。"
+                         + (f" 取得URLの失敗: {_p2n_url_err}" if _p2n_url_err else
+                            " サイドバーの「Addata の場所を設定する」で場所を指定してください。")
+                         + " この経路は Addata なしでは動きません（部品コード・標準指数を引けないため）。")
             elif st.button("🚀 見積書からNEOを生成", key='pdf2neo_run', type="primary",
                            width='stretch'):
                 st.session_state.pop('pdf2neo_result', None)
-                # 前回の変換で決めたファイル名を残すと、別のPDFを変換したのに
-                # 前の車のファイル名でダウンロードされる。
-                st.session_state.pop('_pdf2neo_filename', None)
-                with st.spinner("見積書を解析してNEOを生成しています…（AI-OCRのため30〜90秒かかります）"):
-                    st.session_state['pdf2neo_result'] = run_pdf_to_neo_pipeline(
-                        _p2n_bytes,
-                        api_key,
-                        # 写真（JPG/PNG/HEIC 等）で入れられることもある。
-                        # 拡張子から mime を決めて渡さないと、画像を PDF として
-                        # 送ってしまい読み取りに失敗する。
+                with st.status("見積書を読んで NEO を作っています…（ページ数により 1〜5 分）",
+                               expanded=True) as _p2n_status:
+                    def _p2n_progress(msg):
+                        _p2n_status.write(msg)
+                    _p2n_out = run_pdf_to_neo_skill(
+                        _p2n_bytes, _p2n_file.name, claude_api_key,
                         mime_type=get_mime_type(_p2n_file.name),
-                        model_name=selected_model,
-                        template_bytes=st.session_state.get('custom_neo_bytes'),
-                        is_tax_inclusive=_pdf_is_tax_incl,
-                        expenses={
-                            'towing':     st.session_state.get('exp_towing', 0),
-                            'rental_car': st.session_state.get('exp_rental', 0),
-                            'tax_exempt': st.session_state.get('exp_exempt', 0),
-                        },
-                        # サイドバーの「🛡️ 事故・保険情報」。渡さないと
-                        # この経路の .neo には保険欄が1つも入らない。
-                        insurance_info={
-                            'policy_no':       st.session_state.get('policy_no', ''),
-                            'contractor_name': st.session_state.get('contractor_name', ''),
-                            'accept_no':       st.session_state.get('accept_no', ''),
-                            'accident_date':   st.session_state.get('accident_date', ''),
-                            'agency_name':     st.session_state.get('agency_name', ''),
-                            'adjuster_name':   st.session_state.get('adjuster_name', ''),
-                            'garage_in_date':  st.session_state.get('garage_in_date', ''),
-                            'garage_out_date': st.session_state.get('garage_out_date', ''),
-                            'repair_days':     st.session_state.get('repair_days', 0),
-                            'note1':           st.session_state.get('note1', ''),
-                        },
+                        # サイドバーの「事故・保険情報」。見積書に印字が無い項目にだけ補われる
+                        insurance_hint=_sidebar_insurance_hint(),
+                        progress=_p2n_progress,
+                        # 工場プロファイル（取引先名）は既定で書かない。ローカル運用で学習させたいときだけ
+                        record_profile=(os.environ.get('NEO_SKILL_PROFILE') == '1'),
+                        # サイドバー / URL / ZIP で決めた ADDATA を vendor にも使わせる（版の食い違いを防ぐ）
+                        addata_root=_p2n_addata,
                     )
-                st.session_state['pdf2neo_tax_inclusive'] = _pdf_is_tax_incl
+                    _p2n_status.update(
+                        label=("✅ 合格" if _p2n_out.get('ok') else "❌ 不合格（下の理由をご確認ください）"),
+                        state=('complete' if _p2n_out.get('ok') else 'error'), expanded=False)
+                st.session_state['pdf2neo_result'] = _p2n_out
                 st.rerun()
 
         _p2n_res = st.session_state.get('pdf2neo_result')
         if _p2n_res:
-            if _p2n_res.get('error'):
+            _p2n_rd = _p2n_res.get('read') or {}
+            _p2n_mk = _p2n_res.get('make') or {}
+            _p2n_st = _p2n_rd.get('stats') or {}
+            if _p2n_rd:
+                st.caption(
+                    f"読み取り: {_p2n_rd.get('n_pages')} ページ ／ "
+                    f"初回検算合格 {int(round(100 * float(_p2n_st.get('first_try_ok_rate') or 0)))}% ／ "
+                    f"読み直し {_p2n_st.get('retries', 0)} 回 ／ Claude 呼び出し {_p2n_st.get('calls', 0)} 回 ／ "
+                    f"{_p2n_st.get('seconds', 0)} 秒")
+            if _p2n_res.get('cleanup_warning'):
+                st.warning("⚠️ " + _p2n_res['cleanup_warning'])
+            if _p2n_res.get('error') and _p2n_res.get('stage') in ('error',):
                 st.error(f"❌ {_p2n_res['error']}")
-            elif not _p2n_res.get('ok'):
-                st.error("❌ 見積書からNEOを生成できませんでした。")
-                for _w in (_p2n_res.get('warnings') or []):
-                    st.caption(f"・{_w}")
-            elif not (_p2n_res.get('items') or []):
-                st.error(
-                    "❌ 見積書から明細を1行も読み取れませんでした。"
-                    "スキャン画像で文字が読めない、APIのクォータ超過、"
-                    "対応していない書式のいずれかが考えられます。"
-                )
-                for _w in (_p2n_res.get('warnings') or []):
-                    st.caption(f"・{_w}")
-            else:
-                _p2n_items = _p2n_res.get('items') or []
-                _p2n_parts = sum(safe_int(it.get('parts_amount', 0)) for it in _p2n_items)
-                _p2n_wage  = sum(safe_int(it.get('wage', 0)) for it in _p2n_items)
-                st.success(
-                    f"✅ 解析完了 — {len(_p2n_items)}行 ／ "
-                    f"部品 ¥{_p2n_parts:,} ／ 工賃 ¥{_p2n_wage:,}"
-                )
-                # 車検証OCRの失敗など、成功扱いでも伝えるべき警告がある
-                for _w in (_p2n_res.get('warnings') or []):
-                    st.warning(f"⚠️ {_w}")
-                # 注記(AnNote.ini)の数量欄は2桁固定で、100以上は99として
-                # 書かれる。明細欄には原本どおり入るので、同じ .neo の中で
-                # 数量が食い違う。プレビュー経由では知らせていたが、
-                # この一発生成の経路では何も出ていなかった。
-                _p2n_qty_over = [str(_it.get('name', '') or '')
-                                 for _it in (_p2n_items or [])
-                                 if safe_int(_it.get('quantity', 1), 1) > 99]
-                if _p2n_qty_over:
-                    st.warning(
-                        f"⚠️ 数量が100以上の行が{len(_p2n_qty_over)}件あります"
-                        f"（{'、'.join(_p2n_qty_over[:3])}"
-                        f"{'ほか' if len(_p2n_qty_over) > 3 else ''}）。"
-                        "コグニセブンの注記欄は数量が2桁までのため、注記側は99として"
-                        "書かれます（明細欄には原本どおりの数量が入ります）。")
-                _p2n_v = _p2n_res.get('verify') or {}
-                # 「比べていない」を「一致」と言ってはいけない。
-                # 見積書の小計が読み取れていないと、突き合わせる相手が
-                # 自分の読み取り結果そのものになり、明細を丸ごと
-                # 読み落としても「一致」と出てしまう。
-                if _p2n_v.get('error'):
-                    # 保険会社に出すファイルなので、検証できなかったことは
-                    # 小さな文字ではなく警告として出す。
-                    st.warning(
-                        f"🔍 検証できませんでした（{_p2n_v['error']}）。"
-                        "生成NEOと原本を突き合わせていません。"
-                        "「プレビューに取り込む」で1行ずつご確認ください。")
-                elif _p2n_v.get('ok'):
-                    # verify の ok は、行数・合計・行ごとの金額・工賃・
-                    # 総額をすべて見た結果。個別の項目だけを見ていると、
-                    # 行ごとの検証が落ちても「検証OK」と出てしまう。
-                    # 工賃は長らく検証に入っておらず、部品計と行数だけで
-                    # 「一致」と出していた。工賃も見ているときはそう書く。
-                    _p2n_wm = _p2n_v.get('wage_match')
-                    _p2n_gm = _p2n_v.get('grand_match')
-                    st.caption(
-                        "🔍 検証OK: 生成NEOの明細件数と"
-                        + ("部品・工賃の金額（税抜）" if _p2n_wm
-                           else "部品金額（税抜）")
-                        + ("、および総額" if _p2n_gm else "")
-                        + "が原本と一致しました。"
-                        + ("" if _p2n_wm else
-                           "（見積書に工賃計が印字されていないため、工賃は"
-                           "突き合わせていません）"))
-                elif not _p2n_v.get('verified_against_pdf'):
-                    st.warning(
-                        "🔍 検証できていません: 見積書に印字された部品計が読み取れなかったため、"
-                        "生成NEOと突き合わせていません。明細を丸ごと読み落としていても気づけない状態です。"
-                        "「プレビューに取り込む」で原本と1行ずつご確認ください。")
-                else:
-                    st.warning(
-                        "🔍 検証: 原本と生成NEOに差異があります。"
-                        f"件数 NEO {_p2n_v.get('neo_count')} / 原本 {_p2n_v.get('pdf_count')}、"
-                        f"部品金額(税抜) NEO ¥{safe_int(_p2n_v.get('neo_total')):,} / "
-                        f"原本 ¥{safe_int(_p2n_v.get('pdf_parts_total')):,}"
-                        # 工賃の食い違いは、以前は検証そのものに入っていなかった。
-                        # 差が工賃側にあるとき、どこが違うのか出さないと
-                        # 「部品は合っているのに差異あり」と読めてしまう。
-                        + (f"、工賃(税抜) NEO ¥{safe_int(_p2n_v.get('neo_wage_total')):,}"
-                           f" / 原本 ¥{safe_int(_p2n_v.get('pdf_wage_total')):,}"
-                           if _p2n_v.get('wage_match') is False else "")
-                        # どの行が違うのかまで出さないと、突き合わせの起点が分からない。
-                        + (('、' + '／'.join(
-                            "%d行目「%s」の%s NEO %s / 原本 %s"
-                            % (_b.get('line'), _b.get('name'), _b.get('kind'),
-                               format(safe_int(_b.get('neo')), ','),
-                               format(safe_int(_b.get('pdf')), ','))
-                            for _b in (_p2n_v.get('bad_lines') or [])[:3]))
-                           if _p2n_v.get('line_match') is False else '')
-                        + "。「プレビューに取り込む」で内容を確認・修正してください。"
+            elif _p2n_res.get('stage') == 'read' and not _p2n_rd.get('ok'):
+                if _p2n_res.get('error'):
+                    st.error(f"❌ 読み取りを続けられませんでした: {_p2n_res['error']}")
+                st.error("❌ 見積書の写しが機械検算に通りませんでした。NEO は作っていません"
+                         "（合計を合わせるために行を消したり金額を動かしたりはしません）。"
+                         "下の項目を見積書と突き合わせてください。")
+                for _f in (_p2n_rd.get('fails') or []):
+                    st.markdown(f"- {_f}")
+                _p2n_tr = _p2n_rd.get('traces') or []
+                if _p2n_tr:
+                    st.dataframe(pd.DataFrame([{
+                        'ページ': t['page'], '検算': '合格' if t['ok'] else '不合格', '明細行': t['rows'],
+                        '読んだ回数': t['attempts'], '不合格の理由': ' / '.join(t['fail'])[:120]} for t in _p2n_tr]),
+                        hide_index=True, width='stretch')
+                if _p2n_res.get('repair_zip'):
+                    st.download_button(
+                        "🧰 修正用ファイル一式をダウンロード（pages/・reading.json）",
+                        data=_p2n_res['repair_zip'], file_name="neo_repair.zip", mime="application/zip",
+                        key='pdf2neo_dl_repair_read', width='stretch',
                     )
-                _p2n_neo = _p2n_res.get('neo_bytes')
+                    st.caption("NEO_check の案件フォルダに展開し、該当ページの pages/page_N.json を見積書と突き合わせて直してから"
+                               " `make_neo.py <案件フォルダ>` を回すと続きができます。")
+            elif _p2n_mk and not _p2n_mk.get('ok'):
+                st.error("❌ NEO の生成が不合格でした（pdf-to-neo スキル make_neo.py の判定）。NEO は出しません。")
+                for _r in (_p2n_mk.get('reasons') or []):
+                    st.markdown(f"- {_r}")
+                if _p2n_mk.get('error'):
+                    st.caption(_p2n_mk['error'])
+                if _p2n_mk.get('match_line'):
+                    st.caption(_p2n_mk['match_line'])
+                if _p2n_res.get('repair_zip'):
+                    st.download_button(
+                        "🧰 修正用ファイル一式をダウンロード（pages/・reading.json・report.md）",
+                        data=_p2n_res['repair_zip'], file_name="neo_repair.zip", mime="application/zip",
+                        key='pdf2neo_dl_repair_make', width='stretch',
+                    )
+                    st.caption("NEO_check の案件フォルダに展開し、report.md の理由に沿って reading.json（または pages/）を直してから"
+                               " `make_neo.py <案件フォルダ>` を回すと続きができます。")
+                if _p2n_res.get('report_md'):
+                    with st.expander("📝 報告文（report.md）", expanded=True):
+                        st.markdown(_p2n_res['report_md'])
+                with st.expander("生成ログ（make_neo）", expanded=False):
+                    st.code(_p2n_mk.get('tail') or '', language='text')
+            elif _p2n_res.get('ok'):
+                st.success(f"✅ 合格 — {_p2n_mk.get('match_line') or '見積書合計との一致: OK'}")
+                for _w in (_p2n_rd.get('warn') or []):
+                    st.warning(f"⚠️ 読み取りの注意: {_w}")
+                _p2n_name = _p2n_res.get('download_name') or '見積_claude'
                 _p2n_c1, _p2n_c2 = st.columns(2)
                 with _p2n_c1:
-                    if _p2n_neo:
-                        # 固定名 "PDF変換_見積.neo" だったため、続けて何件変換しても
-                        # 同じファイル名になり、ダウンロード先で上書き・取り違えが起きた。
-                        # step4 と同じ規則（登録番号があればそれ、無ければ車名＋日時）で作る。
-                        # 一度決めた名前は session_state に置き、再描画で日時が変わらないようにする。
-                        _p2n_name = st.session_state.get('_pdf2neo_filename')
-                        if not _p2n_name:
-                            _p2n_name = generate_filename(
-                                _p2n_res.get('vehicle_info') or {},
-                                0, 0, 0, 0, False, reverse_match=True)
-                            st.session_state['_pdf2neo_filename'] = _p2n_name
-                        st.download_button(
-                            "📥 NEOファイルをダウンロード",
-                            data=_p2n_neo,
-                            file_name=_p2n_name,
-                            mime="application/octet-stream",
-                            key='pdf2neo_dl',
-                            width='stretch',
-                        )
+                    st.download_button(
+                        "📥 NEOファイルをダウンロード",
+                        data=_p2n_res.get('neo_bytes') or b'',
+                        file_name=f"{_p2n_name}.neo",
+                        mime="application/octet-stream",
+                        key='pdf2neo_dl',
+                        width='stretch',
+                    )
                 with _p2n_c2:
-                    if _p2n_items and st.button("📝 プレビューに取り込んで修正する",
-                                                key='pdf2neo_to_preview',
-                                                width='stretch'):
-                        st.session_state['csv_items'] = _p2n_items
-                        st.session_state['csv_mode']  = True
-                        # PDF側で選んだ税区分をプレビュー側にも引き継ぐ。
-                        # 引き継がないと、下流はCSV側のラジオを見るため
-                        # 税区分が食い違い、合計が10%ずれる。
-                        _carry = ('税込み（内税）'
-                                  if st.session_state.get('pdf2neo_tax_inclusive')
-                                  else '税抜き（外税）')
-                        st.session_state['tax_override'] = _carry
-                        # ここで csv_tax_radio に直接代入すると、同じ実行の前半で
-                        # 既に描画済みのウィジェットへの代入となり Streamlit が
-                        # 例外を投げ、取り込みが中断してしまう。次の実行の
-                        # 描画前に反映させるため、一時キーに預けておく。
-                        st.session_state['_tax_carry_pending'] = _carry
-                        st.session_state['pdf2neo_vehicle_info'] = _p2n_res.get('vehicle_info') or {}
-                        st.session_state['vehicle_file_bytes']  = None
-                        st.session_state['vehicle_file_name']   = None
-                        st.session_state['estimate_file_bytes'] = None
-                        st.session_state['estimate_file_name']  = None
-                        st.session_state['selected_model'] = selected_model
-                        st.session_state['step'] = 2
-                        st.rerun()
+                    _p2n_ext = _p2n_res.get('review_ext') or '.xlsx'
+                    st.download_button(
+                        "📥 確認箇所シートをダウンロード",
+                        data=_p2n_res.get('review_bytes') or b'',
+                        file_name=f"{_p2n_name}_確認箇所{_p2n_ext}",
+                        mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                              if _p2n_ext == '.xlsx' else "text/csv"),
+                        key='pdf2neo_dl_review',
+                        width='stretch',
+                    )
+                st.caption("NEO と確認箇所シートは必ず組で保険会社・担当者に渡してください"
+                           "（人が確かめる点は NEO の明細コメントではなくシートにあります）。")
+                if _p2n_res.get('report_md'):
+                    with st.expander("📝 報告文（report.md）", expanded=True):
+                        st.markdown(_p2n_res['report_md'])
+            else:
+                st.error(f"❌ {_p2n_res.get('error') or '変換できませんでした'}")
 
         # ================================================================
         # STEP 1-B: 車検証・テンプレートNEO（任意）

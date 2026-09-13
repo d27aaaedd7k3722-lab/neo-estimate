@@ -1,0 +1,180 @@
+# reading.json（見積書を「印字のまま」写す中間ファイル）
+
+PDF を読んだ Claude（人）は判断をせず、紙に書いてあるとおりに写す。ref 決定・左右分割・板金ランク・装備・塗装の解釈・費用の分類・レバーレートは `scripts/draft_estimate.py` が行い、estimate.json を作る。**時間短縮の要はここ**（判断をコードに任せる）。
+
+```json
+{
+ "source": "元 PDF のパス（/ 区切り）と書式（A〜E）",
+ "issuer": "工場名",
+ "est_date": "20260803",
+ "format": "B",
+ "vehicle": {"model_code": "AGH30W", "serial_no": "AGH30-0000001", "desig": "19553", "category": "0384", "reg_date": "R4.3", "color_code": "070"},
+ "customer": {...}, "insurance": {...},
+ "labor_rate": 8500,
+ "index_policy": "auto",
+ "hints": {"eva_codes": []},
+ "blocks": [
+  {"title": "フロントバンパー", "rows": [
+   {"name": "ﾌﾛﾝﾄﾊﾞﾝﾊﾟ ｶﾊﾞｰ", "method": "取替", "index": 1.50, "wage": 12750, "qty": 1, "price": 101000, "parts_no": "52119-58988-A0"},
+   {"note": "インテリジェントクリアランスソナー"},
+   {"name": "RH ﾌﾛﾝﾄﾌｪﾝﾀﾞ (5dm²)", "method": "鈑金", "index": 1.50, "wage": 12750},
+   {"name": "ﾅﾝﾊﾞｰﾌﾟﾚｰﾄﾛｯｸﾎﾞﾙﾄｽﾃｯｶｰ", "method": "取替", "qty": 1, "price": 1000, "manual": true}
+  ]}
+ ],
+ "paint": {
+  "paint": "2K", "coat": "3コートパール", "hf": "耐スリ傷", "material_rate": 55, "material": 41141, "total": 74800,
+  "lines": [
+   {"name": "右 ﾌﾛﾝﾄﾌｪﾝﾀﾞﾊﾟﾈﾙ 修正 1/3", "index": 2.50, "wage": 21250, "material": 11688},
+   {"name": "加算基礎数値", "index": 4.10, "wage": 34850},
+   {"name": "ﾌﾛﾝﾄﾊﾞﾝﾊﾟｰ 取替", "index": 2.20, "wage": 18700}
+  ]
+ },
+ "expenses": [{"name": "ショートパーツ", "amount": 3000, "in": "部品計"}, {"name": "コーティング", "amount": 15000, "in": "諸費用計"}],
+ "totals": {"parts": 579740, "wage": 37400, "paint": 74800, "material": 41141, "expense": 15000, "taxable": 748081, "tax": 74808, "total": 822889}
+}
+```
+
+## ページ単位の転記（pages/）
+
+2 ページ以上はページ単位で写す（`scripts/reading_pages.py`。SKILL.md 手順 4）。`pages/header.json` に明細以外、`pages/page_N.json` にそのページの明細を書き、`merge` が reading.json を作る。
+
+```json
+{"page": 1, "rows_printed": 18, "subtotal": {"parts": 363370, "wage": 63800}, "marks": {"$": 1, "#": 3},
+ "blocks": [{"title": "フロントバンパー", "rows": ["0010|Frﾊﾞﾝﾊﾟﾌｪｲｽ|取替|71100-T6A-Z10ZB|2.00|1|83400|22000|$|", "..."]}],
+ "paint_lines": [{"name": "加算基礎数値", "index": 4.10, "wage": 34850}],
+ "expenses": [{"name": "写真代", "amount": 800, "in": "部品計"}]}
+```
+
+| キー | 意味 |
+|---|---|
+| rows_printed | そのページに印字された明細行数（注記行・小計行・繰越行は数えない）。**必須**。validate が転記行数と突き合わせる |
+| subtotal.parts / wage | ページ小計が印字されていればその値（保留行を除く）。無いページは省略（合計欄との突合は merge で） |
+| marks | 印字の印の個数 `{"$": 1, "#": 3, "*": 2, "@": 1}`。転記した flags の数と突き合わせる |
+| blocks / rows | reading.json と同じ。merge が各ブロックに `page` を付け、reading.json の `pages` にページ小計を写す |
+| paint_lines / expenses | そのページに印字された塗装行・費用。merge が header の paint.lines / expenses の後ろに繋ぐ |
+
+reading.json を直接書くときも、`blocks[].page` と `pages: {"1": {"rows": 18, "parts": 363370, "wage": 63800, "marks": {...}}}` を書けば同じ検算が効く。ブロック単位の小計は `blocks[].subtotal: {"rows", "parts", "wage"}`。
+
+行の追加キー: `unit`（単価。price が数量分の金額であることを検算する。comment に `unit=NNN` でも可）。
+
+## 短縮記法（転記を速くする）
+
+`rows` の要素は dict の代わりに `|` 区切りの 1 行文字列でもよい。列順は固定で、空欄は空のまま:
+
+```
+code|name|method|parts_no|index|qty|price|wage|flags|comment
+"0010|Frﾊﾞﾝﾊﾟﾌｪｲｽ(ﾄｿｳｽﾞﾐ)|取替|71100-T6A-Z10ZB|2.00|1|83400|22000||"
+"|ﾌﾞﾁﾙﾃｰﾌﾟ材料代|取替||||1000||M|※JAS在庫使用"
+"|インテリジェントクリアランスソナー|||||||N|"
+```
+
+flags: `M` = manual（ADDATA に無い品目）、`R` = reserve（保留）、`N` = 注記行（name を note として扱う）、`$` `#` `*` `@` = コグニ印刷の右端の印（`@` は板金ランク行）（そのまま写す。make_neo が生成結果の WageByManual と照合し、違う行を表示する）。数値のカンマは無視。dict と混在可（dict では `"mark": "*#"`）。
+
+## 税込で印字された見積書（ディーラー・二輪。judgment_rules 10-4）
+
+**各行の金額まで税込**で刷る書式がある。見分け方は合計欄で「課税小計 × 税率 ≠ 消費税」なのに
+「課税小計 × r ÷ (100+r) = 消費税」が成り立つこと（r は税率％。10% 以外は `totals.tax_rate` に書く）。
+**ただし `tax_rate` が効くのはこの見分けだけで、生成器の消費税計算と `Setting.TaxRate` は 10% 固定**。
+8% など 10% 以外の案件は現状つくれない（judgment_rules 10-4）。
+
+この書式では、**印字のまま写す原則の例外**として次を (100+r)/100 で割って税抜にする:
+
+- 明細の `price` / `wage`
+- `paint.lines[].wage` / `paint.material` / `paint.total`。
+  塗装を詳細キーで**直接書いている案件は、その中の金額（`wage` / `material` など）もすべて** ——
+  `panels` / `base` / `booth` / `bumper_front` / `bumper_rear` / `wax` / `sealing` / `door_sash` / `stripe` /
+  `low_cover` / `two_coat_solid` / `two_tone` / `frame` / `other`（生成器はどれも税抜として扱う）
+- `expenses[].amount`（費用を税込のまま残すと費用計・課税小計・消費税がずれる）
+- `totals` の**金額項目すべて**（`parts` / `wage` / `paint` / `paint_total` / `material` / `expense` /
+  `expense_parts` / `expense_wage` / `frame` / `taxable` …）。
+  `tax` / `total` と制御キー（`tax_rate` / `neo_total` / `tolerance` / `tolerance_reason`）は割らない。
+  協定額の `target_total` は `totals` の中ではなく **reading の直下**に書く（`draft_estimate.py` はそこだけ見る）
+
+- 小計も税抜に直す —— ページ小計 `pages["N"]` / `pages/page_N.json` の `subtotal`、ブロック小計 `blocks[].subtotal`
+  （`reading_check.py` はどちらも行合計と突き合わせるので、印字の税込のまま残すと紙上検算が落ちる。印字の値は `note` に残す）
+
+`totals.tax`（消費税額）と `totals.total`（税込の御見積金額）だけは**印字どおり**に書く。
+
+## 指定合計に合わせる（協定額の NEO）
+
+`"target_total": 715000`（税込）を reading に書くと、draft_estimate が 課税小計 = 指定額 − 消費税（10% 四捨五入）を満たす額を求め、**塗装材料代** = 課税小計 − 部品計 − 工賃計 − 塗装工賃計 − 内板骨格 − 費用 − 値引 を `paint.material` に入れ、`totals` も指定額で作る。条件: `paint.panels` の詳細塗装であること、工賃未確定の行（wage/index とも無い取替・脱着・脱着修理）が無いこと。消費税は `tax_round`（既定 四捨五入。切り捨て・切り上げの工場はその設定）で解く。指定レートは `labor_rate` に書き、明細は index だけ写す。
+
+**損保が「○○の工賃で調整」と指定してきたとき**は、`target_total` を書くだけでは足りない。
+手順の正本は `judgment_rules.md` の **10-14**（工場見積そのままで先に検算 → 指定行の指数を 0.1 刻みで動かす →
+ページ小計とブロック小計の両方を直す → 残る端数を `target_total` に任せる → 前後の値を報告）。そちらに従う
+
+## 真偽値の欄（`manual` / `reserve` / `taxfree` / `auto_panels` / `generic` / `basic` / `draft` …）
+
+**`true` / `false` で書く**（JSON の真偽値）。人が書く欄なので次も受ける:
+
+- 真: `true` / `1` / `"true"` / `"yes"` / `"あり"` / `"有"` / `"はい"` / `"する"` / `"要"` / `"○"`
+- 偽: `false` / `0` / `"false"` / `"no"` / `"なし"` / `"無"` / `"いいえ"` / `"しない"` / `"不要"` / `"×"`、キー自体を書かない、空文字、空白だけ
+- **上のどれでもない値は ValueError で止まる**（`"maybe"` など）。黙って既定に落とさないのは、書き損じに人が気づけるようにするため（2026-09-12〜）
+- 金額・数量・指数の欄に真偽値を書くのは別のエラー（数値欄は数値だけ）
+- `recycle` は真偽値ではなく**リサイクル部品の情報（オブジェクト）**。`{"name": …, "price": …}`
+- 車種特定のヒント（`hints.four_wd` / `hints.hybrid`）は、**空や空白で書くと「指定なし」**になる（`false` を書くと 2WD 指定として候補の採点に効く）
+
+## 写し方の規則
+
+| 項目 | 規則 |
+|---|---|
+| blocks[].title | 見積書のブロック見出し（【フロントバンパー】等）。無い書式は 1 ブロックにまとめる（title は空でよい） |
+| rows[].code | コグニ印刷（書式 A）の 4 桁部品コード。あれば script はそのまま ref にする（12.DB に無いコードは品番/名称で照合） |
+| rows[].name | 印字どおり（RH/LH・全角半角・スペースそのまま）。板金の面積 `(5dm²)` も名称に含めてよい（`area` でも可） |
+| rows[].method | 印字どおりの区分語（取替 / 脱着 / 鈑金 / 修正 / 部品 / 交換 / 調整 …）。script が DisposalCode に写す |
+| rows[].index / wage | 印字どおり。工賃欄が空の付属部品は `wage` を書かない（script が 0 にする）。工賃欄自体が無い書式で取替/脱着行は index/wage とも省略（標準に任せる） |
+| rows[].qty / price | 数量と **数量分の金額**（印字が単価なら qty 倍して書く）。数量 0 や負は draft がエラーで止める（1 に化けさせない。行ごと消えている見積なら行を削る） |
+| rows[].parts_no | 印字どおり（ハイフン有無・末尾記号込み） |
+| rows[].note | 金額の無い注記行（装備条件など）。直前の部品に付く条件として記録される |
+| rows[].manual | ADDATA に無いと分かっている品目（素材列の `*`、社外品、ステッカー）は true |
+| rows[].comment | 任意。**転記メモ**（NEO には書かない。確認箇所シートに載る）。`要確認:` で始めるか `?` を含むと 要確認、それ以外は 参考。見積書に**印字された明細コメント**だけは先頭に `NEO:`（全角可）を付ける → NEO の明細コメント（40 バイト）。dict 行は `neo_comment` でも可（2026-09-13） |
+| rows[].reserve / area | 任意。`area` は板金の面積 d㎡（名称の `(6dm²)` でも可。小数は四捨五入） |
+| 「〃」の行 | 名称が `〃 交換工賃`（`〃 工賃` / `〃 脱着工賃` 等）で金額の無い行は、下書きが直前の部品の行の工賃にまとめる（まとめずに印字どおり写してよい）。`〃（モデリスタ）` のように金額のある行は、直前の名称を補った別の行になる |
+| 数量 1 のまま複数個分の金額 | 印字どおり写す。下書きが ADDATA の標準単価（3,000 円以下の小物）の整数倍（2〜99 倍）なら数量を直し、確認箇所シートに「数量」として載せる（判断規則 10-21） |
+| rows[].unit | 任意。単価（price が数量分の金額であることを reading_check が検算する。comment に `unit=NNN` でも可） |
+| rows[].bankin / recycle | **dict 形式の行でのみ** 書ける（短縮記法には列が無い）。`bankin: {"area": 6, "yes": [1,0,0]}` を書いた行は自動のランク判定をしない。リサイクル部品は `recycle: {"name": "リサイクル 左Fドア", "price": 30000, "stock_price": 30000}`（真偽値だけでは金額が決まらない） |
+| rows[].count | 塗装行（`paint.lines[]`）のワックスの本数だけで使う。明細行では読まれない |
+| paint.lines[].name | 印字どおり（「右 フロントフェンダパネル 修正 1/3」「加算基礎数値」「フロントバンパー 取替」「ブース」「防錆ワックス」）。バンパの修正は 変形修正 / 外傷修正小 / 外傷修正大 のいずれかを name に含める |
+| paint.auto_panels | `true` にすると、**明細の取替・板金・修理行から塗装パネルを起こす**（工場が塗装を一式でしか出していない見積書用）。`total`（工場の一式・税抜）との差は材料代で埋まる。判断規則 10-15 |
+| paint.material / material_rate / total | 材料計・割合（材料計 ÷ 塗装工賃計）・塗装工賃計。材料計が 塗装工賃計 × 割合 の一括四捨五入と一致すれば draft は割合だけ渡す（コグニの費用割合モード）。一致しなければ材料計を手入力 `*` として渡す |
+| expenses[].in | その費用が入っている合計欄の名前（部品計 / 作業計 / 諸費用計 / 非課税）。script が kind に写す |
+| totals | 見積書の合計欄そのまま（部品計・作業計・塗装計・材料計・諸費用計・課税小計・消費税・御見積額）。`expense` は諸費用計。**税込印字の見積書だけは例外** — 下の「税込で印字された見積書」のとおり `tax` / `total` 以外を税抜に直す |
+| labor_rate | 省略可（script が wage ÷ index の最頻値で逆算） |
+| index_policy | 非コグニ書式（日産系 FAX 等）だけ `manual` |
+| hints.eva_codes | 通常は空（script が品番から採用）。手で決めたいときだけ書く |
+
+## script が出す `_draft_notes`
+
+**必ず目を通す**（inspect_estimate.py の ★ と併せて判断する）。出るのは次の種類:
+
+| 注記 | 意味 / どうするか |
+|---|---|
+| 名称照合で決めた行 / 名称だけで決めた | 品番も部品コードも無く名称が唯一の根拠。別の部品を選んでいないか 12.DB 名称と照らす |
+| 未照合: … | ADDATA で引けず manual にした。ADDATA にある品目なら `code` を書く |
+| 左右が食い違う / 前後が食い違う | 名称と部品コードの左右・前後が合わない。**合計は合うので検算では見つからない**。印字のコードか名称の写し間違いを疑う |
+| 修理 / 板金 / 脱着 の行に部品代がある | 部品代が付くのは取替の行と手入力行だけ（実 NEO 5,400 行で確認）。区分の取り違えを疑う |
+| 部品コード … の行が 2 行ある | コグニもこの形を保つが、左右・前後を取り違えて同じ ref に寄せていないか見直す |
+| 左右分割した行 / 板金ランク / 装備の採用・不採用 | 従来どおり。根拠を報告に書く |
+| 塗装 … の行が 2 回ある | 加算基礎・ブース・ワックス・バンパは 1 案件 1 つ。後の行を採ったので、別項目なら name を直す |
+| 塗装計: 印字 … と塗装行の工賃合計 … が違う | 行の写し漏れか、内板骨格・付加塗装が含まれていないか確かめる |
+| 費用 / 塗装行の同じ行が 2 回ある（merge） | ページごとに繰り返し印字される合計欄を写していないか（二重計上） |
+
+## header（reading.json 直下）の追加キー — draft / reading_check が読む
+
+| キー | 例 | 何に効くか |
+|---|---|---|
+| `wage_round` | `100` | 工賃の丸め単位（1/10/100 円）。draft が印字工賃から自動推定するので普通は書かない |
+| `tax_round` | `"切り捨て"` | 消費税の計算単位。draft が合計欄から自動判定する（Setting.tx_ArrangeFlag） |
+| `discount` | `{"parts": -5000, "wage": 0}` | 値引き（−）・割増（＋） |
+| `frame` | `{"basic": true, "basic_index": 1.5, "items": [{"code": "1400", "rank": "A"}]}` | 内板骨格修正（estimate_schema の frame と同じ形） |
+| `index_policy` | `"manual"` | 非コグニ書式で全行を手入力指数にする |
+（数値欄の許容: 全角数字・カンマ・`¥`・`円` はそのまま写してよい（金額・数量・レート・塗装計・材料代・塗装パネルの工賃・費用の額すべて）。小数（`12.9`）や真偽値はどの項目かを示すエラーで止まる。印字の `-`（金額なし・指数なし）は空欄と同じ扱い。flags の全角 `＊＃＄＠` も半角に直して読む。それ以外の文字は draft が明確なエラーで止める）
+
+| `hints` | `{"eva_codes": ["U"], "eva_exclude": ["T"], "note": "…"}` | 装備の採用・除外（`eva_exclude` は draft の自動採用を外す） |
+| `note` | `"…"` | 転記メモ（merge で header に通る。生成には使わない） |
+| `target_total` | `715000` | 協定額（税込）。塗装材料代で自動調整する |
+| `adas` | `[{"name": "フロントカメラエーミング", "time": 1.0, "wage": 8000}]` | ADAS のエーミング作業（生成器の `estimate['adas']` にそのまま渡る） |
+| `_merged_from` | — | `reading_pages.py merge` が付ける（何ページを束ねたか） |
+
+行の印は短縮記法の `flags`（`$ # * @` と M 手入力 / R 保留 / N 注記）か、dict 行の `mark` に書く。
+draft が estimate.json に付ける内部キーは `items[]._mark` / `paint.lines[].draft` / `totals.expense_printed`（印字の印・絞模様・印字された諸費用計）で、reading には書かない。

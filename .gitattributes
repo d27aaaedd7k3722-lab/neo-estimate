@@ -1,0 +1,3 @@
+# vendor/pdf_to_neo は git archive のバイト列そのもの（LF）。内容ハッシュ（VENDOR_COMMIT.json の tree_sha256）で照合するので
+# git に改行を触らせない（core.autocrlf=true の clone で CRLF 化されると照合に落ちる）
+vendor/pdf_to_neo/** -text
