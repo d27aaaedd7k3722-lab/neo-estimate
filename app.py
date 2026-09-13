@@ -6350,18 +6350,20 @@ def _session_cache_scope() -> str:
         return _uuid.uuid4().hex
 
 
-def run_pdf_to_neo_skill(pdf_bytes, file_name, claude_api_key, mime_type='application/pdf',
+def run_pdf_to_neo_skill(pdf_bytes, file_name, api_key, mime_type='application/pdf',
                          vehicle_hint=None, insurance_hint=None, progress=None, record_profile=False,
-                         addata_root=None):
+                         addata_root=None, reader_kind='claude', model_name=''):
     """見積書 PDF → pdf-to-neo スキル（vendor/pdf_to_neo）で NEO と確認箇所シートを作る。
 
-    読む段だけ Claude API（neo_skill.reader）。判断・生成・検算・合否は vendor の make_neo.py そのもの
+    読む段だけ LLM（neo_skill.reader。reader_kind='claude' か 'gemini'。指示文・検算・読み直しは同じ）。
+    判断・生成・検算・合否は vendor の make_neo.py そのもの
     （docs/pdf-to-neo_アプリ移植ガイド.md）。合計を合わせるための調整はどこにも無い。
     戻り値 dict:
       ok / stage('read' | 'make' | 'done' | 'error') / error
       read: {ok, n_pages, stats, usage, fails[], traces[], warn[]}
       make: {ok, match_line, reasons[], tail}
       neo_bytes / review_bytes / review_ext / report_md / download_name / vendor_commit / cleanup_warning
+      reader: {kind, model}（どの AI が読んだか）
       repair_zip: 不合格のとき、人が直して続きをするための一式（pages/*.json・reading.json・report.md 等。NEO は入れない）
     insurance_hint: サイドバーの保険情報（policy_no / contractor / accident_date(8桁) / company）。
       見積書に印字が無い項目にだけ補う（reading の insurance → 生成器の Insurance テーブル）。
@@ -6378,7 +6380,8 @@ def run_pdf_to_neo_skill(pdf_bytes, file_name, claude_api_key, mime_type='applic
     from neo_skill import maker as _nsk_maker
     from neo_skill import reader as _nsk_reader
     from neo_skill import vendor as _nsk_vendor
-    out = {'ok': False, 'stage': 'error', 'error': '', 'vendor_commit': _nsk_vendor.commit_short()}
+    out = {'ok': False, 'stage': 'error', 'error': '', 'vendor_commit': _nsk_vendor.commit_short(),
+           'reader': {'kind': reader_kind, 'model': model_name or ''}}
     _why = _nsk_vendor.readiness_error()
     if _why:
         out['error'] = 'pdf-to-neo スキル（vendor）が使えません: ' + _why
@@ -6393,9 +6396,10 @@ def run_pdf_to_neo_skill(pdf_bytes, file_name, claude_api_key, mime_type='applic
         if str(mime_type or '').startswith('image/'):
             pdf_bytes = _nsk_llm.image_to_pdf(pdf_bytes)
         try:
-            reader = _nsk_llm.ClaudeReader(api_key=claude_api_key or None)
+            reader = _nsk_llm.make_reader(reader_kind, api_key=api_key or None, model=model_name or '')
+            out['reader']['model'] = getattr(reader, 'model', model_name or '')
         except Exception as e:
-            out['error'] = f'Claude API を使えません（anthropic パッケージ／キー）: {e}'
+            out['error'] = f'{reader_kind} の API を使えません（パッケージ／キー）: {e}'
             return out
         case_dir = _nsk_maker.new_case_dir()
         rd = _nsk_reader.read_estimate(pdf_bytes, reader=reader, case_dir=case_dir,
@@ -6718,8 +6722,8 @@ def main():
         # ── 設定 ──
         st.markdown('<div style="font-size:10px;font-weight:700;color:#94a3b8;letter-spacing:.08em;text-transform:uppercase;padding:4px 0">設定</div>', unsafe_allow_html=True)
         st.header("🔑 APIキー設定")
-        # 見積書 PDF → NEO は Claude API で読む（pdf-to-neo スキル経路）。
-        # Gemini は CSV 取り込み・車検証 OCR・旧経路で使う。
+        # 見積書 PDF → NEO（pdf-to-neo スキル経路）は Claude か Gemini で読む（両方あれば画面で選ぶ）。
+        # Gemini は CSV 取り込み・車検証 OCR・旧経路でも使う。
         if ANTHROPIC_API_KEY:
             claude_api_key = ANTHROPIC_API_KEY
             st.success("Claude APIキー: 設定済み (.env)")
@@ -6735,7 +6739,7 @@ def main():
             st.success("Gemini APIキー: 設定済み (.env)")
         else:
             api_key = st.text_input(
-                "Gemini APIキー（CSV取り込み・車検証OCR）",
+                "Gemini APIキー（見積書の読み取り・CSV取り込み・車検証OCR）",
                 type="password",
                 help=".envファイルの GEMINI_API_KEY にキーを設定すれば毎回入力不要"
             )
@@ -7232,9 +7236,9 @@ def main():
                 st.error("❌ pdf-to-neo スキル（vendor/pdf_to_neo）が使えません: " + _nsk_why
                          + "  → `python tools/vendor_sync.py --source <files> --commit <ID>` で取り込み、"
                          "アプリを再起動してください。")
-            elif not claude_api_key:
-                st.warning("⚠️ 見積書の読み取りには Claude APIキーが必要です。"
-                           "サイドバーの「APIキー設定」で入力するか、.env の ANTHROPIC_API_KEY に設定してください。")
+            elif not (claude_api_key or api_key):
+                st.warning("⚠️ 見積書の読み取りには Claude または Gemini の APIキーが必要です。"
+                           "サイドバーの「APIキー設定」で入力するか、.env の ANTHROPIC_API_KEY / GEMINI_API_KEY に設定してください。")
             elif not (_p2n_addata := find_addata_dir()):
                 # Addata が決まらないときは vendor の自動検出に落とさず止める（別の版で作らない）。
                 # 取得 URL を設定していて失敗しているなら、その理由を出す
@@ -7243,29 +7247,49 @@ def main():
                          + (f" 取得URLの失敗: {_p2n_url_err}" if _p2n_url_err else
                             " サイドバーの「Addata の場所を設定する」で場所を指定してください。")
                          + " この経路は Addata なしでは動きません（部品コード・標準指数を引けないため）。")
-            elif st.button("🚀 見積書からNEOを生成", key='pdf2neo_run', type="primary",
-                           width='stretch'):
-                st.session_state.pop('pdf2neo_result', None)
-                with st.status("見積書を読んで NEO を作っています…（ページ数により 1〜5 分）",
-                               expanded=True) as _p2n_status:
-                    def _p2n_progress(msg):
-                        _p2n_status.write(msg)
-                    _p2n_out = run_pdf_to_neo_skill(
-                        _p2n_bytes, _p2n_file.name, claude_api_key,
-                        mime_type=get_mime_type(_p2n_file.name),
-                        # サイドバーの「事故・保険情報」。見積書に印字が無い項目にだけ補われる
-                        insurance_hint=_sidebar_insurance_hint(),
-                        progress=_p2n_progress,
-                        # 工場プロファイル（取引先名）は既定で書かない。ローカル運用で学習させたいときだけ
-                        record_profile=(os.environ.get('NEO_SKILL_PROFILE') == '1'),
-                        # サイドバー / URL / ZIP で決めた ADDATA を vendor にも使わせる（版の食い違いを防ぐ）
-                        addata_root=_p2n_addata,
-                    )
-                    _p2n_status.update(
-                        label=("✅ 合格" if _p2n_out.get('ok') else "❌ 不合格（下の理由をご確認ください）"),
-                        state=('complete' if _p2n_out.get('ok') else 'error'), expanded=False)
-                st.session_state['pdf2neo_result'] = _p2n_out
-                st.rerun()
+            else:
+                # 読み手: 両方のキーがあれば選べる（既定は Claude。移植ガイド §3-4 が「同じ精度を狙うなら Claude が近い」）。
+                # 片方だけならそれを使う。指示文・検算・読み直し・生成は同じなので、違うのは読み取りの精度だけ
+                _p2n_choices = []
+                if claude_api_key:
+                    _p2n_choices.append(('claude', f"Claude（{os.environ.get('NEO_READER_MODEL') or 'claude-opus-5'}）"))
+                if api_key:
+                    _p2n_choices.append(('gemini', f"Gemini（{selected_model}）"))
+                if len(_p2n_choices) > 1:
+                    _p2n_pick = st.radio("🤖 見積書を読む AI", options=[c[1] for c in _p2n_choices], index=0,
+                                         horizontal=True, key='pdf2neo_reader',
+                                         help="判断・生成・検算は同じです。読み取りの精度だけが変わります。"
+                                              "読み取り結果の行（初回検算合格・読み直し回数）で比べられます。")
+                    _p2n_kind = next(c[0] for c in _p2n_choices if c[1] == _p2n_pick)
+                else:
+                    _p2n_kind = _p2n_choices[0][0]
+                    st.caption(f"読み取りに使う AI: {_p2n_choices[0][1]}")
+                _p2n_key = claude_api_key if _p2n_kind == 'claude' else api_key
+                _p2n_model = '' if _p2n_kind == 'claude' else selected_model
+                if st.button("🚀 見積書からNEOを生成", key='pdf2neo_run', type="primary",
+                             width='stretch'):
+                    st.session_state.pop('pdf2neo_result', None)
+                    with st.status("見積書を読んで NEO を作っています…（ページ数により 1〜5 分）",
+                                   expanded=True) as _p2n_status:
+                        def _p2n_progress(msg):
+                            _p2n_status.write(msg)
+                        _p2n_out = run_pdf_to_neo_skill(
+                            _p2n_bytes, _p2n_file.name, _p2n_key,
+                            mime_type=get_mime_type(_p2n_file.name),
+                            # サイドバーの「事故・保険情報」。見積書に印字が無い項目にだけ補われる
+                            insurance_hint=_sidebar_insurance_hint(),
+                            progress=_p2n_progress,
+                            # 工場プロファイル（取引先名）は既定で書かない。ローカル運用で学習させたいときだけ
+                            record_profile=(os.environ.get('NEO_SKILL_PROFILE') == '1'),
+                            # サイドバー / URL / ZIP で決めた ADDATA を vendor にも使わせる（版の食い違いを防ぐ）
+                            addata_root=_p2n_addata,
+                            reader_kind=_p2n_kind, model_name=_p2n_model,
+                        )
+                        _p2n_status.update(
+                            label=("✅ 合格" if _p2n_out.get('ok') else "❌ 不合格（下の理由をご確認ください）"),
+                            state=('complete' if _p2n_out.get('ok') else 'error'), expanded=False)
+                    st.session_state['pdf2neo_result'] = _p2n_out
+                    st.rerun()
 
         _p2n_res = st.session_state.get('pdf2neo_result')
         if _p2n_res:
@@ -7273,10 +7297,11 @@ def main():
             _p2n_mk = _p2n_res.get('make') or {}
             _p2n_st = _p2n_rd.get('stats') or {}
             if _p2n_rd:
+                _p2n_reader = _p2n_res.get('reader') or {}
                 st.caption(
-                    f"読み取り: {_p2n_rd.get('n_pages')} ページ ／ "
+                    f"読み取り（{_p2n_reader.get('kind', '?')} {_p2n_reader.get('model', '')}）: {_p2n_rd.get('n_pages')} ページ ／ "
                     f"初回検算合格 {int(round(100 * float(_p2n_st.get('first_try_ok_rate') or 0)))}% ／ "
-                    f"読み直し {_p2n_st.get('retries', 0)} 回 ／ Claude 呼び出し {_p2n_st.get('calls', 0)} 回 ／ "
+                    f"読み直し {_p2n_st.get('retries', 0)} 回 ／ API 呼び出し {_p2n_st.get('calls', 0)} 回 ／ "
                     f"{_p2n_st.get('seconds', 0)} 秒")
             if _p2n_res.get('cleanup_warning'):
                 st.warning("⚠️ " + _p2n_res['cleanup_warning'])

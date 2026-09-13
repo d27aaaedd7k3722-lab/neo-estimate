@@ -36,7 +36,7 @@
 
 - 取り込んでいるコミット: `vendor/pdf_to_neo/VENDOR_COMMIT.json`（いま `9136473db9c6`）
 - 取り直し: `python tools/vendor_sync.py --source "<files>" --commit <ID>`／改変チェック `--check`
-- 見積書を読む LLM は Claude API（`.env` の `ANTHROPIC_API_KEY`。Gemini は CSV 取り込み・車検証 OCR 用）
+- 見積書を読む LLM は Claude API（`.env` の `ANTHROPIC_API_KEY`）か Gemini API（`GEMINI_API_KEY`）。両方あれば画面で選ぶ（既定 Claude）、Gemini だけならそれで動く。判断・生成・検算は同じ
 - 合格の条件は vendor の `make_neo.py` と同じ。NEO と確認箇所シート（xlsx）は必ず組で出す
 - 旧経路（`pdf_to_neo_pipeline` / `auto_matching`）は UI から外した。関数は残してある
 - 詳細は `docs/引き継ぎ書.md` §12、方針は files の `docs/pdf-to-neo_アプリ移植ガイド.md`

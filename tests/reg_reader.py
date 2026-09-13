@@ -257,6 +257,40 @@ def main() -> int:
     if p.returncode != 0:
         fails.append('tools/vendor_sync.py --check が NG: ' + (p.stdout + p.stderr).strip()[-300:])
 
+    # ── 17: Gemini 版の読み手は、同じブロック（document / text）を Gemini の形に写し、finish_reason を同じ規則で扱う（API は呼ばない）
+    try:
+        from google.genai import types as _gt
+        parts = llm_mod.GeminiReader.to_parts([llm_mod.document_block(pdf), {'type': 'text', 'text': 'こんにちは'}], _gt)
+        if len(parts) != 2 or not isinstance(parts[1], str) or getattr(getattr(parts[0], 'inline_data', None), 'mime_type', '') != 'application/pdf':
+            fails.append(f'GeminiReader.to_parts の写しが違う: {parts}')
+        if llm_mod.GeminiReader._fatal('404 NOT_FOUND model') is not True or llm_mod.GeminiReader._fatal('503 Service Unavailable') is not False:
+            fails.append('GeminiReader._fatal の判定が違う（404 は即諦め、503 は再試行）')
+
+        class _Stub:  # generate_content の返事を差し替えて、切れた返事・空の返事を拒む規則を確かめる
+            def __init__(self, text, fin):
+                self.text = text
+                self.candidates = [type('C', (), {'finish_reason': type('F', (), {'name': fin})()})()]
+                self.usage_metadata = type('U', (), {'prompt_token_count': 5, 'candidates_token_count': 2, 'cached_content_token_count': 0})()
+                self.response_id = 'r1'
+
+        gr = llm_mod.GeminiReader.__new__(llm_mod.GeminiReader)
+        gr._types = _gt; gr.model = 'stub'; gr.max_tokens = 10; gr.calls = 0
+        gr.client = type('Cl', (), {'models': type('M', (), {'generate_content': staticmethod(lambda **kw: _Stub('{"a":1}', 'STOP'))})()})()
+        rp = gr.ask('sys', [{'type': 'text', 'text': 'x'}])
+        if rp.text != '{"a":1}' or rp.stop_reason != 'STOP' or rp.input_tokens != 5:
+            fails.append(f'GeminiReader.ask の戻りが違う: {rp}')
+        for bad_fin in ('MAX_TOKENS', 'OTHER', 'LANGUAGE', 'SAFETY', 'FINISH_REASON_UNSPECIFIED', ''):
+            gr.client = type('Cl', (), {'models': type('M', (), {'generate_content': staticmethod(lambda _f=bad_fin, **kw: _Stub('{"a":1}', _f))})()})()
+            try:
+                gr.ask('sys', [{'type': 'text', 'text': 'x'}])
+                fails.append(f'GeminiReader が finish_reason={bad_fin!r} の返事を通した（STOP 以外は拒む）')
+            except llm_mod.LLMError:
+                pass
+        if llm_mod.make_reader('gemini', api_key='dummy', model='gemini-x').model != 'gemini-x':
+            fails.append('make_reader(gemini) がモデル名を通していない')
+    except ImportError:
+        print('（google-genai が無いので項目 17 は省略）')
+
     for f in fails:
         print('*** FAILED:', f)
     print('reg_reader:', 'all ok' if not fails else f'{len(fails)} 件が不合格')

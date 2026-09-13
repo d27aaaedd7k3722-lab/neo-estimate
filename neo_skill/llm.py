@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import time
 from typing import Optional
 
 DEFAULT_MODEL = os.environ.get('NEO_READER_MODEL') or 'claude-opus-5'
@@ -98,6 +99,114 @@ def parse_json_reply(text: str) -> dict:
     if not isinstance(v, dict):
         raise LLMError('返事の JSON がオブジェクトでない')
     return v
+
+
+DEFAULT_GEMINI_MODEL = os.environ.get('NEO_READER_GEMINI_MODEL') or 'gemini-3.5-flash'
+
+
+class GeminiReader:
+    """Gemini API 版の読み手。ClaudeReader と同じ ask(system, blocks) を持ち、reader.py からは区別されない。
+    指示文・PDF の渡し方（1 ページずつ）・出力（JSON だけ）・検算と読み直しのループは Claude 版と同じ。
+    違うのは API の呼び方だけ: system は system_instruction、document ブロックは Part.from_bytes、JSON モードで返させる"""
+
+    def __init__(self, api_key: Optional[str] = None, model: str = '', max_tokens: int = 16000,
+                 timeout: float = 600.0):
+        from google import genai  # 遅延 import
+        from google.genai import types
+        self._types = types
+        kw = {'api_key': api_key} if api_key else {}
+        self.client = genai.Client(http_options=types.HttpOptions(timeout=int(timeout * 1000)), **kw)
+        self.model = model or DEFAULT_GEMINI_MODEL
+        self.max_tokens = max_tokens
+        self.calls = 0
+
+    @staticmethod
+    def to_parts(blocks: list, types_mod) -> list:
+        """Claude 形式のブロック（document / text）を Gemini の contents に写す（テストしやすいよう純関数）"""
+        out = []
+        for b in blocks:
+            t = b.get('type')
+            if t == 'document':
+                src = b.get('source') or {}
+                if src.get('type') != 'base64':
+                    raise LLMError('Gemini 版は base64 の document ブロックだけ受ける')
+                out.append(types_mod.Part.from_bytes(data=base64.standard_b64decode(src['data']),
+                                                     mime_type=src.get('media_type') or 'application/pdf'))
+            elif t == 'image':
+                src = b.get('source') or {}
+                out.append(types_mod.Part.from_bytes(data=base64.standard_b64decode(src['data']),
+                                                     mime_type=src.get('media_type') or 'image/png'))
+            elif t == 'text':
+                out.append(str(b.get('text') or ''))
+            else:
+                raise LLMError(f'未知のブロック種別: {t!r}')
+        return out
+
+    @staticmethod
+    def _fatal(msg: str) -> bool:
+        """待っても通らないエラー（モデル無し・上限・不正な要求・認証）は即座に諦める（app.py の call_gemini と同じ流儀）"""
+        m = msg.upper()
+        return any(k in m for k in ('404', 'NOT_FOUND', '429', 'RESOURCE_EXHAUSTED', '400', 'INVALID_ARGUMENT',
+                                    '401', '403', 'PERMISSION', 'UNAUTHENTICATED', 'API KEY', 'API_KEY'))
+
+    def ask(self, system: str, blocks: list, *, cache_system: bool = True) -> LLMReply:
+        """system（固定の指示文）＋ user（PDF と作業の指示）を送り、テキストを返す。
+        max_tokens で切れた返事・安全性で止まった返事は使わない（壊れた JSON を検算に回さない）。
+        Gemini の指示文キャッシュは対応モデルで自動（implicit caching）なので、ここでは何もしない"""
+        t = self._types
+        parts = self.to_parts(blocks, t)
+        config = t.GenerateContentConfig(system_instruction=system, temperature=0.0,
+                                         max_output_tokens=self.max_tokens, response_mime_type='application/json')
+        last: Optional[Exception] = None
+        r = None
+        for attempt in range(3):
+            try:
+                r = self.client.models.generate_content(model=self.model, contents=parts, config=config)
+                break
+            except Exception as e:  # noqa: BLE001  SDK の例外型は版で変わるので文言で判断
+                msg = str(e)
+                if self._fatal(msg):
+                    raise LLMError(f'Gemini API エラー（{self.model}）: {msg[:300]}')
+                last = e
+                time.sleep(1 + attempt)
+        if r is None:
+            raise LLMError(f'Gemini API に 3 回失敗（{self.model}）: {last}')
+        self.calls += 1
+        try:
+            text = r.text or ''
+        except Exception:  # noqa: BLE001  候補が無い・複数パートで .text が使えない
+            text = ''
+        fin = ''
+        try:
+            fr = r.candidates[0].finish_reason if r.candidates else None
+            fin = str(getattr(fr, 'name', fr) or '')
+        except Exception:  # noqa: BLE001
+            fin = ''
+        um = getattr(r, 'usage_metadata', None)
+        rep = LLMReply(text=text, stop_reason=fin,
+                       input_tokens=int(getattr(um, 'prompt_token_count', 0) or 0),
+                       output_tokens=int(getattr(um, 'candidates_token_count', 0) or 0),
+                       cache_read_tokens=int(getattr(um, 'cached_content_token_count', 0) or 0),
+                       request_id=str(getattr(r, 'response_id', '') or ''), model=self.model)
+        if fin == 'MAX_TOKENS':
+            raise LLMError(f'返事が max_output_tokens（{self.max_tokens}）で切れた。ページを分けるか max_tokens を増やす')
+        if fin != 'STOP':
+            # STOP 以外（SAFETY / RECITATION / BLOCKLIST / LANGUAGE / OTHER / UNSPECIFIED / 読めない …）は、本文が付いていても
+            # 正常に終わった返事ではないので検算に回さない（Claude 版の refusal と同じ扱い）
+            raise LLMError(f'Gemini が正常に終わらなかった（finish_reason={fin or "不明"}）')
+        if not text.strip():
+            raise LLMError('Gemini から空の返事（finish_reason=STOP）')
+        return rep
+
+
+def make_reader(kind: str, api_key: Optional[str] = None, model: str = ''):
+    """読み手を作る。kind は 'claude' か 'gemini'。どちらも ask(system, blocks) を持つ"""
+    k = (kind or '').lower()
+    if k == 'gemini':
+        return GeminiReader(api_key=api_key, model=model)
+    if k == 'claude':
+        return ClaudeReader(api_key=api_key, model=model)
+    raise LLMError(f'未知の読み手: {kind!r}（claude / gemini）')
 
 
 class ClaudeReader:
