@@ -32,7 +32,7 @@ from typing import Optional
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
-from draft_estimate import ROW_FIELDS, SMALL_WORDS, _flag, _hw_kana, _num, _side_of, detect_wage_round, expand_row, infer_labor_rate, labor_pairs, rate_score  # noqa: E402
+from draft_estimate import PARTS_NAME_BYTES, ROW_FIELDS, SMALL_WORDS, _cp932_len, _flag, _hw_kana, _num, _side_of, detect_wage_round, expand_row, hw, infer_labor_rate, labor_pairs, rate_score  # noqa: E402
 
 def _profiles_path() -> str:
     """工場プロファイル（工場名・レート・丸め）の置き場 = <NEO_CHECK_ROOT>/_profiles/factory_profiles.json。
@@ -192,6 +192,17 @@ class Checker:
             # 短縮記法の列数
 
     # ------------------------------------------------------------------ 3. 左右
+    def check_long_names(self) -> None:
+        """手入力の行（M・汎用車種）の名称は見積の印字がそのまま NEO の名称欄（24 バイト）に入る。入らない行を先に知らせ、
+        reading の行に neo_name（24 バイト以内の短い名前）を書いてもらう（書かなければ下書きが自動で短くし、確認箇所シートの 要確認 になる）"""
+        generic = _flag((self.rd.get('vehicle') or {}).get('generic'), 'vehicle.generic')
+        long_rows = [r for r in self.rows if (r.get('manual') or generic) and not r.get('neo_name')
+                     and _cp932_len(hw(_hw_kana(str(r.get('name') or ''))).strip()) > PARTS_NAME_BYTES]
+        if long_rows:
+            self.warn(f'手入力の行の名称が NEO の名称欄 {PARTS_NAME_BYTES} バイトを超える: {len(long_rows)} 行（'
+                      + '、'.join(f"行{r['_no']} {str(r.get('name') or '')[:14]}" for r in long_rows[:5])
+                      + '）。dict の行にして neo_name（24 バイト以内）を書くと、その名前で NEO に入る（書かなければ自動で短くする）')
+
     def check_sides(self) -> None:
         for r in self.rows:
             side_row = _side_of(str(r.get('name') or ''))
@@ -506,6 +517,7 @@ class Checker:
         self.note(f'推定: レバーレート {labor:,} / 工賃丸め {wage_round} 円')
         self.check_rows(labor, wage_round)
         self.check_sides()
+        self.check_long_names()
         self.check_subtotals()
         self.check_expenses()
         self.check_totals(labor, wage_round)

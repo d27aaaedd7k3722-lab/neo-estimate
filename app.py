@@ -596,23 +596,54 @@ def jpy_round(value) -> int:
             return 0
 
 
+_ERA_BASE = {'R': 2018, '令和': 2018, 'H': 1988, '平成': 1988, 'S': 1925, '昭和': 1925}   # 元年 = base + 1
+# 各元号の期間（この外の日付は「その元号の日付として存在しない」ので空にする。黙って別の日にしない）
+_ERA_SPAN = {2018: ((2019, 5, 1), (9999, 12, 31)), 1988: ((1989, 1, 8), (2019, 4, 30)), 1925: ((1926, 12, 25), (1989, 1, 7))}
+
+
 def _normalize_date8(raw) -> str:
     """日付入力を YYYYMMDD の8桁に正規化する。解釈できなければ空文字。
 
-    「2026/09/01」「2026-09-01」「20260901」いずれも受け付ける。
-    妥当でない日付（13月など）は書き込まない。
+    受け付ける形: 「20260901」「2026/09/01」「2026-9-1」「2026.09.01」「2026年9月1日」、
+    和暦「R6.9.1」「R6/9/1」「令和6年9月1日」「H30.4.5」「S60.1.1」（元号 R/H/S・令和/平成/昭和、元年は 1 か 元）。
+    年の無い「9/1」や、13 月などの妥当でない日付は空文字（黙って別の日にしない）。
+    以前は「数字だけ抜いて 8 桁」だったため、2026-9-1 や和暦が黙って空になっていた（2026-09-14）。
     """
-    s = re.sub(r'[^\d]', '', str(raw or ''))
-    if len(s) != 8:
+    import unicodedata as _ud
+    t = _ud.normalize('NFKC', str(raw or '')).strip()
+    if not t:
+        return ''
+    y = m = d = None
+    mo = re.fullmatch(r'(\d{8})', t)
+    if mo:
+        y, m, d = int(t[:4]), int(t[4:6]), int(t[6:8])
+    else:
+        mo = re.fullmatch(r'(\d{4})\s*[/\-.年]\s*(\d{1,2})\s*[/\-.月]\s*(\d{1,2})\s*日?', t)
+        if mo:
+            y, m, d = int(mo.group(1)), int(mo.group(2)), int(mo.group(3))
+        else:
+            mo = re.fullmatch(r'(令和|平成|昭和|[RHS])\s*(\d{1,2}|元)\s*[/\-.年]\s*(\d{1,2})\s*[/\-.月]\s*(\d{1,2})\s*日?', t, re.I)
+            if mo:
+                era = mo.group(1).upper() if len(mo.group(1)) == 1 else mo.group(1)
+                n = 1 if mo.group(2) == '元' else int(mo.group(2))
+                if n < 1:
+                    return ''
+                y, m, d = _ERA_BASE[era] + n, int(mo.group(3)), int(mo.group(4))
+                era_span = _ERA_SPAN[_ERA_BASE[era]]
+    if y is None:
         return ''
     try:
-        d = datetime.datetime.strptime(s, '%Y%m%d')
+        dt = datetime.datetime(y, m, d)
     except ValueError:
         return ''
+    if mo and mo.re.pattern.startswith('(令和|平成|昭和'):
+        lo, hi = era_span
+        if not (datetime.datetime(*lo) <= dt <= datetime.datetime(*hi)):
+            return ''   # 平成31年5月1日・昭和64年1月8日 のような、その元号に無い日付
     # 昭和より前は和暦に変換できず、日付だけ入って元号が空になるため受け付けない
-    if d.year < 1926:
+    if dt.year < 1926:
         return ''
-    return s
+    return dt.strftime('%Y%m%d')
 
 
 def _normalize_number_text(raw):
@@ -6463,14 +6494,22 @@ def run_pdf_to_neo_skill(pdf_bytes, file_name, api_key, mime_type='application/p
 
 
 def _sidebar_insurance_hint():
-    """サイドバーの「事故・保険情報」のうち、pdf-to-neo の生成器が読む項目だけを reading の insurance の形にする。
-    受付番号・代理店・アジャスター・入出庫日は生成器が読まない（files 側の課題）ので渡さない"""
+    """サイドバーの「事故・保険情報」を reading の insurance の形にする（キー名は生成器 estimate_schema.md の insurance）。
+    証券番号 policy_no / 契約者 contractor / 事故日 accident_date / 受付番号 accept_no / 代理店 agency / アジャスター adjuster /
+    入庫日 garage_in / 出庫日 garage_out / 修理日数 repair_days。見積書に印字が無い項目にだけ補われる。
+    日付は _normalize_date8 で YYYYMMDD（読めない形は空 = 渡さない）。生成器が読まないキーは無視されるだけで害は無い"""
     _h = {
         'policy_no': str(st.session_state.get('policy_no', '') or '').strip(),
         'contractor': str(st.session_state.get('contractor_name', '') or '').strip(),
         'accident_date': _normalize_date8(st.session_state.get('accident_date', '')),
+        'accept_no': str(st.session_state.get('accept_no', '') or '').strip(),
+        'agency': str(st.session_state.get('agency_name', '') or '').strip(),
+        'adjuster': str(st.session_state.get('adjuster_name', '') or '').strip(),
+        'garage_in': _normalize_date8(st.session_state.get('garage_in_date', '')),
+        'garage_out': _normalize_date8(st.session_state.get('garage_out_date', '')),
+        'repair_days': str(st.session_state.get('repair_days', '') or '').strip(),
     }
-    return {k: v for k, v in _h.items() if v}
+    return {k: v for k, v in _h.items() if v and v != '0'}
 
 
 def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=None,
@@ -6728,21 +6767,21 @@ def main():
             claude_api_key = ANTHROPIC_API_KEY
             st.success("Claude APIキー: 設定済み (.env)")
         else:
-            claude_api_key = st.text_input(
+            claude_api_key = (st.text_input(
                 "Claude APIキー（見積書の読み取り）",
                 type="password",
                 key='claude_api_key_input',
                 help=".envファイルの ANTHROPIC_API_KEY にキーを設定すれば毎回入力不要"
-            )
+            ) or '').strip()   # 空白だけの入力を「キーあり」にしない
         if GEMINI_API_KEY:
             api_key = GEMINI_API_KEY
             st.success("Gemini APIキー: 設定済み (.env)")
         else:
-            api_key = st.text_input(
+            api_key = (st.text_input(
                 "Gemini APIキー（見積書の読み取り・CSV取り込み・車検証OCR）",
                 type="password",
                 help=".envファイルの GEMINI_API_KEY にキーを設定すれば毎回入力不要"
-            )
+            ) or '').strip()
         # 利用可能なモデルをAPIで動的取得（APIキーがある場合のみ）
         if api_key:
             _ck = _model_cache_key(api_key)
@@ -7229,7 +7268,8 @@ def main():
             _p2n_bytes = _p2n_file.read()
             _p2n_file.seek(0)
             st.caption(f"📄 {_p2n_file.name}（{len(_p2n_bytes):,} bytes）")
-            st.caption("サイドバーの「事故・保険情報」（証券番号・契約者名・事故日）は、見積書に印字が無ければ NEO に補われます。"
+            st.caption("サイドバーの「事故・保険情報」（証券番号・契約者名・事故日・受付番号・代理店・アジャスター・入出庫日・修理日数）は、"
+                       "見積書に印字が無ければ NEO に補われます。"
                        "「費用（Expense）」欄はこの経路では使いません — 見積書に印字された費用だけを写します"
                        "（印字に無い費用を足すと、原本との照合が崩れるため）。")
             if not _nsk_ready:

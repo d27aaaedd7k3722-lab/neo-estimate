@@ -48,6 +48,17 @@ def test_row_numbers_are_neo_record_numbers():
     assert [e['row'] for e in es if e['kind'] == '標準価格と違う'] == [2], es
 
 
+def test_generic_vehicle_collapses_manual_rows():
+    """汎用車種（コグニ非収録）は全行が手入力なので「手入力の行」を 1 行ずつ挙げず、1 件にまとめる"""
+    est = dict(EST, vehicle={'generic': True, 'car_code': 'Z10', 'car_name': 'ﾃｽﾄ'})
+    rows = [dict(r, PartsCode='', _manual=True) for r in ROWS]
+    est['items'] = [dict(it, manual=True, code='') for it in EST['items']]
+    es = rs.collect(est, rows)
+    assert not [e for e in es if e['kind'] == '手入力の行'], es
+    g = [e for e in es if e['kind'] == '汎用車種']
+    assert len(g) == 1 and '3 行' in g[0]['text'], g
+
+
 def test_write_xlsx_or_csv():
     d = tempfile.mkdtemp(prefix='review_')
     p = rs.write(os.path.join(d, 'x_確認箇所.xlsx'), rs.collect(EST, ROWS), EST, ROWS, {'totals': {'parts': 51440, 'total': 56584}})

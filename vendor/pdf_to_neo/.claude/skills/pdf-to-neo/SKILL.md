@@ -27,6 +27,9 @@ description: 工場見積 PDF（どの書式でも）＋車検証から、コグ
 | `scripts/find_ref_by_price.py` | 名称と 1 個あたりの標準単価から ADDATA の部品コードを探す（同名候補が多い小物の特定） |
 | `scripts/pick_grade.py` | グレードが決まらない案件を、部品金額と ADDATA 標準価格の一致数で絞る |
 | `scripts/make_neo.py` | 案件フォルダを渡すと 下書き → 突合せ → NEO 生成 → 検算 → 印字の印との照合 → 報告文（report.md）→ 確認箇所シート（xlsx）→ 納品コピー を 1 コマンドで行う |
+| `scripts/intent_check.py` | できあがった NEO を読み戻し、estimate.json（下書きの意図）と 1 行ずつ突き合わせる（部品コード・数量・金額・工賃・コメント・名称・顧客名）。make_neo が呼び、食い違いは不合格、欄で切れた名称などは確認箇所シートの 要確認 |
+| `scripts/neo_compare.py` | 納品した NEO と、あとで確報・協定に使われた NEO（コグニで直したもの・別アプリのもの）を明細単位で突き合わせ、品番の違い・数量の違い・足された行・削られた行を出す（読むだけ。手順 9 の答え合わせ） |
+| `scripts/pdf_pages.py` | 見積 PDF をページごとの拡大画像（上下に分けたもの）と文字層に切り分ける。転記の下ごしらえ |
 | `scripts/review_sheet.py` | 確認箇所シート（xlsx: 確認箇所 / 手入力の行 / 下書きの判断 / 合計）を作る。make_neo が呼ぶ（openpyxl が無い PC は CSV） |
 | `scripts/reading_check.py` / `reading_pages.py` / `ocr_prefill.py` | 紙上検算 / ページ単位の転記 / Windows OCR 先読み（手順 4〜5） |
 | `scripts/option_audit.py` | 装備監査（印字品番 vs 装備で決まる標準品番）。make_neo が生成後に呼ぶ |
@@ -75,7 +78,7 @@ python .claude/skills/pdf-to-neo/scripts/env_check.py --save --install-skill
 4. **車両**: 確度 `confirmed` か `high`。`low` のときは何で絞ったか（`hints.grade_name` 等）と、
    確定に足りない資料（型式指定番号・類別区分番号）を報告に書く
 5. **根拠**: レバーレートの決め手、税込印字の有無、丸め差を残した理由が estimate.json と報告に残っている
-6. **確認箇所シート**: 人が確かめる点・下書きが判断した点は、NEO と一緒に渡す `<顧客>_<車名>_claude_確認箇所.xlsx` にまとめる。NEO の明細コメントに入れるのは、見積書に印字された明細コメント（`NEO:` 付き）だけ（2026-09-13 亮平さん指示。判断規則 10-22）
+6. **確認箇所シート**: 人が確かめる点・下書きが判断した点は、NEO と一緒に渡す `<顧客>_<車名>_claude_確認箇所.xlsx`（openpyxl が無い PC では `.csv`）にまとめる。NEO の明細コメントに入れるのは、見積書に印字された明細コメント（`NEO:` 付き）だけ（2026-09-13 亮平さん指示。判断規則 10-22）
 
 **よくある取りこぼし**（2026-09-09 の 3 件で実際に起きたもの）
 
@@ -103,6 +106,7 @@ python .claude/skills/pdf-to-neo/scripts/env_check.py --save --install-skill
 - **案件フォルダに既存の NEO（立会で作ったもの）があれば必ず見る**。`python claude_neo_pipeline/tests/neo_diff.py <生成.neo> <既存.neo>` で全列を突き合わせると、合計・名称・作業区分の入れ方が確認できる（既存ファイルは開くだけ。上書き・削除は禁止）
 
 PDF は Read ツールで開く（画像 PDF でも Vision で読める。`pypdf` の文字層は FAX だとゼロなので当てにしない）。
+3 ページ以上・品番の細かい見積は、先に `python .claude/skills/pdf-to-neo/scripts/pdf_pages.py <PDF> <NEO_CHECK_ROOT>/<案件>/pages/img --top 0.2 --bottom 0.9` でページを上下に分けた拡大画像にしてから読む（読み違いが減り、ページ全体を何度も開き直さずに済む）。
 
 ### 2. PDF を読み取り、書式を分類する
 
@@ -174,7 +178,7 @@ PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/ocr_prefill.py "
 4. 左右（RH/LH・右/左）、Fr/Rr、上下は印字どおり。見出しの左右と行の左右が違う行は comment に理由を書く
 5. 小計・消費税・前頁繰越・合計行は明細に入れない（header.totals / page.subtotal に）
 6. 塗装行・費用がそのページに印字されていれば `paint_lines` / `expenses`（`in` 必須）に
-7. 読めない数値は推測せず、その行の comment に `?` と読めた範囲を書く（validate が拾う）。人に確かめてほしい点は comment を `要確認:` で始める（確認箇所シートの 要確認 になる）。見積書に印字された明細コメント（※JAS在庫使用 等）だけは `NEO:※JAS在庫使用` と書く（NEO の明細コメントになる）
+7. 読めない数値は推測せず、その行の comment に `?` と読めた範囲を書く（validate が拾う）。人に確かめてほしい点は comment を `要確認:` で始める（確認箇所シートの 要確認 になる）。見積書に印字された明細コメント（※JAS在庫使用 等）だけは `NEO:※JAS在庫使用` と書く（NEO の明細コメントになる）。手入力の行（M・汎用車種）で名称が 24 バイト（半角カナ換算）を超える行は dict の行にして `neo_name` に 24 バイト以内の短い名前を書く（NEO の名称欄に入る。印字の全文は確認箇所シートに残る。書かなければ自動で短くして 要確認）
 8. 保存 → `validate --page N`。FAIL はそのページを読み直す（他のページは触らない）。WARN は理由が言えれば進む
 
 全ページ合格 → `merge`（全体の合計欄・費用の集計先・工場設定の検算）。FAIL があれば「差額と同じ額の行/費用」のヒントを手掛かりに header.json か該当ページを直す。
@@ -197,6 +201,7 @@ PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/make_neo.py "<NE
 - `draft_estimate.py` が reading.json から estimate.json を作り、`_draft_notes`（名称照合で決めた行・左右分割・板金ランク・採用した装備・追加項目（paint.other）と手入力の塗装行にした塗装行・manual にした行）を表示する。**必ず読む**
 - 続けて `inspect_estimate.py` の突合せ（★ 要確認）と `run_case.py` の検算が出る。全部 OK なら「合格」
 - 生成後に **装備監査**（`option_audit.py`）が走る。生成器が選んだ装備で決まる標準品番と印字品番を突き合わせ、「装備 X を追加/除外すると一致する行が増える」行があれば ★ で出る。装備の取り違いは合計を変えずに標準品番・指数だけを変えるので、合計一致だけでは見つからない。★ が出たら 10.DB の装備名と見積の注記で採否を決め、採るなら reading の `hints.eva_codes` に書いて再実行
+- 生成の後に **意図との突き合わせ**（`intent_check.py`）が走り、できあがった NEO を読み戻して estimate.json と 1 行ずつ比べる。部品コード・数量・金額・工賃・明細コメントが違えば不合格。名称・顧客名などが欄の長さで切れたものは確認箇所シートの 要確認（2026-09-13 に追加。合計が合っていても、手入力の作業名が 24 バイトで途中まで・顧客名が「…株式」までになっていた）
 - `report.md` ができる（不合格でも書かれるので、合格の行と合わせて読む）（車両・合計表・手入力行・判断点・要確認・印字の印との照合・紙上検算・装備監査）。**報告はこれを元に書く**。コグニ印刷（書式 A）で右端の印（$ # *）を flags に写しておくと、生成 NEO の印との差が出る（差ゼロ = コグニで作ったのと同じ書式）
 - 工場が塗装を「一式」でしか出していない見積書は、reading の paint に `auto_panels: true` を足すと
   **明細からパネルを起こしてコグニと同じ塗装明細に組み直す**（差は材料代で埋まり、塗装費用計と合計は動かない。10-15）
@@ -270,13 +275,14 @@ computer-use では `コグニセブン`（AudaMenu）と、同じフォルダ�
 ### 8. 納品する
 
 - 同じ部品コードの行が複数あると `report.md` と画面に出る。コグニもこの形を保つので直す必要は無いが、左右や前後を取り違えて同じ ref に寄せていないか見直す
-- `make_neo.py ... --deliver "Z:/2026年/MM月/DD日/<案件フォルダ>"` で `<顧客>_<車名>_claude.neo` と `<顧客>_<車名>_claude_確認箇所.xlsx` がコピーされる（既存ファイルは上書きせず、両方そろえて `_2` を付ける）。手でコピーするときも同じ名前規則
+- `make_neo.py ... --deliver "Z:/2026年/MM月/DD日/<案件フォルダ>"` で `<顧客>_<車名>_claude.neo` と `<顧客>_<車名>_claude_確認箇所.xlsx`（openpyxl が無い PC では `.csv`）がコピーされる（既存ファイルは上書きせず、両方そろえて `_2` を付ける）。手でコピーするときも同じ名前規則
 - SendUserFile で NEO と確認箇所シートを渡す（caption に合計と一致の旨）。報告の「確認していただきたいこと」はシートの **要確認** の行から書く
 - 報告は結論先: 合計一致、車両特定の根拠、`#` 手入力にした行と理由、左右分割・装備・板金ランクなど判断した点、未確認事項
 
 ### 9. 記録する
 
 - 日誌 `~/.claude/brain/05_日誌/YYYY-MM-DD.md` に案件名・車両・判断点・出力先を追記
+- **答え合わせ**: あとで案件フォルダに確報・協定に使った NEO（`<登録番号>_見積.neo` など、納品した `_claude` 以外）が置かれたら、`python .claude/skills/pdf-to-neo/scripts/neo_compare.py <納品した.neo> <その NEO>` で突き合わせる（既存ファイルは開くだけ）。「品番の違い」は見積書でどちらが正しいか確かめる。「相手の側だけ」「納品の側だけ」は協定で足した・削った行か、読み落としかを見分ける。読み落とし・規則の違いが見つかったら `reference/judgment_rules.md` に書く（2026-09-13 の結果は 10-24）
 - 新しい書式・新しい判断規則が出たら `reference/format_catalog.md` / `reference/judgment_rules.md` に追記（このスキル自体を育てる）
 - 生成器の不具合や規則の追加が必要なら codex-loop で修正し、`claude_neo_pipeline/tests/verify_all.sh` を通す（実機保存 NEO との総当たり比較は `claude_neo_pipeline/tests/audit_cogni_files.py`、AnSMB の 142 桁一致は `audit_cogni_files.py --ansmb`）
 

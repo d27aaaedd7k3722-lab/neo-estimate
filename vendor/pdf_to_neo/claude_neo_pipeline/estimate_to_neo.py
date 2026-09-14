@@ -1737,7 +1737,7 @@ class NeoBuilder:
                             sec_used = sec_pdf; work_code = (sec_used or '').ljust(10)[:10]
             if dcode in (2, 6):
                 work_code = ''  # 板金(6)/修理(2) 行の WorkCode は空欄（工場 NEO の板金 7 行・修理 13 行、コグニ再検索 C-HR 3500 板金 '#'。取替(K) 行の区分を流用しない）
-            name_disp = display_name(std_name) if std_name else hw(re.sub(r'S$', 'ｽ', it.get('name', '')))
+            name_disp = display_name(std_name) if std_name else hw(re.sub(r'(?<=[ｦ-ﾟ])S$', 'ｽ', it.get('name', '')))  # 半角カナの末尾の 'S' だけ 'ｽ' に（OCR の読み違い）。英字の品名 'SPL. S' は直さない（2026-09-13 ベンツ）
             if it.get('name') and ('左' in it['name'] or '右' in it['name']) and name_disp and name_disp[0] not in '左右':
                 name_disp = ('左' if '左' in it['name'] else '右') + name_disp
             is_sub = pprice > 0 and wage == 0 and dcode == 0 and ref is not None  # 手入力行（部品コード無し）には付属部品の 2 スペース接頭辞を付けない（コグニ実機 2026-09-08）
@@ -2856,13 +2856,32 @@ class NeoBuilder:
         # コグニ運用では所有者欄に顧客名を入れることが多い（実機 cogni_R1/R2）ため自動では採用しない
                      cust.get('user_name', '同上'), cust.get('owner_name', cust.get('name', '')), term, tera, tey, reg_date, era, ey, int(cust.get('kilometer') or 0)))
         # Insurance / FileInfo / Setting
-        acc = ins.get('accident_date', '') or '00000000'; pre = ins.get('presence_date', '') or '00000000'
+        def _date8(v):
+            """YYYYMMDD 以外（空・区切り付きで 8 桁にならないもの）は ''。区切り付きでも数字が 8 桁なら受ける。
+            日付なしの番兵 '00000000' も ''（元号の年が '0000' にならないように。Codex 指摘 2026-09-14）"""
+            s = re.sub(r'\D', '', str(v or ''))
+            return s if len(s) == 8 and s != '00000000' else ''
+
+        def _int_or(v, default):
+            try:
+                return int(str(v).strip()) if str(v or '').strip() else default
+            except ValueError:
+                return default
+        acc = _date8(ins.get('accident_date', '')) or '00000000'; pre = _date8(ins.get('presence_date', '')) or '00000000'
         aera, aey = nc.get_era_info(acc) if acc != '00000000' else ('令和', ''); pera, pey = nc.get_era_info(pre) if pre != '00000000' else ('令和', '')
-        cur.execute('''UPDATE Insurance SET PolicyNo=?,ContractorName=?,AgencyName='',AccidentDate=?,AccidentEra=?,AccidentEraYear=?,PresenceDate=?,PresenceEra=?,PresenceEraYear=?,
-                       AgreedDate='00000000',AgreedEra='令和',AgreedEraYear='',RepairDays=-1,TimelyPriceOutTax=-1,TimelyPriceInTax=-1,TimelyPriceTax=-1,AdjusterName='',AdjusterPost='',ConsultantName='',ConsultantFactory=?''',
-                    (_fit(ins.get('policy_no', ''), 20), _fit(ins.get('contractor', ''), 20), acc, aera, aey, pre, pera, pey, _fit(ins.get('factory', ''), 30)))
+        # 受付番号・代理店・アジャスター・入出庫日・修理日数（2026-09-14）: estimate の insurance にあれば書く。無ければ従来どおり
+        # 空 / -1 / '00000000'（雛形と同じ）。置き場所はコグニと同じ列（Insurance.AgencyName / AdjusterName / RepairDays、
+        # FileInfo.AcceptNo / GarageIn* / GarageOut*）。XML の GarageIn/OutDate は実機 NEO 178 本で日付があっても空なので書かない
+        gin = _date8(ins.get('garage_in', '')); gout = _date8(ins.get('garage_out', ''))
+        giera, giey = nc.get_era_info(gin) if gin else ('令和', ''); goera, goey = nc.get_era_info(gout) if gout else ('令和', '')
+        cur.execute('''UPDATE Insurance SET PolicyNo=?,ContractorName=?,AgencyName=?,AccidentDate=?,AccidentEra=?,AccidentEraYear=?,PresenceDate=?,PresenceEra=?,PresenceEraYear=?,
+                       AgreedDate='00000000',AgreedEra='令和',AgreedEraYear='',RepairDays=?,TimelyPriceOutTax=-1,TimelyPriceInTax=-1,TimelyPriceTax=-1,AdjusterName=?,AdjusterPost='',ConsultantName='',ConsultantFactory=?''',
+                    (_fit(ins.get('policy_no', ''), 20), _fit(ins.get('contractor', ''), 20), _fit(ins.get('agency', ''), 20), acc, aera, aey, pre, pera, pey,
+                     _int_or(ins.get('repair_days'), -1), _fit(ins.get('adjuster', ''), 20), _fit(ins.get('factory', ''), 30)))
         eera, eey = nc.get_era_info(est_date)
-        cur.execute("UPDATE FileInfo SET EstimatedDate=?,EstimatedEra=?,EstimatedEraYear=?,GarageInDate='00000000',GarageOutDate='00000000',Note1='',Note2='',Note3=''", (est_date, eera, eey))
+        cur.execute("UPDATE FileInfo SET EstimatedDate=?,EstimatedEra=?,EstimatedEraYear=?,AcceptNo=?,GarageInDate=?,GarageInEra=?,GarageInEraYear=?,"
+                    "GarageOutDate=?,GarageOutEra=?,GarageOutEraYear=?,Note1='',Note2='',Note3=''",
+                    (est_date, eera, eey, _fit(ins.get('accept_no', ''), 37), gin or '00000000', giera, giey, gout or '00000000', goera, goey))
         tax_flag = {'四捨五入': 1, '切り捨て': 2, '切り上げ': 3}.get(str(getattr(self, '_tax_round', None) or '四捨五入'), 1)
         cur.execute('UPDATE Setting SET wb_PriceBase=?, wb_Round=?, wi_Round=10, TaxKindFlag=0, TaxRate=10, tx_ArrangeFlag=?', (labor_rate, wage_unit(), tax_flag))  # 工賃単位（1/10/100 円）は wb_Round だけ（コグニ実機 2026-09-08 cogni_frame_F2_r100: wi_Round は 10 のまま）。消費税の計算単位 tx_ArrangeFlag 1=四捨五入/2=切り捨て/3=切り上げ（cogni_frame_F2_taxfloor）
         try:  # 帳票タイトルの並びはコグニ保存版と同じ ReportID（Unicode）順
@@ -2907,7 +2926,7 @@ class NeoBuilder:
         reg = car.get('ps_CarRegDate', '')
         m = re.match(r'^\s*(\S+?)\s*(\d{2,3})\s*([ぁ-んア-ン])\s*[\-‐]?\s*(\d{1,4})\s*$', unicodedata.normalize('NFKC', cust.get('reg_no', '')))
         dep, div, biz, ser = (m.groups() if m else ('', '', '', ''))
-        vals = {'CustomerName1': cust.get('name', ''), 'CustomerName2': '', 'AdjusterName': '', 'AcceptNo': '', 'TicketNo': ins.get('policy_no', ''),
+        vals = {'CustomerName1': cust.get('name', ''), 'CustomerName2': '', 'AdjusterName': ins.get('adjuster', ''), 'AcceptNo': ins.get('accept_no', ''), 'TicketNo': ins.get('policy_no', ''),
                 'AccidentDate': (f"{ins['accident_date'][:4]}/{ins['accident_date'][4:6]}/{ins['accident_date'][6:8]}" if ins.get('accident_date') else ''),
                 'CarNo': f'{dep}{div}{biz}{ser}', 'CarName': car.get('CarNameByUser', ''), 'CarMouldNo': car.get('ps_CarMouldNo', ''), 'CarKindNo': car.get('ps_CarKindNo', ''),
                 'ColorCode': car.get('ColorCode', ''), 'OwnerName': cust.get('owner_name', cust.get('name', '')), 'UserName': cust.get('user_name', '同上'),
@@ -2927,6 +2946,8 @@ class NeoBuilder:
     def build(self, estimate: dict, vehicle_inputs: dict, hints: Optional[dict] = None, labor_rate: Optional[int] = None,  # noqa: D401
               est_date: Optional[str] = None, insurance: Optional[dict] = None) -> tuple[bytes, dict]:
         labor_rate = _money(labor_rate, 'labor_rate（レバーレート）') or None  # '8,000' のような写し方でも受ける
+        if insurance is None:  # estimate_schema.md は estimate['insurance'] が正。引数で渡さない呼び出し元でも保険・案件欄を落とさない（Codex 指摘 2026-09-14）
+            insurance = estimate.get('insurance') if isinstance(estimate.get('insurance'), dict) else None
         token = set_wage_unit(_money(estimate.get('wage_round'), 'wage_round（工賃の丸め単位）') or 10)  # 工賃丸め単位（工場のコグニ設定。100 円丸めの工場あり）。この build の間だけ有効
         com_tables.reset_sources()  # このビルドで COM の表をどこから読んだか（予備を使ったら run_case が ★）
         try:
@@ -3294,7 +3315,7 @@ class NeoBuilder:
             dep, div, biz, ser = (m.groups() if m else ('', '', '', ''))
             mail = '\r\n'.join(['[General]', 'Signature=NEOMAIL2', '[Audaneo2]', f"CustomerName={ins.get('contractor', '')}",
                                 f'CarNoDepartment={dep}', f'CarNoDivision={div}', f'CarNoBusiness={biz}', f'CarNoSerial={ser}',
-                                f"TicketNo={ins.get('policy_no', '')}", 'AcceptNo=', f"AccidentDate={ins.get('accident_date', '') or '00000000'}",
+                                f"TicketNo={ins.get('policy_no', '')}", f"AcceptNo={ins.get('accept_no', '')}", f"AccidentDate={ins.get('accident_date', '') or '00000000'}",
                                 f"AgreedName={_fit(ins.get('factory', ''), 30)}", f"CarName={car['CarNameByUser']}", ''])
             files['AnSvMail.ini'] = mail.encode('cp932w', 'replace')
         # AnFlInfo: 車種データ版数を ADDATA の AnVer.DB に合わせる（コグニ保存時と同形）

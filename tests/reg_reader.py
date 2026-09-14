@@ -75,6 +75,27 @@ def rows_of(rd: dict) -> list:
     return [r for b in (rd or {}).get('blocks', []) for r in b.get('rows', [])]
 
 
+def neo_if_tables(neo_path: str) -> dict:
+    """生成した NEO の AnSvIf の Insurance / FileInfo を読む。vendor の neo_container を使うが、
+    このプロセスには import しない（別プロセス。項目 9 の非汚染検査と両立させる）"""
+    import subprocess
+    from neo_skill import vendor as _v
+    code = (
+        'import sys, os, json, sqlite3, tempfile\n'
+        'sys.path.insert(0, sys.argv[1]); import neo_container as nc\n'
+        'neo = open(sys.argv[2], "rb").read(); ck = nc.find_real_cks(neo); raw = nc.decompress_neo(neo, ck)\n'
+        'mgmt, entries = nc.parse_entries(neo, ck[0]); fs = nc.extract_files(raw, entries)\n'
+        'p = os.path.join(tempfile.gettempdir(), "reg_reader_if_%d.db" % os.getpid()); open(p, "wb").write(fs["AnSvIf0001.sld"])\n'
+        'c = sqlite3.connect(p); out = {}\n'
+        'for t in ("Insurance", "FileInfo"):\n'
+        '    cols = [r[1] for r in c.execute("pragma table_info(%s)" % t)]; out[t] = dict(zip(cols, c.execute("select * from %s" % t).fetchone()))\n'
+        'c.close(); os.unlink(p); print("@@" + json.dumps(out, ensure_ascii=False, default=str))\n')
+    p = subprocess.run([sys.executable, '-c', code, _v.PIPELINE_DIR, neo_path], capture_output=True, text=True,
+                       encoding='utf-8', errors='replace', env=dict(os.environ, PYTHONIOENCODING='utf-8'))
+    line = next((l for l in (p.stdout or '').splitlines() if l.startswith('@@')), '')
+    return json.loads(line[2:]) if line else {}
+
+
 def main() -> int:
     fails = []
     pdf = blank_pdf(1)
@@ -163,13 +184,26 @@ def main() -> int:
     # ── 7: サイドバーの保険情報（insurance_hint）は、見積書に印字が無い項目にだけ補われる
     case = tempfile.mkdtemp(prefix='reg_reader_')
     fake = FakeReader([HEADER, PAGE_OK])
-    hint = {'policy_no': 'P-0001', 'contractor': 'ｹﾝｼｮｳ ﾊﾅｺ', 'accident_date': '20260901', 'company': '上書きされない'}
+    hint = {'policy_no': 'P-0001', 'contractor': 'ｹﾝｼｮｳ ﾊﾅｺ', 'accident_date': '20260901', 'company': '上書きされない',
+            'accept_no': 'A-2026-0001', 'agency': 'テスト代理店', 'adjuster': 'テスト査定', 'garage_in': '20260903', 'garage_out': '20260910', 'repair_days': '7'}
     res = reader.read_estimate(pdf, reader=fake, case_dir=case, source_name='test.pdf', insurance_hint=hint)
     ins = ((res.reading or {}).get('insurance') or {})
     if not res.ok or ins.get('policy_no') != 'P-0001' or ins.get('contractor') != 'ｹﾝｼｮｳ ﾊﾅｺ' or ins.get('accident_date') != '20260901':
         fails.append(f'insurance_hint が reading に補われていない: ok={res.ok} insurance={ins} error={res.error}')
     if ins.get('company') != 'テスト損保':
         fails.append(f'見積書に印字のある項目（company）がヒントで上書きされた: {ins.get("company")}')
+    # 生成まで通し、受付番号・代理店・アジャスター・入出庫日・修理日数が NEO の Insurance / FileInfo に本当に入ること
+    # （ソース文字列の検査だけだと、vendor の生成器が古くて無視していても通ってしまう。Codex 指摘 2026-09-14）
+    if res.ok:
+        mk = maker.make_neo(case, 'estimate', no_profile=True)
+        t = neo_if_tables(mk.neo_path) if (mk.ok and mk.neo_path) else {}
+        ins_t, fi_t = (t.get('Insurance') or {}), (t.get('FileInfo') or {})
+        if (not mk.ok or ins_t.get('AgencyName') != 'テスト代理店' or ins_t.get('AdjusterName') != 'テスト査定'
+                or str(ins_t.get('RepairDays')) != '7' or fi_t.get('AcceptNo') != 'A-2026-0001'
+                or fi_t.get('GarageInDate') != '20260903' or fi_t.get('GarageOutDate') != '20260910'):
+            fails.append('保険情報が NEO の Insurance/FileInfo に入っていない（vendor の生成器が古い可能性。files 2026-09-14 以降を取り直す）: '
+                         f'ok={mk.ok} AgencyName={ins_t.get("AgencyName")!r} AdjusterName={ins_t.get("AdjusterName")!r} RepairDays={ins_t.get("RepairDays")!r} '
+                         f'AcceptNo={fi_t.get("AcceptNo")!r} GarageIn={fi_t.get("GarageInDate")!r} GarageOut={fi_t.get("GarageOutDate")!r}')
     shutil.rmtree(case, ignore_errors=True)
 
     # ── 8: 作業フォルダの後始末。消せたら None、無いパスも None
@@ -290,6 +324,133 @@ def main() -> int:
             fails.append('make_reader(gemini) がモデル名を通していない')
     except ImportError:
         print('（google-genai が無いので項目 17 は省略）')
+
+    # ── 18: LLM が subtotal / marks を配列・文字列で返しても読み取り全体は止まらず、形の FAIL 文言で読み直して合格する
+    case = tempfile.mkdtemp(prefix='reg_reader_')
+    bad_shape = dict(PAGE_OK, subtotal=[45000, 16000], marks='$')
+    fake = FakeReader([HEADER, bad_shape, PAGE_OK])
+    res = reader.read_estimate(pdf, reader=fake, case_dir=case, source_name='test.pdf')
+    if not res.ok or fake.calls != 3:
+        fails.append(f'形の崩れたページが読み直しに回らない: ok={res.ok} calls={fake.calls} error={res.error[:120]}')
+    if len(fake.prompts) >= 3 and ('subtotal は' not in fake.prompts[2] or 'marks は' not in fake.prompts[2]):
+        fails.append('形の崩れの読み直し指示文に、どのキーの形が違うかが書かれていない')
+    shutil.rmtree(case, ignore_errors=True)
+    # header 側の型崩れ（vehicle が配列、expenses が文字列、要素がオブジェクトでない）は落とさず PageShapeError（読み直しの理由）
+    for label, bad_h in (('vehicle が配列', {'vehicle': ['JF1'], 'totals': {'parts': 1}}), ('expenses が文字列', {'totals': {'parts': 1}, 'expenses': 'x'}),
+                         ('expenses の要素が文字列', {'totals': {'parts': 1}, 'expenses': ['x', {'name': 'y', 'amount': 1}]}), ('adas の要素が null', {'totals': {'parts': 1}, 'adas': [None]}),
+                         ('paint.lines の要素が文字列', {'totals': {'parts': 1}, 'paint': {'lines': ['x']}}), ('paint.lines が文字列', {'totals': {'parts': 1}, 'paint': {'lines': 'x'}}),
+                         ('paint.panels の要素が文字列', {'totals': {'parts': 1}, 'paint': {'panels': ['x']}}), ('paint.other の要素が文字列', {'totals': {'parts': 1}, 'paint': {'other': ['x']}}),
+                         ('frame.items の要素が文字列', {'totals': {'parts': 1}, 'frame': {'items': ['x']}}), ('hints.eva_codes の要素が数値', {'totals': {'parts': 1}, 'hints': {'eva_codes': [1]}}),
+                         ('paint.sealing が文字列', {'totals': {'parts': 1}, 'paint': {'sealing': 'x'}}), ('paint.wax が配列', {'totals': {'parts': 1}, 'paint': {'wax': [1]}}),
+                         ('paint.booth が数値', {'totals': {'parts': 1}, 'paint': {'booth': 2550}})):
+        try:
+            h = reader._normalise_header(bad_h, {'model_code': 'JF1'}, None)
+            fails.append(f'_normalise_header が型崩れ（{label}）を黙って落とした: {h}')
+        except reader.PageShapeError:
+            pass
+    # schema どおりの入れ子（frame.items のオブジェクト、hints.eva_codes の文字列）は通る
+    try:
+        h = reader._normalise_header({'totals': {'parts': 1}, 'frame': {'basic': True, 'items': [{'code': '1400', 'rank': 'A'}]}, 'hints': {'eva_codes': ['U'], 'eva_exclude': ['T']},
+                                      'paint': {'lines': [{'name': 'a', 'index': 1.0, 'wage': 1}], 'panels': [{'code': '1400', 'wage': 1}], 'other': [{'name': 'b', 'wage': 1}],
+                                                'booth': {'index': 0.3, 'wage': 2550}, 'sealing': {'m': 2, 'wage': 1000}, 'material': 12000, 'total': 34850}}, None, None)
+        if not (h.get('frame', {}).get('items') and h.get('hints', {}).get('eva_codes') == ['U'] and len(h.get('paint', {})) == 7):
+            fails.append(f'_normalise_header が schema どおりの入れ子を落とした: {h}')
+    except reader.PageShapeError as e:
+        fails.append(f'_normalise_header が schema どおりの入れ子を形の誤りにした: {e}')
+    # null / 空の項目は「書かなかった」として落とすだけ（形の誤りにしない）
+    h = reader._normalise_header({'vehicle': None, 'totals': {'parts': 1, 'wage': None}, 'expenses': [], 'paint': {}}, {'model_code': 'JF1'}, None)
+    if h.get('vehicle') != {'model_code': 'JF1'} or h.get('totals') != {'parts': 1} or 'expenses' in h or 'paint' in h:
+        fails.append(f'_normalise_header が null / 空の扱いを変えた: {h}')
+
+    # ── 20: 要素の形崩れ（expenses が文字列の配列、rows が文字列）でも検算プロセスが落ちず、形の FAIL 文言で読み直して合格する（Codex 17）
+    for label, bad_page in (('expenses の要素が文字列', dict(PAGE_OK, expenses=['short parts 1000'])),
+                            ('paint_lines の要素が文字列', dict(PAGE_OK, paint_lines=['x'])),
+                            ('rows の要素が配列', dict(PAGE_OK, blocks=[{'title': '', 'rows': [['Rrﾊﾞﾝﾊﾟ', '取替', 45000]]}])),
+                            ('blocks の要素が文字列', dict(PAGE_OK, blocks=['|Rrﾊﾞﾝﾊﾟ|取替|71501-TY0-000ZZ|1.00|1|45000|8000||']))):
+        case = tempfile.mkdtemp(prefix='reg_reader_')
+        fake = FakeReader([HEADER, bad_page, PAGE_OK])
+        res = reader.read_estimate(pdf, reader=fake, case_dir=case, source_name='test.pdf')
+        if not res.ok or fake.calls != 3:
+            fails.append(f'{label}: 読み直しに回らない: ok={res.ok} calls={fake.calls} error={res.error[:120]}')
+        if len(fake.prompts) >= 3 and ('オブジェクト' not in fake.prompts[2] and '文字列' not in fake.prompts[2]):
+            fails.append(f'{label}: 読み直し指示文に要素の形が書かれていない')
+        if len(fake.prompts) >= 3 and label == 'rows の要素が配列' and '"取替"' not in fake.prompts[2]:
+            fails.append(f'{label}: 読み直し指示文の「前回の写し」から形の崩れた行が消えている（元の返事を書き換えている。Codex 23）')
+        if len(fake.prompts) >= 3 and label == 'blocks の要素が文字列' and '取替' not in fake.prompts[2]:
+            fails.append(f'{label}: 読み直し指示文の「前回の写し」から文字列の block が消えている（Codex 24）')
+        shutil.rmtree(case, ignore_errors=True)
+    # ── 21: header.json が配列で返っても読み取り全体は止まらない — parse_json_reply が非オブジェクトを拒み、_ask_json が
+    #        1 回言い直させる（Codex 19 の「AttributeError で止まる」は到達しない。_normalise_header にも明確なガードを置いた）
+    case = tempfile.mkdtemp(prefix='reg_reader_')
+    fake = FakeReader(['[1, 2]', HEADER, PAGE_OK])
+    res = reader.read_estimate(pdf, reader=fake, case_dir=case, source_name='test.pdf')
+    if not res.ok or fake.calls != 3:
+        fails.append(f'header が配列のとき言い直しに回らない: ok={res.ok} calls={fake.calls} error={res.error[:120]}')
+    if len(fake.prompts) >= 2 and 'オブジェクト' not in fake.prompts[1]:
+        fails.append('header の言い直し指示文に、オブジェクトで返す旨が書かれていない')
+    shutil.rmtree(case, ignore_errors=True)
+    # 2 回続けて配列なら、理由付きの error で終わる（例外の型名だけにしない・AttributeError で落ちない）
+    case = tempfile.mkdtemp(prefix='reg_reader_')
+    fake = FakeReader(['[1]', '[2]', HEADER, PAGE_OK])
+    res = reader.read_estimate(pdf, reader=fake, case_dir=case, source_name='test.pdf')
+    if res.ok or fake.calls != 2 or 'オブジェクト' not in (res.error or '') or 'AttributeError' in (res.error or ''):
+        fails.append(f'header が配列のまま直らないときの終わり方: ok={res.ok} calls={fake.calls} error={(res.error or "")[:120]}')
+    shutil.rmtree(case, ignore_errors=True)
+    try:  # _normalise_header 自体も配列・文字列・null を AttributeError でなく理由付きで拒む
+        reader._normalise_header([1, 2], None, None); fails.append('_normalise_header が配列を通した')
+    except reader.PageShapeError:
+        pass
+
+    # ── 22: header の totals が配列で返る／無い → 落として合計欄の検算なしで合格にせず、理由を返して読み直して合格する（Codex 21）
+    for label, bad_h in (('totals が配列', dict(HEADER, totals=[45000, 16000])), ('totals が無い', {k: v for k, v in HEADER.items() if k != 'totals'}),
+                         ('paint が配列', dict(HEADER, paint=['x'])), ('paint.lines の要素が文字列', dict(HEADER, paint={'lines': ['x']})),
+                         ('frame.items の要素が文字列', dict(HEADER, frame={'items': ['x']})), ('paint.sealing が文字列', dict(HEADER, paint={'sealing': 'x'}))):
+        case = tempfile.mkdtemp(prefix='reg_reader_')
+        fake = FakeReader([bad_h, HEADER, PAGE_OK])
+        res = reader.read_estimate(pdf, reader=fake, case_dir=case, source_name='test.pdf')
+        if not res.ok or fake.calls != 3:
+            fails.append(f'{label}: header の読み直しに回らない: ok={res.ok} calls={fake.calls} error={res.error[:120]}')
+        if len(fake.prompts) >= 2 and ('totals' not in fake.prompts[1] and 'paint' not in fake.prompts[1] and 'frame' not in fake.prompts[1]):
+            fails.append(f'{label}: header の読み直し指示文に問題の項目が書かれていない')
+        shutil.rmtree(case, ignore_errors=True)
+    # 上限まで直らなければ不合格（合計欄なしで NEO を作らせない）。理由付きの error
+    case = tempfile.mkdtemp(prefix='reg_reader_')
+    bad_h = dict(HEADER, totals=[45000, 16000])
+    fake = FakeReader([bad_h, bad_h, bad_h, bad_h, PAGE_OK])
+    res = reader.read_estimate(pdf, reader=fake, case_dir=case, source_name='test.pdf')
+    if res.ok or fake.calls != 4 or 'totals' not in (res.error or ''):
+        fails.append(f'totals が直らないときの終わり方: ok={res.ok} calls={fake.calls} error={(res.error or "")[:120]}')
+    shutil.rmtree(case, ignore_errors=True)
+
+    # 文字列の行（| 区切り）と dict 行はどちらも正しい形（reading_schema.md）。形の誤りにしない
+    try:
+        reader._normalise_page({'page': 1, 'rows_printed': 2, 'blocks': [{'title': '', 'rows': ['|a|取替||1.00|1|100|||', {'name': 'b', 'method': '脱着', 'qty': 1}]}], 'subtotal': {}, 'marks': {}}, 1)
+    except reader.PageShapeError as e:
+        fails.append(f'文字列の行・dict 行が形の誤りにされた: {e}')
+
+    # ── 19: ページ数の上限。上限を超える PDF は AI を 1 回も呼ばずに止まる。環境変数が読めなくても import が落ちない（Codex 22）
+    old_env = os.environ.get('NEO_READER_MAX_PAGES')
+    try:
+        for val, want in (('abc', 30), ('0', 30), ('-5', 30), (' 12 ', 12), ('', 30)):
+            os.environ['NEO_READER_MAX_PAGES'] = val
+            if reader._env_int('NEO_READER_MAX_PAGES', 30) != want:
+                fails.append(f'NEO_READER_MAX_PAGES={val!r} → {reader._env_int("NEO_READER_MAX_PAGES", 30)}（期待 {want}）')
+    finally:
+        if old_env is None:
+            os.environ.pop('NEO_READER_MAX_PAGES', None)
+        else:
+            os.environ['NEO_READER_MAX_PAGES'] = old_env
+    fake = FakeReader([])
+    old = reader.MAX_PAGES
+    reader.MAX_PAGES = 2
+    try:
+        case = tempfile.mkdtemp(prefix='reg_reader_')
+        res = reader.read_estimate(blank_pdf(3), reader=fake, case_dir=case, source_name='big.pdf')
+        if res.ok or fake.calls != 0 or '上限' not in res.error:
+            fails.append(f'ページ数の上限が効いていない: ok={res.ok} calls={fake.calls} error={res.error[:80]}')
+        shutil.rmtree(case, ignore_errors=True)
+    finally:
+        reader.MAX_PAGES = old
 
     for f in fails:
         print('*** FAILED:', f)

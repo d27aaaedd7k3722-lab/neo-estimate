@@ -26,9 +26,10 @@ HEAD = ('No', '重要度', '区分', 'ページ', '明細No', '見積の名称',
 
 
 def collect(est: dict, rows: Optional[list] = None, inspect_warn: Optional[list] = None, check: Optional[dict] = None,
-            audit_lines: Optional[list] = None, run_out: str = '') -> list[dict]:
-    """確認箇所を集める。戻り値は dict（level, kind, page, row, name, code, text）のリスト（重要度順）"""
-    out: list[dict] = []
+            audit_lines: Optional[list] = None, run_out: str = '', extra: Optional[list] = None) -> list[dict]:
+    """確認箇所を集める。戻り値は dict（level, kind, page, row, name, code, text）のリスト（重要度順）。
+    extra は intent_check.py の結果など、行番号が NEO の明細 No（RecordNo）で入っているもの（そのまま足す）"""
+    out: list[dict] = [{k: e.get(k, '') for k in ('level', 'kind', 'page', 'row', 'name', 'code', 'text')} for e in (extra or [])]
     items = est.get('items') or []
     rows = rows or []
     aligned = len(rows) == len(items)
@@ -46,6 +47,9 @@ def collect(est: dict, rows: Optional[list] = None, inspect_warn: Optional[list]
         if isinstance(e['row'], int) and e['row'] > 0:
             e['row'] = _recno(e['row'] - 1)   # 下書きの行番号は見積（items）の並び → NEO の明細 No に直す
         out.append(e)
+    veh = est.get('vehicle') or {}
+    generic = str(veh.get('generic')).strip().lower() in ('true', '1', 'yes') or veh.get('generic') is True
+    n_manual = 0
     for i, r in enumerate(rows):
         it = items[i] if aligned else {}
         page = it.get('_page', '') if it else ''
@@ -60,9 +64,15 @@ def collect(est: dict, rows: Optional[list] = None, inspect_warn: Optional[list]
             out.append({'level': '要確認', 'kind': '標準価格と違う', 'page': page, 'row': _recno(i), 'name': nm, 'code': code,
                         'text': f'見積 {pr:,} 円 / 標準 {std:,} 円 × {q}（{std * q:,} 円）。部品の取り違え・価格改定・数量のどれかを確かめる'})
         if not code and (it.get('manual') or r.get('_manual')):
+            n_manual += 1
+            if generic:  # 汎用車種（コグニ非収録）は全行が手入力なので 1 行ずつは挙げない（下でまとめて 1 件）
+                continue
             memo = str(it.get('_memo') or '').strip()
             out.append({'level': '判断', 'kind': '手入力の行', 'page': page, 'row': _recno(i), 'name': nm, 'code': '',
                         'text': 'ADDATA に無い品目として手入力した' + (f'（{memo}）' if memo else '')})
+    if generic and n_manual:
+        out.append({'level': '判断', 'kind': '汎用車種', 'page': '', 'row': '', 'name': str(veh.get('car_name') or ''), 'code': str(veh.get('car_code') or ''),
+                    'text': f'コグニ非収録の車なので汎用車種（{veh.get("car_code") or "Z10"}）で作り、明細 {n_manual} 行はすべて手入力（部品コード・標準価格なし）'})
     for w in inspect_warn or []:
         out.append({'level': '要確認', 'kind': '突合せ', 'page': '', 'row': '', 'name': '', 'code': '', 'text': str(w)})
     for w in (check or {}).get('fail') or []:

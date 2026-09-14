@@ -130,20 +130,68 @@ def _ask_json(reader, system: str, blocks: list, usage: _Usage, what: str) -> di
 
 
 EMPTY_BLOCKS = [{'title': '', 'rows': []}]
+def _env_int(name: str, default: int) -> int:
+    """環境変数の整数（読めない・0 以下なら既定。'abc' で import ごと落ちてアプリが起動しなくならないように）"""
+    try:
+        v = int(str(os.environ.get(name) or '').strip() or default)
+    except ValueError:
+        return default
+    return v if v > 0 else default
+
+
+MAX_PAGES = _env_int('NEO_READER_MAX_PAGES', 30)   # 誤アップロード（写真集・全案件の束）で API を何百回も呼ばない
+
+
+class PageShapeError(ValueError):
+    """LLM の返事の形が page_N.json と違う（subtotal が配列、marks が文字列 …）。
+    値の問題ではなく形の問題なので、読み直しの FAIL 文言として LLM に返す（読み取り全体は止めない）"""
 
 
 def _normalise_page(page: dict, page_no: int) -> dict:
     """LLM の出力を page_N.json の形に揃える（値には触らない。欠けたキーを補い、page 番号を固定する）。
     明細の無いページは blocks を空リストにせず 1 つの空ブロックにする（vendor の validate_page は
-    `not page.get('blocks')` を FAIL にするため。文言は「空の blocks を書く」だが空リストは通らない）"""
-    p = dict(page or {})
+    `not page.get('blocks')` を FAIL にするため。文言は「空の blocks を書く」だが空リストは通らない）。
+    形が違うキーは PageShapeError（読み直しの FAIL 文言になる）"""
+    if not isinstance(page, dict):
+        raise PageShapeError('page_N.json 全体が JSON オブジェクトでない')
+    p = copy.deepcopy(page)   # 浅いコピーだと blocks[].rows の書き換えが元の返事に及び、読み直しの指示文から形の崩れた行が消える（Codex 23）
     p['page'] = page_no
-    p['blocks'] = [b for b in (p.get('blocks') or []) if isinstance(b, dict)] or [dict(b) for b in EMPTY_BLOCKS]
-    p['subtotal'] = dict(p.get('subtotal') or {})
-    p['marks'] = dict(p.get('marks') or {})
+    bad = []
+    blocks = p.get('blocks')
+    if blocks is not None and not isinstance(blocks, list):
+        bad.append('blocks は配列（[{"title": …, "rows": […]}]）')
+    elif blocks and not all(isinstance(b, dict) for b in blocks):  # 要素が文字列（行を直に並べた等）なら黙って捨てず読み直し（Codex 24）
+        bad.append('blocks の各要素は {"title": …, "rows": […]} のオブジェクト（行は rows の中に書く。文字列や配列を直に並べない）')
+    p['blocks'] = [b for b in (blocks or []) if isinstance(b, dict)] if isinstance(blocks, list) else []
+    for b in p['blocks']:
+        if b.get('rows') is not None and not isinstance(b.get('rows'), list):
+            bad.append('blocks[].rows は配列')
+            b['rows'] = []
+        elif b.get('rows') and not all(isinstance(r, (str, dict)) for r in b['rows']):  # 行は "code|name|method|…" の文字列か dict 行（reading_schema.md）
+            bad.append('blocks[].rows の各要素は "code|name|method|parts_no|index|qty|price|wage|flags|comment" の文字列（または {"name": …} のオブジェクト）。配列や数値で書かない')
+            b['rows'] = [r for r in b['rows'] if isinstance(r, (str, dict))]
+    p['blocks'] = p['blocks'] or [dict(b) for b in EMPTY_BLOCKS]
+    for k, shape in (('subtotal', '{"parts": …, "wage": …} のオブジェクト'), ('marks', '{"$": n, "#": n} のオブジェクト')):
+        v = p.get(k)
+        if v in (None, '', [], {}):
+            p[k] = {}
+        elif isinstance(v, dict):
+            p[k] = dict(v)
+        else:
+            bad.append(f'{k} は {shape}')
+            p[k] = {}
     for k in ('paint_lines', 'expenses'):
-        if not p.get(k):
+        v = p.get(k)
+        if not v:
             p.pop(k, None)
+        elif not isinstance(v, list):
+            bad.append(f'{k} は配列')
+            p.pop(k, None)
+        elif not all(isinstance(x, dict) for x in v):  # 文字列の要素は vendor の検算が .get() で落ちて読み取り全体が止まる（Codex 指摘）
+            bad.append(f'{k} の各要素はオブジェクト（{{"name": …, "amount": …}}。文字列で書かない）')
+            p[k] = [x for x in v if isinstance(x, dict)]
+    if bad:
+        raise PageShapeError('page_' + str(page_no) + '.json の形が違う: ' + ' / '.join(bad))
     return p
 
 
@@ -159,8 +207,49 @@ def _apply_hint(header: dict, key: str, hint: Optional[dict]) -> None:
         header[key] = v
 
 
+HEADER_LISTS = ((('expenses',), 'object'), (('adas',), 'object'), (('paint', 'lines'), 'object'), (('paint', 'panels'), 'object'),
+                (('paint', 'other'), 'object'), (('frame', 'items'), 'object'), (('hints', 'eva_codes'), 'string'), (('hints', 'eva_exclude'), 'string'))
+# 塗装の詳細キーはオブジェクト（estimate_schema.md: booth {"index", "wage"}、bumper_front {"method", …}、wax / sealing / … README）。
+# 生成器が .get() で読むので、文字列や配列で来たら読み直し（Codex 26）
+HEADER_OBJECTS = tuple(('paint', k) for k in ('base', 'booth', 'bumper_front', 'bumper_rear', 'wax', 'sealing', 'door_sash', 'stripe',
+                                               'low_cover', 'two_coat_solid', 'two_tone', 'frame'))
+
+
 def _normalise_header(h: dict, vehicle_hint: Optional[dict], insurance_hint: Optional[dict]) -> dict:
-    out = {k: v for k, v in (h or {}).items() if k in prompts.HEADER_KEYS}
+    """header.json の形に揃える。値には触らない（null・空の項目は「書かなかった」として落とすだけ）。
+    形が違うキー（配列で来た totals / vehicle / paint、expenses / adas のオブジェクトでない要素）は **落とさず** PageShapeError
+    （ask_header が理由を返して読み直させる）。落として続けると、vendor の Checker は totals 無しを WARN にしかしないので
+    合計欄の検算なしで合格してしまう（Codex 指摘・実行で再現 2026-09-14）。
+    全体がオブジェクトでないものも PageShapeError（実際には llm.parse_json_reply が先に拒み _ask_json が 1 回言い直させる）"""
+    if not isinstance(h, dict):
+        raise PageShapeError('header.json 全体が JSON オブジェクトでない（{"source": …, "vehicle": {…}, "totals": {…}} の 1 つのオブジェクトで返す。配列や文字列で包まない）')
+    out = {k: v for k, v in h.items() if k in prompts.HEADER_KEYS}
+    bad = []
+    for k in ('totals', 'vehicle', 'customer', 'insurance', 'paint', 'hints', 'discount', 'frame'):
+        if k in out and out[k] not in (None, '', []) and not isinstance(out[k], dict):
+            bad.append(f'{k} は {{…}} のオブジェクト（配列や文字列で書かない）')
+    for k in ('expenses', 'adas'):
+        if k in out and out[k] not in (None, '', {}) and not isinstance(out[k], list):
+            bad.append(f'{k} は [{{"name": …}}, …] の配列')
+    # 入れ子の配列（reading_schema.md）: オブジェクトの配列は vendor の Checker / draft が .get() で読む（文字列が混ざると別プロセスごと落ちる。Codex 22・25）。
+    # hints.eva_codes / eva_exclude は文字列の配列
+    for path, kind in HEADER_LISTS:
+        v = out
+        for key in path:
+            v = v.get(key) if isinstance(v, dict) else None
+        if v in (None, '', []):
+            continue
+        want = dict if kind == 'object' else str
+        if not isinstance(v, list) or not all(isinstance(x, want) for x in v):
+            bad.append('.'.join(path) + (' は [{"name": …}, …] のオブジェクトの配列（文字列で書かない）' if kind == 'object' else ' は文字列の配列'))
+    for path in HEADER_OBJECTS:
+        v = out
+        for key in path:
+            v = v.get(key) if isinstance(v, dict) else None
+        if v not in (None, '', [], {}) and not isinstance(v, dict):
+            bad.append('.'.join(path) + ' は {"index": …, "wage": …} のオブジェクト（文字列や配列で書かない）')
+    if bad:
+        raise PageShapeError('header.json の形が違う: ' + ' / '.join(bad))
     # 空の totals 項目（null）は落とす（reading_check は「書いた項目」だけを突き合わせる）
     tt = out.get('totals')
     if isinstance(tt, dict):
@@ -226,13 +315,43 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
     if n <= 0:
         res.error = 'PDF にページが無い'
         return res
+    if n > MAX_PAGES:
+        res.error = (f'PDF が {n} ページあります（上限 {MAX_PAGES}）。見積書だけの PDF にして入れてください'
+                     f'（ページ数ぶん AI を呼ぶので、誤って大きな PDF を入れると時間と費用がかかります。上限は NEO_READER_MAX_PAGES で変更）')
+        return res
+
+    def normalise_or_fail(raw: dict, pg: int) -> tuple:
+        """形が違えば (None, FAIL 文言) を返し、読み直しに回す（読み取り全体を止めない）"""
+        try:
+            return _normalise_page(raw, pg), None
+        except PageShapeError as e:
+            return None, str(e)
+
+    def ask_header(task_text: str, system: str, whole: dict) -> dict:
+        """header.json を読ませる。形が違う（配列で来た totals など）・合計欄が無いときは理由を返して読み直させる
+        （ページの検算と同じ。上限 max_retries。直らなければ PageShapeError がそのまま上がり、読み取りは理由付きで不合格 —
+        黙って値を落として合計欄の検算なしで進まない。Codex 指摘 2026-09-14）。
+        JSON オブジェクトでない返事（配列・文字列）は _ask_json が 1 回言い直させる"""
+        def normalise(raw):
+            h = _normalise_header(raw, vehicle_hint, insurance_hint)
+            if not isinstance(h.get('totals'), dict) or not h['totals']:
+                raise PageShapeError('totals（見積書の合計欄）が無い。合計欄は必ず写す（検算の拠り所）')
+            return h
+        raw = _ask_json(reader, system, [whole, {'type': 'text', 'text': task_text}], usage, 'header.json')
+        for attempt in range(max_retries):
+            try:
+                return normalise(raw)
+            except PageShapeError as e:
+                _progress(progress, f'合計欄・車両欄の写しに問題があるので読み直しています（{attempt + 1} 回目）: {str(e)[:60]}')
+                raw = _ask_json(reader, system, [whole, {'type': 'text', 'text': prompts.header_shape_retry_task(str(e), raw)}], usage, 'header.json')
+        return normalise(raw)
+
     try:
         system = prompts.build_system_prompt()
         whole = llm_mod.document_block(pdf_bytes)
         # 1) header（明細以外）
         _progress(progress, f'合計欄・車両欄を写しています（全 {n} ページ）')
-        header = _normalise_header(_ask_json(reader, system, [whole, {'type': 'text', 'text': prompts.header_task(n, vehicle_hint, source_name)}], usage, 'header.json'),
-                                   vehicle_hint, insurance_hint)
+        header = ask_header(prompts.header_task(n, vehicle_hint, source_name), system, whole)
         res.header = header
         # 2) ページごとに写して検算
         pages: list = []
@@ -242,17 +361,21 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
             tr = PageTrace(page=pg)
             blocks = [llm_mod.document_block(page_pdfs[i]), {'type': 'text', 'text': prompts.page_task(pg, n, header)}]
             _progress(progress, f'{pg}/{n} ページ目を写しています')
-            page = _normalise_page(_ask_json(reader, system, blocks, usage, f'page_{pg}.json'), pg)
+            raw = _ask_json(reader, system, blocks, usage, f'page_{pg}.json')
+            page, shape_err = normalise_or_fail(raw, pg)
             tr.attempts = 1
-            v = run('validate', header=header, page=page)
+            v = run('validate', header=header, page=page) if page else {'ok': False, 'fail': [shape_err], 'warn': [], 'rows': 0}
             tr.first_try_ok = bool(v.get('ok'))
             while not v.get('ok') and tr.attempts <= max_retries:
                 _progress(progress, f'{pg}/{n} ページ目の検算に落ちたので読み直しています（{tr.attempts} 回目）: {(v.get("fail") or [""])[0][:60]}')
                 blocks = [llm_mod.document_block(page_pdfs[i]),
-                          {'type': 'text', 'text': prompts.retry_task(pg, v.get('fail') or [], v.get('warn') or [], page)}]
-                page = _normalise_page(_ask_json(reader, system, blocks, usage, f'page_{pg}.json'), pg)
+                          {'type': 'text', 'text': prompts.retry_task(pg, v.get('fail') or [], v.get('warn') or [], page if page else raw)}]
+                raw = _ask_json(reader, system, blocks, usage, f'page_{pg}.json')
+                page, shape_err = normalise_or_fail(raw, pg)
                 tr.attempts += 1
-                v = run('validate', header=header, page=page)
+                v = run('validate', header=header, page=page) if page else {'ok': False, 'fail': [shape_err], 'warn': [], 'rows': 0}
+            if not page:  # 上限まで形が直らなかった。空ページとして持ち、不合格の理由に残す
+                page = _normalise_page({'page': pg, 'rows_printed': raw.get('rows_printed') if isinstance(raw, dict) else None, 'blocks': []}, pg)
             tr.ok, tr.rows, tr.fail, tr.warn = bool(v.get('ok')), int(v.get('rows') or 0), list(v.get('fail') or []), list(v.get('warn') or [])
             pages.append(page)
             res.traces.append(tr)
@@ -267,8 +390,7 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
             rounds += 1
             if rounds == 1:
                 _progress(progress, '合計欄と合わないので、合計欄・費用・塗装の写しを読み直しています')
-                header = _normalise_header(_ask_json(reader, system, [whole, {'type': 'text', 'text': prompts.header_retry_task(check['fail'], check.get('warn') or [], header)}], usage, 'header.json'),
-                                           vehicle_hint, insurance_hint)
+                header = ask_header(prompts.header_retry_task(check['fail'], check.get('warn') or [], header), system, whole)
                 res.header = header
             else:
                 _progress(progress, '合計欄と合わないので、各ページの写し漏れ・二重写しを確かめています')
@@ -277,8 +399,8 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
                     pg = i + 1
                     blocks = [llm_mod.document_block(page_pdfs[i]),
                               {'type': 'text', 'text': prompts.page_totals_retry_task(pg, check['fail'], page)}]
-                    p2 = _normalise_page(_ask_json(reader, system, blocks, usage, f'page_{pg}.json'), pg)
-                    v = run('validate', header=header, page=p2)
+                    p2, shape_err = normalise_or_fail(_ask_json(reader, system, blocks, usage, f'page_{pg}.json'), pg)
+                    v = run('validate', header=header, page=p2) if p2 else {'ok': False}
                     if v.get('ok'):
                         new_pages.append(p2)
                         res.traces[i].attempts += 1

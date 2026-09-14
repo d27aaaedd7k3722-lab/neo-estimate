@@ -154,6 +154,19 @@ def retry_task(page_no: int, fails: list, warns: list, previous: dict) -> str:
 直した page_{page_no}.json 全体を JSON だけで返してください。"""
 
 
+def header_shape_retry_task(problem: str, previous) -> str:
+    """header.json の返事の形が違う／合計欄が無いときの読み直し（値ではなく形・欠落の問題。Codex 指摘 2026-09-14）"""
+    return f"""header.json の写しに問題があります: {problem}
+添付の見積書（全ページ）をもう一度見て、header.json を直してください。各項目は決められた形で書きます
+（totals / vehicle / customer / insurance / paint はオブジェクト、expenses / adas はオブジェクトの配列。配列や文字列に置き換えない）。
+totals（見積書の合計欄）は必ず写します — 検算の拠り所です。値は印字どおりに写します（計算して埋めない）。
+
+前回の header.json（これを直す）:
+{json.dumps(previous, ensure_ascii=False, indent=1)[:6000]}
+
+直した header.json 全体を JSON だけで返してください。"""
+
+
 def header_retry_task(fails: list, warns: list, previous: dict) -> str:
     """合計欄の検算（全体）に落ちたときの header の読み直し"""
     return f"""全ページを束ねて合計欄と突き合わせたところ、次の点で不合格でした。添付の見積書（全ページ）をもう一度見て、

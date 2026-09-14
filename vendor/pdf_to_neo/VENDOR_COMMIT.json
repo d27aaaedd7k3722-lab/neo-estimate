@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "9136473db9c68d04e1c77eb25adf4cb1fc6c663f",
- "subject": "docs: pdf-to-neo をアプリ（neo-estimate）で同じ結果に再現するための移植ガイドを追加",
- "synced_at": "2026-09-13T21:56:52",
- "files": 90,
- "tree_sha256": "375fe7892135e68bc37d0c7dbac91bc2f77fbb4b6782df49202006bfb78a8ff2",
+ "commit": "1bd202b9805cd0b1612b9bb8cd7613d7dab6655c",
+ "subject": "fix: 元号を改元日で分ける — 2019-01〜04 が令和 1 になっていた（get_era_info）",
+ "synced_at": "2026-09-14T10:07:09",
+ "files": 97,
+ "tree_sha256": "9c5fd25021084c1219a214ae0683d95e1d638fd5703555e1cc1fc21501e7aa77",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

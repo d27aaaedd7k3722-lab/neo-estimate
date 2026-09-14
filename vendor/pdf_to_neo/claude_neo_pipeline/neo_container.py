@@ -332,15 +332,22 @@ def datetime_to_dos(dt):
 
 
 def get_era_info(date_str):
-    """YYYYMMDD文字列 → (和暦名, 和暦年4桁ゼロ埋め)"""
-    if not date_str or len(date_str) < 4 or date_str == '00000000':
+    """YYYYMMDD文字列（日の無い YYYYMM00 / YYYYMM も可）→ (和暦名, 和暦年4桁ゼロ埋め)
+
+    年だけで分けると改元の年が狂う: 2019-01〜04 は平成 31（令和 1 ではない）、1989-01-01〜07 は昭和 64、
+    1926-12-25〜31 は昭和元年。平成 31 年 3 月登録の車は実際に多い。日が無いときは月初とみなす（Codex 指摘 2026-09-14）"""
+    s = str(date_str or '').strip()
+    if s == '00000000' or not re.fullmatch(r'[0-9]{4}([0-9]{2}([0-9]{2})?)?', s):  # 4 / 6 / 8 桁の数字だけ。区切り付き（2019-05-01）や文字混じりは番兵（1 月 1 日扱いにしない。Codex 指摘）
         return '令和', '0000'
-    year = int(date_str[:4])
-    if year >= 2019:
+    year = int(s[:4])
+    month = int(s[4:6]) if len(s) >= 6 else 0
+    day = int(s[6:8]) if len(s) >= 8 else 0
+    ymd = (year, month or 1, day or 1)
+    if ymd >= (2019, 5, 1):
         return '令和', f'{year - 2018:04d}'
-    elif year >= 1989:
+    if ymd >= (1989, 1, 8):
         return '平成', f'{year - 1988:04d}'
-    elif year >= 1926:
+    if ymd >= (1926, 12, 25):
         return '昭和', f'{year - 1925:04d}'
     return '令和', '0000'
 

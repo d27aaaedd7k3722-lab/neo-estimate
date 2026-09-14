@@ -162,6 +162,8 @@ EXCLUDE_DIR_NAMES = {'__pycache__', 'out', 'evidence'}
 SELFTEST_TESTS = [  # 配布先でも動く自己診断（ADDATA だけで完結し、実機 NEO・案件フォルダを使わない）
     'unit_types.py', 'unit_consistency.py', 'unit_guards.py', 'unit_manual_rows.py',
     'unit_settings.py', 'unit_eva_slot.py', 'unit_link_absorb.py', 'unit_frame.py',
+    'unit_insurance.py',  # 受付番号・代理店・アジャスター・入出庫日・修理日数の書き込み
+    'unit_era.py',  # 元号は改元日で分ける（2019-01〜04 は平成 31）
     'unit_handoff.py',  # 引き継ぎ文書（HANDOFF.md）の主張と実装・ADDATA の突き合わせ（3〜4 秒）
     'neo_diff.py',  # 上記テストが使う NEO 差分ツール
 ]

@@ -27,7 +27,7 @@
 
 `make_bundle.py` の配布 zip と同じ範囲（`python .claude/skills/pdf-to-neo/scripts/make_bundle.py`）:
 
-- `claude_neo_pipeline/`（`tests/` を除く。生成器・車両特定・塗装指数・NEO の器）
+- `claude_neo_pipeline/`（生成器・車両特定・塗装指数・NEO の器。`tests/` は `make_bundle.py` の `SELFTEST_TESTS` に並べた自己診断用のテストと `neo_diff.py` だけ入る。§5-1）
 - `.claude/skills/pdf-to-neo/scripts/`（下書き・検算・突合せ・確認箇所シート・一括実行）と `reference/`（規則の文書と辞書）
 - `_addata_db_search.py`
 
@@ -43,21 +43,26 @@ python .claude/skills/pdf-to-neo/scripts/make_neo.py <作業フォルダ> --name
 ```
 
 - 作業フォルダに `reading.json`（または `pages/header.json` + `pages/page_N.json`）を置いて呼ぶ
-- 出てくるもの: `<name>.neo` / `<name>_確認箇所.xlsx` / `report.md` / `estimate.json` / `inspect.json` / `reading_check.json`
-- 終了コード 0 = 合格。1 = 不合格（検算差・未照合・前後左右の食い違い・低照合率・確認箇所シートが作れない）。**不合格の NEO は `<name>.ng.neo` に隔離され、`<name>.neo` は作られない**
-- アプリは合格したときだけダウンロードを出し、NEO と確認箇所シートを必ず組で渡す
+- 出てくるもの: `<name>.neo` / `<name>_確認箇所.xlsx`（openpyxl が無い環境では `<name>_確認箇所.csv`）/ `report.md` / `estimate.json` / `inspect.json` / `reading_check.json`
+- 終了コード 0 = 合格。1 = 不合格（検算差・未照合・前後左右の食い違い・低照合率・できあがった NEO が下書きの意図と違う（`intent_check.py`）・確認箇所シートが作れない・例外）。
+  **この実行で作った NEO は、不合格なら `<name>.ng.neo` に隔離される**（run_case の検算で落ちたときも、make_neo 側の関門で落ちたときも）
+- ただし**前回の実行で合格した `<name>.neo` は消されずに残る**。アプリは要求ごとに新しい作業フォルダ（一時フォルダ）で呼び、
+  **終了コード 0 のときだけ** `<name>.neo` と確認箇所シート（`<name>_確認箇所.xlsx` か `.csv`。拡張子を決め打ちしない）を組で渡す（ファイルがあるかどうかで合否を判断しない）
 
 **B. 関数で呼ぶ（画面で途中を見せたいとき）**
 
 | 段 | 入口 | 戻り値・出力 |
 |---|---|---|
 | ページの検算 | `reading_pages.validate_page(header, page)` | `{'ok', 'fail', 'warn', 'rows'}`。fail の文言をそのまま LLM に返して読み直させる |
-| ページの束ね | `reading_pages.merge(case)` | `(reading, messages)` |
-| 紙上検算 | `reading_check.Checker(reading)` → `load_rows()` → `check_*()` → `result()`（CLI は `reading_check.py <reading.json> --json <out>`） | FAIL / WARN / 推定した設定 |
+| ページの束ね | `reading_pages.merge(case_dir, force=False)`（`case_dir/pages/` を読む。**ファイルは書かない**。`reading.json` への保存・全体の検算は呼ぶ側で行う。CLI の `reading_pages.py merge <case_dir>` は保存と `Checker(...).run()` まで行う） | `(reading or None, messages)` |
+| 紙上検算 | `reading_check.Checker(reading).run()`（個別の `check_*` は引数と順序があるので直接呼ばない。CLI は `reading_check.py <reading.json> --json <out>`） | `{'fail', 'warn', 'note', 'settings', 'rows'}` |
 | 下書き | `draft_estimate.Drafter(reading).build()` | estimate（`_draft_notes` と確認点 `_review` 付き） |
-| 突合せ | `inspect_estimate.main(estimate_path, out_json)` | 要確認（★）の JSON |
-| 生成・検算 | `run_case.py <estimate.json> <out.neo>`（関数なら `NeoBuilder().build(...)`） | NEO と検算 11 項目 |
-| 確認箇所シート | `review_sheet.collect(...)` → `review_sheet.write(...)` | xlsx |
+| 突合せ | `inspect_estimate.main(estimate_path, out_json)` | 戻り値は終了コード（0/1）。要確認（★）は `out_json` の `warnings` に書かれる |
+| 生成・検算 | `run_case.main(estimate_path, out_neo)`（CLI は `run_case.py <estimate.json> <out.neo>`） | 戻り値 True = 合格（NEO を `out_neo` に置く）/ False（`.ng.neo` に隔離）。検算 11 項目と ★ は標準出力。**`NeoBuilder().build()` は NEO のバイト列と行を返すだけで検算・関門を通らないので、合否には使わない** |
+| 意図との突き合わせ | `intent_check.check(estimate, neo_path)` | `{'hard': [...], 'soft': [...], 'rows'}`。hard が 1 件でもあれば不合格（make_neo と同じ） |
+| 確認箇所シート | `review_sheet.collect(est, rows, inspect_warn, check, audit_lines, run_out, extra=hard+soft)` → `review_sheet.write(path, entries, est, rows, rep)`（rows は `run_case._rows_in_source_order(rep['rows'])` で見積の並びに戻したもの） | xlsx（openpyxl が無ければ .csv）のパス |
+
+| 答え合わせ（任意・納品後） | `neo_compare.compare(neo_compare.load(納品した.neo), neo_compare.load(確報に使った.neo))` → `neo_compare.report(res)` | `{'rows', 'matched', 'diffs', 'only_mine', 'only_other', 'style', 'totals'}`。合否には使わない（振り返り用。判断規則 10-24） |
 
 B で組むときも、**合否の判定は `make_neo.py` の `main()` と同じ条件**にすること（部分的に真似ると関門が抜ける）。
 
@@ -74,6 +79,7 @@ B で組むときも、**合否の判定は `make_neo.py` の `main()` と同じ
   - `reference/reading_schema.md`（出力の形。**短縮記法** `code|name|method|parts_no|index|qty|price|wage|flags|comment`）
   - `reference/format_catalog.md`（書式ごとの写し方。書式 F の「〃 交換工賃」「作業区分空欄」など）
   - `SKILL.md` 手順 4 の「ページを写す順番と自己チェック」8 項目
+  - 手入力の行で名称が 24 バイトを超えるときは `neo_name`（判断規則 10-23）
 - 車検証・速報（あれば）: 型式・車台番号・型式指定・類別・初度登録・カラー
 
 ### 3-2. LLM にさせないこと（判断はプログラムがする）
@@ -114,8 +120,14 @@ Cloud で動かすなら、上の 2 つの展開物を ADDATA と一緒に配る
 
 ## 5. 同じ結果になっていることの確かめ方（受け入れテスト）
 
-1. **プログラム部分が同じか**: アプリの環境で `claude_neo_pipeline/tests/verify_all.sh` と `scripts/regress_cases.py` を回す
-   （実機 NEO との全列比較 73 実験・全ファイル一致 25 本・案件回帰。実機 NEO と案件は NEO_check にあり git に無いので、この PC で回す）
+1. **プログラム部分が同じか**: 取り込んだコミットと同じコミットの **git の作業ツリー（全体）** で
+   `bash claude_neo_pipeline/tests/verify_all.sh` と `python .claude/skills/pdf-to-neo/scripts/regress_cases.py` を回す
+   （実機 NEO との全列比較・全ファイル一致・案件回帰。合格の基準は「差のある実験 0・全ファイル一致の不一致 0・不合格 0・`=== verify_all exit 0`」。
+   件数は NEO_check にある実機 NEO と案件の数で変わる（この PC では 2026-09-13 に 73 実験・25 本・案件 4 + 8）ので、分母を合格条件にしない。
+   実機 NEO と案件は NEO_check にあり git にも無いので、**この PC で回す**）
+   配布 zip の `claude_neo_pipeline/tests/` には `make_bundle.py` の `SELFTEST_TESTS` に並べた自己診断用のテスト
+   （`unit_types` / `unit_consistency` / `unit_guards` / `unit_manual_rows` / `unit_settings` / `unit_eva_slot` / `unit_link_absorb` / `unit_frame` / `unit_handoff` と `neo_diff.py`）だけが入る
+   （`verify_all.sh`・`audit_cogni_files.py`・`unit_struct.py` などは入らない）。配布 zip だけの環境では `python .claude/skills/pdf-to-neo/scripts/env_check.py --self-test` が **`unit_` で始まるテストだけ**を回す（`neo_diff.py` は引数に NEO を 2 本渡して使う比較ツールで、自己診断では回らない。NEO の全列比較は下の 2 で個別に行う）。取り込むときにこれらを消さない
 2. **同じ reading.json から同じ NEO か**: NEO_check の各案件の `reading.json` をアプリに通し、
    `python claude_neo_pipeline/tests/neo_diff.py <アプリの NEO> <このリポジトリの NEO>` で全列一致を確かめる
 3. **読む段の精度**: 同じ PDF を LLM に読ませた `reading.json` と、NEO_check の `reading.json`（Claude が読んで合格したもの）を比べる。

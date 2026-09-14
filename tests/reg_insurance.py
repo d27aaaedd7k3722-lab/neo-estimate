@@ -210,16 +210,21 @@ chk('insurance_info=' in _call,
     '4d: app.py が pipeline に insurance_info を渡していない')
 chk('insurance_info' in app._PIPE_ARGS_EXPECTED,
     '4e: _PIPE_ARGS_EXPECTED に insurance_info が無い（古い版の検出から漏れる）')
+# 2026-09-13〜 見積 PDF→NEO は pdf-to-neo スキル経路（run_pdf_to_neo_skill）。画面はサイドバーの保険情報を
+# _sidebar_insurance_hint() で reading の insurance に渡し、vendor の生成器が Insurance / FileInfo / XML に書く。
 # 「定義」ではなく「呼び出し」を拾う（定義を拾うと既定値を引数と誤認する）
-_marker = "st.session_state['pdf2neo_result'] = run_pdf_to_neo_pipeline("
+_marker = "_p2n_out = run_pdf_to_neo_skill("
 chk(_app.count(_marker) == 1, '4f0: 一発生成の呼び出しが1か所に特定できない')
-_tail = chr(10) + ' ' * 20 + ')'
+_tail = chr(10) + ' ' * 24 + ')'
 _ui = _app.split(_marker)[1].split(_tail)[0] if _marker in _app else ''
-chk('insurance_info=' in _ui,
-    '4f: 画面が run_pdf_to_neo_pipeline に事故・保険情報を渡していない')
-for _k in ('accept_no', 'policy_no', 'contractor_name', 'agency_name',
-           'adjuster_name'):
-    chk(_k in _ui, f'4g: 画面が渡す事故・保険情報に {_k} が含まれていない')
+chk('insurance_hint=_sidebar_insurance_hint()' in _ui,
+    '4f: 画面が run_pdf_to_neo_skill に事故・保険情報（insurance_hint）を渡していない')
+_hint_src = inspect.getsource(app._sidebar_insurance_hint)
+for _k in ('accept_no', 'policy_no', 'contractor_name', 'agency_name', 'adjuster_name',
+           'garage_in_date', 'garage_out_date', 'repair_days', 'accident_date'):
+    chk(_k in _hint_src, f'4g: 画面が渡す事故・保険情報に {_k} が含まれていない')
+for _k in ('accept_no', 'agency', 'adjuster', 'garage_in', 'garage_out', 'repair_days'):
+    chk(f"'{_k}'" in _hint_src, f'4h: reading.insurance のキー {_k}（生成器が読む名前）で渡していない')
 
 # ── 5. 保険情報を変えたら、作り直した .neo も変わること ────────────────
 # 同じ見積書の番号だけ直して出し直すのは普通にある。キャッシュのキーに
