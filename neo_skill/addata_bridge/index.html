@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Addata bridge</title>
+<style>
+  body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 13px; color: #1f2937; background: transparent; }
+  .box { padding: 6px 4px; }
+  button { font-size: 13px; padding: 6px 12px; border-radius: 6px; border: 1px solid #94a3b8; background: #f8fafc; cursor: pointer; }
+  button:hover { background: #e2e8f0; }
+  button:disabled { opacity: .5; cursor: default; }
+  .st { margin-top: 6px; line-height: 1.5; white-space: pre-wrap; }
+  .ok { color: #166534; } .ng { color: #b91c1c; } .busy { color: #92400e; }
+</style>
+</head>
+<body>
+<div class="box">
+  <button id="pick">📂 PC の Addata フォルダを選ぶ（C:\Addata）</button>
+  <div class="st" id="st">未接続。ボタンを押して、PC の Addata フォルダ（COM フォルダがあるもの）を選んでください。
+選んだフォルダから、車種マスタ（COM、約 9MB）と、見積の車種フォルダ（数 MB）だけをこの画面のアプリに送ります。</div>
+</div>
+<script>
+// Streamlit のコンポーネント規約（streamlit-component-lib と同じ postMessage）を素の JS で実装する。
+// - 親 → iframe: {type:'streamlit:render', args:{want, have, com}}
+// - iframe → 親: componentReady / setComponentValue / setFrameHeight
+// ブラウザの File System Access API（Chrome / Edge）で PC のフォルダを開き、必要なファイルだけを base64 で送る。
+// サーバ側（クラウド）は PC を直接読めないので、これが「アプリが PC の Addata を見に行く」唯一の経路。
+(function () {
+  const stEl = document.getElementById('st');
+  const btn = document.getElementById('pick');
+  let dirHandle = null;      // 選んだ Addata フォルダ
+  let seq = 0;               // 送信ごとに増やす（Python 側で同じ値の二重処理を避ける）
+  const NONCE = Math.random().toString(36).slice(2, 10);   // この iframe の印。読み直すと変わる（接続解除後の古い値と区別する。Codex 47）
+  let sending = false;
+  let sentCom = false;
+  const sentCars = new Set();
+  let lastArgs = {want: '', have: [], com: false};
+
+  function post(type, extra) {
+    window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: type}, extra || {}), '*');
+  }
+  function setHeight() { post('streamlit:setFrameHeight', {height: document.body.scrollHeight + 8}); }
+  function status(text, cls) { stEl.textContent = text; stEl.className = 'st ' + (cls || ''); setHeight(); }
+  function send(value) { seq += 1; value.seq = seq; value.nonce = NONCE; post('streamlit:setComponentValue', {value: value, dataType: 'json'}); }
+
+  async function readFile(handle) {
+    const f = await handle.getFile();
+    const buf = await f.arrayBuffer();
+    // base64（大きなファイルでも呼び出しスタックを溢れさせない）
+    const bytes = new Uint8Array(buf);
+    let bin = '';
+    const CH = 0x8000;
+    for (let i = 0; i < bytes.length; i += CH) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+    return {b64: btoa(bin), size: bytes.length};
+  }
+
+  async function collect(dir, prefix, skipRe) {
+    const files = {};
+    let total = 0;
+    for await (const [name, h] of dir.entries()) {
+      if (h.kind !== 'file') continue;
+      if (skipRe && skipRe.test(name)) continue;
+      const r = await readFile(h);
+      files[prefix + '/' + name] = r.b64;
+      total += r.size;
+    }
+    return {files: files, total: total};
+  }
+
+  async function sendCom() {
+    if (!dirHandle || sending) return;
+    sending = true;
+    try {
+      const com = await dirHandle.getDirectoryHandle('COM');
+      status('COM（車種マスタ）を読んでいます…', 'busy');
+      const c = await collect(com, 'COM', null);
+      status(`COM を送っています（${Object.keys(c.files).length} ファイル・${(c.total / 1048576).toFixed(1)}MB）…`, 'busy');
+      send({phase: 'com', root_name: dirHandle.name, files: c.files, bytes: c.total});
+      sentCom = true;
+    } catch (e) {
+      // アプリ側にも知らせる: 前に送った Addata を消して「未接続」に戻す（古い Addata のまま黙って作らない。Codex 46）
+      sentCom = false; sentCars.clear();
+      send({phase: 'com', root_name: dirHandle ? dirHandle.name : '', files: {}, bytes: 0,
+            error: `選んだフォルダ（${dirHandle ? dirHandle.name : ''}）には COM フォルダがありません。Addata の直下（A〜Z のフォルダと COM がある場所）を選んでください: ` + e});
+      status('このフォルダには COM フォルダがありません。Addata の直下（A〜Z のフォルダと COM がある場所）を選んでください: ' + e, 'ng');
+    } finally { sending = false; }
+  }
+
+  async function sendCar(car) {
+    if (!dirHandle || sending || !car) return;
+    sending = true;
+    try {
+      const letter = car[0];
+      const d1 = await dirHandle.getDirectoryHandle(letter);
+      const d2 = await d1.getDirectoryHandle(car);
+      status(`車種 ${car} のフォルダを読んでいます…`, 'busy');
+      const c = await collect(d2, letter + '/' + car, /IMG\.CAB$/i);   // 部品画像の CAB は要らない
+      status(`車種 ${car} を送っています（${Object.keys(c.files).length} ファイル・${(c.total / 1048576).toFixed(1)}MB）…`, 'busy');
+      send({phase: 'car', car: car, root_name: dirHandle.name, files: c.files, bytes: c.total});
+      sentCars.add(car);
+    } catch (e) {
+      sentCars.add(car);   // 同じ車種の error を render のたびに送り直さない（フォルダを選び直せば clear される）
+      send({phase: 'car', car: car, root_name: dirHandle ? dirHandle.name : '', files: {}, bytes: 0,
+            error: `車種 ${car} のフォルダ（${car[0]}/${car}）が PC の Addata にありません: ` + e});
+      status(`車種 ${car} のフォルダが見つかりません（${car[0]}\\${car}）。Addata の版が古いか、車種コードが違います。`, 'ng');
+    } finally { sending = false; }
+  }
+
+  btn.addEventListener('click', async function () {
+    if (!window.showDirectoryPicker) {
+      status('このブラウザはフォルダの選択（File System Access API）に対応していません。Chrome か Edge で開いてください。', 'ng');
+      return;
+    }
+    try {
+      dirHandle = await window.showDirectoryPicker({id: 'addata', mode: 'read'});
+    } catch (e) { return; }   // キャンセル
+    sentCom = false; sentCars.clear();
+    await sendCom();
+  });
+
+  window.addEventListener('message', async function (ev) {
+    const d = ev.data || {};
+    if (d.type !== 'streamlit:render') return;
+    lastArgs = d.args || lastArgs;
+    const want = (lastArgs.want || '').toString().trim();
+    const have = lastArgs.have || [];
+    if (!lastArgs.com && sentCom && !sending) {
+      // サーバ側の取り込みが消えた（接続の解除・古いフォルダの掃除・別のセッション）: 送った印を戻し、選び直しを促す
+      sentCom = false; sentCars.clear();
+      status('アプリ側の接続が解除されました。使うには、もう一度ボタンで PC の Addata フォルダを選んでください。', 'ng');
+    }
+    if (!dirHandle && want) {
+      // 画面を読み直すとフォルダの選択は消える（ブラウザの決まり）。読み取り結果はアプリ側に取り置かれているので、
+      // ここで選び直せば車種フォルダだけ送って続きができる（読み直しは要らない）
+      status(`車種 ${want} のフォルダが必要ですが、PC のフォルダの選択が消えています（画面を読み直したため）。「📂 PC の Addata フォルダを選ぶ」でもう一度選ぶと続きができます。`, 'ng');
+    }
+    if (dirHandle) {
+      if (lastArgs.com && !want) {
+        status(`接続中: ${dirHandle.name}（COM 取り込み済み${have.length ? '。車種フォルダ: ' + have.join(', ') : ''}）。見積を入れて生成すると、必要な車種フォルダを自動で送ります。`, 'ok');
+      }
+      // 車種フォルダは、アプリ側が COM を受け取っている（com=true）ときだけ送る。COM の無いフォルダを選んだ直後に
+      // 車種を探しに行くと「無い」の error になり、待ち（取り置き）を捨ててしまう（Codex 49）
+      if (lastArgs.com && want && !have.includes(want) && !sentCars.has(want)) {
+        await sendCar(want);
+      }
+    }
+    setHeight();
+  });
+
+  post('streamlit:componentReady', {apiVersion: 1});
+  setHeight();
+})();
+</script>
+</body>
+</html>

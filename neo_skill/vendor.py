@@ -21,7 +21,7 @@ import sys
 from typing import Optional
 
 # 取り込んでいる files（pdf-to-neo ブランチ）のコミット。tools/vendor_sync.py が取り直すときに書き換える
-EXPECTED_COMMIT = 'e8d6d2883164f0b03f9a34bf1eec0ee2f2e25b10'
+EXPECTED_COMMIT = '5747932abd93a0581b9912a3f910ff90798fea05'
 
 APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENDOR_ROOT = os.path.join(APP_ROOT, 'vendor', 'pdf_to_neo')
@@ -124,6 +124,12 @@ def subprocess_env(addata_root: Optional[str] = None, neo_check_root: Optional[s
         env.setdefault('TZ', 'Asia/Tokyo')
     if addata_root:
         env['ADDATA_ROOT'] = addata_root
+        # PC からブラウザ経由で取り寄せた部分 Addata（COM ＋ 見積の車種フォルダ。neo_skill.bridge の addata_bridge_<id>）は、
+        # vendor の skill_env が「メーカーフォルダ 5 つ以上」の検証（is_addata）で弾いて自動検出に落とす
+        # （この PC では C:\Addata に化けて気づけず、Cloud では見つからず失敗）。ADDATA_ROOT_PARTIAL=1 で
+        # 「部分コピーを渡している」と伝える（vendor の skill_env.is_addata_or_partial。2026-09-14 Codex 43）
+        if os.path.basename(os.path.normpath(addata_root)).startswith('addata_bridge_'):
+            env['ADDATA_ROOT_PARTIAL'] = '1'
     if neo_check_root:
         env['NEO_CHECK_ROOT'] = neo_check_root
     return env

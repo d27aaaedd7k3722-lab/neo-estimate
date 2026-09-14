@@ -7,6 +7,7 @@ skill_env.apply() で os.environ と sys.path を書き換えるので、アプ�
 
   stdin : JSON {"op": "validate", "vendor_root": ..., "header": {...}, "page": {...}}
           JSON {"op": "merge",    "vendor_root": ..., "case_dir": ..., "force": false}
+          JSON {"op": "resolve_vehicle", "vendor_root": ..., "addata_root": ..., "vehicle": {...}, "hints": {...}}
   stdout: 最後の行に  @@RESULT@@<JSON>   （vendor 側の print が混ざっても拾えるように目印を付ける）
 """
 from __future__ import annotations
@@ -35,6 +36,20 @@ def main() -> int:
         rd, msgs = reading_pages.merge(req['case_dir'], bool(req.get('force')))
         check = Checker(rd).run() if rd else {}
         out = {'reading': rd, 'messages': list(msgs), 'check': check}
+    elif op == 'resolve_vehicle':
+        # reading の vehicle / hints から車種コードを決める（PC の Addata を橋渡しする経路: COM だけで足りる。2026-09-14）
+        from addata_vehicle_resolver import AddataVehicleResolver  # noqa: E402  vendor
+        v = req.get('vehicle') or {}
+        try:
+            r = AddataVehicleResolver(req.get('addata_root') or os.environ.get('ADDATA_ROOT') or '').resolve(
+                model_code=str(v.get('model_code') or ''), serial_no=str(v.get('serial_no') or ''), desig=str(v.get('desig') or ''),
+                category=str(v.get('category') or ''), reg_date=str(v.get('reg_date') or ''), color_code=str(v.get('color_code') or ''),
+                hints=req.get('hints') or {})
+            car = r.get('neo_car') or {}
+            out = {'car_code': str(car.get('CarCode') or ''), 'car_name': str(car.get('CarName') or ''),
+                   'confidence': r.get('confidence'), 'evidence': r.get('evidence')}
+        except Exception as e:  # noqa: BLE001  理由を返す（呼び出し側が画面に出す）
+            out = {'car_code': '', 'error': f'{type(e).__name__}: {e}'}
     else:
         raise SystemExit(f'unknown op: {op!r}')
     sys.stdout.write('\n' + MARK + json.dumps(out, ensure_ascii=False, default=str) + '\n')

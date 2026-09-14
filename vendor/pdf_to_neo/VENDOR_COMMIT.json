@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "e8d6d2883164f0b03f9a34bf1eec0ee2f2e25b10",
- "subject": "fix: 下書きがコグニ印刷の塗装明細（面積・括弧付き比率・部品コード付き）を 20.DB のパネルに対応付けられるように",
- "synced_at": "2026-09-14T13:22:53",
+ "commit": "5747932abd93a0581b9912a3f910ff90798fea05",
+ "subject": "fix: ADDATA_ROOT_PARTIAL=1 で環境変数 ADDATA_ROOT が無効なら、設定・既定パス・自動検出に落とさない（別の Addata で黙って作らない。skill_env.resolve と resolver.find_addata_root の両方）",
+ "synced_at": "2026-09-14T16:53:02",
  "files": 100,
- "tree_sha256": "99323cf4d04081b7793f2e9c5c9b71e1fa2f9ef393488b548b15c746179f91b7",
+ "tree_sha256": "561dc58dc5a0a74aeca7449c7689e521354b3fbf317e4518e7aa6ba911f6af95",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

@@ -50,3 +50,6 @@ vendor/pdf_to_neo.failed/
 # （*.DB の参照表・tests/test_*.py・find_*.py が落ちると clone 先でハッシュ照合に落ちて経路が止まる）
 !vendor/pdf_to_neo/**
 vendor/pdf_to_neo/**/__pycache__/
+
+# ローカル起動の設定（Claude Code の Browser ペイン用。PC ごとの venv パスを含むので追跡しない）
+.claude/launch.json

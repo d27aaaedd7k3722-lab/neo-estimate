@@ -213,7 +213,7 @@ chk('insurance_info' in app._PIPE_ARGS_EXPECTED,
 # 2026-09-13〜 見積 PDF→NEO は pdf-to-neo スキル経路（run_pdf_to_neo_skill）。画面はサイドバーの保険情報を
 # _sidebar_insurance_hint() で reading の insurance に渡し、vendor の生成器が Insurance / FileInfo / XML に書く。
 # 「定義」ではなく「呼び出し」を拾う（定義を拾うと既定値を引数と誤認する）
-_marker = "_p2n_out = run_pdf_to_neo_skill("
+_marker = "_p2n_kw = dict("   # 一発生成と PC の Addata 橋渡し（p2n_read / p2n_make）が共有する引数（2026-09-14）
 chk(_app.count(_marker) == 1, '4f0: 一発生成の呼び出しが1か所に特定できない')
 _tail = chr(10) + ' ' * 24 + ')'
 _ui = _app.split(_marker)[1].split(_tail)[0] if _marker in _app else ''

@@ -74,6 +74,31 @@ def remove_case_dir(case_dir: Optional[str], attempts: int = 4, wait: float = 0.
     return case_dir
 
 
+CASE_TTL_SEC = 2 * 3600.0
+
+
+def sweep_case_dirs(max_age_sec: float = CASE_TTL_SEC, prefix: str = 'neo_case_') -> int:
+    """放置された作業フォルダ（車種フォルダ待ちのまま画面を閉じた等。reading.json など顧客情報を含む）を消す。
+    生成中のものは make_neo の timeout（15 分）で終わるので、2 時間より古いものだけ消す。消した数を返す"""
+    base = tempfile.gettempdir()
+    n = 0
+    now = time.time()
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith(prefix):
+            continue
+        p = os.path.join(base, name)
+        try:
+            if os.path.isdir(p) and now - os.path.getmtime(p) > max_age_sec and remove_case_dir(p, attempts=1) is None:
+                n += 1
+        except OSError:
+            pass
+    return n
+
+
 def write_reading(case_dir: str, reading: dict) -> str:
     path = os.path.join(case_dir, 'reading.json')
     with open(path, 'w', encoding='utf-8') as fh:

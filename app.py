@@ -3717,6 +3717,15 @@ def find_addata_dir():
       4. 環境変数 / secrets
       5. ローカルの標準的な設置場所（自動検出）
     """
+    # 0. ブラウザ経由で PC から取り込んだ Addata（neo_skill.bridge。クラウドで PC の C:\Addata を使う経路）
+    try:
+        from neo_skill import bridge as _br
+        _bp = st.session_state.get('_bridge_path')
+        if _bp and _br.has_com(_bp):
+            _br.touch(_bp)
+            return _bp
+    except Exception:
+        pass
     # 1. この画面でアップロードされたもの
     try:
         up = st.session_state.get(_ADDATA_UPLOAD_KEY)
@@ -3767,6 +3776,9 @@ def find_addata_dir():
         if _env and _addata_is_valid(_env):
             return _env
     # 5. ローカルの標準的な設置場所
+    #    （NEO_ADDATA_NO_AUTODETECT=1 で飛ばす: クラウドと同じ「Addata 無し」をこの PC で再現する試験用。本番では設定しない）
+    if str(os.environ.get('NEO_ADDATA_NO_AUTODETECT') or '').lower() in ('1', 'true', 'yes'):
+        return None
     try:
         import addata_locator as _loc
         found = _loc.find_addata()
@@ -6381,38 +6393,24 @@ def _session_cache_scope() -> str:
         return _uuid.uuid4().hex
 
 
-def run_pdf_to_neo_skill(pdf_bytes, file_name, api_key, mime_type='application/pdf',
-                         vehicle_hint=None, insurance_hint=None, progress=None, record_profile=False,
-                         addata_root=None, reader_kind='claude', model_name=''):
-    """見積書 PDF → pdf-to-neo スキル（vendor/pdf_to_neo）で NEO と確認箇所シートを作る。
+def _p2n_new_out(reader_kind, model_name):
+    from neo_skill import vendor as _nsk_vendor
+    return {'ok': False, 'stage': 'error', 'error': '', 'vendor_commit': _nsk_vendor.commit_short(),
+            'reader': {'kind': reader_kind, 'model': model_name or ''}}
 
-    読む段だけ LLM（neo_skill.reader。reader_kind='claude' か 'gemini'。指示文・検算・読み直しは同じ）。
-    判断・生成・検算・合否は vendor の make_neo.py そのもの
-    （docs/pdf-to-neo_アプリ移植ガイド.md）。合計を合わせるための調整はどこにも無い。
-    戻り値 dict:
-      ok / stage('read' | 'make' | 'done' | 'error') / error
-      read: {ok, n_pages, stats, usage, fails[], traces[], warn[]}
-      make: {ok, match_line, reasons[], tail}
-      neo_bytes / review_bytes / review_ext / report_md / download_name / vendor_commit / cleanup_warning
-      reader: {kind, model}（どの AI が読んだか）
-      repair_zip: 不合格のとき、人が直して続きをするための一式（pages/*.json・reading.json・report.md 等。NEO は入れない）
-    insurance_hint: サイドバーの保険情報（policy_no / contractor / accident_date(8桁) / company）。
-      見積書に印字が無い項目にだけ補う（reading の insurance → 生成器の Insurance テーブル）。
-    record_profile: 合格時に工場の設定を NEO_check/_profiles に記録する（vendor の既定動作）。
-      作業フォルダの外に取引先名が残るので、共有プロセスのアプリでは既定で記録しない。
-    addata_root: アプリで決めた ADDATA（サイドバー / URL / ZIP。find_addata_dir()）。vendor の生成器と検算ランナーに
-      環境変数 ADDATA_ROOT として渡し、アプリと同じ版を使わせる。**無ければ止める**（vendor の設定ファイル→自動検出に
-      落とすと、Addata の URL 取得に失敗したときなどに別の版で「それらしい NEO」ができてしまう）。
-    作業フォルダは要求ごとに作り、終わったら消す（見積書・NEO・シートには顧客情報が入る）。
-    消せなかったときは cleanup_warning に残ったパスを入れて知らせる（黙って残さない）。
-    """
-    import shutil
+
+def p2n_read(pdf_bytes, file_name, api_key, mime_type='application/pdf',
+             vehicle_hint=None, insurance_hint=None, progress=None, record_profile=False,
+             addata_root=None, reader_kind='claude', model_name=''):
+    """見積書 PDF を読む段（LLM ＋ ページ検算 ＋ 合計欄の検算）。成功すると作業フォルダ（pages/・reading.json）を残したまま
+    state を返す（p2n_make がそれを使って NEO を作り、作業フォルダを消す）。失敗したら作業フォルダを消して repair_zip を付ける。
+    state のキー: ok / stage / error / read / reader / vendor_commit / case_dir / reading / record_profile
+    （PC の Addata を橋渡しする経路では、読んだあとに車種フォルダの取り込みを待つので、読む段と作る段を分ける）"""
     from neo_skill import llm as _nsk_llm
     from neo_skill import maker as _nsk_maker
     from neo_skill import reader as _nsk_reader
     from neo_skill import vendor as _nsk_vendor
-    out = {'ok': False, 'stage': 'error', 'error': '', 'vendor_commit': _nsk_vendor.commit_short(),
-           'reader': {'kind': reader_kind, 'model': model_name or ''}}
+    out = _p2n_new_out(reader_kind, model_name)
     _why = _nsk_vendor.readiness_error()
     if _why:
         out['error'] = 'pdf-to-neo スキル（vendor）が使えません: ' + _why
@@ -6450,7 +6448,46 @@ def run_pdf_to_neo_skill(pdf_bytes, file_name, api_key, mime_type='application/p
             # 作業フォルダは消すので、直すための pages/ と merge 結果を zip で渡す
             out['error'] = rd.error
             out['repair_zip'] = _nsk_maker.repair_bundle(case_dir, rd.reading)
+            _left = _nsk_maker.remove_case_dir(case_dir)
+            if _left:
+                out['cleanup_warning'] = f'作業フォルダを消せませんでした。手で削除してください: {_left}'
             return out
+        out['ok'] = True
+        out['case_dir'] = case_dir
+        out['reading'] = rd.reading
+        out['record_profile'] = bool(record_profile)
+        return out
+    except Exception as e:
+        out['error'] = f'{type(e).__name__}: {e}'
+        if case_dir:
+            _left = _nsk_maker.remove_case_dir(case_dir)
+            if _left:
+                out['cleanup_warning'] = f'作業フォルダを消せませんでした。手で削除してください: {_left}'
+        return out
+
+
+def p2n_make(state, addata_root=None, record_profile=None, progress=None):
+    """p2n_read の state から NEO と確認箇所シートを作る（vendor の make_neo.py）。作業フォルダは終わったら消す。
+    戻り値は run_pdf_to_neo_skill と同じ形"""
+    from neo_skill import maker as _nsk_maker
+    out = dict(state or {})
+    out['ok'] = False
+    case_dir = out.pop('case_dir', None)
+    reading = out.pop('reading', None)
+    if record_profile is None:
+        record_profile = bool(out.pop('record_profile', False))
+    else:
+        out.pop('record_profile', None)
+    if not case_dir or not os.path.isdir(str(case_dir)):
+        out['stage'] = 'error'
+        out['error'] = '読み取りの作業フォルダが無くなっています（時間が経ちすぎたか、アプリが再起動しました）。もう一度読み取ってください'
+        return out
+    if not addata_root or not os.path.isdir(str(addata_root)):
+        out['stage'] = 'error'
+        out['error'] = 'Addata（コグニの車種データ）が決まっていないので生成しません'
+        _nsk_maker.remove_case_dir(case_dir)
+        return out
+    try:
         if progress:
             progress('下書き → ADDATA 突合せ → NEO 生成 → 検算（pdf-to-neo スキル make_neo.py）')
         mk = _nsk_maker.make_neo(case_dir, 'estimate', no_profile=not record_profile, addata_root=addata_root)
@@ -6460,7 +6497,7 @@ def run_pdf_to_neo_skill(pdf_bytes, file_name, api_key, mime_type='application/p
         out['report_md'] = _nsk_maker.read_text(mk.report_path)
         if not mk.ok:
             out['error'] = mk.error
-            out['repair_zip'] = _nsk_maker.repair_bundle(case_dir, rd.reading)
+            out['repair_zip'] = _nsk_maker.repair_bundle(case_dir, reading)
             return out
         out['neo_bytes'] = _nsk_maker.read_bytes(mk.neo_path)
         out['review_bytes'] = _nsk_maker.read_bytes(mk.review_path)
@@ -6489,8 +6526,116 @@ def run_pdf_to_neo_skill(pdf_bytes, file_name, api_key, mime_type='application/p
     finally:
         _left = _nsk_maker.remove_case_dir(case_dir)
         if _left:
-            out['cleanup_warning'] = ('作業フォルダを消せませんでした。見積書・NEO・確認箇所シートが残っているので'
+            out['cleanup_warning'] = ('作業フォルダを消せませんでした。見積書・NEO・確認箇所シートが残っています。'
                                       f'手で削除してください: {_left}')
+
+
+def _render_beta_result(_p2n_res, selected_model):
+    """Addata なしのベタ打ち（旧経路 run_pdf_to_neo_pipeline）の結果を出す。
+    b15bd06 で UI から外した表示を、部品コード無しの断りを添えて戻した（2026-09-14）"""
+    st.info("✏️ ベタ打ち（Addata なし）で作った NEO です: 明細・金額・品名は見積書のとおりですが、"
+            "部品コード・標準品番・標準指数は入っていません。部品コードまで入れるなら、"
+            "サイドバー「🖥️ PC の Addata をこの画面から使う」で C:\\Addata を選んで作り直してください。")
+    if _p2n_res.get('error'):
+        st.error(f"❌ {_p2n_res['error']}")
+        for _w in (_p2n_res.get('warnings') or []):
+            st.caption(f"・{_w}")
+        return
+    if not _p2n_res.get('ok'):
+        st.error("❌ 見積書からNEOを生成できませんでした。")
+        for _w in (_p2n_res.get('warnings') or []):
+            st.caption(f"・{_w}")
+        return
+    _p2n_items = _p2n_res.get('items') or []
+    if not _p2n_items:
+        st.error("❌ 見積書から明細を1行も読み取れませんでした。スキャン画像で文字が読めない、APIのクォータ超過、"
+                 "対応していない書式のいずれかが考えられます。")
+        for _w in (_p2n_res.get('warnings') or []):
+            st.caption(f"・{_w}")
+        return
+    _p2n_parts = sum(safe_int(it.get('parts_amount', 0)) for it in _p2n_items)
+    _p2n_wage = sum(safe_int(it.get('wage', 0)) for it in _p2n_items)
+    st.success(f"✅ 解析完了（ベタ打ち） — {len(_p2n_items)}行 ／ 部品 ¥{_p2n_parts:,} ／ 工賃 ¥{_p2n_wage:,}")
+    for _w in (_p2n_res.get('warnings') or []):
+        st.warning(f"⚠️ {_w}")
+    _p2n_qty_over = [str(_it.get('name', '') or '') for _it in _p2n_items if safe_int(_it.get('quantity', 1), 1) > 99]
+    if _p2n_qty_over:
+        st.warning(f"⚠️ 数量が100以上の行が{len(_p2n_qty_over)}件あります（{'、'.join(_p2n_qty_over[:3])}"
+                   f"{'ほか' if len(_p2n_qty_over) > 3 else ''}）。コグニセブンの注記欄は数量が2桁までのため、"
+                   "注記側は99として書かれます（明細欄には原本どおりの数量が入ります）。")
+    _p2n_v = _p2n_res.get('verify') or {}
+    if _p2n_v.get('error'):
+        st.warning(f"🔍 検証できませんでした（{_p2n_v['error']}）。生成NEOと原本を突き合わせていません。"
+                   "「プレビューに取り込む」で1行ずつご確認ください。")
+    elif _p2n_v.get('ok'):
+        st.caption("🔍 検証OK: 生成NEOの明細件数と"
+                   + ("部品・工賃の金額（税抜）" if _p2n_v.get('wage_match') else "部品金額（税抜）")
+                   + ("、および総額" if _p2n_v.get('grand_match') else "") + "が原本と一致しました。"
+                   + ("" if _p2n_v.get('wage_match') else "（見積書に工賃計が印字されていないため、工賃は突き合わせていません）"))
+    elif not _p2n_v.get('verified_against_pdf'):
+        st.warning("🔍 検証できていません: 見積書に印字された部品計が読み取れなかったため、生成NEOと突き合わせていません。"
+                   "「プレビューに取り込む」で原本と1行ずつご確認ください。")
+    else:
+        st.warning("🔍 検証: 原本と生成NEOに差異があります。"
+                   f"件数 NEO {_p2n_v.get('neo_count')} / 原本 {_p2n_v.get('pdf_count')}、"
+                   f"部品金額(税抜) NEO ¥{safe_int(_p2n_v.get('neo_total')):,} / 原本 ¥{safe_int(_p2n_v.get('pdf_parts_total')):,}"
+                   + (f"、工賃(税抜) NEO ¥{safe_int(_p2n_v.get('neo_wage_total')):,} / 原本 ¥{safe_int(_p2n_v.get('pdf_wage_total')):,}"
+                      if _p2n_v.get('wage_match') is False else "")
+                   + "。「プレビューに取り込む」で内容を確認・修正してください。")
+    _p2n_neo = _p2n_res.get('neo_bytes')
+    if _p2n_neo:
+        _p2n_name = st.session_state.get('_pdf2neo_filename')
+        if not _p2n_name:
+            _p2n_name = generate_filename(_p2n_res.get('vehicle_info') or {}, 0, 0, 0, 0, False, reverse_match=True)
+            st.session_state['_pdf2neo_filename'] = _p2n_name
+        st.download_button("📥 NEOファイルをダウンロード（ベタ打ち）", data=_p2n_neo, file_name=_p2n_name,
+                           mime="application/octet-stream", key='pdf2neo_dl_beta', width='stretch')
+    if st.button("📝 プレビューに取り込んで修正する", key='pdf2neo_to_preview_beta', width='stretch'):
+        st.session_state['csv_items'] = _p2n_items
+        st.session_state['csv_mode'] = True
+        _carry = '税込み（内税）' if st.session_state.get('pdf2neo_tax_inclusive') else '税抜き（外税）'
+        st.session_state['tax_override'] = _carry
+        st.session_state['_tax_carry_pending'] = _carry
+        st.session_state['pdf2neo_vehicle_info'] = _p2n_res.get('vehicle_info') or {}
+        st.session_state['vehicle_file_bytes'] = None
+        st.session_state['vehicle_file_name'] = None
+        st.session_state['estimate_file_bytes'] = None
+        st.session_state['estimate_file_name'] = None
+        st.session_state['selected_model'] = selected_model
+        st.session_state['step'] = 2
+        st.rerun()
+
+
+def run_pdf_to_neo_skill(pdf_bytes, file_name, api_key, mime_type='application/pdf',
+                         vehicle_hint=None, insurance_hint=None, progress=None, record_profile=False,
+                         addata_root=None, reader_kind='claude', model_name=''):
+    """見積書 PDF → pdf-to-neo スキル（vendor/pdf_to_neo）で NEO と確認箇所シートを作る（読む → 作る を続けて行う）。
+
+    読む段だけ LLM（neo_skill.reader。reader_kind='claude' か 'gemini'。指示文・検算・読み直しは同じ）。
+    判断・生成・検算・合否は vendor の make_neo.py そのもの
+    （docs/pdf-to-neo_アプリ移植ガイド.md）。合計を合わせるための調整はどこにも無い。
+    戻り値 dict:
+      ok / stage('read' | 'make' | 'done' | 'error') / error
+      read: {ok, n_pages, stats, usage, fails[], traces[], warn[]}
+      make: {ok, match_line, reasons[], tail}
+      neo_bytes / review_bytes / review_ext / report_md / download_name / vendor_commit / cleanup_warning
+      reader: {kind, model}（どの AI が読んだか）
+      repair_zip: 不合格のとき、人が直して続きをするための一式（pages/*.json・reading.json・report.md 等。NEO は入れない）
+    insurance_hint: サイドバーの保険情報（policy_no / contractor / accident_date(8桁) / company …）。
+      見積書に印字が無い項目にだけ補う（reading の insurance → 生成器の Insurance テーブル）。
+    record_profile: 合格時に工場の設定を NEO_check/_profiles に記録する（vendor の既定動作）。
+      作業フォルダの外に取引先名が残るので、共有プロセスのアプリでは既定で記録しない。
+    addata_root: アプリで決めた ADDATA（サイドバー / URL / ZIP / PC からの橋渡し。find_addata_dir()）。vendor の生成器と
+      検算ランナーに環境変数 ADDATA_ROOT として渡し、アプリと同じ版を使わせる。**無ければ止める**。
+    作業フォルダは要求ごとに作り、終わったら消す（見積書・NEO・シートには顧客情報が入る）。
+    PC の Addata を橋渡しする経路（車種フォルダを読んだあとに取り込む）は p2n_read / p2n_make を分けて呼ぶ（STEP 1-A）。
+    """
+    state = p2n_read(pdf_bytes, file_name, api_key, mime_type=mime_type, vehicle_hint=vehicle_hint,
+                     insurance_hint=insurance_hint, progress=progress, record_profile=record_profile,
+                     addata_root=addata_root, reader_kind=reader_kind, model_name=model_name)
+    if not state.get('ok'):
+        return state
+    return p2n_make(state, addata_root=addata_root, record_profile=record_profile, progress=progress)
 
 
 def _sidebar_insurance_hint():
@@ -6804,6 +6949,48 @@ def main():
         )
         st.markdown("---")
         st.markdown("**🗂 Addata（車種データベース）**")
+        # ── PC の Addata をブラウザ経由で使う（クラウド向け。neo_skill.bridge / addata_bridge/index.html）──
+        # サーバは利用者の PC を読めないので、ブラウザ側で PC のフォルダを選んでもらい、
+        # 車種マスタ（COM）と見積の車種フォルダだけをこの画面のアプリに送ってもらう
+        with st.expander("🖥️ PC の Addata をこの画面から使う（クラウド向け・おすすめ）",
+                         expanded=bool(st.session_state.get('_bridge_path') or not find_addata_dir())):
+            st.caption("PC の Addata フォルダ（C:\\Addata）を一度選ぶと、車種マスタ（約 9MB）と見積の車種フォルダ（数 MB）だけを"
+                       "この画面に送って照合に使います。5GB を上げる必要はありません。Chrome / Edge で使えます。")
+            try:
+                from neo_skill import bridge as _br
+                _bpath = _br.root(st.session_state)
+                _br.touch(_bpath)   # 使用中の印を先に付けてから古いものを掃除する（自分のフォルダを消さない。Codex 42）
+                _br.sweep()
+                from neo_skill import maker as _nsk_maker_sw
+                _nsk_maker_sw.sweep_case_dirs()   # 車種フォルダ待ちのまま放置された作業フォルダ（reading.json 入り）も消す
+                _bval = _br.render(want=st.session_state.get('_bridge_want', ''), have=_br.cars(_bpath),
+                                   com=_br.has_com(_bpath), key='addata_bridge')
+                _bmsg = _br.ingest(st.session_state, _bval)
+                # COM を受け取った直後は、部品はまだ com=false の render しか見ていない（render は ingest より先）。
+                # もう一度 rerun して com=true を届ける: 車種フォルダ待ちがあれば部品はその後それを送る（Codex 50）
+                _bridge_rerun = bool(_bmsg and isinstance(_bval, dict) and _bval.get('phase') == 'com' and _br.has_com(_bpath))
+                if _br.has_com(_bpath):
+                    st.session_state['_bridge_path'] = _bpath
+                    st.success(f"PC の Addata（{st.session_state.get('_bridge_root_name') or 'フォルダ'}）を使用中 ／ "
+                               f"データ版 {_br.version(_bpath) or '不明'} ／ 取り込んだ車種: "
+                               f"{', '.join(_br.cars(_bpath)) or 'なし（見積を入れると自動で送ります）'}")
+                    if st.button("🔌 PC の Addata との接続を解除", key='bridge_disconnect',
+                                 help="この画面に送った車種マスタ・車種フォルダを消し、他の設定（ZIP・パス・取得URL・自動検出）に戻します"):
+                        _br.disconnect(st.session_state)
+                        st.rerun()
+                if _bmsg:
+                    st.caption(_bmsg)
+                if st.session_state.get('_bridge_want'):
+                    if _br.has_com(_bpath):
+                        st.info(f"車種 {st.session_state['_bridge_want']} のフォルダを PC から送っています…（届くと自動で続きます）")
+                    else:
+                        st.warning(f"車種 {st.session_state['_bridge_want']} のフォルダ待ちです。上のボタンで PC の Addata フォルダ（COM があるもの）を"
+                                   "選び直すと、読み取り結果はそのまま続きから生成します")
+            except Exception as _be:  # noqa: BLE001
+                st.caption(f"PC の Addata 連携を表示できません: {_be}")
+                _bridge_rerun = False
+        if _bridge_rerun:
+            st.rerun()
         addata_status = find_addata_dir()
         if addata_status:
             _ka06 = find_ka06_path(addata_status)
@@ -6865,7 +7052,8 @@ def main():
                 _discard_uploaded_addata()
                 st.rerun()
         else:
-            st.warning("Addataフォルダ未検出（ベタ打ちモードで生成します）")
+            st.warning("Addata 未検出 — 見積 PDF は「ベタ打ちで生成」（部品コード・標準指数なし）になります。"
+                       "部品コードまで入れるなら、上の「🖥️ PC の Addata をこの画面から使う」で PC の C:\\Addata を選んでください")
             # 「無いと分かった」のか「時間切れで探しきれていない」のかは
             # 別の話。応答しない共有や未同期の OneDrive があると、Addata が
             # 手元にあるのにベタ打ちモードに落ちたまま気づけない。
@@ -6898,8 +7086,9 @@ def main():
                 "そのため、お使いのPCの `C:\\Addata` をサーバから読むことはできません。"
                 "パスを入れて効くのは、**このアプリをそのPCで直接起動している場合**か、"
                 "社内サーバ・Docker でフォルダを渡している場合です。\n\n"
-                "クラウドから使うときは **② 取得URL** を設定してください。"
-                "一度設定すれば、**どのPCでもそのURLを開くだけ**で使えます。"
+                "クラウドから使うときは、上の **「🖥️ PC の Addata をこの画面から使う」** で PC の `C:\\Addata` を選ぶのが"
+                "おすすめです（車種マスタ 約 9MB と見積の車種フォルダだけを送ります）。"
+                "**② 取得URL** は、300MB までの ZIP を置ける場合の代替です。"
             )
 
             _cur_dir = addata_setting(_QS_ADDATA_DIR)
@@ -7267,6 +7456,8 @@ def main():
         if _p2n_file is not None:
             _p2n_bytes = _p2n_file.read()
             _p2n_file.seek(0)
+            # この見積の同一性（車種フォルダ待ちの取り置きが別の見積で再開されないよう照合する）
+            _p2n_file_key = f"{_p2n_file.name}|{len(_p2n_bytes)}|{hashlib.sha256(_p2n_bytes).hexdigest()}"
             st.caption(f"📄 {_p2n_file.name}（{len(_p2n_bytes):,} bytes）")
             st.caption("サイドバーの「事故・保険情報」（証券番号・契約者名・事故日・受付番号・代理店・アジャスター・入出庫日・修理日数）は、"
                        "見積書に印字が無ければ NEO に補われます。"
@@ -7280,13 +7471,43 @@ def main():
                 st.warning("⚠️ 見積書の読み取りには Claude または Gemini の APIキーが必要です。"
                            "サイドバーの「APIキー設定」で入力するか、.env の ANTHROPIC_API_KEY / GEMINI_API_KEY に設定してください。")
             elif not (_p2n_addata := find_addata_dir()):
-                # Addata が決まらないときは vendor の自動検出に落とさず止める（別の版で作らない）。
-                # 取得 URL を設定していて失敗しているなら、その理由を出す
+                # Addata が決まらないとき: pdf-to-neo スキルの経路（部品コード・標準指数を引く）は vendor の自動検出に
+                # 落とさず止める（別の版で作らない）。代わりに、以前からある「ベタ打ち（モードA）」で作れるようにする
+                # （2026-09-14 亮平さん指示: Addata が特定できない状態ではベタ打ちも使えなくなっていた）。
+                # ベタ打ち = 見積書の明細・金額・品名をそのまま写す。部品コード・標準品番・標準指数は入らない
                 _p2n_url_err = st.session_state.get('_addata_url_error')
-                st.error("❌ Addata（コグニの車種データ）が決まっていないので生成できません。"
-                         + (f" 取得URLの失敗: {_p2n_url_err}" if _p2n_url_err else
-                            " サイドバーの「Addata の場所を設定する」で場所を指定してください。")
-                         + " この経路は Addata なしでは動きません（部品コード・標準指数を引けないため）。")
+                st.warning("⚠️ Addata（コグニの車種データ）が決まっていないので、部品コード・標準指数を引く生成（pdf-to-neo スキル）はできません。"
+                           + (f" 取得URLの失敗: {_p2n_url_err}" if _p2n_url_err else "")
+                           + " サイドバー「🖥️ PC の Addata をこの画面から使う」で PC の C:\\Addata を選ぶか、"
+                           "下の「ベタ打ちで生成」で部品コード無しの NEO を作れます（明細・金額・品名は見積書のとおり）。")
+                if not api_key:
+                    st.caption("ベタ打ちの読み取りは Gemini を使います。サイドバーの「APIキー設定」に Gemini API キーを入れてください。")
+                elif st.button("✏️ ベタ打ちで生成（Addata なし・部品コード/標準指数は入りません）", key='pdf2neo_run_beta',
+                               width='stretch'):
+                    st.session_state.pop('pdf2neo_result', None)
+                    st.session_state.pop('_pdf2neo_filename', None)
+                    _p2n_beta_tax = ('内税' in str(_pdf_tax_sel) or '税込' in str(_pdf_tax_sel))
+                    with st.spinner("見積書を読んでベタ打ちの NEO を作っています…（1〜3 分）"):
+                        _p2n_beta = run_pdf_to_neo_pipeline(
+                            _p2n_bytes, api_key,
+                            mime_type=get_mime_type(_p2n_file.name),
+                            model_name=selected_model,
+                            template_bytes=st.session_state.get('custom_neo_bytes'),
+                            is_tax_inclusive=_p2n_beta_tax,
+                            # サイドバーの費用欄・事故・保険欄（旧経路と同じ扱い。b15bd06 で外す前の呼び方）
+                            expenses={'towing': st.session_state.get('exp_towing', 0),
+                                      'rental_car': st.session_state.get('exp_rental', 0),
+                                      'tax_exempt': st.session_state.get('exp_exempt', 0)},
+                            insurance_info={k: st.session_state.get(k, 0 if k == 'repair_days' else '') for k in (
+                                'policy_no', 'contractor_name', 'accept_no', 'accident_date', 'agency_name',
+                                'adjuster_name', 'garage_in_date', 'garage_out_date', 'repair_days', 'note1')},
+                        )
+                    if not isinstance(_p2n_beta, dict):
+                        _p2n_beta = {'ok': False, 'error': 'ベタ打ち生成が想定外の値を返しました'}
+                    _p2n_beta['legacy_beta'] = True
+                    st.session_state['pdf2neo_tax_inclusive'] = _p2n_beta_tax
+                    st.session_state['pdf2neo_result'] = _p2n_beta
+                    st.rerun()
             else:
                 # 読み手: 両方のキーがあれば選べる（既定は Claude。移植ガイド §3-4 が「同じ精度を狙うなら Claude が近い」）。
                 # 片方だけならそれを使う。指示文・検算・読み直し・生成は同じなので、違うのは読み取りの精度だけ
@@ -7306,33 +7527,110 @@ def main():
                     st.caption(f"読み取りに使う AI: {_p2n_choices[0][1]}")
                 _p2n_key = claude_api_key if _p2n_kind == 'claude' else api_key
                 _p2n_model = '' if _p2n_kind == 'claude' else selected_model
+                from neo_skill import bridge as _br
+                _p2n_bridge = _br.is_bridge(_p2n_addata)   # PC の Addata をブラウザ経由で使っている
+                _p2n_profile = (os.environ.get('NEO_SKILL_PROFILE') == '1')  # 工場プロファイルは既定で書かない
+                _p2n_pending = st.session_state.get('_bridge_pending')
+                _p2n_stale_why = ''
+                if _p2n_pending:
+                    import time as _p2n_time
+                    if _p2n_pending.get('file_key') != _p2n_file_key:
+                        _p2n_stale_why = '見積書が変わったので'          # 別の見積の NEO を出さない
+                    elif _p2n_time.time() - float(_p2n_pending.get('parked_at') or 0) > 2 * 3600:
+                        _p2n_stale_why = '車種フォルダを 2 時間待っても届かなかったので'   # 取り置き（顧客情報）を残し続けない
+                if _p2n_stale_why:
+                    from neo_skill import maker as _nsk_maker
+                    _nsk_maker.remove_case_dir((st.session_state.pop('_bridge_pending') or {}).get('case_dir'))
+                    st.session_state['_bridge_want'] = ''
+                    _p2n_pending = None
+                    st.info(f"{_p2n_stale_why}、前の読み取り結果は捨てました。もう一度「見積書からNEOを生成」を押してください。")
+                if _p2n_bridge and _p2n_pending and not st.session_state.get('_bridge_want'):
+                    # 車種フォルダの取り込みを待っていた読み取りの続き（部品が送り終わると rerun されてここに来る）
+                    _p2n_car = str(_p2n_pending.get('car_code') or '')
+                    st.session_state.pop('_bridge_pending', None)
+                    if _p2n_car and not _br.has_car(_p2n_addata, _p2n_car):
+                        _p2n_out = dict(_p2n_pending, ok=False, stage='error',
+                                        error=f"車種 {_p2n_car} のフォルダを PC の Addata から取り込めませんでした"
+                                              f"（{st.session_state.get('_bridge_msg') or '理由不明'}）。"
+                                              "PC の Addata に その車種フォルダがあるか（版が新しいか）を確かめてください")
+                        from neo_skill import maker as _nsk_maker
+                        _nsk_maker.remove_case_dir(_p2n_pending.get('case_dir'))
+                    else:
+                        with st.status("車種フォルダが届いたので NEO を作っています…", expanded=True) as _p2n_status:
+                            def _p2n_progress(msg):
+                                _p2n_status.write(msg)
+                            _p2n_out = p2n_make(_p2n_pending, addata_root=_p2n_addata, record_profile=_p2n_profile,
+                                                progress=_p2n_progress)
+                            _p2n_status.update(
+                                label=("✅ 合格" if _p2n_out.get('ok') else "❌ 不合格（下の理由をご確認ください）"),
+                                state=('complete' if _p2n_out.get('ok') else 'error'), expanded=False)
+                    st.session_state['pdf2neo_result'] = _p2n_out
+                    st.rerun()
                 if st.button("🚀 見積書からNEOを生成", key='pdf2neo_run', type="primary",
                              width='stretch'):
                     st.session_state.pop('pdf2neo_result', None)
+                    _p2n_stale = st.session_state.pop('_bridge_pending', None)
+                    if _p2n_stale:
+                        # 車種フォルダ待ちのまま押し直した: 取り置きの作業フォルダ（reading.json 入り）を消してから読み直す
+                        from neo_skill import maker as _nsk_maker
+                        _nsk_maker.remove_case_dir(_p2n_stale.get('case_dir'))
+                    st.session_state['_bridge_want'] = ''
                     with st.status("見積書を読んで NEO を作っています…（ページ数により 1〜5 分）",
                                    expanded=True) as _p2n_status:
                         def _p2n_progress(msg):
                             _p2n_status.write(msg)
-                        _p2n_out = run_pdf_to_neo_skill(
-                            _p2n_bytes, _p2n_file.name, _p2n_key,
+                        _p2n_kw = dict(
                             mime_type=get_mime_type(_p2n_file.name),
                             # サイドバーの「事故・保険情報」。見積書に印字が無い項目にだけ補われる
                             insurance_hint=_sidebar_insurance_hint(),
                             progress=_p2n_progress,
-                            # 工場プロファイル（取引先名）は既定で書かない。ローカル運用で学習させたいときだけ
-                            record_profile=(os.environ.get('NEO_SKILL_PROFILE') == '1'),
-                            # サイドバー / URL / ZIP で決めた ADDATA を vendor にも使わせる（版の食い違いを防ぐ）
+                            record_profile=_p2n_profile,
+                            # サイドバー / URL / ZIP / PC からの橋渡し で決めた ADDATA を vendor にも使わせる（版の食い違いを防ぐ）
                             addata_root=_p2n_addata,
                             reader_kind=_p2n_kind, model_name=_p2n_model,
                         )
+                        if _p2n_bridge:
+                            # PC の Addata: 読む → 車種を決める（COM だけで足りる）→ 車種フォルダが無ければ部品に頼んで待つ
+                            _p2n_state = p2n_read(_p2n_bytes, _p2n_file.name, _p2n_key, **_p2n_kw)
+                            if not _p2n_state.get('ok'):
+                                _p2n_out = _p2n_state
+                            else:
+                                _p2n_progress('車種を決めています（PC の Addata の車種マスタ）')
+                                _p2n_res = _br.resolve_car(_p2n_addata, _p2n_state.get('reading') or {})
+                                _p2n_car = str(_p2n_res.get('car_code') or '')
+                                _p2n_state['car_code'] = _p2n_car
+                                _p2n_state['file_key'] = _p2n_file_key
+                                import time as _p2n_time
+                                _p2n_state['parked_at'] = _p2n_time.time()
+                                if _p2n_car and not _br.has_car(_p2n_addata, _p2n_car):
+                                    st.session_state['_bridge_pending'] = _p2n_state
+                                    st.session_state['_bridge_want'] = _p2n_car
+                                    _p2n_status.update(label=f"車種 {_p2n_car} のフォルダを PC から取り込んでいます…",
+                                                       state='running', expanded=True)
+                                    st.rerun()
+                                if not _p2n_car:
+                                    _p2n_progress('車種マスタで車種を決められませんでした（' + str(_p2n_res.get('error') or _p2n_res.get('evidence') or '')[:120]
+                                                  + '）。そのまま生成に進みます')
+                                _p2n_out = p2n_make(_p2n_state, addata_root=_p2n_addata, record_profile=_p2n_profile,
+                                                    progress=_p2n_progress)
+                        else:
+                            _p2n_out = run_pdf_to_neo_skill(_p2n_bytes, _p2n_file.name, _p2n_key, **_p2n_kw)
                         _p2n_status.update(
                             label=("✅ 合格" if _p2n_out.get('ok') else "❌ 不合格（下の理由をご確認ください）"),
                             state=('complete' if _p2n_out.get('ok') else 'error'), expanded=False)
                     st.session_state['pdf2neo_result'] = _p2n_out
                     st.rerun()
 
+        if _p2n_file is None and st.session_state.get('_bridge_pending'):
+            # 車種フォルダ待ちの途中で見積を外した: 取り置きを捨てる（作業フォルダも消す。部品への依頼も取り下げる）
+            from neo_skill import maker as _nsk_maker
+            _nsk_maker.remove_case_dir((st.session_state.pop('_bridge_pending') or {}).get('case_dir'))
+            st.session_state['_bridge_want'] = ''
+
         _p2n_res = st.session_state.get('pdf2neo_result')
-        if _p2n_res:
+        if _p2n_res and _p2n_res.get('legacy_beta'):
+            _render_beta_result(_p2n_res, selected_model)
+        elif _p2n_res:
             _p2n_rd = _p2n_res.get('read') or {}
             _p2n_mk = _p2n_res.get('make') or {}
             _p2n_st = _p2n_rd.get('stats') or {}

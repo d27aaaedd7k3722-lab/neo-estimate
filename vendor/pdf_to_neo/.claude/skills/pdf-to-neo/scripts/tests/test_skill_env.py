@@ -546,6 +546,60 @@ def test_find_addata_all_lists_the_obvious_one():
     assert os.path.normcase(os.path.abspath(root)) in norm,         f'自動検出した {root} が一覧に無い（{got}）'
 
 
+def test_partial_root_only_with_flag():
+    """ADDATA_ROOT_PARTIAL=1 のときだけ、環境変数 ADDATA_ROOT の「COM ＋ 車種フォルダ」の部分コピー（アプリの橋渡し）を採る。
+    旗が無ければ弾く（自動検出に落ちる）。設定ファイル・自動検出の候補は旗があっても部分コピーを採らない"""
+    shutil.rmtree(ROOT, ignore_errors=True)
+    part = os.path.join(ROOT, 'addata_bridge_test')
+    os.makedirs(os.path.join(part, 'COM'), exist_ok=True)
+    for n in ('AnVer.DB', 'KA06_ALL.DB'):
+        open(os.path.join(part, 'COM', n), 'wb').write(b'x')
+    os.makedirs(os.path.join(part, 'W', 'W54'), exist_ok=True)
+    open(os.path.join(part, 'W', 'W54', 'W5401.DB'), 'wb').write(b'x')
+    assert not skill_env.is_addata(part), '部分コピーを is_addata が通してしまう（自動検出で拾われる）'
+    assert skill_env.is_addata_partial(part), '部分コピーを is_addata_partial が弾いている'
+    assert not skill_env.is_addata_partial(os.path.join(ROOT, 'nothing')), '存在しないパスを部分コピーと誤認'
+    keep = {k: os.environ.get(k) for k in ('ADDATA_ROOT', 'ADDATA_ROOT_PARTIAL')}
+    try:
+        os.environ['ADDATA_ROOT'] = part
+        os.environ.pop('ADDATA_ROOT_PARTIAL', None)
+        assert not skill_env.is_addata_or_partial(part), '旗なしで部分コピーを採ってしまう'
+        os.environ['ADDATA_ROOT_PARTIAL'] = '1'
+        assert skill_env.is_addata_or_partial(part), '旗ありで部分コピーを採らない'
+        os.environ['ADDATA_ROOT'] = os.path.join(ROOT, 'other')
+        assert not skill_env.is_addata_or_partial(part), '環境変数と違うパスまで部分コピーとして採ってしまう'
+        os.environ['ADDATA_ROOT'] = part
+        got = skill_env.resolve().get('ADDATA_ROOT')
+        assert os.path.normcase(os.path.abspath(got or '')) == os.path.normcase(os.path.abspath(part)), \
+            f'resolve() が部分コピーを採らず {got!r} に落ちた（自動検出に化けると別の版で作る）'
+        os.environ.pop('ADDATA_ROOT_PARTIAL', None)
+        got2 = skill_env.resolve().get('ADDATA_ROOT')
+        assert os.path.normcase(os.path.abspath(got2 or '')) != os.path.normcase(os.path.abspath(part)), \
+            '旗なしの resolve() が部分コピーを採ってしまう'
+        # 旗ありで環境変数が無効（COM が届いていない）: 自動検出・既定パスに落とさず空（fail closed）
+        os.environ['ADDATA_ROOT_PARTIAL'] = '1'
+        os.environ['ADDATA_ROOT'] = os.path.join(ROOT, 'nothing')
+        got3 = skill_env.resolve().get('ADDATA_ROOT')
+        assert got3 == '', f'旗ありで無効な環境変数なのに {got3!r} に落ちた（別の Addata で黙って作る）'
+        sys.path.insert(0, os.path.join(skill_env.FILES, 'claude_neo_pipeline'))
+        import addata_vehicle_resolver as _avr
+        try:
+            _avr.find_addata_root()
+            raise AssertionError('resolver の find_addata_root() が旗ありで無効な環境変数から既定パス・探索に落ちた')
+        except FileNotFoundError:
+            pass
+        os.environ['ADDATA_ROOT'] = part
+        assert os.path.normcase(os.path.abspath(_avr.find_addata_root())) == os.path.normcase(os.path.abspath(part)), \
+            'resolver が部分コピー（COM あり）の環境変数を採らない'
+    finally:
+        for k, v in keep.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(ROOT, ignore_errors=True)
+
+
 def test_find_addata_all_keeps_the_budget():
     """一覧は与えた予算をおおむね守る（呼び出し全体が返らなくならない）"""
     import time as _t

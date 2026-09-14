@@ -96,6 +96,10 @@ def find_addata_root() -> str:
     env = os.environ.get('ADDATA_ROOT')
     if _looks_like_addata(env or ''):
         return env
+    if (os.environ.get('ADDATA_ROOT_PARTIAL') or '').strip().lower() in ('1', 'true', 'yes'):
+        # 部分 Addata（COM ＋ 必要な車種フォルダだけ）を環境変数で渡すと宣言しているのに無効: 設定・既定パス・探索に落とさない
+        # （開発機の C:\Addata で黙って作らない。skill_env.partial_flag と同じ約束。2026-09-14）
+        raise FileNotFoundError(f'ADDATA_ROOT_PARTIAL=1 なのに ADDATA_ROOT={env!r} に COM がありません（部分 Addata が届いていない）')
     v = _addata_from_config()
     if v:
         return v
