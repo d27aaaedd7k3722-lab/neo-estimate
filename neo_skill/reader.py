@@ -201,7 +201,12 @@ def _apply_hint(header: dict, key: str, hint: Optional[dict]) -> None:
         return
     v = dict(header.get(key) or {})
     for k, val in hint.items():
-        if val not in (None, '') and not v.get(k):
+        cur = v.get(k)
+        # 顧客名・所有者欄の「同上」「***」は印字ではなく穴（車検証の値で埋める。使用者欄の '同上' は正しい値。Codex hunt B1）
+        if key == 'customer' and k in ('name', 'owner', 'owner_name') and isinstance(cur, str) \
+                and (cur.strip() in ('同上', '***', '＊＊＊') or (cur.strip() and set(cur.strip()) <= set('*＊'))):
+            cur = ''
+        if val not in (None, '') and not cur:
             v[k] = val
     if v:
         header[key] = v

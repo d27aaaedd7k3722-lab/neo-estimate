@@ -559,7 +559,14 @@ def _strip_control_chars(value) -> str:
     return re.sub(r'[ \t]+', ' ', s).strip()
 
 
-def _reg_no_part(value, digits: bool = False, strip_hyphen: bool = False) -> str:
+def _num_code(value, width: int) -> str:
+    """類別区分番号（4 桁）・型式指定番号（5 桁）を実機 NEO の形に: 数字だけにして左を 0 で埋める（'2' → '0002'）。
+    数字が無ければ空。実機 299 本: CarKindNo は全て 4 桁、CarMouldNo は全て 5 桁（2026-09-15 集計。Codex hunt B8）"""
+    s = re.sub(r'\D', '', unicodedata.normalize('NFKC', _strip_control_chars(value)))
+    return s.zfill(width) if s else ''
+
+
+def _reg_no_part(value, digits: bool = False, strip_hyphen: bool = False, kana: bool = False) -> str:
     """登録番号の 1 区画（地名・分類番号・かな・一連番号）をコグニの NEO と同じ形に揃える。
 
     実機 NEO 108 本（登録番号あり）の集計（2026-09-14）: 分類番号・一連番号は
@@ -571,6 +578,10 @@ def _reg_no_part(value, digits: bool = False, strip_hyphen: bool = False) -> str
     s = _strip_control_chars(value).strip()
     if digits:
         s = unicodedata.normalize('NFKC', s)
+    if kana:
+        # かなは全角ひらがな（実機 108 本すべて）。OCR の半角カナ 'ｱ'・カタカナ 'ア' を 'あ' に（Codex hunt B5）
+        s = unicodedata.normalize('NFKC', s)
+        s = ''.join(chr(ord(c) - 0x60) if 0x30A1 <= ord(c) <= 0x30F6 else c for c in s)
     if strip_hyphen:
         s = re.sub(r'[\s\-‐‑―ー・･.]', '', s)   # '12-34' → '1234'、'・・12' → '12'
     return s
@@ -1879,10 +1890,16 @@ def _trimmed_cust_values(cust: dict) -> dict:
     片側だけ切り詰めると、1つの .neo の中で使用者名や車名が
     2種類存在する状態になってしまう。
     """
-    cust = cust or {}
+    cust = dict(cust or {})
+    # 住所は実機 NEO と同じく 都道府県 / 市区郡（'〜市' まで。政令市の区は以降側）/ 以降 に分け直す（Codex hunt B2）
+    if any(str(cust.get(k) or '').strip() for k in ('prefecture', 'municipality', 'address_other')):
+        cust['prefecture'], cust['municipality'], cust['address_other'] = _doc_hints.split_address(
+            _strip_control_chars(cust.get('prefecture', '')), _strip_control_chars(cust.get('municipality', '')),
+            _strip_control_chars(cust.get('address_other', '')))
     return {
         'customer_name': cp932_trim(_strip_control_chars(cust.get('customer_name', '')), _CUST_WIDTH['Name1']),
-        'user_name':     cp932_trim(_strip_control_chars(cust.get('customer_name', '')), _CUST_WIDTH['UserName']),
+        # 使用者欄: vehicle_info に user_name があればそれ（車検証の使用者が同上なら '同上'。Codex hunt B7）、無ければ従来どおり顧客名
+        'user_name':     cp932_trim(_strip_control_chars(cust.get('user_name') if str(cust.get('user_name') or '').strip() else cust.get('customer_name', '')), _CUST_WIDTH['UserName']),
         'owner_name':    cp932_trim(_strip_control_chars(cust.get('owner_name', '')),    _CUST_WIDTH['OwnerName']),
         'postal_no':     cp932_trim(_strip_control_chars(cust.get('postal_no', '')),     _CUST_WIDTH['PostalNo']),
         'prefecture':    cp932_trim(_strip_control_chars(cust.get('prefecture', '')),    _CUST_WIDTH['Prefecture']),
@@ -1891,11 +1908,11 @@ def _trimmed_cust_values(cust: dict) -> dict:
         # 登録番号はコグニと同じ半角数字・ハイフン無しに揃える（_reg_no_part。実機 NEO 108 本の集計）
         'car_dept':      cp932_trim(_reg_no_part(cust.get('car_reg_department', '')), _CUST_WIDTH['CarRegNoDepartment']),
         'car_div':       cp932_trim(_reg_no_part(cust.get('car_reg_division', ''), digits=True), _CUST_WIDTH['CarRegNoDivision']),
-        'car_biz':       cp932_trim(_reg_no_part(cust.get('car_reg_business', '')),   _CUST_WIDTH['CarRegNoBusiness']),
+        'car_biz':       cp932_trim(_reg_no_part(cust.get('car_reg_business', ''), kana=True), _CUST_WIDTH['CarRegNoBusiness']),
         'car_serial':    cp932_trim(_reg_no_part(cust.get('car_reg_serial', ''), digits=True, strip_hyphen=True), _CUST_WIDTH['CarRegNoSerial']),
         'car_serial_no': cp932_trim(_strip_control_chars(cust.get('car_serial_no', '')),      _CUST_WIDTH['CarSerialNo']),
-        'model_desig':   cp932_trim(_strip_control_chars(cust.get('car_model_designation', '')), _CUST_WIDTH['CarMouldNo']),
-        'category_num':  cp932_trim(_strip_control_chars(cust.get('car_category_number', '')),   _CUST_WIDTH['CarKindNo']),
+        'model_desig':   cp932_trim(_num_code(cust.get('car_model_designation', ''), 5), _CUST_WIDTH['CarMouldNo']),
+        'category_num':  cp932_trim(_num_code(cust.get('car_category_number', ''), 4),   _CUST_WIDTH['CarKindNo']),
         'car_name':      cp932_trim(_strip_control_chars(cust.get('car_name', '')),      _CAR_WIDTH['CarName']),
         'body_color':    cp932_trim(_strip_control_chars(cust.get('body_color', '')),    _CAR_WIDTH['ColorName']),
         'color_code':    cp932_trim(_strip_control_chars(cust.get('color_code', '')),    _CAR_WIDTH['ColorCode']),
@@ -4666,7 +4683,7 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
                 result = extract_json_from_response(response.text)
                 _method_used = "response_schema+extract"
     except Exception as e:
-        print(f"[shaken_ocr] response_schema failed: {e}")
+        print(f"[shaken_ocr] response_schema failed: {type(e).__name__}")   # 生のエラー文は出さない（キーや値が混ざる。Codex hunt C2）
         _method_used = "fallback"
         _last_error = e
 
@@ -4684,7 +4701,7 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
                     result = extract_json_from_response(result_text)
                     _method_used = "json_mode+extract"
         except Exception as e2:
-            print(f"[shaken_ocr] json_mode fallback also failed: {e2}")
+            print(f"[shaken_ocr] json_mode fallback also failed: {type(e2).__name__}")
             result = {}
             _last_error = e2
 
@@ -4729,8 +4746,9 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
     if 'confidence' in result:
         result['confidence'] = safe_float(result.get('confidence', 0), 0.0)
 
-    print(f"[shaken_ocr] method={_method_used}, car_name={result.get('car_name','')}, "
-          f"car_model={result.get('car_model','')}, reg={result.get('car_reg_department','')}")
+    # 共有サーバのログに車検証の値を残さない（Codex hunt C2）: 方式と埋まった項目数だけ
+    print(f"[shaken_ocr] method={_method_used}, filled_fields="
+          f"{sum(1 for _k, _v in result.items() if _k != 'confidence' and _v and str(_v).strip())}")
 
     # 車名が空欄の場合、車台番号からメーカーを推定
     if not result.get('car_name') and result.get('car_serial_no'):
@@ -6664,8 +6682,10 @@ def _render_beta_result(_p2n_res, selected_model):
             _p2n_name = generate_filename(_p2n_res.get('vehicle_info') or {}, 0, 0, 0, 0, False, reverse_match=True)
             st.session_state['_pdf2neo_filename'] = _p2n_name
         st.download_button("📥 NEOファイルをダウンロード（ベタ打ち）", data=_p2n_neo, file_name=_p2n_name,
-                           mime="application/octet-stream", key='pdf2neo_dl_beta', width='stretch')
-    if st.button("📝 プレビューに取り込んで修正する", key='pdf2neo_to_preview_beta', width='stretch'):
+                           mime="application/octet-stream", key='pdf2neo_dl_beta', width='stretch',
+                           disabled=bool(_p2n_res.get('stale')))   # 入力が変わった結果は落とさせない（Codex hunt A1）
+    if st.button("📝 プレビューに取り込んで修正する", key='pdf2neo_to_preview_beta', width='stretch',
+                 disabled=bool(_p2n_res.get('stale'))):   # 入力が変わった結果は取り込ませない（Codex 70）
         st.session_state['csv_items'] = _p2n_items
         st.session_state['csv_mode'] = True
         _carry = '税込み（内税）' if st.session_state.get('pdf2neo_tax_inclusive') else '税抜き（外税）'
@@ -6796,6 +6816,138 @@ def _doc_fill_plan(att_fill, prev_filled, current) -> tuple:
         if k not in now and str(pv or '').strip() and cur_of(k) == str(pv or ''):
             now[k] = pv
     return updates, now
+
+
+_CASE_INPUT_KEYS = (
+    # サイドバーの事故・保険情報と費用
+    'policy_no', 'contractor_name', 'accept_no', 'accident_date', 'agency_name', 'adjuster_name', 'adjuster_post',
+    'garage_in_date', 'garage_out_date', 'repair_days', 'note1', 'exp_towing', 'exp_rental', 'exp_exempt',
+    # 添付の書類の読み取りの控えと反映の印
+    '_doc_ocr_cache', '_insdoc_applied', '_insdoc_sha', '_insdoc_cleared_sha', '_insdoc_filled', '_insdoc_ocr_id', '_doc_ocr_error',
+    # 生成結果・ベタ打ちの費用チェック
+    '_beta_exp_file_key', 'pdf2neo_beta_use_exp', 'pdf2neo_result', '_pdf2neo_filename', 'pdf2neo_vehicle_info',
+)
+
+
+_DOC_STATE_KEYS = ('_doc_ocr_cache', '_insdoc_applied', '_insdoc_sha', '_insdoc_cleared_sha', '_insdoc_filled', '_insdoc_ocr_id', '_doc_ocr_error')
+
+
+def _reset_case_inputs(keep_docs: bool = False):
+    """案件の入力を消す（見積書が別のファイルに変わった ＝ 別の案件）: サイドバーの事故・保険情報と費用、添付の書類の控え、
+    車検証・書類の uploader（キーを進めて空にする）、生成結果、車種フォルダ待ちの取り置き。
+    見積書そのもの・API キー・モデル・Addata の設定は残す。
+    無いと、見積書だけ入れ替えた次の案件に前の案件の車検証・速報・受付番号が付いた NEO ができる（Codex hunt A2 2026-09-15）。
+    keep_docs=True: 見積書を外した後に入れ替えた書類（＝次の案件の書類）と、その書類から入れた欄は残し、
+    手で入れた保険欄・費用・結果だけ消す（前の案件の手入力を次の NEO に持ち越さない。Codex 72）"""
+    _filled = dict(st.session_state.get('_insdoc_filled') or {}) if keep_docs else {}
+    for key in _CASE_INPUT_KEYS:
+        if keep_docs and key in _DOC_STATE_KEYS:
+            continue
+        if keep_docs and key in _filled and str(st.session_state.get(key, '') or '') == str(_filled.get(key) or ''):
+            continue   # 今の書類から入れたまま ＝ 残す
+        st.session_state.pop(key, None)
+    _pend = st.session_state.pop('_bridge_pending', None)
+    if _pend:
+        try:
+            from neo_skill import maker as _nsk_maker
+            _nsk_maker.remove_case_dir(_pend.get('case_dir'))
+        except Exception:  # noqa: BLE001
+            pass
+    st.session_state['_bridge_want'] = ''
+    st.session_state['form_seq'] = int(st.session_state.get('form_seq', 0)) + 1      # サイドバーの入力欄を作り直す（残す値は value= で戻る）
+    if not keep_docs:
+        st.session_state['upload_seq'] = int(st.session_state.get('upload_seq', 0)) + 1  # 車検証・書類の uploader を作り直して空に
+
+
+def _docs_ocr_state(s, api_key, model_name, keys) -> str:
+    """添付の書類の OCR の状態（控え _doc_ocr_cache の中身のハッシュ。無い／失敗は ''）。API は呼ばない。
+    同じファイルでも、キーを直して読めるようになれば状態が変わる ＝ 前の（書類なしで作った）結果を落とさせない（Codex 72）"""
+    cache = s.get('_doc_ocr_cache') or {}
+    out = []
+    for kind, key in (('shaken', keys[0]), ('insdoc', keys[1])):
+        f = s.get(key)
+        if f is None:
+            out.append('')
+            continue
+        try:
+            h = hashlib.sha256(f.getvalue()).hexdigest()
+        except Exception:  # noqa: BLE001
+            out.append('?')
+            continue
+        hit = cache.get((kind, h, str(model_name or ''), hashlib.sha256((api_key or '').encode('utf-8')).hexdigest()[:12]))
+        if isinstance(hit, dict) and not hit.get('_error'):
+            out.append(hashlib.sha256(repr(sorted((str(k), str(v)) for k, v in hit.items())).encode('utf-8')).hexdigest())
+        else:
+            out.append('')
+    return '|'.join(out)
+
+
+def _p2n_inputs_signature(file_key, state=None, api_key='', model_name='', beta=False) -> str:
+    """生成結果に添える「入力の指紋」: 見積書・添付の書類（内容ハッシュ）・事故/保険欄・費用とそのチェック・税区分・テンプレート。
+    画面に出すとき今の指紋と違えば、その結果は前の入力で作ったもの ＝ ダウンロードさせない（別の見積の NEO や、直す前の
+    保険欄で作った NEO を落とせてしまう。Codex hunt A1 2026-09-15）"""
+    s = st.session_state if state is None else state
+    parts = [str(file_key or '')]
+    _keys = _doc_upload_keys() if state is None else ('vehicle_upload', 'insurance_doc_upload')
+    parts.append(_docs_ocr_state(s, api_key, model_name, _keys))   # 読めたか・何が読めたか（Codex 72）
+    for _k in _keys:
+        _f = s.get(_k)
+        try:
+            parts.append(hashlib.sha256(_f.getvalue()).hexdigest() if _f is not None else '')
+        except Exception:  # noqa: BLE001
+            parts.append('?')
+    def _sv(k):
+        v = str(s.get(k, 0 if k == 'repair_days' else '') or '')
+        if k in ('accident_date', 'garage_in_date', 'garage_out_date'):
+            v = _normalize_date8(v) or v   # 生成は日付を YYYYMMDD に正規化して書く。'2026/09/01' と '20260901' は同じ入力（Codex 76）
+        return v
+    parts.append(repr([(k, _sv(k)) for k in (
+        'policy_no', 'contractor_name', 'accept_no', 'accident_date', 'agency_name',
+        'adjuster_name', 'adjuster_post', 'garage_in_date', 'garage_out_date', 'repair_days', 'note1')]))
+    # 費用の額はベタ打ちでチェックが入っているときだけ NEO に入る ＝ それ以外（スキル経路・チェック無し）は額を変えても結果は同じ（Codex 75/77）
+    _use_exp = bool(beta) and bool(s.get('pdf2neo_beta_use_exp'))
+    parts.append(repr((_use_exp, safe_int(s.get('exp_towing', 0)) if _use_exp else 0,
+                       safe_int(s.get('exp_rental', 0)) if _use_exp else 0, safe_int(s.get('exp_exempt', 0)) if _use_exp else 0)))
+    # 税区分の選択とテンプレート NEO はベタ打ちだけが使う（スキル経路は見積書の合計欄から判定し、テンプレートも使わない。Codex 78）
+    parts.append(str(s.get('pdf_tax_radio', '')) if beta else '')
+    # テンプレートは受け付けた（検証済みの）custom_neo_bytes で取る。uploader は照合より後に描かれるので、受け付けが変わった run は
+    # uploader の側で描き直す（_tpl_sig_seen。Codex 70/73: 弾いたファイルの中身で照合しない）
+    _tb = (s.get('custom_neo_bytes') or b'') if beta else b''
+    parts.append(hashlib.sha256(_tb).hexdigest() if _tb else '')
+    return hashlib.sha256('|'.join(parts).encode('utf-8')).hexdigest()
+
+
+def _docs_sig() -> str:
+    """添付の書類（車検証・事故/保険の書類）の同一性（内容ハッシュの組）。見積書を変えたときに、添付が前の見積書のときと
+    同じなら前の案件の書類 ＝ 消す、変わっていれば新しい案件のために入れ替えたもの ＝ 残す（Codex 71）"""
+    parts = []
+    for _k in _doc_upload_keys():
+        _f = st.session_state.get(_k)
+        try:
+            parts.append(hashlib.sha256(_f.getvalue()).hexdigest() if _f is not None else '')
+        except Exception:  # noqa: BLE001
+            parts.append('?')
+    return '|'.join(parts)
+
+
+def _attached_docs_caption(api_key, model_name) -> str:
+    """生成ボタンの上の案内。添付したファイル名ではなく「実際に読めたか」で文を変える（読めていない書類は NEO に入らない。
+    Codex hunt A3 2026-09-15）。読み取りは控え（_doc_ocr_cache）から返るので、ここで API を余分に呼ぶことはない"""
+    _kv, _kd = _doc_upload_keys()
+    fv, fd = st.session_state.get(_kv), st.session_state.get(_kd)
+    if fv is None and fd is None:
+        return ("📎 車検証や事故・保険の書類（速報報告書など）があれば、上の「車検証」「事故・保険の書類」に入れてから生成すると、"
+                "車両・顧客・保険の情報が NEO に入ります")
+    if not api_key:
+        return "📎 添付の書類はまだ読めていません（Gemini API キーが無いため）。このまま生成すると書類の値は NEO に入りません"
+    vd, doc = _attached_docs_ocr(api_key, model_name)
+    parts = []
+    if fv is not None:
+        parts.append("車検証: " + ("読み取り済み → 車両・顧客の情報に使います" if vd else "読めていません → 使われません"))
+    if fd is not None:
+        parts.append("事故・保険の書類: " + ("読み取り済み → サイドバーの事故・保険情報と車両の情報に使います" if doc
+                                     else "読めていません → 使われません"))
+    return "📎 " + " ／ ".join(parts)
 
 
 def _attached_docs_ocr(api_key, model_name=None, progress=None):
@@ -7647,6 +7799,43 @@ def main():
             type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
             key='pdf2neo_upload',
         )
+        # 見積書が**別のファイル**に変わったら別の案件: 前の見積書のときの車検証・書類の添付、サイドバーの事故・保険情報と費用、
+        # 生成結果を消す（Codex hunt A2 2026-09-15）。最初の 1 枚目（前が無い）では消さない ＝ 書類を先に入れてから見積書でもよい
+        _p2n_early_key = ''
+        if _p2n_file is not None:
+            try:
+                _p2n_early_bytes = _p2n_file.getvalue()
+                _p2n_early_key = f"{_p2n_file.name}|{len(_p2n_early_bytes)}|{hashlib.sha256(_p2n_early_bytes).hexdigest()}"
+            except Exception:  # noqa: BLE001
+                _p2n_early_key = f"{_p2n_file.name}|?"
+            _p2n_prev_key = str(st.session_state.get('_p2n_last_file_key') or '')
+            if _p2n_prev_key and _p2n_prev_key != _p2n_early_key:
+                st.session_state['_p2n_last_file_key'] = _p2n_early_key
+                _docs_now = _docs_sig()
+                _docs_prev = str(st.session_state.get('_p2n_last_docs_sig') or '')
+                # 片方の書類だけ前の見積書のときのまま（もう片方だけ入れ替えた）なら、残った方は前の案件の書類 ＝ 全部消す（Codex 76）
+                _slot_same = any(p and p == n for p, n in zip(_docs_prev.split('|'), _docs_now.split('|')))
+                if not any(_docs_now.split('|')) or _docs_now == _docs_prev or _slot_same:
+                    # 添付が無い、前の見積書のときのまま、または片方が前のまま ＝ 前の案件の書類・保険欄。消して案内する（Codex 73/76）
+                    _reset_case_inputs()
+                    st.session_state['_p2n_reset_msg'] = (
+                        f"見積書が「{_p2n_file.name}」に変わったので、前の見積書のときの車検証・事故/保険の書類の添付、サイドバーの"
+                        "事故・保険情報と費用、生成結果を消しました（別の案件の値を持ち越さないため）。同じ案件なら入れ直してください。")
+                    st.rerun()
+                else:
+                    # 見積書を外した後に書類を入れ替えてから次の見積書を入れた ＝ 新しい案件の書類。書類とその書類から入れた欄は残し、
+                    # 前の案件の手入力の保険欄・費用・結果は消す（Codex 71/72）。
+                    # ここで st.rerun() すると、この run でまだ描いていない書類の uploader の値が捨てられて書類が消える
+                    # （実ブラウザで確認 2026-09-15）ので、書類の uploader を描き終えてから描き直す（_p2n_deferred_rerun）
+                    _reset_case_inputs(keep_docs=True)
+                    st.session_state['_p2n_reset_msg'] = (
+                        f"見積書が「{_p2n_file.name}」に変わりました。添付の車検証・事故/保険の書類は見積書を外した後に入れ替えたものなので"
+                        "そのまま使います（書類から入れた欄も残します）。手で入れた事故・保険情報・費用と前の生成結果は消しました。")
+                    st.session_state['_p2n_deferred_rerun'] = True
+            st.session_state['_p2n_last_file_key'] = _p2n_early_key
+            st.session_state['_p2n_last_docs_sig'] = _docs_sig()   # この見積書のときの添付（見積書を外している間は更新しない）
+        if st.session_state.get('_p2n_reset_msg') and not st.session_state.get('_p2n_deferred_rerun'):
+            st.info("🔄 " + str(st.session_state.pop('_p2n_reset_msg')))
         # 添付の書類（車検証・事故/保険の書類）は生成ボタンより前に描く: ボタンの処理が st.rerun() したとき、まだ描いていない
         # uploader の値は Streamlit に捨てられ、車種フォルダ待ちからの再開で添付が消えてしまう（2026-09-14 実ブラウザで発覚）
         with st.container():
@@ -7713,6 +7902,8 @@ def main():
                     st.rerun()
             elif (vehicle_file or insurance_doc_file) and not api_key:
                 st.caption("書類の読み取りには Gemini API キーが必要です（サイドバーの「APIキー設定」）")
+        if st.session_state.pop('_p2n_deferred_rerun', False):
+            st.rerun()   # 書類の uploader を描き終えたので、サイドバーの入力欄（form_seq）と案内を描き直す
         if _p2n_file is not None:
             _p2n_bytes = _p2n_file.read()
             _p2n_file.seek(0)
@@ -7744,10 +7935,7 @@ def main():
                 _p2n_beta_exp = {'towing': safe_int(st.session_state.get('exp_towing', 0)),
                                  'rental_car': safe_int(st.session_state.get('exp_rental', 0)),
                                  'tax_exempt': safe_int(st.session_state.get('exp_exempt', 0))}
-                _p2n_att = [_n for _n in (getattr(st.session_state.get(_k), 'name', '') for _k in _doc_upload_keys()) if _n]
-                st.caption(("📎 添付の書類を車両・顧客・保険の情報に使います: " + "、".join(_p2n_att)) if _p2n_att else
-                           "📎 車検証や事故・保険の書類（速報報告書など）があれば、上の「車検証」「事故・保険の書類」に入れてから生成すると、"
-                           "車両・顧客・保険の情報が NEO に入ります")
+                st.caption(_attached_docs_caption(api_key, selected_model))
                 _p2n_beta_use_exp = False
                 if st.session_state.get('_beta_exp_file_key') != _p2n_file_key:
                     # 見積が変わったらチェックは外す（前の見積で入れた同意を次の見積に持ち越さない。Codex 52）
@@ -7788,6 +7976,7 @@ def main():
                     if not isinstance(_p2n_beta, dict):
                         _p2n_beta = {'ok': False, 'error': 'ベタ打ち生成が想定外の値を返しました'}
                     _p2n_beta['legacy_beta'] = True
+                    _p2n_beta['inputs_sig'] = _p2n_inputs_signature(_p2n_file_key, api_key=api_key, model_name=selected_model, beta=True)
                     st.session_state['pdf2neo_tax_inclusive'] = _p2n_beta_tax
                     st.session_state['pdf2neo_result'] = _p2n_beta
                     st.rerun()
@@ -7852,12 +8041,11 @@ def main():
                             _p2n_status.update(
                                 label=("✅ 合格" if _p2n_out.get('ok') else "❌ 不合格（下の理由をご確認ください）"),
                                 state=('complete' if _p2n_out.get('ok') else 'error'), expanded=False)
+                    if isinstance(_p2n_out, dict):
+                        _p2n_out['inputs_sig'] = _p2n_inputs_signature(_p2n_file_key, api_key=api_key, model_name=selected_model)
                     st.session_state['pdf2neo_result'] = _p2n_out
                     st.rerun()
-                _p2n_att = [_n for _n in (getattr(st.session_state.get(_k), 'name', '') for _k in _doc_upload_keys()) if _n]
-                st.caption(("📎 添付の書類を車両・顧客・保険の情報に使います: " + "、".join(_p2n_att)) if _p2n_att else
-                           "📎 車検証や事故・保険の書類（速報報告書など）があれば、上の「車検証」「事故・保険の書類」に入れてから生成すると、"
-                           "車両・顧客・保険の情報が NEO に入ります")
+                st.caption(_attached_docs_caption(api_key, selected_model))
                 if st.button("🚀 見積書からNEOを生成", key='pdf2neo_run', type="primary",
                              width='stretch'):
                     st.session_state.pop('pdf2neo_result', None)
@@ -7920,6 +8108,8 @@ def main():
                         _p2n_status.update(
                             label=("✅ 合格" if _p2n_out.get('ok') else "❌ 不合格（下の理由をご確認ください）"),
                             state=('complete' if _p2n_out.get('ok') else 'error'), expanded=False)
+                    if isinstance(_p2n_out, dict):
+                        _p2n_out['inputs_sig'] = _p2n_inputs_signature(_p2n_file_key, api_key=api_key, model_name=selected_model)
                     st.session_state['pdf2neo_result'] = _p2n_out
                     st.rerun()
 
@@ -7930,6 +8120,13 @@ def main():
             st.session_state['_bridge_want'] = ''
 
         _p2n_res = st.session_state.get('pdf2neo_result')
+        if isinstance(_p2n_res, dict) and _p2n_res.get('inputs_sig'):
+            # 生成したあとに入力（見積書・添付・事故/保険欄・費用・税区分・テンプレート）が変わっていたら、前の入力の結果 ＝ 落とさせない
+            if _p2n_res['inputs_sig'] != _p2n_inputs_signature(_p2n_early_key, api_key=api_key, model_name=selected_model,
+                                                              beta=bool(_p2n_res.get('legacy_beta'))):
+                _p2n_res = dict(_p2n_res, stale=True)
+                st.warning("⚠️ 生成したあとに 見積書・添付の書類・事故/保険情報・費用 のどれかが変わりました。下の結果は前の入力で作ったもので、"
+                           "ダウンロードは止めています。生成ボタンを押して作り直してください。")
         if _p2n_res and _p2n_res.get('legacy_beta'):
             _render_beta_result(_p2n_res, selected_model)
         elif _p2n_res:
@@ -7965,7 +8162,7 @@ def main():
                     st.download_button(
                         "🧰 修正用ファイル一式をダウンロード（pages/・reading.json）",
                         data=_p2n_res['repair_zip'], file_name="neo_repair.zip", mime="application/zip",
-                        key='pdf2neo_dl_repair_read', width='stretch',
+                        key='pdf2neo_dl_repair_read', width='stretch', disabled=bool(_p2n_res.get('stale')),
                     )
                     st.caption("NEO_check の案件フォルダに展開し、該当ページの pages/page_N.json を見積書と突き合わせて直してから"
                                " `make_neo.py <案件フォルダ>` を回すと続きができます。")
@@ -7981,7 +8178,7 @@ def main():
                     st.download_button(
                         "🧰 修正用ファイル一式をダウンロード（pages/・reading.json・report.md）",
                         data=_p2n_res['repair_zip'], file_name="neo_repair.zip", mime="application/zip",
-                        key='pdf2neo_dl_repair_make', width='stretch',
+                        key='pdf2neo_dl_repair_make', width='stretch', disabled=bool(_p2n_res.get('stale')),
                     )
                     st.caption("NEO_check の案件フォルダに展開し、report.md の理由に沿って reading.json（または pages/）を直してから"
                                " `make_neo.py <案件フォルダ>` を回すと続きができます。")
@@ -8002,7 +8199,7 @@ def main():
                         data=_p2n_res.get('neo_bytes') or b'',
                         file_name=f"{_p2n_name}.neo",
                         mime="application/octet-stream",
-                        key='pdf2neo_dl',
+                        key='pdf2neo_dl', disabled=bool(_p2n_res.get('stale')),   # 入力が変わった結果は落とさせない（Codex hunt A1）
                         width='stretch',
                     )
                 with _p2n_c2:
@@ -8013,7 +8210,7 @@ def main():
                         file_name=f"{_p2n_name}_確認箇所{_p2n_ext}",
                         mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                               if _p2n_ext == '.xlsx' else "text/csv"),
-                        key='pdf2neo_dl_review',
+                        key='pdf2neo_dl_review', disabled=bool(_p2n_res.get('stale')),
                         width='stretch',
                     )
                 st.caption("NEO と確認箇所シートは必ず組で保険会社・担当者に渡してください"
@@ -8092,6 +8289,13 @@ def main():
                     st.rerun()
             else:
                 st.caption(f"未選択 → デフォルトテンプレート（{TEMPLATE_FILENAME}）を使用")
+            # 受け付けたテンプレートが変わったら描き直す: 生成結果の陳腐化の照合はこの uploader より前にあるので、その run では
+            # 前のテンプレートで照合している（Codex 70/73）
+            _tpl_now = (hashlib.sha256(st.session_state['custom_neo_bytes']).hexdigest()
+                        if st.session_state.get('custom_neo_bytes') else '')
+            if str(st.session_state.get('_tpl_sig_seen', '') or '') != _tpl_now:
+                st.session_state['_tpl_sig_seen'] = _tpl_now
+                st.rerun()
 
         # ================================================================
         # STEP 1-C: Gemini で CSV 化（PDF で読み取れないときの代替手段）
@@ -9873,6 +10077,8 @@ def main():
                     # 添付の書類の読み取り（車検証・事故/保険の書類）の控え。残すと次の案件に前の値が付く／同じ書類を入れ直しても埋まらない
                     '_doc_ocr_cache', '_insdoc_applied', '_insdoc_sha', '_insdoc_cleared_sha', '_insdoc_filled', '_insdoc_ocr_id',
                     '_doc_ocr_error', '_beta_exp_file_key',
+                    # 見積書の同一性の控え（残すと次の案件で書類を先に入れたときに「見積書が変わった」扱いで消される。Codex 69）
+                    '_p2n_last_file_key', '_p2n_last_docs_sig', '_p2n_reset_msg',
                     'exp_towing', 'exp_rental', 'exp_exempt',
                     'custom_neo_bytes', 'custom_neo_name',
                     'tax_override',

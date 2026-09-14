@@ -75,18 +75,77 @@ INSURANCE_DOC_PROMPT = """<task_execution>
 
 
 def _nfkc(s) -> str:
-    return unicodedata.normalize('NFKC', str(s or '')).strip()
+    return unicodedata.normalize('NFKC', '' if s is None else str(s)).strip()   # 数値の 0 は '0'（Codex 69）
+
+
+_MAX_VALUE_LEN = 120   # OCR の 1 項目の上限（住所でもこの程度。長い文はプロンプトに命令文を紛れ込ませる余地になる。Codex hunt C1）
+
+
+def _clean(s) -> str:
+    """OCR の値を「データ」として安全な形に: 制御文字・改行を空白に、連続空白を 1 つに、長さを抑える"""
+    t = re.sub(r'[\x00-\x1f\x7f\u2028\u2029]+', ' ', '' if s is None else str(s))   # 数値の 0 は '0'（Codex 69）
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t[:_MAX_VALUE_LEN]
 
 
 def _get(d: Optional[dict], key: str) -> str:
     if not isinstance(d, dict):
         return ''
     v = d.get(key)
-    if v is None:
+    if v is None or isinstance(v, (dict, list, tuple, set)):
+        return ''
+    if isinstance(v, bool):
         return ''
     if isinstance(v, float) and v.is_integer():
         v = int(v)
-    return str(v).strip()
+    return _clean(v)
+
+
+def kana_hira(s) -> str:
+    """登録番号のかな: 半角カナ・全角カタカナをひらがなに（実機 NEO 108 本はすべて全角ひらがな。Codex hunt B5）"""
+    t = _nfkc(s)
+    return ''.join(chr(ord(c) - 0x60) if 0x30A1 <= ord(c) <= 0x30F6 else c for c in t)
+
+
+def parse_km(s) -> str:
+    """走行距離を km の整数（文字列）に: '15,345km' → '15345'、'1.5万km' → '15000'、'1万5000km' → '15000'、15345 → '15345'。
+    読めなければ ''（Codex hunt B4: 数字だけ拾うと '1.5万km' が 15 になる）"""
+    t = re.sub(r'^\D+', '', _nfkc(s).replace(',', '').replace(' ', ''))   # '約 2.3 万 km' → '2.3万km'
+    if not t:
+        return ''
+    m = re.match(r'^(\d+(?:\.\d+)?)万(\d*)', t)
+    if m:
+        return str(int(round(float(m.group(1)) * 10000 + (int(m.group(2)) if m.group(2) else 0))))
+    m = re.match(r'^(\d+(?:\.\d+)?)', t)
+    return str(int(round(float(m.group(1))))) if m else ''
+
+
+def split_address(pref='', muni='', other='') -> tuple:
+    """住所を生成器（vendor estimate_to_neo）と同じ規則で 都道府県 / 市区郡 / 以降 に分ける。
+    実機 NEO 51 件の Municipality は '〜市' まで（政令市の区は AddressOther1 側。'市…区' は 0 件。2026-09-15 集計）。
+    車検証 OCR は '北九州市小倉北区' を municipality に返すので、書く前にここで揃える（Codex hunt B2）"""
+    pref_s, muni_s, other_s = (re.sub(r'\s+', '', _nfkc(x)) for x in (pref, muni, other))
+    if muni_s and (pref_s or not re.match(r'^.{2,3}?[都道府県]', muni_s)):
+        # 市区郡が構造化されて来ている（車検証 OCR・Step 4 の vehicle_info）: 名前の中の 市・郡（四日市市・余市郡余市町）で切らず、
+        # 政令市の区（'北九州市小倉北区'）だけを以降側へ移す（Codex 75）
+        m = re.match(r'^(.+?市)(.+区)$', muni_s)
+        if m:
+            return pref_s, m.group(1), m.group(2) + other_s
+        return pref_s, muni_s, other_s
+    addr = pref_s + muni_s + other_s
+    if not addr:
+        return ('', '', '')
+    m = re.match(r'^(.{2,3}?[都道府県])(.*)$', addr)
+    pref_, rest = (m.group(1), m.group(2)) if m else ('', addr)
+    # 1 本の文字列から分けるとき（生成器と同じ規則。名前の中の 市・郡 で切れる癖も同じ ＝ 印字と揃える）
+    m = re.match(r'^((?:.{1,8}?(?:市|区|郡|町|村))+?)(.*)$', rest)
+    muni_, other_ = (m.group(1), m.group(2)) if m else ('', rest)
+    # 以降が無い ＝ 住所が市区郡（町・村を含む）までしかない。'福岡県北九州市'・'福岡県志免町' はそのまま Municipality に残す
+    # （Codex 69/74。生成器は同じ場合に市区郡を以降側へ落とす癖があるが、実機は Municipality に入るのでこちらが正）。
+    # 市区郡が 30 バイトを超えるときだけ分けない
+    if len(muni_.encode('cp932', 'replace')) > 30:
+        muni_, other_ = '', rest
+    return pref_, muni_, other_
 
 
 def strip_emission_prefix(model: str) -> str:
@@ -99,7 +158,7 @@ def strip_emission_prefix(model: str) -> str:
     return s
 
 
-def date8(s) -> str:
+def date8(s, allow_yy: bool = False) -> str:
     """いろいろな書き方の日付を YYYYMMDD に。読めなければ ''。
     受ける形: 20251026 / 2025-10-26 / 2025/10/26 / 2025.10.26 / 令和7年10月26日 / R7.10.26 / 令和7年10月（日なし → 00）"""
     t = _nfkc(s).replace(' ', '')
@@ -124,6 +183,9 @@ def date8(s) -> str:
     m = re.match(r'^(\d{4})[-/.年](\d{1,2})月?$', t)
     if m:
         return _valid(int(m.group(1)), int(m.group(2)), 0)
+    m = re.match(r'^(\d{2})[-/.](\d{1,2})[-/.](\d{1,2})$', t)   # '25.10.26'（保険書類の 2 桁年は 2000 年代。1 桁年は元号か分からないので受けない。Codex hunt B3）
+    if m and allow_yy:   # 事故日など保険書類の日付だけ。車検証の初度登録は元号抜けの '25.10.26'（平成 25 年）と区別できないので受けない（Codex 74）
+        return _valid(2000 + int(m.group(1)), int(m.group(2)), int(m.group(3)))
     m = re.match(r'^(令和|平成|昭和|R|H|S)\s*(\d{1,2}|元)[.年](\d{1,2})(?:[.月](\d{1,2})?)?日?$', t)
     if m:
         era = m.group(1)[0]
@@ -135,9 +197,9 @@ def date8(s) -> str:
     return ''
 
 
-def date8_full(s) -> str:
+def date8_full(s, allow_yy: bool = False) -> str:
     """日まで要る日付（有効期限・事故日など）。年月だけ（日 00）は '' にする（Codex 59）"""
-    d = date8(s)
+    d = date8(s, allow_yy)
     return d if (len(d) == 8 and d[6:8] != '00') else ''
 
 
@@ -183,14 +245,15 @@ def _split_reg(whole: str) -> tuple:
     if not m:
         return ('', '', '', '')
     ser = _serial_clean(m.group(4))
-    return (m.group(1), m.group(2), m.group(3), ser) if 1 <= len(ser) <= 4 else ('', '', '', '')   # 一連番号は 4 桁まで
+    return (m.group(1), m.group(2), kana_hira(m.group(3)), ser) if 1 <= len(ser) <= 4 else ('', '', '', '')   # 一連番号は 4 桁まで
 
 
 def reg_no_text(vd: Optional[dict], doc: Optional[dict] = None) -> str:
     """登録番号を '北九州 539 な 1031' の形に（生成器は 地名 分類 かな 一連 を正規表現で分ける）。数字は半角。
     一連番号はベタ打ち側（app._reg_no_part）と同じ規則で掃除する（Codex 64: 掃除が片側だけだと U+2011 のハイフンや
     '・・12' が生成器の正規表現に合わず、スキル経路の NEO だけ登録番号が空になる）"""
-    dep, div, biz = (_nfkc(_get(vd, k)).strip() for k in ('car_reg_department', 'car_reg_division', 'car_reg_business'))
+    dep, div = (_nfkc(_get(vd, k)).strip() for k in ('car_reg_department', 'car_reg_division'))
+    biz = kana_hira(_get(vd, 'car_reg_business'))
     ser = _serial_clean(_get(vd, 'car_reg_serial'))
     if dep and div and biz and ser:
         return f'{dep} {div} {biz} {ser}'
@@ -227,7 +290,7 @@ def vehicle_hint(vd: Optional[dict], doc: Optional[dict] = None) -> dict:
     out = {
         'model_code': strip_emission_prefix(model) if model else '',
         'serial_no': _nfkc(_get(vd, 'car_serial_no') or _get(doc, 'serial_no')).upper(),
-        'desig': desig,
+        'desig': desig.zfill(5) if desig else '',   # 型式指定番号は 5 桁（Codex 70）
         'category': cat.zfill(4) if cat else '',
         'reg_date': reg_date_wareki(_get(vd, 'car_reg_date') or _get(doc, 'first_reg')),
         'color_code': _nfkc(_get(vd, 'color_code') or _get(doc, 'color_code')).upper(),
@@ -238,7 +301,7 @@ def vehicle_hint(vd: Optional[dict], doc: Optional[dict] = None) -> dict:
 def customer_hint(vd: Optional[dict], doc: Optional[dict] = None) -> dict:
     """reading.customer に補う値（NEO の顧客欄: 名前・登録番号・住所・有効期限・所有者・走行距離）"""
     user, owner = _name(vd, doc)
-    km = re.sub(r'\D', '', _nfkc(_get(vd, 'kilometer') or _get(doc, 'mileage')))
+    km = parse_km(_get(vd, 'kilometer') or _get(doc, 'mileage'))
     out = {
         'name': user,
         'owner': owner,
@@ -264,7 +327,7 @@ def insurance_hint_from_doc(doc: Optional[dict]) -> dict:
         'agency': company,
         'policy_no': _nfkc(_get(doc, 'policy_no')),
         'contractor': _get(doc, 'contractor'),
-        'accident_date': date8_full(_get(doc, 'accident_date')),
+        'accident_date': date8_full(_get(doc, 'accident_date'), allow_yy=True),   # 保険書類の '25.10.26' は 2025 年（Codex 74）
         'accept_no': _nfkc(_get(doc, 'accept_no')),
         'adjuster': _get(doc, 'staff'),
         'adjuster_post': _get(doc, 'branch'),
@@ -281,6 +344,22 @@ def sidebar_insurance_from_doc(doc: Optional[dict]) -> dict:
     return {k: v for k, v in m.items() if v}
 
 
+_PLACEHOLDERS = ('', '同上', '***', '＊＊＊')
+
+
+def _with_user_name(out: dict) -> dict:
+    """使用者欄（Customer.UserName）を決めて返す（実機 307 本: '同上' 270・空 25・名前 12。Codex hunt B7）。
+    使用者 = 車検証の使用者（'_raw_user'。同上に置き換える前の値）、それが穴なら customer_name（書類から足した使用者）。
+    穴・所有者と同じなら '同上'、違えば使用者名。書類から名前を足した後に呼ぶ（先に決めると書類の使用者が落ちる。Codex 69）"""
+    if not out:
+        return out
+    raw = str(out.pop('_raw_user', '') or '').strip()
+    u = raw if (raw not in _PLACEHOLDERS and not set(raw) <= set('*＊')) else str(out.get('customer_name') or '').strip()
+    o = str(out.get('owner_name') or '').strip()
+    out['user_name'] = '同上' if (u in _PLACEHOLDERS or set(u) <= set('*＊') or u == o) else u
+    return out
+
+
 def vehicle_info_for_legacy(vd: Optional[dict], doc: Optional[dict] = None) -> dict:
     """ベタ打ち（旧経路）の vehicle_info。車検証 OCR の dict をそのまま使い、無い項目を書類から補う。
     車検証が無く書類だけのときは、書類の車両欄から同じ形を組み立てる"""
@@ -289,18 +368,31 @@ def vehicle_info_for_legacy(vd: Optional[dict], doc: Optional[dict] = None) -> d
     for k in ('car_reg_department', 'car_reg_division', 'car_reg_business', 'car_reg_serial'):
         if out.get(k):
             out[k] = str(out[k]).strip()
-    for k in ('car_reg_division', 'car_reg_serial'):   # 数字の区画だけ半角に（地名・かなは幅を変えない）
+    for k in ('car_reg_division', 'car_reg_serial'):   # 数字の区画だけ半角に（地名は幅を変えない）
         if out.get(k):
             out[k] = _nfkc(out[k])
     if out.get('car_reg_serial'):
         out['car_reg_serial'] = _serial_clean(out['car_reg_serial'])
+    if out.get('car_reg_business'):
+        out['car_reg_business'] = kana_hira(out['car_reg_business'])   # かなはひらがな（Codex hunt B5）
+    # 類別区分番号は 4 桁・型式指定番号は 5 桁（実機 299 本すべて。車検証 OCR が '2' と返しても '0002'。Codex hunt B8）
+    for k, w in (('car_category_number', 4), ('car_model_designation', 5)):
+        if out.get(k):
+            d = re.sub(r'\D', '', _nfkc(out[k]))
+            out[k] = d.zfill(w) if d else ''
+    # 住所は生成器と同じ規則で 都道府県 / 市区郡 / 以降（'北九州市小倉北区' → 市区郡 '北九州市'、以降 '小倉北区…'。Codex hunt B2）
+    if any(str(out.get(k) or '').strip() for k in ('prefecture', 'municipality', 'address_other')):
+        out['prefecture'], out['municipality'], out['address_other'] = split_address(
+            out.get('prefecture'), out.get('municipality'), out.get('address_other'))
+    if out:
+        out['_raw_user'] = str(out.get('customer_name') or '').strip()   # 車検証の使用者（同上に置き換える前）。_with_user_name で外す
     # 旧経路は customer_name をそのまま顧客名（Customer.Name1）に書く。使用者が「同上」「***」なら所有者を顧客名にする
     # （e2e で Name1 が「同上」になった 2026-09-14）
     if out and str(out.get('customer_name') or '').strip() in ('', '同上', '***', '＊＊＊') or (out and set(str(out.get('customer_name') or '')) <= set('*＊')):
         if str(out.get('owner_name') or '').strip():
             out['customer_name'] = str(out['owner_name']).strip()
     if not isinstance(doc, dict) or not doc:
-        return out
+        return _with_user_name(out)
 
     def fill(key, val):
         val = val if isinstance(val, str) else str(val or '')
@@ -318,19 +410,20 @@ def vehicle_info_for_legacy(vd: Optional[dict], doc: Optional[dict] = None) -> d
     if _get(doc, 'car_name') and (not cur_name or (len(cur_name) <= 5 and not re.search(r'\d', cur_name))):
         out['car_name'] = _get(doc, 'car_name')
     fill('car_model', _nfkc(_get(doc, 'model')).upper())
-    fill('car_model_designation', re.sub(r'\D', '', _nfkc(_get(doc, 'desig'))))
+    _desig = re.sub(r'\D', '', _nfkc(_get(doc, 'desig')))
+    fill('car_model_designation', _desig.zfill(5) if _desig else '')   # 型式指定番号は 5 桁
     cat = re.sub(r'\D', '', _nfkc(_get(doc, 'category')))
     fill('car_category_number', cat.zfill(4) if cat else '')
     fill('engine_model', _get(doc, 'engine_model'))
     fill('color_code', _nfkc(_get(doc, 'color_code')).upper())
     fill('body_color', _get(doc, 'color_name'))
-    km = re.sub(r'\D', '', _nfkc(_get(doc, 'mileage')))
+    km = parse_km(_get(doc, 'mileage'))
     if km and not out.get('kilometer'):
         out['kilometer'] = int(km)
     fill('term_date', date8_full(_get(doc, 'term_date')))
     first = date8(_get(doc, 'first_reg'))
     fill('car_reg_date', first[:6] + '00' if len(first) == 8 else '')
-    return out
+    return _with_user_name(out)
 
 
 def summary(vd: Optional[dict], doc: Optional[dict]) -> str:

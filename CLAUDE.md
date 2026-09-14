@@ -43,7 +43,7 @@
 - **別 PC の ADDATA**: `C:\Addata`／`D:\Addata` なら設定不要（自動検出）。他の場所はサイドバーのパスか `env_check.py --save`。詳細は引き継ぎ書 §12.9
 - **本番（Cloud）から使う ADDATA**: サーバは PC を読めないので、サイドバー「🖥️ PC の Addata をこの画面から使う」で PC の `C:\Addata` を選ぶ（ブラウザの File System Access API で COM 9MB と見積の車種フォルダだけを送る橋渡し。`neo_skill/bridge.py`・`neo_skill/addata_bridge/index.html`。Chrome / Edge）。取得URL（`?addata_url=`）は 300MB までの代替。詳細は引き継ぎ書 §12.10
 - **Addata が決まらないとき**は pdf-to-neo の経路は動かさず、**ベタ打ち（旧経路 `run_pdf_to_neo_pipeline`、部品コード・標準指数なし）** のボタンを出す（2026-09-14 亮平さん指示。引き継ぎ書 §12.11）。試験用 `NEO_ADDATA_NO_AUTODETECT=1` で自動検出を飛ばせる
-- **添付の車検証・事故/保険の書類**（見積書の uploader の直下。生成ボタンより前に描く: ボタン処理内の `st.rerun()` は未描画の uploader の値を捨てる）は Gemini で読み、`neo_skill/doc_hints.py` がスキル経路の hint・ベタ打ちの vehicle_info・サイドバーの保険欄に写す（優先順: 見積書の印字 ＞ サイドバー ＞ 書類 ＞ 車検証）。登録番号の分類番号・一連番号は実機どおり半角数字・ハイフン無し（`_reg_no_part`）。引き継ぎ書 §12.12
+- **添付の車検証・事故/保険の書類**（見積書の uploader の直下。生成ボタンより前に描く: ボタン処理内の `st.rerun()` は未描画の uploader の値を捨てる）は Gemini で読み、`neo_skill/doc_hints.py` がスキル経路の hint・ベタ打ちの vehicle_info・サイドバーの保険欄に写す（優先順: 見積書の印字 ＞ サイドバー ＞ 書類 ＞ 車検証）。登録番号の分類番号・一連番号は実機どおり半角数字・ハイフン無し、かなは全角ひらがな（`_reg_no_part`）。住所は市区郡 '〜市' まで（`split_address`）。見積書が別のファイルに変わったら案件の入力を消す（`_reset_case_inputs`）。生成結果には入力の指紋 `inputs_sig`（変わったらダウンロード無効）。引き継ぎ書 §12.12・§12.13
 - **Linux（Community Cloud）で Windows と同じ NEO にする条件**（2026-09-14）: `packages.txt` の `p7zip-full`（塗装指数表 CHM の展開。無いと修正塗装のあるパネルの見積は理由付きで不合格になる）。COM.CAB は純 Python で展開する。展開キャッシュは `LOCALAPPDATA`（無ければ一時フォルダ。`neo_skill/vendor.py subprocess_env` が渡す）で、vendor の中には書かない。詳細は移植ガイド §4-1
 
 ## 変更するときの手順

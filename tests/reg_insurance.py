@@ -131,11 +131,12 @@ WANT_CUST = {
     'Customer.OwnerName': 'ｹﾝｼｮｳﾊﾅｺ',
     'Customer.PostalNo': '8000000',
     'Customer.Prefecture': '福岡県',
-    'Customer.Municipality': '北九州市小倉北区',
-    'Customer.AddressOther1': '検証町1-2-3',
+    # 住所は実機 NEO と同じく市区郡は '〜市' まで、政令市の区は以降側（Codex hunt B2 2026-09-15）
+    'Customer.Municipality': '北九州市',
+    'Customer.AddressOther1': '小倉北区検証町1-2-3',
     'Customer.CarRegNoDepartment': '北九州',
     'Customer.CarRegNoDivision': '300',
-    'Customer.CarRegNoBusiness': 'ｱ',
+    'Customer.CarRegNoBusiness': 'あ',   # かなは全角ひらがな（実機 108 本すべて。Codex hunt B5）
     'Customer.CarRegNoSerial': '1234',
     'Customer.CarSerialNo': 'MXPJ10-0001234',
     'Customer.CarMouldNo': '18164',
@@ -254,8 +255,15 @@ _tv = app._trimmed_cust_values({'car_reg_department': '北九州', 'car_reg_divi
 chk(_tv['car_div'] == '346' and _tv['car_serial'] == '1224' and _tv['car_biz'] == 'の' and _tv['car_dept'] == '北九州',
     f"6: 登録番号が半角・ハイフン無しになっていない: {_tv['car_dept']!r} {_tv['car_div']!r} {_tv['car_biz']!r} {_tv['car_serial']!r}")
 _tv2 = app._trimmed_cust_values({'car_reg_division': '30A', 'car_reg_serial': '・・12', 'car_reg_business': 'ｱ'})
-chk(_tv2['car_div'] == '30A' and _tv2['car_serial'] == '12' and _tv2['car_biz'] == 'ｱ',
-    f"6b: 英字入り分類番号と「・」付き一連番号、かなは幅を変えない: {_tv2['car_div']!r} {_tv2['car_serial']!r} {_tv2['car_biz']!r}")
+chk(_tv2['car_div'] == '30A' and _tv2['car_serial'] == '12' and _tv2['car_biz'] == 'あ',
+    f"6b: 英字入り分類番号と「・」付き一連番号、かなはひらがなに: {_tv2['car_div']!r} {_tv2['car_serial']!r} {_tv2['car_biz']!r}")
+_tv3 = app._trimmed_cust_values({'customer_name': '顧客 太郎', 'user_name': '同上', 'car_category_number': '2', 'car_model_designation': '１２３４',
+                                 'prefecture': '福岡県', 'municipality': '北九州市小倉北区', 'address_other': '検証町1-2-3'})
+chk(_tv3['user_name'] == '同上' and app._trimmed_cust_values({'customer_name': '顧客 太郎'})['user_name'] == '顧客 太郎',
+    f"6c: 使用者欄は user_name があればそれ、無ければ顧客名: {_tv3['user_name']!r}")
+chk(_tv3['category_num'] == '0002' and _tv3['model_desig'] == '01234', f"6d: 類別 4 桁・型式指定 5 桁: {_tv3['category_num']!r} {_tv3['model_desig']!r}")
+chk(_tv3['prefecture'] == '福岡県' and _tv3['municipality'] == '北九州市' and _tv3['address_other'] == '小倉北区検証町1-2-3',
+    f"6e: 住所分割: {_tv3['prefecture']!r} {_tv3['municipality']!r} {_tv3['address_other']!r}")
 
 # ── 7. 車検証 OCR が confidence だけ返したら「読めなかった」こと（Codex 66）──────
 # 車検証のページが無い画像を渡すと Gemini は全項目空＋confidence だけの JSON を返すことがある。
@@ -294,6 +302,76 @@ _u, _n = app._doc_fill_plan({}, {'accept_no': 'A1'}, {'accept_no': 'A1'})
 chk(_u == {} and _n == {'accept_no': 'A1'}, f'8d: 読めなかったときも前の自動入力の追跡を続ける: {_u!r} {_n!r}')
 _u, _n = app._doc_fill_plan({'accept_no': 'A2'}, {'accept_no': 'A1'}, {'accept_no': ''})
 chk(_u == {'accept_no': 'A2'} and _n == {'accept_no': 'A2'}, f'8e: 利用者が消した欄には入れ直す（同じ書類の読み直し）: {_u!r} {_n!r}')
+
+# ── 9. 見積書が変わったら案件の入力を消す／結果に入力の指紋（Codex hunt A1/A2/A3 2026-09-15）──
+_src9 = inspect.getsource(app._reset_case_inputs)
+for _k in ('policy_no', 'contractor_name', 'accept_no', 'adjuster_post', 'exp_towing', '_doc_ocr_cache', '_insdoc_filled',
+           'pdf2neo_result', '_beta_exp_file_key', 'pdf2neo_beta_use_exp'):
+    chk(_k in inspect.getsource(app).split('_CASE_INPUT_KEYS = (')[1].split(')')[0], f'9: _CASE_INPUT_KEYS に {_k} が無い')
+chk("'form_seq'" in _src9 and "'upload_seq'" in _src9 and '_bridge_pending' in _src9, '9b: _reset_case_inputs が入力欄・uploader・取り置きを作り直していない')
+_wiz = inspect.getsource(app).split('"🔄 新しい見積を作成する"')[1][:3000]
+chk("'_p2n_last_file_key'" in _wiz and "'_p2n_reset_msg'" in _wiz and "'_p2n_last_docs_sig'" in _wiz, '9l: 「新しい見積を作成する」が _p2n_last_file_key / _p2n_last_docs_sig を消していない（Codex 69/71）')
+_blk = inspect.getsource(app).split('_p2n_prev_key and _p2n_prev_key != _p2n_early_key')[1][:1800]
+chk("_docs_now == _docs_prev" in _blk and "_docs_prev = str(st.session_state.get('_p2n_last_docs_sig')" in _blk and '_reset_case_inputs()' in _blk and "pop('pdf2neo_result'" not in _blk.split('else:')[0],
+    '9p: 見積書が変わったとき、添付が前の見積書のときと同じなら消し、変わっていれば残す分岐が無い（Codex 71）')
+chk('"user_name"' in inspect.getsource(P._merge_vehicle_into_customer), '9q: 旧経路の _merge_vehicle_into_customer が user_name を落とす（Codex 71）')
+_mv = P._merge_vehicle_into_customer({'customer_name': '顧客 太郎', 'user_name': '同上'}, {})
+chk(_mv.get('user_name') == '同上', f'9r: user_name が旧経路の merge を通らない: {_mv!r}')
+_app_src = inspect.getsource(app)
+chk("_p2n_prev_key and _p2n_prev_key != _p2n_early_key" in _app_src and '_reset_case_inputs()' in _app_src.split('_p2n_prev_key and _p2n_prev_key != _p2n_early_key')[1][:700],
+    '9c: 見積書が別のファイルに変わったときに _reset_case_inputs を呼んでいない')
+_st9 = {'vehicle_upload': None, 'insurance_doc_upload': None, 'contractor_name': 'A', 'repair_days': 0, 'pdf_tax_radio': '税抜き（外税）'}
+_sig1 = app._p2n_inputs_signature('f1', _st9)
+chk(_sig1 == app._p2n_inputs_signature('f1', dict(_st9)), '9d: 同じ入力なら同じ指紋')
+chk(_sig1 != app._p2n_inputs_signature('f2', _st9), '9e: 見積書が違えば指紋が違う')
+chk(_sig1 != app._p2n_inputs_signature('f1', dict(_st9, contractor_name='B')), '9f: 事故・保険欄が違えば指紋が違う')
+chk(_sig1 != app._p2n_inputs_signature('f1', dict(_st9, pdf2neo_beta_use_exp=True, exp_towing=1000), beta=True), '9g: ベタ打ちで費用のチェックが違えば指紋が違う')
+chk(_sig1 == app._p2n_inputs_signature('f1', dict(_st9, pdf2neo_beta_use_exp=True, exp_towing=1000)), '9g4: スキル経路（beta=False）は費用のチェック・額を見ない（Codex 77）')
+chk(app._p2n_inputs_signature('f1', _st9, beta=True) == app._p2n_inputs_signature('f1', dict(_st9, exp_towing=1000), beta=True), '9g2: チェックが無いときは費用の額を変えても指紋は同じ（Codex 75）')
+chk(app._p2n_inputs_signature('f1', dict(_st9, accident_date='2026/09/01')) == app._p2n_inputs_signature('f1', dict(_st9, accident_date='20260901'))
+    and app._p2n_inputs_signature('f1', dict(_st9, accident_date='20260901')) != app._p2n_inputs_signature('f1', dict(_st9, accident_date='20260902')),
+    '9g3: 日付の書き方の違いで陳腐化させない／日付が違えば指紋が違う（Codex 76）')
+class _FakeUp:
+    def __init__(self, b): self._b = b
+    def getvalue(self): return self._b
+chk(_sig1 != app._p2n_inputs_signature('f1', dict(_st9, vehicle_upload=_FakeUp(b'x'))), '9h: 車検証の添付が違えば指紋が違う')
+# Codex 72 [1]: 同じ添付でも OCR の控え（読めた中身）が変われば指紋が変わる（キーを直して読めるようになった等）
+import hashlib as _hl
+_ck = ('shaken', _hl.sha256(b'x').hexdigest(), 'm', _hl.sha256(b'k').hexdigest()[:12])
+_s_no = dict(_st9, vehicle_upload=_FakeUp(b'x'))
+_s_ok = dict(_s_no, _doc_ocr_cache={_ck: {'car_name': 'トヨタ'}})
+_s_err = dict(_s_no, _doc_ocr_cache={_ck: {'_error': 'x'}})
+chk(app._p2n_inputs_signature('f1', _s_no, api_key='k', model_name='m') != app._p2n_inputs_signature('f1', _s_ok, api_key='k', model_name='m'),
+    '9t: OCR が読めるようになっても指紋が変わらない')
+chk(app._p2n_inputs_signature('f1', _s_no, api_key='k', model_name='m') == app._p2n_inputs_signature('f1', _s_err, api_key='k', model_name='m'),
+    '9u: OCR 失敗の控えは「読めていない」と同じ指紋')
+_src_rc = inspect.getsource(app._reset_case_inputs)
+chk('keep_docs' in _src_rc and '_DOC_STATE_KEYS' in _src_rc and '_insdoc_filled' in _src_rc, '9v: _reset_case_inputs(keep_docs) が書類と書類から入れた欄を残す形になっていない（Codex 72）')
+chk('_reset_case_inputs(keep_docs=True)' in inspect.getsource(app).split('_p2n_prev_key and _p2n_prev_key != _p2n_early_key')[1][:1800],
+    '9w: 書類を入れ替えて別の見積書を入れたとき、手入力の保険欄を消していない（Codex 72）')
+chk("not any(_docs_now.split('|'))" in inspect.getsource(app).split('_p2n_prev_key and _p2n_prev_key != _p2n_early_key')[1][:1800],
+    '9y: 添付が無いときに keep_docs の枝に入る（Codex 73）')
+chk('_slot_same' in inspect.getsource(app).split('_p2n_prev_key and _p2n_prev_key != _p2n_early_key')[1][:1800],
+    '9y2: 片方の書類だけ前のままのときに keep_docs の枝に入る（Codex 76）')
+_kd = inspect.getsource(app).split('_reset_case_inputs(keep_docs=True)')[1][:900]
+chk("_p2n_deferred_rerun'] = True" in _kd and 'st.rerun()' not in _kd.split("_p2n_deferred_rerun'] = True")[0],
+    '9z: 書類を残す枝で uploader を描く前に st.rerun() している（書類が消える）')
+chk("st.session_state.pop('_p2n_deferred_rerun', False)" in inspect.getsource(app), '9z2: 保留した描き直し（_p2n_deferred_rerun）が無い')
+chk('fv.name' not in inspect.getsource(app._attached_docs_caption) and 'fd.name' not in inspect.getsource(app._attached_docs_caption), '9x: 添付の案内にファイル名を出している（Codex 72）')
+_n9i = (_app_src.count("['inputs_sig'] = _p2n_inputs_signature(_p2n_file_key, api_key=api_key, model_name=selected_model)")
+        + _app_src.count("['inputs_sig'] = _p2n_inputs_signature(_p2n_file_key, api_key=api_key, model_name=selected_model, beta=True)"))
+chk(_n9i == 3, f'9i: 結果に指紋を添える箇所が 3 か所ではない: {_n9i}')
+chk("_p2n_res = dict(_p2n_res, stale=True)" in _app_src and _app_src.count("disabled=bool(_p2n_res.get('stale'))") == 6,
+    '9j: 指紋が違う結果のダウンロード・プレビュー取り込み・修正用 ZIP を止めていない（3 つのダウンロード＋プレビュー＋修正用 ZIP 2 つ）')
+chk("custom_neo_bytes" in inspect.getsource(app._p2n_inputs_signature) and "custom_neo_upload" not in inspect.getsource(app._p2n_inputs_signature),
+    '9n: 指紋のテンプレートは受け付けた custom_neo_bytes で取る（弾いたファイルで照合しない。Codex 73）')
+chk("_tpl_sig_seen" in inspect.getsource(app) and inspect.getsource(app).count("st.session_state['_tpl_sig_seen'] = _tpl_now") == 1,
+    '9n2: テンプレートの受け付けが変わったときに描き直していない（Codex 70/73）')
+chk(app._p2n_inputs_signature('f1', _st9, beta=True) != app._p2n_inputs_signature('f1', dict(_st9, custom_neo_bytes=b'tpl'), beta=True), '9o: ベタ打ちはテンプレートが違えば指紋が違う')
+chk(app._p2n_inputs_signature('f1', _st9) == app._p2n_inputs_signature('f1', dict(_st9, custom_neo_bytes=b'tpl', pdf_tax_radio='税込み（内税）')),
+    '9o2: スキル経路はテンプレート・税区分の選択を見ない（Codex 78）')
+chk(app._p2n_inputs_signature('f1', _st9, beta=True) != app._p2n_inputs_signature('f1', dict(_st9, pdf_tax_radio='税込み（内税）'), beta=True), '9o3: ベタ打ちは税区分が違えば指紋が違う')
+chk(_app_src.count('st.caption(_attached_docs_caption(api_key, selected_model))') == 2, '9k: 添付の案内が読めたかで出ていない（2 か所）')
 
 print('REG_INSURANCE:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:

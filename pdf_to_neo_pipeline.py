@@ -1045,6 +1045,7 @@ def _merge_vehicle_into_customer(vehicle_info: Dict[str, Any],
         "color_code", "body_color", "engine_model", "trim_code",
         "grade", "model_year", "mileage", "model_code",
         "customer_name", "owner_name", "postal_no",
+        "user_name",   # 使用者欄（車検証の使用者が同上なら '同上'。落とすと Customer.UserName が顧客名になる。Codex 71）
         "prefecture", "municipality", "address_other",
         "car_reg_department", "car_reg_division", "car_reg_business", "car_reg_serial",
         "car_weight", "engine_displacement", "kilometer",

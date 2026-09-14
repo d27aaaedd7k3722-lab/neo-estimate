@@ -137,6 +137,66 @@ def test_legacy_vehicle_info():
     chk('_error' not in dh.vehicle_info_for_legacy({'_error': 'x', 'car_name': 'A'}, {}), '_ で始まるキーは落とす')
 
 
+def test_hunt_2026_09_15():
+    """バグハント（codex hunt B）の採用分"""
+    # B4 走行距離
+    chk(dh.parse_km('15,345km') == '15345' and dh.parse_km('1.5万km') == '15000' and dh.parse_km('1万5000km') == '15000'
+        and dh.parse_km(15345) == '15345' and dh.parse_km('約 2.3 万 km') == '23000' and dh.parse_km('') == '' and dh.parse_km('不明') == '',
+        f'parse_km: {[dh.parse_km(x) for x in ("15,345km", "1.5万km", "1万5000km", 15345, "約 2.3 万 km", "", "不明")]!r}')
+    chk(dh.customer_hint({}, dict(DOC, mileage='1.5万km')).get('kilometer') == '15000', 'customer_hint の走行距離 1.5万km')
+    chk(dh.vehicle_info_for_legacy({}, dict(DOC, mileage='1.5万km')).get('kilometer') == 15000, '旧経路の走行距離 1.5万km')
+    # B3 2 桁年
+    chk(dh.date8('25.10.26', allow_yy=True) == '20251026' and dh.date8('25/10/26', allow_yy=True) == '20251026'
+        and dh.date8('7.10.26', allow_yy=True) == '' and dh.date8('25.13.01', allow_yy=True) == '',
+        f'date8 2 桁年（保険書類）: {[dh.date8(x, allow_yy=True) for x in ("25.10.26", "25/10/26", "7.10.26", "25.13.01")]!r}')
+    # Codex 74: 2 桁年は保険書類の事故日だけ。車検証の初度登録（元号抜けの平成 25 年かもしれない）では受けない
+    chk(dh.date8('25.10.26') == '' and dh.reg_date_wareki('25.10.26') == '' and dh.date8_full('25.10.26') == '', '2 桁年を既定で受けている')
+    chk(dh.insurance_hint_from_doc(dict(DOC, accident_date='25.10.26')).get('accident_date') == '20251026', '保険書類の事故日 25.10.26')
+    chk(dh.vehicle_hint({}, dict(DOC, first_reg='25.10.26')).get('reg_date', '') == '', '書類の初度登録 25.10.26 は受けない')
+    # B5 かなはひらがな
+    chk(dh.parse_reg_no('北九州 580 ｱ 1234') == ('北九州', '580', 'あ', '1234') and dh.parse_reg_no('北九州 580 ア 1234')[2] == 'あ',
+        f'かな→ひらがな: {dh.parse_reg_no("北九州 580 ｱ 1234")!r}')
+    chk(dh.reg_no_text(dict(SHAKEN, car_reg_business='ｱ')) == '北九州 500 あ 1234', f'reg_no_text のかな: {dh.reg_no_text(dict(SHAKEN, car_reg_business="ｱ"))!r}')
+    chk(dh.vehicle_info_for_legacy(dict(SHAKEN, car_reg_business='ア'), None)['car_reg_business'] == 'あ', '旧経路のかな')
+    chk(dh.kana_hira('ｱ') == 'あ' and dh.kana_hira('あ') == 'あ' and dh.kana_hira('E') == 'E', 'kana_hira')
+    # B2 住所分割（実機: 市区郡は '〜市' まで、政令市の区は以降側）
+    chk(dh.split_address('福岡県', '北九州市小倉北区', '試験町1-2-3') == ('福岡県', '北九州市', '小倉北区試験町1-2-3'), f'split_address 政令市: {dh.split_address("福岡県", "北九州市小倉北区", "試験町1-2-3")!r}')
+    chk(dh.split_address('', '', '東京都渋谷区神宮前1-2-3') == ('東京都', '渋谷区', '神宮前1-2-3'), f'split_address 東京: {dh.split_address("", "", "東京都渋谷区神宮前1-2-3")!r}')
+    chk(dh.split_address('', '', '') == ('', '', ''), 'split_address 空')
+    chk(dh.split_address('福岡県', '北九州市', '') == ('福岡県', '北九州市', ''), f'split_address 市だけ: {dh.split_address("福岡県", "北九州市", "")!r}')
+    # Codex 75: 構造化された市区郡は名前の中の 市・郡 で切らない（四日市市・余市郡余市町・市川市）。政令市の区だけ以降側へ
+    chk(dh.split_address('三重県', '四日市市', '諏訪町1-1') == ('三重県', '四日市市', '諏訪町1-1'), f'四日市市: {dh.split_address("三重県", "四日市市", "諏訪町1-1")!r}')
+    chk(dh.split_address('北海道', '余市郡余市町', '黒川町1') == ('北海道', '余市郡余市町', '黒川町1'), f'余市郡: {dh.split_address("北海道", "余市郡余市町", "黒川町1")!r}')
+    chk(dh.split_address('千葉県', '市川市', '八幡1-1') == ('千葉県', '市川市', '八幡1-1'), '市川市')
+    chk(dh.split_address('福岡県', '北九州市小倉北区', '') == ('福岡県', '北九州市', '小倉北区'), f'政令市の区だけ: {dh.split_address("福岡県", "北九州市小倉北区", "")!r}')
+    chk(dh.split_address('', '北九州市小倉北区', '試験町1-2-3') == ('', '北九州市', '小倉北区試験町1-2-3'), '都道府県なし')
+    chk(dh.split_address('福岡県', '志免町', '') == ('福岡県', '志免町', '') and dh.split_address('', '', '福岡県遠賀郡岡垣町') == ('福岡県', '遠賀郡', '岡垣町'),
+        f'split_address 町だけ／郡町: {dh.split_address("福岡県", "志免町", "")!r} {dh.split_address("", "", "福岡県遠賀郡岡垣町")!r}')
+    chk(dh.split_address('', '', '福岡県試験町1-2-3') == ('福岡県', '試験町', '1-2-3'), f'split_address 町だけ（生成器と同じ規則）: {dh.split_address("", "", "福岡県試験町1-2-3")!r}')
+    # Codex 69 [2]: 車検証に名前が無く書類に使用者≠所有者があれば、書類の使用者が user_name
+    v6 = dh.vehicle_info_for_legacy({'car_serial_no': 'KSP210-9999999'}, dict(DOC, user='使用 花子', owner='所有 太郎'))
+    chk(v6.get('user_name') == '使用 花子' and v6.get('customer_name') == '使用 花子' and v6.get('owner_name') == '所有 太郎' and '_raw_user' not in v6,
+        f'書類の使用者≠所有者: {[v6.get(k) for k in ("user_name", "customer_name", "owner_name")]!r}')
+    chk('_raw_user' not in dh.vehicle_info_for_legacy(SHAKEN, None) and '_raw_user' not in dh.vehicle_info_for_legacy(SHAKEN, DOC), '_raw_user が残っている')
+    chk(dh._get({'a': 0}, 'a') == '0' and dh.parse_km(0) == '0', 'Codex 69 [4]: 数値 0 を落とさない')
+    chk(dh.vehicle_info_for_legacy({}, dict(DOC, desig='1234')).get('car_model_designation') == '01234', '書類だけの型式指定も 5 桁')
+    chk(dh.vehicle_hint({}, dict(DOC, desig='1234')).get('desig') == '01234' and dh.vehicle_hint(SHAKEN, DOC).get('desig') == '19548', 'スキル経路の型式指定も 5 桁（Codex 70）')
+    v = dh.vehicle_info_for_legacy(SHAKEN, DOC)
+    chk(v['prefecture'] == '福岡県' and v['municipality'] == '北九州市' and v['address_other'] == '小倉北区試験町1-2-3', f'旧経路の住所分割: {[v.get(k) for k in ("prefecture", "municipality", "address_other")]!r}')
+    # B7 使用者欄
+    chk(v['user_name'] == '同上', f'使用者が同上なら user_name は 同上: {v.get("user_name")!r}')
+    v2 = dh.vehicle_info_for_legacy(dict(SHAKEN, customer_name='使用 花子'), None)
+    chk(v2['user_name'] == '使用 花子' and v2['customer_name'] == '使用 花子', f'使用者≠所有者なら user_name は使用者名: {v2.get("user_name")!r}')
+    v3 = dh.vehicle_info_for_legacy({}, DOC)
+    chk(v3.get('user_name') == '同上', f'書類だけ（使用者=所有者）: {v3.get("user_name")!r}')
+    # B8 類別 4 桁・型式指定 5 桁
+    chk(v['car_category_number'] == '0002' and v['car_model_designation'] == '19548', f'類別/型式指定の桁: {v.get("car_category_number")!r} {v.get("car_model_designation")!r}')
+    chk(dh.vehicle_info_for_legacy(dict(SHAKEN, car_model_designation='１２３４'), None)['car_model_designation'] == '01234', '型式指定の 0 埋め')
+    # C1 値の掃除
+    chk(dh._get({'a': 'x\ny\x00z'}, 'a') == 'x y z' and len(dh._get({'a': 'あ' * 500}, 'a')) == dh._MAX_VALUE_LEN
+        and dh._get({'a': ['x']}, 'a') == '' and dh._get({'a': True}, 'a') == '', '_get の掃除（制御文字・長さ・型）')
+
+
 def test_reader_merge():
     """スキル経路: reader._normalise_header は 見積書に印字が無い項目にだけ hint を補う（印字があればそちらが残る）"""
     from neo_skill import reader
@@ -148,6 +208,11 @@ def test_reader_merge():
     h2 = reader._normalise_header({'source': 'x', 'totals': {'total': 1}, 'vehicle': {'serial_no': 'AAA-0000001'}, 'customer': {'name': '印字 太郎'}}, vh, ih, ch)
     chk(h2['vehicle']['serial_no'] == 'AAA-0000001' and h2['vehicle'].get('model_code') == 'KSP210', f'印字あり → 印字が残り、無い項目だけ補う: {h2["vehicle"]!r}')
     chk(h2['customer']['name'] == '印字 太郎' and h2['customer'].get('reg_no') == '北九州 500 あ 1234', f'顧客の印字優先: {h2["customer"]!r}')
+    # B1: 印字の「同上」「***」は穴 → 車検証で埋める。使用者欄の '同上' は正しい値なので残す
+    h3 = reader._normalise_header({'source': 'x', 'totals': {'total': 1}, 'customer': {'name': '同上', 'owner_name': '***', 'user_name': '同上'}}, vh, ih,
+                                  {'name': 'テスト自動車販売株式会社', 'owner_name': '所有 太郎', 'user_name': '使用 花子'})
+    chk(h3['customer']['name'] == 'テスト自動車販売株式会社' and h3['customer']['owner_name'] == '所有 太郎' and h3['customer']['user_name'] == '同上',
+        f'同上/*** を hint で埋める: {h3["customer"]!r}')
 
 
 def test_summary():
