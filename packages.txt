@@ -1,4 +1,1 @@
-# Streamlit Community Cloud の apt パッケージ。
-# pdf-to-neo スキル（vendor/pdf_to_neo）が塗装指数表（ADDATA の CHM）を展開するのに 7z を使う
-# （Windows では hh.exe、Linux では p7zip の 7z。無いと修正塗装の標準指数が取れず、そのパネルがある見積は不合格になる）
 p7zip-full
