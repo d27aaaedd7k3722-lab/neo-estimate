@@ -474,6 +474,38 @@ def test_labor_rate_from_standard_index():
     assert any(r['kind'] == 'レバーレート' and r['level'] == '判断' for r in e['_review']), e['_review']
 
 
+def test_paint_total_includes_frame_paint():
+    """印字の塗装工賃計には内板骨格塗装（paint.frame の位置ごとの工賃）が入る。塗装行＋内板骨格塗装＝印字なら「塗装計が違う」と言わない（2026-09-14 C-HR）"""
+    def notes(total):
+        rd = {'source': 't', 'issuer': '', 'est_date': '20260909', 'format': 'A', 'labor_rate': 8000, 'vehicle': dict(VEH),
+              'blocks': [{'title': 'テスト', 'rows': ['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||']}],
+              'paint': {'paint': '2K', 'coat': '2コートパール', 'hf': 'しない', 'total': total,
+                        'lines': [{'name': '左 フロントフェンダパネル 取替', 'wage': 10000}, {'name': '加算基礎数値', 'index': 3.0, 'wage': 24000}],
+                        'frame': {'engine_room': {'option': 2, 'index': 1.5, 'wage': 12000}}},
+              'expenses': [], 'totals': {}}
+        return de.Drafter(rd).build().get('_draft_notes') or []
+    assert not has(notes(46000), '塗装計: 印字'), notes(46000)
+    assert has(notes(46100), '塗装計: 印字'), notes(46100)
+
+
+
+def test_wage_round_1_and_material_rounding():
+    """1 円単位の技術料（指数 × 7,820 = 7,038）は丸め 1。材料代が 1 円四捨五入でしか合わないときは割合モードにせず額を渡す（2026-09-14 JPN タクシー）"""
+    assert de.detect_wage_round([{'index': 0.9, 'wage': 7038}, {'index': 1.8, 'wage': 14076}], 7820) == 1
+    assert de.detect_wage_round([{'index': 0.9, 'wage': 7040}], 7820) == 10
+    assert de.detect_wage_round([{'index': 0.9, 'wage': 7038}, {'index': 1.5, 'wage': 11730}], 7820) == 1   # 10 円の倍数になる行があっても 1
+    assert de.detect_wage_round([{'index': 0.9, 'wage': 7038}, {'index': 0.3, 'wage': 2350}], 7820) == 10   # 丸めた値の行があれば 1 円ではない
+    rd = {'source': 't', 'issuer': '', 'est_date': '20260909', 'format': 'A', 'labor_rate': 8000, 'vehicle': dict(VEH),
+          'blocks': [{'title': 'テスト', 'rows': ['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||']}],
+          'paint': {'paint': '2K', 'coat': '2コートパール', 'hf': 'しない', 'total': 127466, 'material': 20395, 'material_rate': 16,
+                    'lines': [{'name': '左 フロントフェンダパネル 取替', 'wage': 127466}]},
+          'expenses': [], 'totals': {}}
+    est = de.Drafter(rd).build()
+    assert est['paint'].get('material') == 20395, est['paint']      # 10 円丸めは 20,390 なので額のまま
+    rd['paint']['material'] = 20390
+    assert 'material' not in de.Drafter(rd).build()['paint']        # 10 円丸めと一致すれば割合モード
+
+
 if __name__ == '__main__':
     fails = 0
     for name, fn in sorted(globals().items()):

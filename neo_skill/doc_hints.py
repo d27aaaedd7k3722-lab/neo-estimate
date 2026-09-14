@@ -1,0 +1,347 @@
+# -*- coding: utf-8 -*-
+"""doc_hints.py — 添付した書類の OCR 結果を、2 つの生成経路が受け取れる形に写す（2026-09-14）。
+
+  車検証: app.analyze_vehicle_registration の dict（customer_name / owner_name / car_reg_* / car_serial_no / car_model /
+          car_model_designation / car_category_number / car_reg_date(YYYYMM00) / term_date(YYYYMMDD) / kilometer / color_code …）
+  事故・保険の書類（速報報告書・事故受付票・立会依頼書など）: app.analyze_insurance_document の dict（INSURANCE_DOC_KEYS）
+
+  - pdf-to-neo スキル経路: reading の header に補う hint（vehicle / customer / insurance）。reader._apply_hint は
+    「見積書に印字が無い項目にだけ補う」ので、見積書の印字が常に優先される
+  - ベタ打ち（旧経路 run_pdf_to_neo_pipeline）: vehicle_info（車検証 OCR の dict ＋ 書類から分かった色・走行距離）
+  - サイドバー「事故・保険情報」: 書類から読めた項目で入力欄を埋める（利用者が直せる。生成時はサイドバーの値が使われる）
+Streamlit・Gemini に依存しない（tests/reg_hints.py）。
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import re
+import unicodedata
+from typing import Optional
+
+# 事故・保険の書類の OCR が返すキー（値はすべて文字列。無いものは ''）
+INSURANCE_DOC_KEYS = (
+    'company', 'branch', 'staff', 'accept_no', 'report_date', 'accident_date', 'accident_place', 'contractor', 'counterpart',
+    'policy_no', 'coverage', 'market_value',
+    'reg_no', 'car_name', 'model', 'grade', 'first_reg', 'serial_no', 'reg_date', 'engine_model', 'desig', 'category',
+    'term_date', 'owner', 'user', 'mileage', 'color_code', 'color_name', 'equipment', 'confidence',
+)
+INSURANCE_DOC_SCHEMA = {'type': 'object', 'properties': {k: {'type': 'string'} for k in INSURANCE_DOC_KEYS}}
+
+INSURANCE_DOC_PROMPT = """<task_execution>
+<task>事故・保険の書類の読み取り（AI-OCR）</task>
+<description>
+入力は損害保険会社・共済からの「速報報告書」「事故受付票」「立会依頼書」「連絡票」など、事故と車両の情報が印字された書類（写真・スキャン・画面のスクリーンショット）です。
+印字されている文字をそのまま抽出し、下の JSON で返してください。推測で補完しない・無い項目は "" にする。
+</description>
+
+読み取り対象（書類での呼び方の例）:
+- company: 依頼会社名・保険会社名・共済名（例: ○○損害保険、○○共済）
+- branch: 支店・部署・サービスセンター名（例: ○○損調サービスセンター）
+- staff: 担当者名（保険会社側の担当・アジャスター。「様」は付けない）
+- accept_no: 事故番号・受付番号・事故受付番号（ハイフン込みで印字どおり）
+- report_date: 速報日 → YYYYMMDD
+- accident_date: 事故日・事故発生日 → YYYYMMDD
+- accident_place: 事故場所
+- contractor: 契約者名・被保険者名
+- counterpart: 相手者名・相手方
+- policy_no: 証券番号
+- coverage: 担保種目（対物・車両 など。金額や免責があれば「対物 無制限 免責0」のように続ける）
+- market_value: 時価額（数字だけ。カンマ・円は除く）
+- reg_no: 登録番号（「北九州 539 な 1031」のように 地名 分類番号 かな 一連番号 を半角スペース区切り）
+- car_name: 車名（メーカー名や型式が並んでいれば印字どおり）
+- model: 型式（例: 5BA-KSP210）
+- grade: グレード
+- first_reg: 初度登録（年月。和暦のままでよい。例: 令和3年11月）
+- serial_no: 車台番号（例: KSP210-0057662）
+- reg_date: 登録日 → YYYYMMDD
+- engine_model: 原動機型式
+- desig: 型式指定番号（5 桁）
+- category: 類別区分番号（4 桁）
+- term_date: 有効期限・車検満了日 → YYYYMMDD
+- owner: 所有者
+- user: 使用者（「同上」ならそのまま「同上」）
+- mileage: 走行距離（km の数字だけ）
+- color_code: カラーNo・カラーコード（例: 3T3）
+- color_name: 色名
+- equipment: 主要装備
+- confidence: 読み取り信頼度 0.0〜1.0
+
+重要ルール:
+- 印字されている文字を一言一句そのまま抽出する。読めない項目は "" にする
+- 日付は YYYYMMDD の 8 桁（和暦→西暦: 令和N年 = 2018+N 年、平成N年 = 1988+N 年）。年月だけの項目（first_reg）は印字どおりでよい
+- 数字は半角にする（登録番号の分類番号・一連番号も半角）
+- 見積書（部品や工賃の明細）が写っているだけで事故・車両の情報が無い場合は、すべて "" にする
+</task_execution>"""
+
+
+def _nfkc(s) -> str:
+    return unicodedata.normalize('NFKC', str(s or '')).strip()
+
+
+def _get(d: Optional[dict], key: str) -> str:
+    if not isinstance(d, dict):
+        return ''
+    v = d.get(key)
+    if v is None:
+        return ''
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v).strip()
+
+
+def strip_emission_prefix(model: str) -> str:
+    """型式から排ガス規制記号を外す: '5BA-KSP210' → 'KSP210'、'6AA-AYH30W' → 'AYH30W'、'DBA-ZRR80G' → 'ZRR80G'。
+    記号の無い 'KSP210' はそのまま。全角・全角ハイフンは半角に揃える（生成器の resolver は KA06 の型式と突き合わせる）"""
+    s = _nfkc(model).upper().replace('－', '-').replace('‐', '-').replace('—', '-')
+    m = re.match(r'^([0-9A-Z]{2,3})-([0-9A-Z][0-9A-Z-]*)$', s)
+    if m and re.search(r'[A-Z]', m.group(2)) and re.search(r'\d', m.group(2)):
+        return m.group(2)
+    return s
+
+
+def date8(s) -> str:
+    """いろいろな書き方の日付を YYYYMMDD に。読めなければ ''。
+    受ける形: 20251026 / 2025-10-26 / 2025/10/26 / 2025.10.26 / 令和7年10月26日 / R7.10.26 / 令和7年10月（日なし → 00）"""
+    t = _nfkc(s).replace(' ', '')
+    if not t:
+        return ''
+    def _valid(y, mo, d):
+        # 暦どおりか（20251340・2 月 31 日のような OCR の誤りを NEO に書かない。Codex 57）。日 0 は年月だけ
+        if not (1900 <= y <= 2100 and 1 <= mo <= 12 and 0 <= d <= 31):
+            return ''
+        if d:
+            try:
+                _dt.date(y, mo, d)
+            except ValueError:
+                return ''
+        return f'{y:04d}{mo:02d}{d:02d}'
+    m = re.match(r'^(\d{4})(\d{2})(\d{2})$', t)
+    if m:
+        return _valid(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    m = re.match(r'^(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?$', t)
+    if m:
+        return _valid(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    m = re.match(r'^(\d{4})[-/.年](\d{1,2})月?$', t)
+    if m:
+        return _valid(int(m.group(1)), int(m.group(2)), 0)
+    m = re.match(r'^(令和|平成|昭和|R|H|S)\s*(\d{1,2}|元)[.年](\d{1,2})(?:[.月](\d{1,2})?)?日?$', t)
+    if m:
+        era = m.group(1)[0]
+        y = 1 if m.group(2) == '元' else int(m.group(2))
+        base = {'令': 2018, 'R': 2018, '平': 1988, 'H': 1988, '昭': 1925, 'S': 1925}[era]
+        mo = int(m.group(3))
+        d = int(m.group(4)) if m.group(4) else 0
+        return _valid(base + y, mo, d)
+    return ''
+
+
+def date8_full(s) -> str:
+    """日まで要る日付（有効期限・事故日など）。年月だけ（日 00）は '' にする（Codex 59）"""
+    d = date8(s)
+    return d if (len(d) == 8 and d[6:8] != '00') else ''
+
+
+def reg_date_wareki(s) -> str:
+    """初度登録年月を生成器の reading が期待する印字風（'R3.11' / 'H27.5'）に。
+    受ける形: 車検証 OCR の 'YYYYMM00' / '2021-11' / '令和3年11月' / 'R3.11'（そのまま）。読めなければ ''"""
+    t = _nfkc(s).replace(' ', '')
+    if not t:
+        return ''
+    m = re.match(r'^([RHS])(\d{1,2})\.(\d{1,2})$', t.upper())
+    if m:
+        return f'{m.group(1)}{int(m.group(2))}.{int(m.group(3))}'
+    d8 = date8(t)
+    if len(d8) != 8:
+        return ''
+    y, mo = int(d8[:4]), int(d8[4:6])
+    if not (1 <= mo <= 12):
+        return ''
+    if y >= 2019 and not (y == 2019 and mo < 5):
+        return f'R{y - 2018}.{mo}'
+    if y >= 1989:
+        return f'H{y - 1988}.{mo}'
+    return f'S{y - 1925}.{mo}'
+
+
+# 一連番号に混ざるハイフン（'-'・U+2010・U+2011・U+2015・長音）、「・」、小数点、空白。'12-34' → '1234'、'・・12' → '12'
+_SERIAL_JUNK = re.compile(r'[\s\-‐‑―ー・･.]')
+# 地名 分類番号 かな 一連番号（一連番号は数字の前後に「・」やハイフンが混ざっていてもよい。掃除は _serial_clean）。
+# 分類番号は 3 桁の数字のほか、下 2 桁にアルファベットが入る形（30A・3AC。2018 年〜の希望番号）も受ける（Codex 65）。
+# ※ 生成器（vendor estimate_to_neo）の登録番号の正規表現は数字 2〜3 桁しか受けないので、スキル経路では
+#    アルファベット入りの分類番号は空欄になる（files 側の残課題。ベタ打ち側は app._reg_no_part がそのまま書く）
+_REG_SPLIT = re.compile(r'^\s*(\S+?)\s*(\d[0-9A-Z]{1,2})\s*([ぁ-んア-ン])\s*([-‐‑―ー・･.\s\d]+?)\s*$')
+
+
+def _serial_clean(s) -> str:
+    """一連番号を実機 NEO と同じ半角数字だけに（全角→半角、ハイフン・「・」・空白を外す）"""
+    return _SERIAL_JUNK.sub('', _nfkc(s or ''))
+
+
+def _split_reg(whole: str) -> tuple:
+    """'北九州 539 な 10-31' / '北九州539な・・12' → ('北九州', '539', 'な', '1031' / '12')。分けられなければ ('', '', '', '')"""
+    m = _REG_SPLIT.match(_nfkc(whole or ''))
+    if not m:
+        return ('', '', '', '')
+    ser = _serial_clean(m.group(4))
+    return (m.group(1), m.group(2), m.group(3), ser) if 1 <= len(ser) <= 4 else ('', '', '', '')   # 一連番号は 4 桁まで
+
+
+def reg_no_text(vd: Optional[dict], doc: Optional[dict] = None) -> str:
+    """登録番号を '北九州 539 な 1031' の形に（生成器は 地名 分類 かな 一連 を正規表現で分ける）。数字は半角。
+    一連番号はベタ打ち側（app._reg_no_part）と同じ規則で掃除する（Codex 64: 掃除が片側だけだと U+2011 のハイフンや
+    '・・12' が生成器の正規表現に合わず、スキル経路の NEO だけ登録番号が空になる）"""
+    dep, div, biz = (_nfkc(_get(vd, k)).strip() for k in ('car_reg_department', 'car_reg_division', 'car_reg_business'))
+    ser = _serial_clean(_get(vd, 'car_reg_serial'))
+    if dep and div and biz and ser:
+        return f'{dep} {div} {biz} {ser}'
+    whole = _nfkc(_get(vd, 'registration_number')) or _nfkc(_get(doc, 'reg_no'))
+    parts = _split_reg(whole)
+    if all(parts):
+        return ' '.join(parts)
+    return whole
+
+
+def parse_reg_no(text: str) -> tuple:
+    """'北九州 539 な 1031' → ('北九州', '539', 'な', '1031')。分けられなければ ('', '', '', '')"""
+    return _split_reg(text)
+
+
+def address_text(vd: Optional[dict]) -> str:
+    return ''.join(_get(vd, k) for k in ('prefecture', 'municipality', 'address_other')).strip()
+
+
+def _name(vd: Optional[dict], doc: Optional[dict]) -> tuple:
+    """(使用者=顧客名, 所有者)。使用者が '同上' / '***' / 空なら所有者を顧客名にする"""
+    user = _get(vd, 'customer_name') or _get(doc, 'user')
+    owner = _get(vd, 'owner_name') or _get(doc, 'owner')
+    if user in ('', '同上', '***', '＊＊＊') or set(user) <= set('*＊'):
+        user = owner
+    return user, owner
+
+
+def vehicle_hint(vd: Optional[dict], doc: Optional[dict] = None) -> dict:
+    """reading.vehicle に補う値（resolver が車種を決める材料）。書類（速報）は車検証の無い項目だけ補う"""
+    model = _get(vd, 'car_model') or _get(vd, 'model_code') or _get(doc, 'model')
+    desig = re.sub(r'\D', '', _nfkc(_get(vd, 'car_model_designation') or _get(doc, 'desig')))
+    cat = re.sub(r'\D', '', _nfkc(_get(vd, 'car_category_number') or _get(doc, 'category')))
+    out = {
+        'model_code': strip_emission_prefix(model) if model else '',
+        'serial_no': _nfkc(_get(vd, 'car_serial_no') or _get(doc, 'serial_no')).upper(),
+        'desig': desig,
+        'category': cat.zfill(4) if cat else '',
+        'reg_date': reg_date_wareki(_get(vd, 'car_reg_date') or _get(doc, 'first_reg')),
+        'color_code': _nfkc(_get(vd, 'color_code') or _get(doc, 'color_code')).upper(),
+    }
+    return {k: v for k, v in out.items() if v}
+
+
+def customer_hint(vd: Optional[dict], doc: Optional[dict] = None) -> dict:
+    """reading.customer に補う値（NEO の顧客欄: 名前・登録番号・住所・有効期限・所有者・走行距離）"""
+    user, owner = _name(vd, doc)
+    km = re.sub(r'\D', '', _nfkc(_get(vd, 'kilometer') or _get(doc, 'mileage')))
+    out = {
+        'name': user,
+        'owner': owner,
+        # NEO の所有者欄・使用者欄に入るのは owner_name / user_name（estimate_schema）。使用者と所有者が違うときだけ渡す
+        # （同じなら生成器の既定: 所有者=顧客名、使用者='同上'）
+        'owner_name': owner if (owner and user and owner != user) else '',
+        'user_name': user if (owner and user and owner != user) else '',
+        'reg_no': reg_no_text(vd, doc),
+        'address': address_text(vd),
+        'postal': _nfkc(_get(vd, 'postal_no')),
+        'term_date': date8_full(_get(vd, 'term_date') or _get(doc, 'term_date')),
+        'kilometer': km.lstrip('0') or ('0' if km else ''),
+    }
+    return {k: v for k, v in out.items() if v}
+
+
+def insurance_hint_from_doc(doc: Optional[dict]) -> dict:
+    """reading.insurance に補う値（estimate_schema の insurance キー）。保険会社・共済名は agency（Insurance.AgencyName）にも入れる
+    （NEO に保険会社の欄は無く、コグニ運用ではここに保険会社名を入れている。company は記録用）"""
+    company = _get(doc, 'company')
+    out = {
+        'company': company,
+        'agency': company,
+        'policy_no': _nfkc(_get(doc, 'policy_no')),
+        'contractor': _get(doc, 'contractor'),
+        'accident_date': date8_full(_get(doc, 'accident_date')),
+        'accept_no': _nfkc(_get(doc, 'accept_no')),
+        'adjuster': _get(doc, 'staff'),
+        'adjuster_post': _get(doc, 'branch'),
+    }
+    return {k: v for k, v in out.items() if v}
+
+
+def sidebar_insurance_from_doc(doc: Optional[dict]) -> dict:
+    """サイドバー「事故・保険情報」の session_state キーに写す（読めた項目だけ）"""
+    h = insurance_hint_from_doc(doc)
+    m = {'accept_no': h.get('accept_no'), 'accident_date': h.get('accident_date'), 'policy_no': h.get('policy_no'),
+         'contractor_name': h.get('contractor'), 'agency_name': h.get('agency'), 'adjuster_name': h.get('adjuster'),
+         'adjuster_post': h.get('adjuster_post')}
+    return {k: v for k, v in m.items() if v}
+
+
+def vehicle_info_for_legacy(vd: Optional[dict], doc: Optional[dict] = None) -> dict:
+    """ベタ打ち（旧経路）の vehicle_info。車検証 OCR の dict をそのまま使い、無い項目を書類から補う。
+    車検証が無く書類だけのときは、書類の車両欄から同じ形を組み立てる"""
+    out = {k: v for k, v in (vd or {}).items() if not str(k).startswith('_')} if isinstance(vd, dict) else {}
+    # 登録番号は実機 NEO と同じ半角数字・ハイフン無しに（車検証 OCR は全角数字で返すことがある。実機 108 本の集計 2026-09-14）
+    for k in ('car_reg_department', 'car_reg_division', 'car_reg_business', 'car_reg_serial'):
+        if out.get(k):
+            out[k] = str(out[k]).strip()
+    for k in ('car_reg_division', 'car_reg_serial'):   # 数字の区画だけ半角に（地名・かなは幅を変えない）
+        if out.get(k):
+            out[k] = _nfkc(out[k])
+    if out.get('car_reg_serial'):
+        out['car_reg_serial'] = _serial_clean(out['car_reg_serial'])
+    # 旧経路は customer_name をそのまま顧客名（Customer.Name1）に書く。使用者が「同上」「***」なら所有者を顧客名にする
+    # （e2e で Name1 が「同上」になった 2026-09-14）
+    if out and str(out.get('customer_name') or '').strip() in ('', '同上', '***', '＊＊＊') or (out and set(str(out.get('customer_name') or '')) <= set('*＊')):
+        if str(out.get('owner_name') or '').strip():
+            out['customer_name'] = str(out['owner_name']).strip()
+    if not isinstance(doc, dict) or not doc:
+        return out
+
+    def fill(key, val):
+        val = val if isinstance(val, str) else str(val or '')
+        if val and not str(out.get(key) or '').strip():
+            out[key] = val
+
+    user, owner = _name(vd, doc)
+    fill('customer_name', user)
+    fill('owner_name', owner)
+    dep, div, biz, ser = parse_reg_no(reg_no_text(vd, doc))
+    fill('car_reg_department', dep); fill('car_reg_division', div); fill('car_reg_business', biz); fill('car_reg_serial', ser)
+    fill('car_serial_no', _nfkc(_get(doc, 'serial_no')).upper())
+    # 車検証の「車名」はメーカー名（トヨタ）だけのことが多い。書類に車名（ヤリス KSP210 G 1000）があればそちらを使う
+    cur_name = str(out.get('car_name') or '').strip()
+    if _get(doc, 'car_name') and (not cur_name or (len(cur_name) <= 5 and not re.search(r'\d', cur_name))):
+        out['car_name'] = _get(doc, 'car_name')
+    fill('car_model', _nfkc(_get(doc, 'model')).upper())
+    fill('car_model_designation', re.sub(r'\D', '', _nfkc(_get(doc, 'desig'))))
+    cat = re.sub(r'\D', '', _nfkc(_get(doc, 'category')))
+    fill('car_category_number', cat.zfill(4) if cat else '')
+    fill('engine_model', _get(doc, 'engine_model'))
+    fill('color_code', _nfkc(_get(doc, 'color_code')).upper())
+    fill('body_color', _get(doc, 'color_name'))
+    km = re.sub(r'\D', '', _nfkc(_get(doc, 'mileage')))
+    if km and not out.get('kilometer'):
+        out['kilometer'] = int(km)
+    fill('term_date', date8_full(_get(doc, 'term_date')))
+    first = date8(_get(doc, 'first_reg'))
+    fill('car_reg_date', first[:6] + '00' if len(first) == 8 else '')
+    return out
+
+
+def summary(vd: Optional[dict], doc: Optional[dict]) -> str:
+    """画面に出す短い要約（読めた項目の見出しだけ。個人名は出さない）"""
+    got = []
+    if vd:
+        got.append('車検証: ' + '・'.join(n for n, k in (('登録番号', 'car_reg_serial'), ('車台番号', 'car_serial_no'), ('型式', 'car_model'),
+                                                     ('型式指定/類別', 'car_model_designation'), ('使用者', 'customer_name'), ('有効期限', 'term_date'))
+                                        if _get(vd, k)))
+    if doc:
+        got.append('書類: ' + '・'.join(n for n, k in (('依頼会社', 'company'), ('支店', 'branch'), ('担当者', 'staff'), ('事故番号', 'accept_no'),
+                                                    ('事故日', 'accident_date'), ('契約者', 'contractor'), ('登録番号', 'reg_no'), ('車台番号', 'serial_no'),
+                                                    ('カラーNo', 'color_code'), ('走行距離', 'mileage')) if _get(doc, k)))
+    return ' ／ '.join(g for g in got if not g.endswith(': '))

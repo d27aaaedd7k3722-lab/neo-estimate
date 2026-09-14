@@ -214,6 +214,11 @@ def merge(case: str, force: bool = False) -> tuple[dict | None, list[str]]:
         msgs.append(f'ページ番号が連続していない: {nums}（欠けたページを写すか、番号を直す。--force でも束ねない）')
         return None, msgs
     rd: dict = {k: copy.deepcopy(header[k]) for k in HEADER_KEYS if k in header}
+    # 一覧に無い header のキー（target_total_replaces_material など）も引き継ぐ（SKILL の「雛形に無いキーも書けば merge が通す」のとおり。
+    # 以前は一覧だけで、協定の材料代調整の許可が reading.json から落ちていた。2026-09-14）。_ で始まる OCR の推定などの内部キーと、ページ側のキーは除く
+    for k, v in header.items():
+        if k not in rd and not str(k).startswith('_') and k not in ('blocks', 'pages', 'page', 'rows_printed', 'subtotal', 'marks', 'paint_lines'):
+            rd[k] = copy.deepcopy(v)
     rd['blocks'] = []
     rd['pages'] = {}
     paint = dict(rd.get('paint') or {})

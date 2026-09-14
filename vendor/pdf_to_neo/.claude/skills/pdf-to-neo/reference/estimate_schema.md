@@ -59,6 +59,7 @@
 | customer.owner_name / user_name | **NEO の所有者欄・使用者欄に入るのはこの 2 つだけ**。`owner` は車検証の所有者を控えるメモで NEO には書かれない（コグニ運用では所有者欄に顧客名を入れることが多い。実機 cogni_R1/R2）。所有者を出したい案件だけ `owner_name` に書く |
 | insurance.company / policy_no / contractor / accident_date / presence_date / factory | 案件フォルダ名（損保）・速報 PDF。分からない項目は空文字。`factory` は「工場名 電話番号」 |
 | insurance.accept_no / agency / adjuster / garage_in / garage_out / repair_days | 事故受付番号（FileInfo.AcceptNo・XML・AnSvMail）／代理店（Insurance.AgencyName）／アジャスター（Insurance.AdjusterName・XML）／入庫日・出庫日（YYYYMMDD → FileInfo.GarageIn*/GarageOut*。XML には書かない: 実機 178 本で日付があっても空）／修理日数（Insurance.RepairDays、無ければ -1）。無ければ従来どおり空（2026-09-14） |
+| insurance.adjuster_post | アジャスターの支店・所属（速報報告書の「支店」「サービスセンター」）。NEO の Insurance.AdjusterPost（20 バイト）。分からなければ空文字（2026-09-14） |
 
 ## items（明細行、見積書の並び順で）
 
@@ -76,6 +77,7 @@
 | bankin | `{"area": 5, "yes": [1,0,0], "fuka": [...]}` | 板金ランク。area = 損傷面積 d㎡、yes = ダイアログの YES 3 つ（3 つ=A / 0=C / 他=B）、fuka = 付加作業名の配列（省略可） |
 | comment | 文字列 | 明細コメント（TEXT(40)）。**NEO に書かれてコグニの画面・印刷に出る**ので、見積書に印字された明細コメントだけにする（人向けのメモは `_memo` / 確認箇所シート。判断規則 10-22） |
 | _memo / _page / _qty_from_price / _full_name | — | 下書きが付ける内部キー（転記メモ・見積のページ・金額から数量を直した印・名称を短くする前の印字の全文）。生成器は読まない |
+| paint._total_from_lines | — | 下書きが `paint.total` を塗装行の合計から作ったときだけ付く（値はその中に入れた追加項目の工賃）。印字の塗装工賃計と区別して、突合せが追加項目を二重に数えないため。生成器は読まない |
 | reserve | true | 保留部品（合計に入らず「保留」行として印字） |
 | recycle | `{"name", "price", "stock_price"}` | リサイクル部品への置換（純正部品の工賃は消える） |
 

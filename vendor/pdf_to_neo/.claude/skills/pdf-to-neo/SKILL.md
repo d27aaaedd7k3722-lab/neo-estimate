@@ -152,7 +152,7 @@ EOF
 
 ```bash
 PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/reading_pages.py init "<NEO_CHECK_ROOT>/<案件>" --pages 3   # 雛形
-#   pages/header.json … 明細以外（source / issuer / est_date / format / vehicle / customer / insurance / labor_rate / paint / expenses / totals /
+#   pages/header.json … 明細以外（source / issuer / est_date / format / vehicle / customer / insurance / labor_rate / paint / expenses / totals /  ※一覧に無いキー（target_total_replaces_material 等）も merge が引き継ぐ（_ で始まるキーは除く）
 #                        target_total / wage_round / index_policy / hints / discount / frame / adas / note）。init の雛形に無いキーも書けば merge が通す
 #   pages/page_N.json … そのページの明細: page / rows_printed / subtotal{parts,wage} / marks{$,#,*} / blocks[{title, rows[短縮記法]}] / paint_lines / expenses
 PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/reading_pages.py validate "<NEO_CHECK_ROOT>/<案件>" --page 1   # 1 ページ写すたびに

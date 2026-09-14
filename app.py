@@ -32,6 +32,7 @@ AI-OCR連携 NEOファイル自動生成Webアプリ v3.2
 
 from dotenv import load_dotenv
 load_dotenv()
+from neo_skill import doc_hints as _doc_hints  # noqa: E402  車検証・事故/保険の書類の OCR 結果を hint に写す（2026-09-14）
 
 import streamlit as st
 import struct
@@ -556,6 +557,23 @@ def _strip_control_chars(value) -> str:
     """
     s = re.sub(r'[\x00-\x1f\x7f]', ' ', str(value or ''))
     return re.sub(r'[ \t]+', ' ', s).strip()
+
+
+def _reg_no_part(value, digits: bool = False, strip_hyphen: bool = False) -> str:
+    """登録番号の 1 区画（地名・分類番号・かな・一連番号）をコグニの NEO と同じ形に揃える。
+
+    実機 NEO 108 本（登録番号あり）の集計（2026-09-14）: 分類番号・一連番号は
+    すべて半角数字、かなは全角ひらがな、一連番号にハイフンや「・」は無い。
+    旧来の車検証 OCR（analyze_vehicle_registration）は全角数字（"３４６"）で返して
+    いたので、DB・ヘッダ XML・INI に書く直前でここを通して半角にする。
+    地名・かなは幅を変えない（NFKC は半角カナを全角にしてしまう）。
+    """
+    s = _strip_control_chars(value).strip()
+    if digits:
+        s = unicodedata.normalize('NFKC', s)
+    if strip_hyphen:
+        s = re.sub(r'[\s\-‐‑―ー・･.]', '', s)   # '12-34' → '1234'、'・・12' → '12'
+    return s
 
 
 def cp932_trim(value, max_bytes: int) -> str:
@@ -1870,10 +1888,11 @@ def _trimmed_cust_values(cust: dict) -> dict:
         'prefecture':    cp932_trim(_strip_control_chars(cust.get('prefecture', '')),    _CUST_WIDTH['Prefecture']),
         'municipality':  cp932_trim(_strip_control_chars(cust.get('municipality', '')),  _CUST_WIDTH['Municipality']),
         'address_other': cp932_trim(_strip_control_chars(cust.get('address_other', '')), _CUST_WIDTH['AddressOther1']),
-        'car_dept':      cp932_trim(_strip_control_chars(cust.get('car_reg_department', '')), _CUST_WIDTH['CarRegNoDepartment']),
-        'car_div':       cp932_trim(_strip_control_chars(cust.get('car_reg_division', '')),   _CUST_WIDTH['CarRegNoDivision']),
-        'car_biz':       cp932_trim(_strip_control_chars(cust.get('car_reg_business', '')),   _CUST_WIDTH['CarRegNoBusiness']),
-        'car_serial':    cp932_trim(_strip_control_chars(cust.get('car_reg_serial', '')),     _CUST_WIDTH['CarRegNoSerial']),
+        # 登録番号はコグニと同じ半角数字・ハイフン無しに揃える（_reg_no_part。実機 NEO 108 本の集計）
+        'car_dept':      cp932_trim(_reg_no_part(cust.get('car_reg_department', '')), _CUST_WIDTH['CarRegNoDepartment']),
+        'car_div':       cp932_trim(_reg_no_part(cust.get('car_reg_division', ''), digits=True), _CUST_WIDTH['CarRegNoDivision']),
+        'car_biz':       cp932_trim(_reg_no_part(cust.get('car_reg_business', '')),   _CUST_WIDTH['CarRegNoBusiness']),
+        'car_serial':    cp932_trim(_reg_no_part(cust.get('car_reg_serial', ''), digits=True, strip_hyphen=True), _CUST_WIDTH['CarRegNoSerial']),
         'car_serial_no': cp932_trim(_strip_control_chars(cust.get('car_serial_no', '')),      _CUST_WIDTH['CarSerialNo']),
         'model_desig':   cp932_trim(_strip_control_chars(cust.get('car_model_designation', '')), _CUST_WIDTH['CarMouldNo']),
         'category_num':  cp932_trim(_strip_control_chars(cust.get('car_category_number', '')),   _CUST_WIDTH['CarKindNo']),
@@ -1999,6 +2018,7 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
     contractor    = cp932_trim(insurance_info.get('contractor_name', ''), 20)
     agency_name   = cp932_trim(insurance_info.get('agency_name', ''), 20)
     adjuster_name = cp932_trim(insurance_info.get('adjuster_name', ''), 20)
+    adjuster_post = cp932_trim(insurance_info.get('adjuster_post', ''), 20)   # 支店・所属（Insurance.AdjusterPost）
     accept_no     = cp932_trim(insurance_info.get('accept_no', ''), 37)
     accident_date = _normalize_date8(insurance_info.get('accident_date', ''))
     garage_in     = _normalize_date8(insurance_info.get('garage_in_date', ''))
@@ -2016,7 +2036,7 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
     # 前案件のアジャスター名がDBに残る一方でヘッダXMLには空が書かれ、
     # 同じ .neo の中で食い違っていた。
     for _col, _val in (('PolicyNo', policy_no), ('ContractorName', contractor),
-                       ('AgencyName', agency_name), ('AdjusterName', adjuster_name)):
+                       ('AgencyName', agency_name), ('AdjusterName', adjuster_name), ('AdjusterPost', adjuster_post)):
         if _val or not merge_mode:
             _ins_updates.append(f'{_col}=?')
             _ins_values.append(_val)
@@ -3652,7 +3672,7 @@ def _conversion_guard():
 _PIPE_ARGS_EXPECTED = (
     'source_mime', 'addata_root', 'template_path', 'mode_override',
     'model_name', 'api_key', 'cache_scope', 'is_tax_inclusive',
-    'merge_mode', 'expenses', 'insurance_info',
+    'merge_mode', 'expenses', 'insurance_info', 'vehicle_info',
 )
 
 
@@ -4307,6 +4327,8 @@ CORE_PROMPT = """<system_instruction>
 
 TASK_PROMPTS = {}
 
+TASK_PROMPTS["insurance_doc_ocr"] = _doc_hints.INSURANCE_DOC_PROMPT   # 速報報告書・事故受付票など（neo_skill/doc_hints.py）
+
 TASK_PROMPTS["shaken_ocr"] = """<task_execution>
 タスク名: shaken_ocr（車検証OCR）
 
@@ -4331,9 +4353,9 @@ TASK_PROMPTS["shaken_ocr"] = """<task_execution>
 - municipality: 所有者の住所 → 市区町村
 - address_other: 所有者の住所 → 町名・番地以降
 - car_reg_department: 自動車登録番号の地名部分（例: "北九州", "品川", "福岡"）
-- car_reg_division: 自動車登録番号の分類番号（例: "３４６"） → 全角数字で出力
+- car_reg_division: 自動車登録番号の分類番号（例: "346"） → 半角数字で出力（コグニの NEO と同じ）
 - car_reg_business: 自動車登録番号のひらがな（例: "の"） → 全角ひらがなで出力
-- car_reg_serial: 自動車登録番号の一連番号（例: "１２２４"） → 全角数字で出力
+- car_reg_serial: 自動車登録番号の一連番号（例: "1224"） → 半角数字で出力（ハイフンや「・」は付けない）
 - car_serial_no: 車台番号（例: "AYH30-0145328"）
 - car_name: 車名（例: "トヨタ"）
 - car_model: 型式（例: "6AA-AYH30W"）
@@ -4515,6 +4537,59 @@ def _build_prompt(task_type: str, extra: str = "") -> str:
     return "\n\n".join(p for p in parts if p)
 
 
+def analyze_insurance_document(api_key, file_bytes, mime_type, model_name=None):
+    """事故・保険の書類（速報報告書・事故受付票・立会依頼書などの写真/PDF/スクリーンショット）を AI-OCR で読む。
+    返り値は neo_skill.doc_hints.INSURANCE_DOC_KEYS の dict（値は文字列）。失敗は {'_error': 理由}（黙って空を返さない）"""
+    if not api_key:
+        return {'_error': 'Gemini APIキーが設定されていません'}
+    if not model_name:
+        try:
+            model_name = st.session_state.get('selected_model')
+        except Exception:
+            model_name = None
+    if not model_name:
+        model_name = get_default_gemini_model(api_key)
+    prompt = _build_prompt("insurance_doc_ocr")
+    result = {}
+    _last = None
+    try:
+        from google.genai import types
+        client = _get_genai_client(api_key)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[prompt, types.Part.from_bytes(data=file_bytes, mime_type=mime_type)],
+            config={"temperature": 0.0, "max_output_tokens": 4096,
+                    "response_mime_type": "application/json", "response_schema": _doc_hints.INSURANCE_DOC_SCHEMA},
+        )
+        if response.text and response.text.strip():
+            try:
+                result = json.loads(response.text)
+            except (json.JSONDecodeError, TypeError):
+                result = extract_json_from_response(response.text)
+    except Exception as e:  # noqa: BLE001
+        _last = e
+    def _has_data(r):
+        # 許可キーに絞ってから判定（未知のキーだけの返事を「読めた」としない）。confidence だけも「読めた」ではない
+        return isinstance(r, dict) and any(v for k, v in r.items() if k in _doc_hints.INSURANCE_DOC_KEYS and k != 'confidence' and v and str(v).strip())
+    if not _has_data(result):
+        try:
+            _txt = call_gemini(api_key, file_bytes, mime_type, prompt, model_name=model_name, use_json_mode=True)
+            result = json.loads(_txt) if _txt else {}
+        except Exception as e2:  # noqa: BLE001
+            _last = e2
+            result = {}
+    if not _has_data(result):
+        return {'_error': str(_last) if _last else '書類から事故・車両の情報を読み取れませんでした'}
+    return {k: ('' if v is None else str(v).strip()) for k, v in result.items() if k in _doc_hints.INSURANCE_DOC_KEYS}
+
+
+def _shaken_has_data(r) -> bool:
+    """車検証 OCR の返事に中身があるか。confidence だけ（他の項目が全部空）や '_' で始まるキーだけは「読めた」ではない
+    （Codex 66: confidence は文字列で返るので、values() の any() では空の返事が成功に見えていた）"""
+    return isinstance(r, dict) and any(v for k, v in r.items()
+                                       if k != 'confidence' and not str(k).startswith('_') and v and str(v).strip())
+
+
 def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None,
                                  _retried=False):
     """車検証をAI-OCRで解析（JSON mode + プロンプトベースの構造化出力）
@@ -4596,7 +4671,7 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
         _last_error = e
 
     # 方式1で空結果 → 方式2: シンプルなJSON modeにフォールバック
-    if not result or not any(v for v in result.values() if v and str(v).strip()):
+    if not _shaken_has_data(result):
         try:
             print(f"[shaken_ocr] Method '{_method_used}' returned empty, trying json_mode fallback")
             result_text = call_gemini(api_key, file_bytes, mime_type, prompt,
@@ -4616,7 +4691,7 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
     # 2方式とも空 → 失敗として理由を返す。空dictを返すと呼び出し側が
     # 「読み取れたが全項目が空」と区別できず、車両情報なしのNEOが
     # 黙って作られてしまう。
-    if not result or not any(v for v in result.values() if v and str(v).strip()):
+    if not _shaken_has_data(result):
         _msg = str(_last_error) if _last_error else '車検証のページを判別できませんでした'
         # 失敗の理由を記録しないと、提供終了やクォータ超過のモデルを
         # 毎回選び直して4回ずつ無駄に叩き続ける（明細側には同じ記録が
@@ -6400,7 +6475,7 @@ def _p2n_new_out(reader_kind, model_name):
 
 
 def p2n_read(pdf_bytes, file_name, api_key, mime_type='application/pdf',
-             vehicle_hint=None, insurance_hint=None, progress=None, record_profile=False,
+             vehicle_hint=None, insurance_hint=None, customer_hint=None, progress=None, record_profile=False,
              addata_root=None, reader_kind='claude', model_name=''):
     """見積書 PDF を読む段（LLM ＋ ページ検算 ＋ 合計欄の検算）。成功すると作業フォルダ（pages/・reading.json）を残したまま
     state を返す（p2n_make がそれを使って NEO を作り、作業フォルダを消す）。失敗したら作業フォルダを消して repair_zip を付ける。
@@ -6433,7 +6508,7 @@ def p2n_read(pdf_bytes, file_name, api_key, mime_type='application/pdf',
         case_dir = _nsk_maker.new_case_dir()
         rd = _nsk_reader.read_estimate(pdf_bytes, reader=reader, case_dir=case_dir,
                                        source_name=os.path.basename(str(file_name or 'estimate.pdf')),
-                                       vehicle_hint=vehicle_hint, insurance_hint=insurance_hint, progress=progress,
+                                       vehicle_hint=vehicle_hint, insurance_hint=insurance_hint, customer_hint=customer_hint, progress=progress,
                                        addata_root=addata_root)
         out['read'] = {
             'ok': rd.ok, 'n_pages': rd.n_pages, 'stats': rd.stats, 'usage': rd.usage,
@@ -6607,7 +6682,7 @@ def _render_beta_result(_p2n_res, selected_model):
 
 
 def run_pdf_to_neo_skill(pdf_bytes, file_name, api_key, mime_type='application/pdf',
-                         vehicle_hint=None, insurance_hint=None, progress=None, record_profile=False,
+                         vehicle_hint=None, insurance_hint=None, customer_hint=None, progress=None, record_profile=False,
                          addata_root=None, reader_kind='claude', model_name=''):
     """見積書 PDF → pdf-to-neo スキル（vendor/pdf_to_neo）で NEO と確認箇所シートを作る（読む → 作る を続けて行う）。
 
@@ -6631,7 +6706,7 @@ def run_pdf_to_neo_skill(pdf_bytes, file_name, api_key, mime_type='application/p
     PC の Addata を橋渡しする経路（車種フォルダを読んだあとに取り込む）は p2n_read / p2n_make を分けて呼ぶ（STEP 1-A）。
     """
     state = p2n_read(pdf_bytes, file_name, api_key, mime_type=mime_type, vehicle_hint=vehicle_hint,
-                     insurance_hint=insurance_hint, progress=progress, record_profile=record_profile,
+                     insurance_hint=insurance_hint, customer_hint=customer_hint, progress=progress, record_profile=record_profile,
                      addata_root=addata_root, reader_kind=reader_kind, model_name=model_name)
     if not state.get('ok'):
         return state
@@ -6650,6 +6725,8 @@ def _sidebar_insurance_hint():
         'accept_no': str(st.session_state.get('accept_no', '') or '').strip(),
         'agency': str(st.session_state.get('agency_name', '') or '').strip(),
         'adjuster': str(st.session_state.get('adjuster_name', '') or '').strip(),
+        'adjuster_post': str(st.session_state.get('adjuster_post', '') or '').strip(),   # 支店・所属（Insurance.AdjusterPost）
+        'company': str(st.session_state.get('agency_name', '') or '').strip(),   # 「保険会社・代理店名」の欄（記録用）
         'garage_in': _normalize_date8(st.session_state.get('garage_in_date', '')),
         'garage_out': _normalize_date8(st.session_state.get('garage_out_date', '')),
         'repair_days': str(st.session_state.get('repair_days', '') or '').strip(),
@@ -6657,9 +6734,119 @@ def _sidebar_insurance_hint():
     return {k: v for k, v in _h.items() if v and v != '0'}
 
 
+def _doc_upload_keys():
+    """STEP 1-B の uploader のキー（車検証, 事故・保険の書類）。連番 upload_seq を付け、「新しい見積を作成する」で作り直して確実に空にする
+    （Streamlit の uploader は値をプログラムから消せない。前の案件の車検証・書類が次の案件に付いたままにならないように。Codex 56）"""
+    n = int(st.session_state.get('upload_seq', 0))
+    return f'vehicle_upload_{n}', f'insurance_doc_upload_{n}'
+
+
+def _sidebar_insurance_values():
+    """旧経路（ベタ打ち・Step 4）に渡す insurance_info（サイドバーの値そのまま）"""
+    return {k: st.session_state.get(k, 0 if k == 'repair_days' else '') for k in (
+        'policy_no', 'contractor_name', 'accept_no', 'accident_date', 'agency_name',
+        'adjuster_name', 'adjuster_post', 'garage_in_date', 'garage_out_date', 'repair_days', 'note1')}
+
+
+def _fresh_doc_fill(doc):
+    """添付した事故・保険の書類の読み取りが、まだサイドバーに入っていない（この run で初めて読めた）ときに、
+    空欄だけを埋めるための値（サイドバーへの反映は STEP 1-B の描画で次の run に行われるため。Codex 60）。
+    反映済みなら {}（利用者が消した項目を書類から戻さない）"""
+    if not doc:
+        return {}
+    oid = st.session_state.get('_insdoc_ocr_id')
+    if oid and st.session_state.get('_insdoc_applied') == oid:
+        return {}
+    return _doc_hints.sidebar_insurance_from_doc(doc)
+
+
+def _insurance_hint_now(doc):
+    """スキル経路に渡す保険の hint: サイドバーの値 ＋（この run で初めて読めた書類なら）空の項目だけ書類から。
+    読むときも取り置きの再開時も同じ作り方にする（照合の鍵がずれて取り置きを捨てないように。Codex 63）"""
+    h = _sidebar_insurance_hint()
+    if _fresh_doc_fill(doc):
+        for k, v in _doc_hints.insurance_hint_from_doc(doc).items():
+            h.setdefault(k, v)
+    return h
+
+
+def _doc_key(*hints):
+    """添付の書類・サイドバーの保険から作った hint の同一性（車種フォルダ待ちの取り置きが、書類の差し替え後に再開されないよう照合する）"""
+    return hashlib.sha256(json.dumps(list(hints), ensure_ascii=False, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+
+
+# 事故・保険の書類から埋めるサイドバーのキー（差し替え・取り外しのときに消す範囲。備考・入出庫日・修理日数は手入力のまま残す）
+_DOC_INSURANCE_KEYS = ('accept_no', 'accident_date', 'policy_no', 'contractor_name', 'agency_name', 'adjuster_name', 'adjuster_post')
+
+
+def _doc_fill_plan(att_fill, prev_filled, current) -> tuple:
+    """書類から読めた値をサイドバーの欄に入れる計画 → (入れる {欄: 値}, 追跡する {欄: 値})。
+    空欄か、前に書類から入れたままの項目にだけ入れる（利用者が手で入れた・直した値は書き換えない。Codex 62）。
+    今回の読みに無い項目でも、前に書類から入れたままなら追跡を続ける（同じ書類を別モデル/キーで読み直したとき、
+    追跡から外れた値が差し替え・取り外しで消えず次の案件の .neo に残るのを防ぐ。Codex 67）"""
+    prev = prev_filled or {}
+    cur_of = lambda k: str((current or {}).get(k, '') or '')  # noqa: E731
+    updates, now = {}, {}
+    for k, v in (att_fill or {}).items():
+        cur = cur_of(k)
+        if not cur.strip() or cur == str(prev.get(k) or ''):
+            updates[k] = v
+            now[k] = v
+    for k, pv in prev.items():
+        if k not in now and str(pv or '').strip() and cur_of(k) == str(pv or ''):
+            now[k] = pv
+    return updates, now
+
+
+def _attached_docs_ocr(api_key, model_name=None, progress=None):
+    """STEP 1-B に添付した車検証（vehicle_upload）と事故・保険の書類（insurance_doc_upload）を Gemini で読み、
+    (車検証の dict, 書類の dict) を返す。読めなかったものは {}。同じファイルは内容ハッシュでセッションに控えて二度読まない。
+    書類の内容ハッシュは session_state['_insdoc_sha'] に置く（サイドバーへの一度きりの反映に使う）"""
+    out = []
+    cache = st.session_state.setdefault('_doc_ocr_cache', {})
+    _k_veh, _k_doc = _doc_upload_keys()
+    for kind, key, fn, label in (('shaken', _k_veh, analyze_vehicle_registration, '車検証'),
+                                 ('insdoc', _k_doc, analyze_insurance_document, '事故・保険の書類')):
+        f = st.session_state.get(key)
+        data = {}
+        if f is not None and api_key:
+            try:
+                b = f.getvalue()
+            except Exception:  # noqa: BLE001
+                b = None
+            if b:
+                h = hashlib.sha256(b).hexdigest()
+                if kind == 'insdoc':
+                    st.session_state['_insdoc_sha'] = h
+                # 控えはモデルと API キーごと（モデルを切り替えた・キーを直したら読み直す。Codex 59）
+                _ck = (kind, h, str(model_name or ''), hashlib.sha256((api_key or '').encode('utf-8')).hexdigest()[:12])
+                if kind == 'insdoc':
+                    st.session_state['_insdoc_ocr_id'] = '|'.join(_ck[1:])   # 同じファイルでもモデル・キーが変われば別の読み取り（Codex 61）
+                _hit = cache.get(_ck)
+                if isinstance(_hit, dict) and (not _hit.get('_error') or time.time() - float(_hit.get('_t') or 0) < 120):
+                    data = _hit   # 成功はずっと、失敗は 2 分だけ控える（rerun のたびに同じファイルを送らない。Codex 57）
+                else:
+                    if progress:
+                        progress(f'{label}を読んでいます（{f.name}）')
+                    try:
+                        data = fn(api_key, b, get_mime_type(f.name), model_name) or {}
+                    except Exception as e:  # noqa: BLE001
+                        data = {'_error': f'{type(e).__name__}: {e}'}
+                    if kind == 'shaken' and isinstance(data, dict) and not data.get('_error') and not _shaken_has_data(data):
+                        # confidence だけの返事を「読めた」として控えない（Codex 66。書類側は analyze_insurance_document が同じ判定を持つ）
+                        data = {'_error': '車検証のページを判別できませんでした'}
+                    if isinstance(data, dict) and not data.get('_error'):
+                        cache[_ck] = data
+                    elif isinstance(data, dict) and data.get('_error'):
+                        cache[_ck] = dict(data, _t=time.time())
+                        st.session_state['_doc_ocr_error'] = f"{label}: {data['_error']}"
+        out.append(data if isinstance(data, dict) and not data.get('_error') else {})
+    return out[0], out[1]
+
+
 def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=None,
                            is_tax_inclusive=False, expenses=None,
-                           mime_type='application/pdf', insurance_info=None):
+                           mime_type='application/pdf', insurance_info=None, vehicle_info=None):
     """見積書PDFから直接NEOファイルを生成する。
 
     pdf_to_neo_pipeline.process_pdf_to_neo をStreamlitから安全に呼ぶための薄いラッパ。
@@ -6729,6 +6916,8 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
             # プレビュー経由では入っていたので、同じ見積でも入口によって
             # 中身が違う .neo が出ていた。
             insurance_info=insurance_info or None,
+            # 添付の車検証・書類から読んだ車両/顧客情報（無ければ None → パイプラインは見積書を車検証として読もうとして空になる）
+            vehicle_info=vehicle_info or None,
         )
         if not isinstance(result, dict):
             return {'ok': False, 'error': 'PDF→NEO変換が想定外の値を返しました'}
@@ -7287,6 +7476,9 @@ def main():
                                         key=f'agency_name_input_{_fseq}', max_chars=20, help="全角なら10文字までNEOに入ります")
         adjuster_name   = st.text_input("アジャスター名", value=st.session_state.get('adjuster_name', ''),
                                         key=f'adjuster_name_input_{_fseq}', max_chars=20, help="全角なら10文字までNEOに入ります")
+        adjuster_post   = st.text_input("支店・所属（アジャスター）", value=st.session_state.get('adjuster_post', ''),
+                                        key=f'adjuster_post_input_{_fseq}', max_chars=20,
+                                        help="速報報告書の支店名・サービスセンター名など。NEO の保険欄（アジャスター所属）に入ります")
         with st.expander("入庫・出庫・修理日数", expanded=False):
             garage_in_date  = st.text_input("入庫日（YYYYMMDD）", value=st.session_state.get('garage_in_date', ''),
                                             key=f'garage_in_input_{_fseq}')
@@ -7306,7 +7498,7 @@ def main():
         for _k, _v in [
             ('accept_no', accept_no), ('accident_date', accident_date),
             ('policy_no', policy_no), ('contractor_name', contractor_name),
-            ('agency_name', agency_name), ('adjuster_name', adjuster_name),
+            ('agency_name', agency_name), ('adjuster_name', adjuster_name), ('adjuster_post', adjuster_post),
             ('garage_in_date', garage_in_date), ('garage_out_date', garage_out_date),
             ('repair_days', repair_days), ('note1', note1),
         ]:
@@ -7455,6 +7647,72 @@ def main():
             type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
             key='pdf2neo_upload',
         )
+        # 添付の書類（車検証・事故/保険の書類）は生成ボタンより前に描く: ボタンの処理が st.rerun() したとき、まだ描いていない
+        # uploader の値は Streamlit に捨てられ、車種フォルダ待ちからの再開で添付が消えてしまう（2026-09-14 実ブラウザで発覚）
+        with st.container():
+            vehicle_file = st.file_uploader(
+                "📋 車検証（任意）PDF・JPG・PNG 対応",
+                type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
+                key=_doc_upload_keys()[0],
+            )
+            if vehicle_file:
+                st.success(f"✅ {vehicle_file.name}")
+            insurance_doc_file = st.file_uploader(
+                "🛡️ 事故・保険の書類（任意）速報報告書・受付票などの写真/PDF",
+                type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
+                key=_doc_upload_keys()[1],
+                help="保険会社・共済からの速報報告書や事故受付票の写真・スクリーンショット。依頼会社名・支店・担当者・事故番号・事故日・"
+                     "契約者名・カラーNo・走行距離などを読み取り、サイドバーの事故・保険情報と NEO の車両情報に使います",
+            )
+            if insurance_doc_file:
+                st.success(f"✅ {insurance_doc_file.name}")
+            # 事故・保険の書類の差し替え／取り外しに合わせて、書類から埋めた欄を消す（API キーの有無・読み取りの成否に関係なく。
+            # 前の案件の受付番号や担当者を次の案件に残さない。Codex 54〜58）。消したあと、読めたら下で入れ直す
+            _ins_sha = ''
+            if insurance_doc_file is not None:
+                try:
+                    _ins_sha = hashlib.sha256(insurance_doc_file.getvalue()).hexdigest()
+                except Exception:  # noqa: BLE001
+                    _ins_sha = ''
+            if _ins_sha != st.session_state.get('_insdoc_cleared_sha', ''):
+                # 前の書類から入れた値のまま（利用者が直していない）項目だけ消す。手で入れた・直した値は残す（Codex 61）
+                _filled_before = st.session_state.get('_insdoc_filled') or {}
+                for _k in _DOC_INSURANCE_KEYS:
+                    if _k in _filled_before and str(st.session_state.get(_k, '') or '') == str(_filled_before.get(_k) or ''):
+                        st.session_state[_k] = ''
+                st.session_state['_insdoc_cleared_sha'] = _ins_sha
+                st.session_state.pop('_insdoc_applied', None)
+                st.session_state.pop('_insdoc_filled', None)
+                st.session_state['form_seq'] = int(st.session_state.get('form_seq', 0)) + 1   # 入力欄を作り直して空にする
+                st.rerun()
+            # 添付した書類はその場で読み取る（同じファイルは二度読まない）。書類の事故・保険情報はサイドバーの欄に入れ、
+            # 生成時はサイドバーの値（利用者が直せる）と車検証の車両情報を使う
+            if api_key and (vehicle_file or insurance_doc_file):
+                with st.spinner("添付の書類を読み取っています…"):
+                    _att_vd, _att_doc = _attached_docs_ocr(api_key, selected_model)
+                _att_sum = _doc_hints.summary(_att_vd, _att_doc)
+                if _att_sum:
+                    st.caption("読み取り済み → " + _att_sum + "（生成時に車両・顧客・保険の情報に使います）")
+                if st.session_state.get('_doc_ocr_error'):
+                    st.warning("⚠️ 読み取れませんでした: " + str(st.session_state.pop('_doc_ocr_error')))
+                _att_fill = _doc_hints.sidebar_insurance_from_doc(_att_doc) if _att_doc else {}
+                _att_oid = st.session_state.get('_insdoc_ocr_id') if insurance_doc_file is not None else ''
+                if _att_fill and _att_oid and st.session_state.get('_insdoc_applied') != _att_oid:
+                    # 読めた書類の値をサイドバーに入れる（入れる値が無い・読めなかったときは印を付けない ＝ あとで読めたら入る。Codex 58・60）。
+                    # 印は「ファイル＋モデル＋キー」の同一性（モデルを切り替えて読み直したら入れ直す。Codex 61）
+                    # 空欄か、前に書類から入れたままの項目にだけ入れる（利用者が手で入れた・直した値は書き換えない。Codex 62）
+                    _prev_filled = st.session_state.get('_insdoc_filled') or {}
+                    _updates, _now_filled = _doc_fill_plan(
+                        _att_fill, _prev_filled,
+                        {_k: st.session_state.get(_k, '') for _k in set(_att_fill) | set(_prev_filled)})
+                    for _k, _v in _updates.items():
+                        st.session_state[_k] = _v
+                    st.session_state['_insdoc_filled'] = _now_filled   # どの値を書類から入れたか（差し替え・取り外しで消す範囲。読み直しで無かった項目も追跡を続ける）
+                    st.session_state['form_seq'] = int(st.session_state.get('form_seq', 0)) + 1   # 入力欄を作り直して値を出す
+                    st.session_state['_insdoc_applied'] = _att_oid
+                    st.rerun()
+            elif (vehicle_file or insurance_doc_file) and not api_key:
+                st.caption("書類の読み取りには Gemini API キーが必要です（サイドバーの「APIキー設定」）")
         if _p2n_file is not None:
             _p2n_bytes = _p2n_file.read()
             _p2n_file.seek(0)
@@ -7486,6 +7744,10 @@ def main():
                 _p2n_beta_exp = {'towing': safe_int(st.session_state.get('exp_towing', 0)),
                                  'rental_car': safe_int(st.session_state.get('exp_rental', 0)),
                                  'tax_exempt': safe_int(st.session_state.get('exp_exempt', 0))}
+                _p2n_att = [_n for _n in (getattr(st.session_state.get(_k), 'name', '') for _k in _doc_upload_keys()) if _n]
+                st.caption(("📎 添付の書類を車両・顧客・保険の情報に使います: " + "、".join(_p2n_att)) if _p2n_att else
+                           "📎 車検証や事故・保険の書類（速報報告書など）があれば、上の「車検証」「事故・保険の書類」に入れてから生成すると、"
+                           "車両・顧客・保険の情報が NEO に入ります")
                 _p2n_beta_use_exp = False
                 if st.session_state.get('_beta_exp_file_key') != _p2n_file_key:
                     # 見積が変わったらチェックは外す（前の見積で入れた同意を次の見積に持ち越さない。Codex 52）
@@ -7504,18 +7766,24 @@ def main():
                     st.session_state.pop('pdf2neo_result', None)
                     st.session_state.pop('_pdf2neo_filename', None)
                     _p2n_beta_tax = ('内税' in str(_pdf_tax_sel) or '税込' in str(_pdf_tax_sel))
+                    _p2n_beta_vd, _p2n_beta_doc = _attached_docs_ocr(api_key, selected_model)
+                    _p2n_beta_vi = _doc_hints.vehicle_info_for_legacy(_p2n_beta_vd, _p2n_beta_doc)
+                    _p2n_beta_ins = _sidebar_insurance_values()
+                    for _k, _v in _fresh_doc_fill(_p2n_beta_doc).items():
+                        if not str(_p2n_beta_ins.get(_k) or '').strip():
+                            _p2n_beta_ins[_k] = _v
                     with st.spinner("見積書を読んでベタ打ちの NEO を作っています…（1〜3 分）"):
                         _p2n_beta = run_pdf_to_neo_pipeline(
                             _p2n_bytes, api_key,
+                            # 添付の車検証・書類の車両/顧客情報。無ければ None（旧経路は見積書を車検証として読もうとして空になる）
+                            vehicle_info=_p2n_beta_vi or None,
                             mime_type=get_mime_type(_p2n_file.name),
                             model_name=selected_model,
                             template_bytes=st.session_state.get('custom_neo_bytes'),
                             is_tax_inclusive=_p2n_beta_tax,
                             # 費用はチェックしたときだけ（上）。事故・保険欄は旧経路と同じ扱い（b15bd06 で外す前の呼び方）
                             expenses=(_p2n_beta_exp if _p2n_beta_use_exp else None),
-                            insurance_info={k: st.session_state.get(k, 0 if k == 'repair_days' else '') for k in (
-                                'policy_no', 'contractor_name', 'accept_no', 'accident_date', 'agency_name',
-                                'adjuster_name', 'garage_in_date', 'garage_out_date', 'repair_days', 'note1')},
+                            insurance_info=_p2n_beta_ins,
                         )
                     if not isinstance(_p2n_beta, dict):
                         _p2n_beta = {'ok': False, 'error': 'ベタ打ち生成が想定外の値を返しました'}
@@ -7553,6 +7821,11 @@ def main():
                         _p2n_stale_why = '見積書が変わったので'          # 別の見積の NEO を出さない
                     elif _p2n_time.time() - float(_p2n_pending.get('parked_at') or 0) > 2 * 3600:
                         _p2n_stale_why = '車種フォルダを 2 時間待っても届かなかったので'   # 取り置き（顧客情報）を残し続けない
+                    elif _p2n_pending.get('doc_key'):
+                        _vd0, _doc0 = _attached_docs_ocr(api_key, selected_model)   # 控え済みなら Gemini は呼ばない
+                        if _p2n_pending['doc_key'] != _doc_key(_doc_hints.vehicle_hint(_vd0, _doc0), _doc_hints.customer_hint(_vd0, _doc0),
+                                                              _insurance_hint_now(_doc0)):
+                            _p2n_stale_why = '添付の書類や事故・保険情報が変わったので'
                 if _p2n_stale_why:
                     from neo_skill import maker as _nsk_maker
                     _nsk_maker.remove_case_dir((st.session_state.pop('_bridge_pending') or {}).get('case_dir'))
@@ -7581,6 +7854,10 @@ def main():
                                 state=('complete' if _p2n_out.get('ok') else 'error'), expanded=False)
                     st.session_state['pdf2neo_result'] = _p2n_out
                     st.rerun()
+                _p2n_att = [_n for _n in (getattr(st.session_state.get(_k), 'name', '') for _k in _doc_upload_keys()) if _n]
+                st.caption(("📎 添付の書類を車両・顧客・保険の情報に使います: " + "、".join(_p2n_att)) if _p2n_att else
+                           "📎 車検証や事故・保険の書類（速報報告書など）があれば、上の「車検証」「事故・保険の書類」に入れてから生成すると、"
+                           "車両・顧客・保険の情報が NEO に入ります")
                 if st.button("🚀 見積書からNEOを生成", key='pdf2neo_run', type="primary",
                              width='stretch'):
                     st.session_state.pop('pdf2neo_result', None)
@@ -7594,10 +7871,19 @@ def main():
                                    expanded=True) as _p2n_status:
                         def _p2n_progress(msg):
                             _p2n_status.write(msg)
+                        # 添付の車検証・事故/保険の書類（STEP 1-B）の読み取りを hint に写す（見積書に印字が無い項目にだけ補われる）。
+                        # 保険はサイドバーの値（書類から埋めたものを利用者が直せる）を優先する
+                        _p2n_vd, _p2n_doc = _attached_docs_ocr(api_key, selected_model, _p2n_progress)
+                        _p2n_vhint = _doc_hints.vehicle_hint(_p2n_vd, _p2n_doc)
+                        _p2n_chint = _doc_hints.customer_hint(_p2n_vd, _p2n_doc)
+                        # 保険はサイドバーの値だけを使う（書類から読んだ値は添付時にサイドバーへ入れてあり、利用者が消した項目を書類から戻さない。Codex 54）
+                        _p2n_ihint = _insurance_hint_now(_p2n_doc)
+                        _p2n_doc_key = _doc_key(_p2n_vhint, _p2n_chint, _p2n_ihint)
                         _p2n_kw = dict(
                             mime_type=get_mime_type(_p2n_file.name),
-                            # サイドバーの「事故・保険情報」。見積書に印字が無い項目にだけ補われる
-                            insurance_hint=_sidebar_insurance_hint(),
+                            # 車検証（車両・顧客）と サイドバーの「事故・保険情報」。見積書に印字が無い項目にだけ補われる
+                            vehicle_hint=_p2n_vhint, customer_hint=_p2n_chint,
+                            insurance_hint=_p2n_ihint,
                             progress=_p2n_progress,
                             record_profile=_p2n_profile,
                             # サイドバー / URL / ZIP / PC からの橋渡し で決めた ADDATA を vendor にも使わせる（版の食い違いを防ぐ）
@@ -7615,6 +7901,7 @@ def main():
                                 _p2n_car = str(_p2n_res.get('car_code') or '')
                                 _p2n_state['car_code'] = _p2n_car
                                 _p2n_state['file_key'] = _p2n_file_key
+                                _p2n_state['doc_key'] = _p2n_doc_key   # 添付の書類・保険が変われば取り置きを捨てる（Codex 60）
                                 import time as _p2n_time
                                 _p2n_state['parked_at'] = _p2n_time.time()
                                 if _p2n_car and not _br.has_car(_p2n_addata, _p2n_car):
@@ -7740,18 +8027,10 @@ def main():
         # ================================================================
         # STEP 1-B: 車検証・テンプレートNEO（任意）
         # ================================================================
-        st.markdown('<div class="section-title">📁 車検証・テンプレートNEO（任意）</div>',
+        st.markdown('<div class="section-title">📁 テンプレートNEO（任意）</div>',
                     unsafe_allow_html=True)
-        st.caption("車検証を入れると車両情報の精度が上がります。見積書PDFだけでも生成できます。")
-        _up_col1, _up_col2 = st.columns(2)
-        with _up_col1:
-            vehicle_file = st.file_uploader(
-                "📋 車検証（任意）PDF・JPG・PNG 対応",
-                type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
-                key='vehicle_upload',
-            )
-            if vehicle_file:
-                st.success(f"✅ {vehicle_file.name}")
+        st.caption("車検証・事故/保険の書類は上の見積書の下に入れます。テンプレートNEO は任意です。")
+        _up_col2 = st.container()
         with _up_col2:
             custom_neo_file = st.file_uploader(
                 "📁 テンプレートNEOファイル（任意）",
@@ -9378,6 +9657,7 @@ def main():
             'accident_date':    st.session_state.get('accident_date', ''),
             'agency_name':      st.session_state.get('agency_name', ''),
             'adjuster_name':    st.session_state.get('adjuster_name', ''),
+            'adjuster_post':    st.session_state.get('adjuster_post', ''),
             'garage_in_date':   st.session_state.get('garage_in_date', ''),
             'garage_out_date':  st.session_state.get('garage_out_date', ''),
             'repair_days':      st.session_state.get('repair_days', 0),
@@ -9588,8 +9868,11 @@ def main():
                     'pdf_parts', 'pdf_wages',
                     # 事故・保険情報
                     'policy_no', 'contractor_name', 'accept_no', 'accident_date',
-                    'agency_name', 'adjuster_name', 'garage_in_date', 'garage_out_date',
+                    'agency_name', 'adjuster_name', 'adjuster_post', 'garage_in_date', 'garage_out_date',
                     'repair_days', 'note1',
+                    # 添付の書類の読み取り（車検証・事故/保険の書類）の控え。残すと次の案件に前の値が付く／同じ書類を入れ直しても埋まらない
+                    '_doc_ocr_cache', '_insdoc_applied', '_insdoc_sha', '_insdoc_cleared_sha', '_insdoc_filled', '_insdoc_ocr_id',
+                    '_doc_ocr_error', '_beta_exp_file_key',
                     'exp_towing', 'exp_rental', 'exp_exempt',
                     'custom_neo_bytes', 'custom_neo_name',
                     'tax_override',
@@ -9615,6 +9898,8 @@ def main():
                         del st.session_state[key]
                 # サイドバー入力のウィジェットを作り直して確実に空にする
                 st.session_state['form_seq'] = st.session_state.get('form_seq', 0) + 1
+                # 車検証・事故/保険の書類の uploader も作り直す（前の案件の書類を持ち越さない）
+                st.session_state['upload_seq'] = int(st.session_state.get('upload_seq', 0)) + 1
                 st.session_state['step'] = 1
                 st.rerun()
         except Exception as e:

@@ -246,6 +246,66 @@ def test_wage_unknown_row_catches_total_mismatch():
     assert has(r['fail'], '御見積額'), r['fail']
 
 
+
+def test_paint_other_outside_paint_total():
+    """印字の塗装工賃計は追加項目（プライマー塗装など paint.other。コグニ印刷の「追加塗装費用計」）を含まない。
+    塗装計（材料込）・課税小計は 塗装工賃計 + 追加項目 + 材料代で見て、材料代の割合は追加項目を除いて出す（2026-09-14 C-HR）"""
+    rd = copy.deepcopy(BASE)
+    rd['paint'] = {'total': 40000, 'material': 12400, 'other': [{'name': 'プライマー塗装', 'index': 1.0, 'wage': 8000}]}   # 12,400 = 40,000 × 31%
+    rd['totals'] = {'parts': 95000, 'wage': 28000, 'paint': 40000, 'paint_total': 60400, 'material': 12400, 'expense': 10000,
+                    'taxable': 193400, 'tax': 19340, 'total': 212740}
+    r = run(rd)
+    assert not r['fail'], r['fail']
+    assert r['settings'].get('material_rate') == 31.0, r['settings']
+    rd2 = copy.deepcopy(rd); rd2['paint']['other'] = []      # 追加項目を写し落とすと塗装計・課税小計で落ちる
+    assert has(run(rd2)['fail'], '塗装計（材料込）'), run(rd2)['fail']
+    rd3 = copy.deepcopy(rd)   # 塗装工賃計を書かず塗装行だけ写したときも、内板骨格塗装（paint.frame の位置ごとの工賃）と追加項目を 1 回ずつ足す
+    rd3['paint'] = {'lines': [{'name': '加算基礎数値', 'index': 4.0, 'wage': 32000}], 'frame': {'engine_room': {'option': 2, 'index': 1.0, 'wage': 8000}},
+                    'material': 12400, 'other': [{'name': 'プライマー塗装', 'index': 1.0, 'wage': 8000}]}
+    r3 = run(rd3)
+    assert not r3['fail'] and r3['settings'].get('material_rate') == 31.0, (r3['fail'], r3['settings'])
+    rd5 = copy.deepcopy(rd)   # パネル別（total なし）でも付加塗装（ドアサッシュ等）を塗装工賃に入れる
+    rd5['paint'] = {'panels': [{'code': '2300', 'name': 'x', 'method': '取替', 'wage': 30000}], 'door_sash': {'count': 2, 'wage': 2000},
+                    'frame': {'engine_room': {'option': 2, 'wage': 8000}}, 'material': 12400, 'other': [{'name': 'プライマー塗装', 'wage': 8000}]}
+    r5 = run(rd5)
+    assert not r5['fail'] and r5['settings'].get('material_rate') == 31.0, (r5['fail'], r5['settings'])
+    rd6 = copy.deepcopy(rd)   # バンパだけの詳細塗装（panels: [] + bumper_*。生成器と同じく許可されたキーだけの形）も工賃を数える
+    rd6['paint'] = {'panels': [], 'bumper_front': {'method': '新品', 'wage': 40000}, 'material': 12400}
+    rd6['totals'] = {'parts': 95000, 'wage': 28000, 'paint': 40000, 'paint_total': 52400, 'material': 12400, 'expense': 10000,
+                     'taxable': 185400, 'tax': 18540, 'total': 203940}
+    r6 = run(rd6)
+    assert not r6['fail'], r6['fail']
+
+
+def test_expense_on_both_columns_profile():
+    """部品と工賃の両方に金額がある費用（同じ名前で 2 行に写す）は 'parts+wage' として工場プロファイルと比べる（2026-09-14 C-HR）"""
+    ex = [{'name': 'モデリスタ サイドスカート', 'amount': 36000, 'in': '部品計'}, {'name': 'モデリスタ サイドスカート', 'amount': 5000, 'in': '作業計'},
+          {'name': '内張り費用', 'amount': 5000, 'in': '作業計'}]
+    k = rc._expense_kinds(ex)
+    assert k == {'モデリスタサイドスカート': 'parts+wage', '内張り費用': 'wage'}, k
+    import json, shutil, tempfile
+    d = tempfile.mkdtemp(prefix='prof_')
+    old = rc.PROFILES
+    rc.PROFILES = os.path.join(d, 'factory_profiles.json')
+    try:   # 旧形式のプロファイル（同名 2 行を 'wage' 1 つで保存）でも WARN にしない。区分が入れ替わったときは従来どおり WARN
+        json.dump({'テスト鈑金': {'expense_in': {'モデリスタサイドスカート': 'wage', '内張り費用': 'parts'}}}, open(rc.PROFILES, 'w', encoding='utf-8'), ensure_ascii=False)
+        rd = copy.deepcopy(BASE); rd['expenses'] = ex
+        w = run(rd)['warn']
+        assert not any('モデリスタサイドスカート' in x for x in w), w
+        assert any('内張り費用' in x for x in w), w
+        rd5 = copy.deepcopy(rd); rd5['expenses'] = [ex[1], dict(ex[0], **{'in': '諸費用計', 'taxfree': True})]   # 過去 wage → 今回 taxfree+wage は区分の変更なので WARN
+        assert rc._expense_kinds(rd5['expenses'])['モデリスタサイドスカート'] == 'taxfree+wage'
+        assert any('モデリスタサイドスカート' in x for x in run(rd5)['warn']), run(rd5)['warn']
+        json.dump({'テスト鈑金': {'expense_in': {'モデリスタサイドスカート': 'parts+wage'}}}, open(rc.PROFILES, 'w', encoding='utf-8'), ensure_ascii=False)
+        rd4 = copy.deepcopy(rd); rd4['expenses'] = [ex[0]]      # 過去 parts+wage → 今回 parts だけ（工賃の行の写し漏れの疑い）は WARN
+        assert any('モデリスタサイドスカート' in x for x in run(rd4)['warn']), run(rd4)['warn']
+        rc.save_profile(rd4, {'labor_rate': 8000, 'wage_round': 10, 'format': 'B'})     # 片方だけの今回で 'parts+wage' を上書きしない
+        assert rc.load_profiles()['テスト鈑金']['expense_in']['モデリスタサイドスカート'] == 'parts+wage', rc.load_profiles()
+    finally:
+        rc.PROFILES = old
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == '__main__':
     fails = 0
     for name, fn in sorted(globals().items()):

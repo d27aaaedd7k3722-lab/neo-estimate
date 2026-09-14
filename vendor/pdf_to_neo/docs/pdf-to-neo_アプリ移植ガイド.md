@@ -168,3 +168,5 @@ Cloud で動かすなら、§4-1 の条件（`packages.txt` の `p7zip-full`）�
 ### 4-2. 部分 Addata（COM ＋ 見積の車種フォルダだけ）を渡すとき — 2026-09-14
 
 アプリがブラウザ経由で利用者の PC から COM と見積の車種フォルダだけを取り寄せた一時フォルダ（`addata_bridge_<id>`）を `ADDATA_ROOT` に渡すときは、**`ADDATA_ROOT_PARTIAL=1` も一緒に渡す**。`skill_env.resolve()` の環境変数の検証は `is_addata()`（メーカーフォルダ 5 つ以上）なので、旗が無いと部分コピーは弾かれて自動検出に落ちる ＝ 開発機では `C:\Addata` に化けて気づけず、Cloud では見つからず失敗する。旗があるときだけ `is_addata_or_partial()` が 環境変数 `ADDATA_ROOT` そのものに限って部分コピー（`COM/KA06_ALL.DB` と `AnVer.DB` か `COM.CAB`）を採る。設定ファイル・自動検出の候補は旗があっても部分コピーを採らない（`tests/test_skill_env.py::test_partial_root_only_with_flag`）。
+
+**残課題（2026-09-14 夜、アプリのバグハントで判明）**: 車種フォルダの一部の DB が無い（壊れたコピー・古い版）と、生成器は止まらずに汎用値で作る。W69 の実案件で `W6921〜29.DB` 等を抜いて試すと合格のまま NEO が変わった（バンパ標準指数 2.2 → 1.7、色名が空、ColorCodeFlag）。`*LTB.CHM` だけ無い場合は同じ NEO（その案件では塗装指数表を使わないため）。「その車種で期待する表が無い」を silent_errors ではなく不合格の理由に上げる改善が要る（COM/Disk*.TXT は版番号だけで、ファイル一覧は無い）。

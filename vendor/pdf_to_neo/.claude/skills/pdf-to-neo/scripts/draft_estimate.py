@@ -322,10 +322,11 @@ def _expand_row(row) -> dict:
 
 
 def detect_wage_round(rows: list[dict], labor: int) -> int:
-    """工賃の丸め単位を推定: 指数×レートが 10 円丸めと 100 円丸めで違う行の印字工賃がどちらに一致するか（既定 10）"""
+    """工賃の丸め単位を推定: 指数×レートが 10 円丸めと 100 円丸めで違う行の印字工賃がどちらに一致するか（既定 10）。
+    指数×レートが 10 円の倍数にならない行の印字工賃が 1 円単位のまま（7,820 × 0.90 = 7,038）なら 1（2026-09-14 JPN タクシー、トヨタ系ディーラーの書式）"""
     if not labor:
         return 10
-    hit100 = hit10 = 0
+    hit100 = hit10 = hit1 = against1 = 0
     for r in rows:
         if r.get('manual') or r.get('reserve') or r.get('note'):
             continue  # 手入力行・保留行は工場コグニの丸め設定の証拠にならない
@@ -340,12 +341,21 @@ def detect_wage_round(rows: list[dict], labor: int) -> int:
         x = round(t * labor, 2)
         w10 = int(x // 10 + (1 if (x % 10) >= 5 else 0)) * 10
         w100 = int(x // 100 + (1 if (x % 100) >= 50 else 0)) * 100
+        w1 = int(x // 1 + (1 if (x % 1) >= 0.5 else 0))
+        if w1 != w10:
+            if w == w1:
+                hit1 += 1
+                continue
+            if w == w10:
+                against1 += 1   # 丸めた値が印字されている = 1 円単位ではない
         if w10 == w100:
             continue
         if w == w100:
             hit100 += 1
         elif w == w10:
             hit10 += 1
+    if hit1 and not against1 and not hit100:   # 10 円の倍数になる行は 1 円単位とも矛盾しないので hit10 では打ち消さない（2026-09-14 JPN タクシー 1.50 × 7,820 = 11,730）
+        return 1
     return 100 if hit100 and not hit10 else 10
 
 
@@ -1125,8 +1135,10 @@ class Drafter:
         if not lines or self.generic:
             if 'total' not in out and lines:
                 out['total'] = sum(int(float(_num(l.get('wage')) or 0)) for l in lines)
+                out['_total_from_lines'] = 0   # 塗装行から作った total（印字の塗装工賃計ではない）。数字は total に含めた追加項目の工賃（inspect が二重に数えないため）
             return out
         panels, other = list(out.get('panels') or []), list(out.get('other') or [])
+        n_other0 = len(other)   # ここから後ろが塗装行から追加項目にした行（前は転記の paint.other）
         auto_manual: list = []  # 下書きが作った手入力の塗装行（rec, 見積の名前）
         for ln in lines:
             name = _hw_kana(ln.get('name') or '')
@@ -1240,23 +1252,36 @@ class Drafter:
             if dropped or other:
                 self.notes.append('塗装: 20.DB のパネルに対応付けできた行が無いので一括計上（paint.total）にした。パネル別にするなら reading の name をコグニのパネル名に直す')
         s_lines = sum(int(float(_num(l.get('wage')) or 0)) for l in lines)
+        # 塗装行から追加項目（paint.other）にした行の工賃。パネル別なら other として別に書くので、印字の塗装工賃計（追加項目を含まない）と比べるときは外す。
+        # 一括計上では other に残さず total に入れたまま（生成器は一括の塗装費用に書く）
+        line_other_w = sum(int(float(_num(o.get('wage')) or 0)) for o in other[n_other0:]) if out.get('panels') is not None and 'other' in out else 0
+        _pf = out.get('frame') if isinstance(out.get('frame'), dict) else {}
+        s_frame = sum(int(float(_num((_pf.get(k) or {}).get('wage')) or 0)) for k in ('engine_room', 'front_pillar', 'center_pillar', 'rear_floor')
+                      if isinstance(_pf.get(k), dict))  # 内板骨格塗装も印字の塗装工賃計に入る（2026-09-14 C-HR ラジエータサポート 13,130）
         if 'total' not in out:
             out['total'] = s_lines
+            out['_total_from_lines'] = line_other_w
         else:  # 印字の塗装計と塗装行の合計が違う = 行の写し漏れか、total に骨格塗装・付加塗装が入っている（監査 9）
             try:
                 t_in = int(float(_num(out['total']) or 0))
             except ValueError:
                 t_in = None
-            if t_in is not None and t_in != s_lines:
+            if t_in is not None and t_in != s_lines - line_other_w + s_frame:
                 self.notes.append(f'塗装計: 印字 {t_in:,} と塗装行の工賃合計 {s_lines:,} が違う（差 {t_in - s_lines:+,}）。行の写し漏れか、内板骨格・付加塗装が含まれていないか確かめる')
         # 材料代が「塗装工賃計 × 割合」の一括四捨五入と一致するなら割合だけ渡す（コグニは費用割合モード = MaterialTotalbyManual ''。額を渡すと '*' 手入力扱いになる。実機 2026-09-08 exp_paint_B）
         try:
             mat = int(float(_num(out.get('material')) or 0)); rate = float(_num(out.get('material_rate')) or 0); tot = int(float(_num(out.get('total')) or 0))
         except ValueError:
             mat = rate = tot = 0
-        if mat and rate and tot and mat in (material_default(tot, rate), int(tot * rate / 100 + 0.5)):  # 生成器と同じ 10 円丸め（material_default）か 1 円四捨五入のどちらかに一致
+        if tot and '_total_from_lines' in out:   # 塗装行から作った total: 追加項目にした行を外し、内板骨格塗装を足したものが材料率の対象（Codex 指摘）
+            tot = tot - int(out.get('_total_from_lines') or 0) + s_frame
+        # 生成器は材料代を 塗装工賃計 × 割合 の 10 円丸め（material_default）で作る。1 円四捨五入でしか一致しない材料代（工場が 1 円単位で出す書式）で
+        # 割合モードにすると NEO の材料代が数円ずれるので、そのときは印字の額を手入力（*）で渡す（2026-09-14 JPN タクシー: 127,466 × 16% = 20,394.56 → 印字 20,395 / 10 円丸め 20,390）
+        if mat and rate and tot and mat == material_default(tot, rate):
             out.pop('material')
-            self.notes.append(f'材料代 {mat:,} = 塗装工賃計 {tot:,} × {rate:g}%（一括四捨五入）と一致 → 費用割合モード（material を渡さない）')
+            self.notes.append(f'材料代 {mat:,} = 塗装工賃計 {tot:,} × {rate:g}%（10 円丸め）と一致 → 費用割合モード（material を渡さない）')
+        elif mat and rate and tot and mat == int(tot * rate / 100 + 0.5):
+            self.notes.append(f'材料代 {mat:,} は 塗装工賃計 {tot:,} × {rate:g}% の 1 円四捨五入。コグニの割合計算（10 円丸め {material_default(tot, rate):,}）とは違うので額を手入力（*）で渡す')
         return out
 
     # ------------------------------------------------------------------ 費用・合計
@@ -1478,6 +1503,7 @@ class Drafter:
                               f'（常識の幅は {self.MATERIAL_RATE_MIN}〜{self.MATERIAL_RATE_MAX}%）。調整しない')
             return None
         paint['material'] = material
+        paint['_material_from_target'] = True   # 協定額に合わせて決めた材料代（割合の既定値と違って当然。生成器は _ で始まるキーを読まない）
         paint['total'] = pw
         if _flag(paint.get('auto_panels'), 'paint.auto_panels'):
             paint['material_rate'] = rate  # 画面の割合も実態に合わせる（fit_paint_total と同じ扱い）
@@ -1504,7 +1530,15 @@ class Drafter:
         t['expense_wage'] = ex_w
         if paint and paint.get('total') is not None and paint.get('material') is not None:
             t.setdefault('paint', paint['total']); t.setdefault('material', paint['material'])
-            t.setdefault('paint_total', int(paint['total']) + int(paint['material']))
+            # 塗装費用計 = 塗装工賃計 + 材料代 + 追加項目（paint.other。印字の塗装工賃計に入らない）。下書きが塗装行から作った total は
+            # その中に入れた追加項目を外し、内板骨格塗装（塗装行に無い）を足す（Codex 指摘。2026-09-14 C-HR）
+            _oth = sum(int(float(_num(o.get('wage')) or 0)) for o in (paint.get('other') or []) if isinstance(o, dict))
+            _base = int(paint['total'])
+            if '_total_from_lines' in paint:
+                _pf = paint.get('frame') if isinstance(paint.get('frame'), dict) else {}
+                _base = _base - int(paint.get('_total_from_lines') or 0) + sum(int(float(_num((_pf.get(k) or {}).get('wage')) or 0))
+                                                                              for k in ('engine_room', 'front_pillar', 'center_pillar', 'rear_floor') if isinstance(_pf.get(k), dict))
+            t.setdefault('paint_total', _base + _oth + int(paint['material']))
         t.update(getattr(self, '_paint_split', None) or {})  # auto_panels で決めた塗装の内訳は印字より優先する
         return t
 

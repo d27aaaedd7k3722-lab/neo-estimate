@@ -278,6 +278,18 @@ def main(path: str, out: str = ''):
            'wage': [t.get('wage'), (t.get('wage') or 0) + (t.get('frame') or 0), (t.get('wage') or 0) + (t.get('paint') or 0) + (t.get('frame') or 0),
                     (t.get('wage') or 0) + (t.get('paint') or 0) + (t.get('frame') or 0) + (t.get('expense_wage') or 0),
                     (t.get('wage') or 0) + (t.get('paint') or 0) - (t.get('paint_material') or 0) + (t.get('frame') or 0) + (t.get('expense_wage') or 0)]}
+    # 費用工賃の一部だけが「作業計」に入り、残りが印字の「諸費用計」（下書きが totals.expense_printed に残す）に入る書式（トヨタ系ディーラー:
+    # センサーエーミングは作業計、レッカー・産廃は諸費用計。2026-09-14 JPN タクシー 作業計 378,938 = 明細 296,378 + 内骨 62,560 + エーミング 20,000）
+    # 印字の塗装工賃計は追加項目（paint.other）を含まない（生成器の塗装計は含む）。追加項目を除いた額も一致の候補にする（Codex 指摘。2026-09-14 C-HR）
+    _oth = sum(int((o or {}).get('wage') or 0) for o in ((est.get('paint') or {}).get('other') or []) if isinstance(o, dict))
+    if _oth:
+        alt['paint'] = [(t.get('paint') or 0) - (t.get('paint_material') or 0) - _oth]
+    _ep = pt.get('expense_printed')
+    if _ep is not None and 0 <= int(_ep) <= int(t.get('expense_wage') or 0):
+        _ew_in = int(t.get('expense_wage') or 0) - int(_ep)
+        alt['wage'] += [(t.get('wage') or 0) + (t.get('frame') or 0) + _ew_in,
+                        (t.get('wage') or 0) + (t.get('paint') or 0) - (t.get('paint_material') or 0) + (t.get('frame') or 0) + _ew_in,
+                        (t.get('wage') or 0) + (t.get('paint') or 0) + (t.get('frame') or 0) + _ew_in]
     cat_ok = True
     # 差を許してよいのは、工場側の丸めを 3 点（neo_total / tolerance / 理由）で説明したときだけ。
     # 揃っていなければ tolerance は 0 として扱い、項目別の差も見逃さない

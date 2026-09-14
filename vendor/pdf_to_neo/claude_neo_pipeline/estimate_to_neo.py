@@ -206,6 +206,12 @@ BUMPER_ONLY_KEYS = ('paint', 'coat', 'hf', 'panels', 'bumper_front', 'bumper_rea
 PAINT_DETAIL_KEYS = ('bumper_front', 'bumper_rear', 'wax', 'door_sash', 'stripe', 'low_cover', 'two_coat_solid', 'two_tone')  # パネル別指数（paint.panels）のときだけ書ける項目。frame / sealing / other は一括計上でも可
 
 
+def is_bumper_only_paint(p: dict) -> bool:
+    """外板パネルが無くバンパだけ塗る詳細塗装（panels: [] + bumper_*、キーは許可リストだけ）か。NeoBuilder の判定と同じ（検算側が同じ関数を使う）"""
+    return (isinstance(p.get('panels'), list) and not p.get('panels') and any(p.get(k) for k in ('bumper_front', 'bumper_rear'))
+            and all(k in BUMPER_ONLY_KEYS or str(k).startswith('_') for k in p))
+
+
 def _code4(v) -> str:
     """部品コードを 4 桁の文字列にする。10 / '10' / '0010' / 10.0 のどれで書かれても同じに扱う"""
     if v is None or v == '':
@@ -2880,9 +2886,11 @@ class NeoBuilder:
         gin = _date8(ins.get('garage_in', '')); gout = _date8(ins.get('garage_out', ''))
         giera, giey = nc.get_era_info(gin) if gin else ('令和', ''); goera, goey = nc.get_era_info(gout) if gout else ('令和', '')
         cur.execute('''UPDATE Insurance SET PolicyNo=?,ContractorName=?,AgencyName=?,AccidentDate=?,AccidentEra=?,AccidentEraYear=?,PresenceDate=?,PresenceEra=?,PresenceEraYear=?,
-                       AgreedDate='00000000',AgreedEra='令和',AgreedEraYear='',RepairDays=?,TimelyPriceOutTax=-1,TimelyPriceInTax=-1,TimelyPriceTax=-1,AdjusterName=?,AdjusterPost='',ConsultantName='',ConsultantFactory=?''',
+                       AgreedDate='00000000',AgreedEra='令和',AgreedEraYear='',RepairDays=?,TimelyPriceOutTax=-1,TimelyPriceInTax=-1,TimelyPriceTax=-1,AdjusterName=?,AdjusterPost=?,ConsultantName='',ConsultantFactory=?''',
                     (_fit(ins.get('policy_no', ''), 20), _fit(ins.get('contractor', ''), 20), _fit(ins.get('agency', ''), 20), acc, aera, aey, pre, pera, pey,
-                     _int_or(ins.get('repair_days'), -1), _fit(ins.get('adjuster', ''), 20), _fit(ins.get('factory', ''), 30)))
+                     _int_or(ins.get('repair_days'), -1), _fit(ins.get('adjuster', ''), 20),
+                     _fit(ins.get('adjuster_post', ''), 20),   # アジャスターの支店・所属（速報報告書の「支店」。2026-09-14）
+                     _fit(ins.get('factory', ''), 30)))
         eera, eey = nc.get_era_info(est_date)
         cur.execute("UPDATE FileInfo SET EstimatedDate=?,EstimatedEra=?,EstimatedEraYear=?,AcceptNo=?,GarageInDate=?,GarageInEra=?,GarageInEraYear=?,"
                     "GarageOutDate=?,GarageOutEra=?,GarageOutEraYear=?,Note1='',Note2='',Note3=''",
@@ -3254,7 +3262,7 @@ class NeoBuilder:
         _pd0 = estimate.get('paint') or {}
         # パネルが 1 枚も無くバンパだけ塗る見積（`panels: []` + bumper_front/rear）も塗装詳細として扱う（実機 2026-09-12 w66d_real: 加算基礎数値 -1、BAN.DB のバンパ加算基礎）
         _bumper_only0 = (isinstance(_pd0.get('panels'), list) and not _pd0.get('panels') and any(_pd0.get(k) for k in ('bumper_front', 'bumper_rear'))
-                        and all(k in BUMPER_ONLY_KEYS for k in _pd0))  # 許可リスト外のキー（sealing / frame / other / 付加塗装 / base / booth …）が混じる組合せは実機未確認なので従来どおり止める（Codex 指摘）
+                        and all(k in BUMPER_ONLY_KEYS or str(k).startswith('_') for k in _pd0))  # _ で始まる下書きの内部キー（_total_from_lines 等）は読まない  # 許可リスト外のキー（sealing / frame / other / 付加塗装 / base / booth …）が混じる組合せは実機未確認なので従来どおり止める（Codex 指摘）
         self._paint_detail = _pd0 if (_pd0.get('panels') or _bumper_only0) else None
         if not self._paint_detail:
             extra = [k for k in PAINT_DETAIL_KEYS if (estimate.get('paint') or {}).get(k)]

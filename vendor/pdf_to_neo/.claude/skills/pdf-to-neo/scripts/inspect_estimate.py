@@ -37,7 +37,7 @@ flag = skill_env.flag  # 人が書いた真偽値欄の厳密な読み取り（�
 sys.path.insert(0, os.path.join(FILES, 'claude_neo_pipeline'))
 
 from estimate_to_neo import (AddataParts, NeoBuilder, BUMPER_DISPOSAL, BUMPER_DRAFT_ADD, COAT_CODES, DISPOSAL, HF_CODE,  # noqa: E402
-                             _xor_lines_ref, bankin_time, default_material_rate, material_default, r10, r10_even)
+                             _xor_lines_ref, bankin_time, default_material_rate, is_bumper_only_paint, material_default, r10, r10_even, wage_unit)
 from paint_index import PaintIndex  # noqa: E402
 
 
@@ -312,7 +312,7 @@ def _inspect(path: str, out_json: str = '') -> int:
     # ---- 6. 塗装 --------------------------------------------------------------------------------
     p = est.get('paint') or {}
     print('=' * 100)
-    if p.get('panels'):
+    if p.get('panels') or is_bumper_only_paint(p):   # バンパだけの詳細塗装（panels: []）も標準指数を見る（Codex 指摘）
         paint_c, hf_c = _paint_code(p.get('paint', '２Ｋ')), _hf_code(p.get('hf', 'しない'))
         try:  # 生成器 build と同じ: 車両色の 66.DB 先頭桁 → 見積の塗膜名 → 既定 2（メタリック）
             fc = nb.resolver.finish_code(car_code, car.get('ColorCode', '') or '')
@@ -376,7 +376,7 @@ def _inspect(path: str, out_json: str = '') -> int:
             if t_eff is not None and labor:
                 w_std = r10_even(float(t_eff) * labor)  # 生成器と同じ 10 円四捨五入
                 if int(pnl.get('wage') or 0) and int(pnl['wage']) != w_std:
-                    msg = f"塗装 {code} {pnl.get('name', '')}: ★工賃 {pnl['wage']} ≠ 指数×レート（10 円四捨五入）{w_std}"
+                    msg = f"塗装 {code} {pnl.get('name', '')}: ★工賃 {pnl['wage']} ≠ 指数×レート（{wage_unit()} 円四捨五入）{w_std}"
                     print('      ' + msg)
                     warn.append(msg)
         try:
@@ -434,33 +434,79 @@ def _inspect(path: str, out_json: str = '') -> int:
                 mark_b = '不一致（見積値が手入力で保持される）'
             print(f"   {key}: {disp_name} {color_b}{'（絞模様 +0.4）' if draft else ''} 標準 {bt}（{src_b}） / 見積 {given_b} → {mark_b}")
         # 材料代
-        wages = [int(x.get('wage') or 0) for x in p['panels']] + [int((p.get(k) or {}).get('wage') or 0) for k in PAINT_WAGE_KEYS]
+        wages = ([int(x.get('wage') or 0) for x in p['panels']] + [int((p.get(k) or {}).get('wage') or 0) for k in PAINT_WAGE_KEYS]
+                 + [paint_frame_wage(p.get('frame'))])
         mat_base, other_w = _paint_wages(p)
-        wage_total_p = (int(p.get('total') or 0) - other_w) if int(p.get('total') or 0) else mat_base  # 材料率の対象 = 塗装工賃計 − 追加項目（生成器と同じ）
+        if paint_wage_missing(p) and int(p.get('total') or 0) and p.get('_total_from_lines') is None:
+            wage_total_p = paint_base_from_total(p)   # 工賃の分からないパネルがある: total から出す（下書きが塗装行から作った total は追加項目を外す）
+        else:
+            wage_total_p = mat_base   # 材料率の対象 = パネル・付加塗装・内板骨格塗装の工賃（生成器と同じ。印字の塗装工賃計は追加項目を含まないので total から引くと二重に引く）
         rate = float(p.get('material_rate') or 0)
         if rate:
             lump = material_default(wage_total_p, rate)  # コグニ既定値（10 円四捨五入）= 生成器と同じ
             per_line = sum(int(w * rate / 100.0 + 0.5) for w in wages) + int((wage_total_p - sum(wages)) * rate / 100.0 + 0.5)  # 工場書式によくある行ごと 1 円四捨五入（内訳が無い残りは 1 行扱い）
             print(f"   材料代: 工賃計 {wage_total_p} × {rate}% = コグニ既定(10円四捨五入) {lump} / 行ごと1円四捨五入 {per_line} / 見積 {p.get('material')}"
                   + ('' if (int(p.get('material') or 0) or None) in (None, lump, per_line) else ' ★どちらとも違う（読み取りか割合を確認）'))
-            if (int(p.get('material') or 0) or None) not in (None, lump, per_line) and not flag(p.get('auto_panels'), 'paint.auto_panels'):  # auto_panels は材料代で工場の一式に合わせる設計（10-15）
+            if ((int(p.get('material') or 0) or None) not in (None, lump, per_line) and not flag(p.get('auto_panels'), 'paint.auto_panels')  # auto_panels は材料代で工場の一式に合わせる設計（10-15）
+                    and not p.get('_material_from_target')):   # 協定額に合わせて下書きが決めた材料代は既定値と違って当然
                 warn.append(f"塗装 ★材料代 {p.get('material')} がコグニ既定 {lump} とも行ごと丸め {per_line} とも違う（割合 {rate}% か読み取りを確認）")
             if int(p.get('material') or 0) and int(p['material']) != lump:
                 print("      → コグニ既定値と違う。paint.material に見積値を入れると PaintingTotal は '*'（手入力）で保持される")
     else:
         print(f"6. 塗装: パネル明細なし → 一括 {p.get('total')}（塗装費用(工場見積) 1 行）")
 
-    _totals(est, warn, rep, str(car.get('CarFormCode', '') or ''), labor, coat_c if p.get('panels') else None)
+    _totals(est, warn, rep, str(car.get('CarFormCode', '') or ''), labor, coat_c if (p.get('panels') or is_bumper_only_paint(p)) else None)
     _finish(warn, rep, out_json)
     return 0
 
 
-PAINT_WAGE_KEYS = ('base', 'bumper_front', 'bumper_rear', 'booth', 'wax', 'sealing', 'door_sash', 'stripe', 'low_cover', 'two_coat_solid', 'two_tone', 'frame')
+PAINT_WAGE_KEYS = ('base', 'bumper_front', 'bumper_rear', 'bumper_base', 'booth', 'wax', 'sealing', 'door_sash', 'stripe', 'low_cover', 'two_coat_solid', 'two_tone')
+PAINT_FRAME_KEYS = ('engine_room', 'front_pillar', 'center_pillar', 'rear_floor')   # 内板骨格塗装（生成器 PaintingFrame の er/fp/cp/rp）
+
+
+def paint_frame_wage(pf) -> int:
+    """内板骨格塗装 paint.frame の工賃（位置ごとの入れ子 {engine_room: {option, index, wage}}）。選択肢の番号だけ（標準値に任せる）の位置は 0。
+    コグニ印刷の「塗装工賃計」に含まれ、材料率の対象（2026-09-14 C-HR: 塗装工賃計 180,280 = 塗装行 167,150 + ラジエータサポート 13,130、材料代 55,890 = 180,280 × 31%）"""
+    if not isinstance(pf, dict):
+        return 0
+    return sum(int((pf.get(k) or {}).get('wage') or 0) for k in PAINT_FRAME_KEYS if isinstance(pf.get(k), dict))
+
+
+def paint_base_from_total(p: dict) -> int:
+    """paint.total から材料率の対象（= 印字の塗装工賃計）を出す。印字の total は内板骨格塗装を含み、追加項目 paint.other を含まない。
+    下書きが塗装行から作った total（_total_from_lines = その中に入れた追加項目の工賃）は、追加項目を外して内板骨格塗装を足す（Codex 指摘: 二重加算の防止）"""
+    tot = int(p.get('total') or 0)
+    inc = p.get('_total_from_lines')
+    if inc is None:
+        return tot
+    return tot - int(inc or 0) + paint_frame_wage(p.get('frame'))
+
+
+def paint_wage_missing(p: dict) -> bool:
+    """詳細塗装の中に、工賃が書かれず指数（や内板骨格塗装の選択肢の番号）だけの項目があるか。
+    生成器はレートや標準値から工賃を補うので、明細からの合算は過少になる → 印字の total があればそちらを使う（Codex 指摘）"""
+    def _no_wage(d: dict) -> bool:
+        """工賃が書かれていない（生成器が指数×レートか標準で補う）。指数があるのに工賃 0 / 空も同じ。指数 0・工賃 0（ブース加算なし等）は本当に 0（Codex 指摘）"""
+        w = d.get('wage')
+        if w in (None, ''):
+            return True
+        try:
+            return not int(float(str(w).replace(',', ''))) and float(str(d.get('index') or 0).replace(',', '') or 0) > 0
+        except ValueError:
+            return True
+    if any(_no_wage(x) for x in (p.get('panels') or []) if isinstance(x, dict)):
+        return True
+    if any(isinstance(p.get(k), dict) and _no_wage(p[k]) for k in PAINT_WAGE_KEYS):   # バンパの method だけ（指数も工賃も無い）も標準で補われる
+        return True
+    pf = p.get('frame') if isinstance(p.get('frame'), dict) else {}
+    return any((isinstance(pf.get(k), dict) and pf[k].get('wage') in (None, '')) or isinstance(pf.get(k), (int, float)) and pf.get(k)
+               for k in PAINT_FRAME_KEYS if pf.get(k))
 
 
 def _paint_wages(p: dict) -> tuple[int, int]:
     """詳細塗装の (材料率の対象になる工賃計, 追加項目 paint.other の工賃) を明細から合算する（生成器 write_ansvem と同じ範囲。other は塗装計に入るが材料率は掛けない）"""
-    base = sum(int(x.get('wage') or 0) for x in (p.get('panels') or [])) + sum(int((p.get(k) or {}).get('wage') or 0) for k in PAINT_WAGE_KEYS)
+    base = (sum(int(x.get('wage') or 0) for x in (p.get('panels') or [])) + sum(int((p.get(k) or {}).get('wage') or 0) for k in PAINT_WAGE_KEYS)
+            + paint_frame_wage(p.get('frame')))
     other = sum(int((x or {}).get('wage') or 0) for x in (p.get('other') or []))
     return base, other
 
@@ -499,21 +545,29 @@ def _totals(est: dict, warn: list[str], rep: dict, form_x: str = '', labor: int 
     parts_sum = sum(int(it.get('parts_price') if it.get('parts_price') is not None else (it.get('price') or 0)) for it in items if not it.get('reserve'))
     wage_sum = sum(int(it.get('wage') or 0) for it in items if not it.get('reserve'))
     p = est.get('paint') or {}
-    if int(p.get('total') or 0) or not p.get('panels'):
-        paint_w = int(p.get('total') or 0)
-    else:  # パネル別塗装で total が 0/省略: 生成器はパネル・加算基礎・バンパ・ブース・付加塗装の工賃を合算する（index だけの項目は工賃を出せないので参考値）
-        mat_base_t, other_t = _paint_wages(p)
-        paint_w = mat_base_t + other_t  # 付加塗装・内板骨格塗装・追加項目も生成器は塗装工賃計に含める
-        if any((x.get('wage') is None and x.get('index') is not None) for x in (p.get('panels') or [])):
-            warn.append('塗装 paint.total 省略かつ wage 無しのパネルがある: 検算の塗装工賃は参考値（run_case の検算を正とする）')
+    mat_base_t, other_t = _paint_wages(p)
+    idx_only = paint_wage_missing(p)
+    detailed = bool(p.get('panels')) or is_bumper_only_paint(p)   # 生成器と同じ判定（panels: [] はバンパだけの形のときだけ詳細。Codex 指摘）
+    # 工賃の分からない項目があるときは、印字の total（下書きが塗装行から作った total ではない）があればそれを信じる
+    trust_total = idx_only and int(p.get('total') or 0) and p.get('_total_from_lines') is None
+    if detailed and not trust_total:
+        # パネル別塗装: 生成器はパネル・加算基礎・バンパ・ブース・付加塗装・内板骨格塗装の工賃（= 材料率の対象）に追加項目 paint.other を足す。
+        # paint.total（印字の塗装工賃計）は追加項目を含まないので、total を使うと追加項目が落ちる（2026-09-14 C-HR のプライマー塗装 14,880）
+        paint_w = mat_base_t + other_t
+        if idx_only:
+            warn.append('塗装 工賃の無い塗装項目があり印字の塗装工賃計も無い: 検算の塗装工賃は参考値（run_case の検算を正とする）')
+    else:  # 一括計上（total）または wage 無しのパネルがあって total を信じるとき: 追加項目は total の外（生成器は一括の塗装費用に追加項目を足す）
+        mat_base_t = paint_base_from_total(p)
+        paint_w = mat_base_t + other_t
     if int(p.get('material') or 0):
         material = int(p['material'])
-    elif p.get('panels'):  # 生成器: 詳細塗装で material が 0/未指定なら material_rate → AnUsrTblPnt の既定率 → 26% で自動計算
+    elif detailed:  # 生成器: 詳細塗装で material が 0/未指定なら material_rate → AnUsrTblPnt の既定率 → 26% で自動計算
         cc = coat_c if coat_c in (1, 2, 3, 4) else (_coat_code(p.get('coat', '')) or 2)
         mr = float(p.get('material_rate') or default_material_rate(_paint_code(p.get('paint', '２Ｋ')), cc, _hf_code(p.get('hf', 'しない'))) or 26)
-        other_t2 = sum(int((x or {}).get('wage') or 0) for x in (p.get('other') or []))
-        material = material_default(paint_w - other_t2, mr)  # 追加項目 paint.other は材料率の対象外
-        warn.append(f'塗装 material 未指定: 生成器は {mr}% で {material} 円を自動計算する（見積書に材料代があるなら paint.material に入れる）')
+        material = material_default(mat_base_t, mr)  # 追加項目 paint.other は材料率の対象外。内板骨格塗装は対象
+        _t_mat = (est.get('totals') or {}).get('material')
+        if _t_mat is None or int(_t_mat) != material:  # 下書きが割合モードにした（印字の材料代 = 工賃計 × 割合）ときは合っているので挙げない
+            warn.append(f'塗装 material 未指定: 生成器は {mr}% で {material} 円を自動計算する（見積書に材料代があるなら paint.material に入れる）')
     else:  # 一括塗装で material 無しは 0
         material = 0
     ex = est.get('expenses') or []
@@ -525,19 +579,25 @@ def _totals(est: dict, warn: list[str], rep: dict, form_x: str = '', labor: int 
     disc = est.get('discount') or {}
     disc_sum = int(disc.get('parts') or 0) + int(disc.get('wage') or 0)  # + 割増 / − 値引（生成器 write_ansvem が課税小計に加える）
     sub = parts_sum + wage_sum + paint_w + material + (ex_p + ex_w - ex_nt) + frame_w + disc_sum
-    tax = (sub * 10 + 50) // 100  # 消費税 10% 四捨五入（生成器と同じ整数演算）
+    _tr = str(est.get('tax_round') or '四捨五入')   # 工場の消費税の丸め（生成器と同じ。切り捨て・切り上げの工場がある）
+    tax = sub * 10 // 100 if _tr == '切り捨て' else (-(-sub * 10 // 100) if _tr == '切り上げ' else (sub * 10 + 50) // 100)
     t = est.get('totals') or {}
     print('=' * 100)
     print('7. 検算（estimate.json 内の再計算 / totals）')
     rows = [('部品（明細）', parts_sum, t.get('parts')), ('工賃（明細）', wage_sum, t.get('wage')), ('塗装工賃', paint_w, t.get('paint')),
             ('材料代', material, t.get('material')), ('費用部品', ex_p, t.get('expense_parts')), ('費用工賃', ex_w, t.get('expense_wage')),
-            ('内板骨格', frame_w, t.get('frame')), ('値引/割増', disc_sum, t.get('discount')), ('課税小計', sub, t.get('taxable')), ('消費税(四捨五入)', tax, t.get('tax')), ('非課税費用', ex_nt, None), ('合計', sub + tax + ex_nt, t.get('total'))]
+            ('内板骨格', frame_w, t.get('frame')), ('値引/割増', disc_sum, t.get('discount')), ('課税小計', sub, t.get('taxable')), (f'消費税({_tr})', tax, t.get('tax')), ('非課税費用', ex_nt, None), ('合計', sub + tax + ex_nt, t.get('total'))]
     for label, calc, given in rows:
         note = ''
         if given is not None and int(given) != calc:
             if label == '部品（明細）' and int(given) == calc + ex_p:
                 note = '（見積の部品計は費用部品込み）'
-            elif label == '工賃（明細）' and int(given) in _wage_alts(calc, paint_w, material, frame_w, ex_w):
+            elif label == '塗装工賃' and other_t and int(given) == calc - other_t:
+                note = '（見積の塗装工賃計は追加項目 paint.other を含まない）'
+            elif label == '工賃（明細）' and (int(given) in _wage_alts(calc, paint_w, material, frame_w, ex_w)
+                                            or (t.get('expense_printed') is not None and 0 <= int(t['expense_printed']) <= ex_w
+                                                and int(given) in _wage_alts(calc, paint_w, material, frame_w, ex_w - int(t['expense_printed'])))):
+                # 費用工賃のうち印字の「諸費用計」に入らない分（センサーエーミング等）だけが作業計に入る書式（run_case と同じ。2026-09-14 JPN タクシー）
                 note = '（見積の工賃計は塗装/材料/内骨/費用工賃のいずれかを含む集計）'
             else:
                 note = ' ★不一致'

@@ -33,6 +33,7 @@ from typing import Optional
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
 from draft_estimate import PARTS_NAME_BYTES, ROW_FIELDS, SMALL_WORDS, _cp932_len, _flag, _hw_kana, _num, _side_of, detect_wage_round, expand_row, hw, infer_labor_rate, labor_pairs, rate_score  # noqa: E402
+from estimate_to_neo import is_bumper_only_paint  # noqa: E402  （draft_estimate の import で claude_neo_pipeline が sys.path に入る）
 
 def _profiles_path() -> str:
     """工場プロファイル（工場名・レート・丸め）の置き場 = <NEO_CHECK_ROOT>/_profiles/factory_profiles.json。
@@ -85,6 +86,17 @@ def _float(v) -> Optional[float]:
 
 def _round_to(x: float, u: int) -> int:
     return int(x // u + (1 if (x % u) >= u / 2 else 0)) * u
+
+
+def _expense_kinds(expenses: list) -> dict:
+    """費用の名前（空白を除く）→ 集計先。部品と工賃の両方に金額がある費用は同じ名前で 2 行に写すので 'parts+wage' のようにまとめる
+    （1 行ずつ比べると「過去は wage、今回は parts」と誤って WARN になる。2026-09-14 C-HR の TRD ドアハンドルプロテクター・モデリスタ 2 品）"""
+    kinds: dict = {}
+    for e in expenses:
+        k = _in_kind(e)
+        if k and k != '?':
+            kinds.setdefault(_nfkc(e.get('name') or '').replace(' ', ''), set()).add(k)
+    return {n: '+'.join(sorted(ks)) for n, ks in kinds.items()}
 
 
 def _in_kind(e: dict) -> str:
@@ -350,15 +362,26 @@ class Checker:
             elif k == '?':
                 ex_by['wage'] += _int(e.get('amount')) or 0
         p = self.rd.get('paint') or {}
+        # 塗装工賃 = 印字の塗装工賃計（無ければ塗装行・パネル＋内板骨格塗装の合算）＋ 追加項目（paint.other）。
+        # 印字の塗装工賃計は内板骨格塗装を含み、追加項目（コグニ印刷の「追加塗装費用計」）を含まない（2026-09-14 C-HR: 180,280 = 塗装行 167,150 + ﾗｼﾞｴｰﾀｻﾎﾟｰﾄ 13,130、
+        # 塗装費用計 251,050 = 180,280 + 材料代 55,890 + プライマー塗装 14,880）。追加項目はどの書き方でも 1 回だけ足す
+        pf = p.get('frame') if isinstance(p.get('frame'), dict) else {}
+        frame_pw = sum(_int((pf.get(k) or {}).get('wage')) or 0 for k in ('engine_room', 'front_pillar', 'center_pillar', 'rear_floor') if isinstance(pf.get(k), dict))
+        other_w = sum(_int(x.get('wage')) or 0 for x in p.get('other') or [] if isinstance(x, dict))
         paint_w = _int(p.get('total'))
         if paint_w is None:
             lines = p.get('lines') or []
             if lines:
-                paint_w = sum(_int(l.get('wage')) or 0 for l in lines)
-            elif p.get('panels'):
-                paint_w = sum(_int(x.get('wage')) or 0 for x in p.get('panels') or []) + sum(_int((p.get(k) or {}).get('wage')) or 0 for k in ('base', 'booth', 'wax', 'bumper_front', 'bumper_rear', 'sealing')) + sum(_int(x.get('wage')) or 0 for x in p.get('other') or [])
+                paint_w = sum(_int(l.get('wage')) or 0 for l in lines) + frame_pw
+            elif p.get('panels') or is_bumper_only_paint(p):   # panels: [] はバンパだけの形のときだけ詳細塗装（生成器・inspect と同じ判定。Codex 指摘）
+                paint_w = (sum(_int(x.get('wage')) or 0 for x in p.get('panels') or [])
+                           + sum(_int((p.get(k) or {}).get('wage')) or 0 for k in ('base', 'booth', 'wax', 'bumper_front', 'bumper_rear', 'bumper_base', 'sealing', 'door_sash', 'stripe',
+                                                                                   'low_cover', 'two_coat_solid', 'two_tone') if isinstance(p.get(k), dict))
+                           + frame_pw)   # 付加塗装も塗装工賃計（生成器・inspect と同じ範囲。Codex 指摘）
             else:
-                paint_w = 0
+                paint_w = frame_pw
+        paint_w += other_w
+        other_in = other_w   # paint_w に含めた追加項目の工賃（材料代の割合を出すときは外す。追加項目は材料率の対象外）
         material = _int(p.get('material')) or 0
         disc = self.rd.get('discount') or {}
         disc_sum = (_int(disc.get('parts')) or 0) + (_int(disc.get('wage')) or 0)
@@ -391,7 +414,8 @@ class Checker:
                     wage_alts['明細 + ' + ' + '.join(c[0] for c in comb)] = wage_sum + sum(c[1] for c in comb)
             cmp('工賃計（作業計）', wage_sum, t.get('wage'), wage_alts)
         if t.get('paint') is not None:
-            cmp('塗装計', paint_w, t.get('paint'), {'塗装工賃 + 材料': paint_w + material})
+            cmp('塗装計', paint_w, t.get('paint'), {'塗装工賃 + 材料': paint_w + material, '塗装工賃計（追加項目を除く）': paint_w - other_in,
+                                                    '塗装工賃計（追加項目を除く）+ 材料': paint_w - other_in + material})
         if t.get('paint_total') is not None:
             cmp('塗装計（材料込）', paint_w + material, t.get('paint_total'))
         if t.get('material') is not None:
@@ -435,12 +459,12 @@ class Checker:
             if g_sub + g_tax + ex_by['taxfree'] != g_total:
                 self.fail(f"合計欄 御見積額: 印字 {g_total:,} ≠ 課税小計 {g_sub:,} + 消費税 {g_tax:,} + 非課税 {ex_by['taxfree']:,} = {g_sub + g_tax + ex_by['taxfree']:,}（合計欄自体の読み違いか、非課税費用の見落とし）")
         # 材料代の割合と丸め方
-        if material and paint_w:
-            rate = material * 100.0 / paint_w
+        if material and paint_w - other_in:
+            rate = material * 100.0 / (paint_w - other_in)
             self.settings['material_rate'] = round(rate, 1)
             near = min((abs(rate - x), x) for x in range(10, 101, 5))
             if near[0] > 0.6:
-                self.note(f'材料代 {material:,} ÷ 塗装工賃 {paint_w:,} = {rate:.1f}%（5% 刻みでない → 行ごと四捨五入の合算か、材料代に他の費目が混ざっている）')
+                self.note(f'材料代 {material:,} ÷ 塗装工賃 {paint_w - other_in:,} = {rate:.1f}%（5% 刻みでない → 行ごと四捨五入の合算か、材料代に他の費目が混ざっている）')
 
     # ------------------------------------------------------------------ 6b. 手入力行モード（塗装・費用を塗装/費用画面ではなく明細の手入力行で入れる工場）
     def check_layout_mode(self) -> None:
@@ -511,11 +535,11 @@ class Checker:
             self.warn(f"工場「{issuer}」の書式は過去 {prof['format']}、今回の判定は {self.settings['format']}")
         if prof.get('manual_rows_mode') and not self.settings.get('manual_rows_mode'):
             self.note(f"工場「{issuer}」は過去、塗装・費用を明細の手入力行で入れていた。今回 paint/expenses に書いたなら印字を見直す（手入力行モードなら manual 行で）")
-        for e in self.rd.get('expenses') or []:
-            k = _in_kind(e)
-            past = (prof.get('expense_in') or {}).get(_nfkc(e.get('name') or '').replace(' ', ''))
-            if past and k and k != '?' and past != k:
-                self.warn(f"費用 {e.get('name')}: 過去この工場では {past} 扱い、今回は {k}（in={e.get('in')}）。合計欄で確かめる")
+        for nm, now in _expense_kinds(self.rd.get('expenses') or []).items():
+            past = (prof.get('expense_in') or {}).get(nm)
+            # 旧形式（同名 2 行を 1 つの区分で保存: 'wage'）→ 今回 'parts+wage' への移行だけ許す。'parts+wage' から片方に減ったときは写し漏れの疑いなので WARN（Codex 指摘）
+            if past and past != now and not (now == 'parts+wage' and past in ('parts', 'wage')):   # 例外は旧形式の単一区分 → 'parts+wage' だけ（expense+wage 等は区分の変更として WARN。Codex 指摘）
+                self.warn(f"費用 {nm}: 過去この工場では {past} 扱い、今回は {now}。合計欄で確かめる")
 
     # ------------------------------------------------------------------ 実行
     def run(self) -> dict:
@@ -632,10 +656,11 @@ def _save_profile_locked(rd: dict, settings: dict, issuer: str) -> str:
         profs = {}
     p = profs.get(issuer) or {}
     ex_in = dict(p.get('expense_in') or {})
-    for e in rd.get('expenses') or []:
-        k = _in_kind(e)
-        if k and k != '?':
-            ex_in[_nfkc(e.get('name') or '').replace(' ', '')] = k
+    for _nm, _now in _expense_kinds(rd.get('expenses') or []).items():
+        _past = ex_in.get(_nm)
+        if str(_past) == 'parts+wage' and _now in ('parts', 'wage'):
+            continue   # 'parts+wage' を今回の片方だけで上書きしない（1 回の写し漏れで次から WARN が消えるのを防ぐ。Codex 指摘）
+        ex_in[_nm] = _now
     t = rd.get('totals') or {}
     case_id = hashlib.sha1(f"{rd.get('est_date', '')}|{t.get('total', '')}|{t.get('parts', '')}".encode('utf-8')).hexdigest()[:10]  # 案件の識別（顧客情報は使わない）
     seen = list(p.get('seen') or [])

@@ -92,11 +92,15 @@ PAGE_TEMPLATE = {'page': 1, 'rows_printed': None, 'subtotal': {}, 'marks': {}, '
                  'paint_lines': [], 'expenses': []}
 
 
-def header_task(n_pages: int, vehicle_hint: Optional[dict] = None, source_name: str = '') -> str:
+def header_task(n_pages: int, vehicle_hint: Optional[dict] = None, source_name: str = '',
+                customer_hint: Optional[dict] = None) -> str:
     hint = ''
     if vehicle_hint:
         hint = ('\n\n車検証・速報から分かっている車両情報（見積書と食い違うときは見積書の印字を写し、comment ではなく '
                 '`note` に食い違いを書く）:\n' + json.dumps(vehicle_hint, ensure_ascii=False))
+    if customer_hint:
+        hint += ('\n\n車検証から分かっている顧客情報（見積書に印字が無ければ空のままでよい。印字があればその印字を写す）:\n'
+                 + json.dumps(customer_hint, ensure_ascii=False))
     return f"""この見積書 PDF は全 {n_pages} ページです。**明細以外**を pages/header.json の形で書いてください（明細の行はここには書かない）。
 
 書くキー（無いものは省く。値が読めないキーは空文字か null）: {', '.join(HEADER_KEYS)}

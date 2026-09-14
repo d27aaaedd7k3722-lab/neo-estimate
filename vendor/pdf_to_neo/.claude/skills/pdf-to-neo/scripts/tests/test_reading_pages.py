@@ -105,6 +105,17 @@ def test_merge_ok_and_totals():
         shutil.rmtree(case, ignore_errors=True)
 
 
+def test_merge_keeps_extra_header_keys():
+    """一覧に無い header のキー（協定の target_total_replaces_material など）も reading.json に引き継ぐ。_ で始まる内部キーは落とす（2026-09-14）"""
+    h = dict(HEADER, target_total_replaces_material=True, _ocr_guess={'x': 1})
+    case = make_case([PAGE1, PAGE2], header=h)
+    try:
+        rd, msgs = rp.merge(case)
+        assert rd is not None, msgs
+        assert rd.get('target_total_replaces_material') is True and '_ocr_guess' not in rd, sorted(rd)
+    finally:
+        shutil.rmtree(case, ignore_errors=True)
+
 def test_merge_refuses_failed_page():
     p2 = copy.deepcopy(PAGE2)
     p2['rows_printed'] = 3

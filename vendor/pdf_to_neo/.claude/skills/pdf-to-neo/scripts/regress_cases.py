@@ -41,6 +41,8 @@ def strip(est: dict) -> dict:
             v = est[k]
             if k == 'items':
                 v = [{kk: vv for kk, vv in it.items() if not kk.startswith('_')} for it in v]
+            elif isinstance(v, dict):   # paint の _total_from_lines など下書きの内部キーは比べない
+                v = {kk: vv for kk, vv in v.items() if not str(kk).startswith('_')}
             out[k] = v
     return out
 

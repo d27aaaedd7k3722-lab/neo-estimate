@@ -1942,6 +1942,10 @@ def process_pdf_to_neo(pdf_path,
             # 同じ見積書を番号だけ直して出し直すのは普通にあるので、
             # 気づかないまま別案件の番号が入ったファイルを出すことになる。
             repr(sorted((insurance_info or {}).items())),
+            # 車検証・書類から来る vehicle_info も Customer/Car を変える。上の条件（vehicle_info が
+            # あればキャッシュを通らない）で守られているが、条件を緩めても前の車検証の .neo が
+            # 返らないよう、キーにも入れておく（Codex 65）。
+            repr(sorted((vehicle_info or {}).items())),
             _pdf_md5((ocr_text or "").encode("utf-8", "ignore")),
             # 同じバイト列でも、PDF として送るか画像として送るかで
             # 読み取り結果が変わる。キーに入れないと前の結果が返る。

@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "5747932abd93a0581b9912a3f910ff90798fea05",
- "subject": "fix: ADDATA_ROOT_PARTIAL=1 で環境変数 ADDATA_ROOT が無効なら、設定・既定パス・自動検出に落とさない（別の Addata で黙って作らない。skill_env.resolve と resolver.find_addata_root の両方）",
- "synced_at": "2026-09-14T16:53:02",
- "files": 100,
- "tree_sha256": "561dc58dc5a0a74aeca7449c7689e521354b3fbf317e4518e7aa6ba911f6af95",
+ "commit": "3551419b6f0630eb1665c305d51348b356fc0511",
+ "subject": "feat: insurance.adjuster_post（アジャスターの支店・所属）を NEO の Insurance.AdjusterPost に書く（速報報告書の「支店」。アプリの書類 OCR 用）",
+ "synced_at": "2026-09-14T21:30:52",
+ "files": 101,
+ "tree_sha256": "283a01fef0908e2837157f27f4f8303366fc59287efc60f91d40ef62d39c5a52",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

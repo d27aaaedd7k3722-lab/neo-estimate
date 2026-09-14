@@ -215,7 +215,8 @@ HEADER_OBJECTS = tuple(('paint', k) for k in ('base', 'booth', 'bumper_front', '
                                                'low_cover', 'two_coat_solid', 'two_tone', 'frame'))
 
 
-def _normalise_header(h: dict, vehicle_hint: Optional[dict], insurance_hint: Optional[dict]) -> dict:
+def _normalise_header(h: dict, vehicle_hint: Optional[dict], insurance_hint: Optional[dict],
+                      customer_hint: Optional[dict] = None) -> dict:
     """header.json の形に揃える。値には触らない（null・空の項目は「書かなかった」として落とすだけ）。
     形が違うキー（配列で来た totals / vehicle / paint、expenses / adas のオブジェクトでない要素）は **落とさず** PageShapeError
     （ask_header が理由を返して読み直させる）。落として続けると、vendor の Checker は totals 無しを WARN にしかしないので
@@ -262,6 +263,7 @@ def _normalise_header(h: dict, vehicle_hint: Optional[dict], insurance_hint: Opt
             out.pop(k)
     _apply_hint(out, 'vehicle', vehicle_hint)
     _apply_hint(out, 'insurance', insurance_hint)
+    _apply_hint(out, 'customer', customer_hint)   # 車検証（使用者・登録番号・住所・有効期限・走行距離）。印字が無い項目にだけ
     return out
 
 
@@ -295,6 +297,7 @@ def _pages_for_merge(header: dict, pages: list) -> tuple:
 
 def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str = '',
                   vehicle_hint: Optional[dict] = None, insurance_hint: Optional[dict] = None, max_retries: int = 3,
+                  customer_hint: Optional[dict] = None,
                   progress: Optional[Callable[[str], None]] = None, addata_root: Optional[str] = None) -> ReadResult:
     """PDF → case_dir/pages/（header.json + page_N.json）→ 検算・読み直し。
     reader は neo_skill.llm.ClaudeReader（ask(system, blocks) を持つもの）。
@@ -333,7 +336,7 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
         黙って値を落として合計欄の検算なしで進まない。Codex 指摘 2026-09-14）。
         JSON オブジェクトでない返事（配列・文字列）は _ask_json が 1 回言い直させる"""
         def normalise(raw):
-            h = _normalise_header(raw, vehicle_hint, insurance_hint)
+            h = _normalise_header(raw, vehicle_hint, insurance_hint, customer_hint)
             if not isinstance(h.get('totals'), dict) or not h['totals']:
                 raise PageShapeError('totals（見積書の合計欄）が無い。合計欄は必ず写す（検算の拠り所）')
             return h
@@ -351,7 +354,7 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
         whole = llm_mod.document_block(pdf_bytes)
         # 1) header（明細以外）
         _progress(progress, f'合計欄・車両欄を写しています（全 {n} ページ）')
-        header = ask_header(prompts.header_task(n, vehicle_hint, source_name), system, whole)
+        header = ask_header(prompts.header_task(n, vehicle_hint, source_name, customer_hint), system, whole)
         res.header = header
         # 2) ページごとに写して検算
         pages: list = []
