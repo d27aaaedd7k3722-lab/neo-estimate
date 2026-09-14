@@ -43,6 +43,14 @@
   function status(text, cls) { stEl.textContent = text; stEl.className = 'st ' + (cls || ''); setHeight(); }
   function send(value) { seq += 1; value.seq = seq; value.nonce = NONCE; post('streamlit:setComponentValue', {value: value, dataType: 'json'}); }
 
+  function whyText(e, what) {
+    // NotFoundError = フォルダやファイルが無い。それ以外（NotReadableError・NotAllowedError 等）は読めない ＝ コグニセブンが
+    // 開いていてファイルを掴んでいる、権限が無い、など。原因ごとに次にやることを書く
+    const name = (e && e.name) || '';
+    if (name === 'NotFoundError') return `${what}がありません`;
+    if (name === 'NotAllowedError' || name === 'SecurityError') return `${what}を読む許可がありません（ダイアログで「ファイルを表示」を許可してください）`;
+    return `${what}を読めませんでした（コグニセブンが開いているとファイルを掴んで読めないことがあります。閉じてからもう一度選んでください）: ` + name;
+  }
   async function readFile(handle) {
     const f = await handle.getFile();
     const buf = await f.arrayBuffer();
@@ -80,9 +88,10 @@
     } catch (e) {
       // アプリ側にも知らせる: 前に送った Addata を消して「未接続」に戻す（古い Addata のまま黙って作らない。Codex 46）
       sentCom = false; sentCars.clear();
+      const why = whyText(e, `選んだフォルダ（${dirHandle ? dirHandle.name : ''}）の COM フォルダ`);
       send({phase: 'com', root_name: dirHandle ? dirHandle.name : '', files: {}, bytes: 0,
-            error: `選んだフォルダ（${dirHandle ? dirHandle.name : ''}）には COM フォルダがありません。Addata の直下（A〜Z のフォルダと COM がある場所）を選んでください: ` + e});
-      status('このフォルダには COM フォルダがありません。Addata の直下（A〜Z のフォルダと COM がある場所）を選んでください: ' + e, 'ng');
+            error: why + '。Addata の直下（A〜Z のフォルダと COM がある場所）を選んでください: ' + e});
+      status(why + '。Addata の直下（A〜Z のフォルダと COM がある場所）を選んでください。', 'ng');
     } finally { sending = false; }
   }
 
@@ -100,9 +109,10 @@
       sentCars.add(car);
     } catch (e) {
       sentCars.add(car);   // 同じ車種の error を render のたびに送り直さない（フォルダを選び直せば clear される）
+      const why = whyText(e, `車種 ${car} のフォルダ（${car[0]}/${car}）`);
       send({phase: 'car', car: car, root_name: dirHandle ? dirHandle.name : '', files: {}, bytes: 0,
-            error: `車種 ${car} のフォルダ（${car[0]}/${car}）が PC の Addata にありません: ` + e});
-      status(`車種 ${car} のフォルダが見つかりません（${car[0]}\\${car}）。Addata の版が古いか、車種コードが違います。`, 'ng');
+            error: why + '（PC の Addata）: ' + e});
+      status(why + (e && e.name === 'NotFoundError' ? '。Addata の版が古いか、車種コードが違います。' : ''), 'ng');
     } finally { sending = false; }
   }
 

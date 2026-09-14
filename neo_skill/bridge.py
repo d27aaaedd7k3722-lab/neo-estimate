@@ -204,10 +204,24 @@ def ingest(session_state, value) -> Optional[str]:
     """部品の戻り値を 1 回だけ処理して、画面に出す短い文を返す（同じ seq は二度処理しない）"""
     if not isinstance(value, dict) or not value.get('seq'):
         return None
-    key = (value.get('phase'), value.get('seq'), value.get('nonce'))   # nonce は iframe ごとの印（読み直すと変わる）
-    if session_state.get('_bridge_seen') == key:
+    # 二重処理防止: nonce（iframe ごとの印。読み直すと変わる）ごとに、処理した最大の seq を覚える。
+    # 同じ値の再送だけでなく、遅れて届いた古い値（seq が小さい）も受けない（古い COM で新しい選択を上書きしない。Codex 51）
+    nonce = str(value.get('nonce') or '')
+    try:
+        seq = int(value.get('seq'))
+    except (TypeError, ValueError):
         return None
-    session_state['_bridge_seen'] = key
+    seen = session_state.get('_bridge_seen')
+    if not isinstance(seen, dict):
+        seen = {}
+    active = seen.get('_active')
+    if active is not None and nonce != active and nonce in seen:
+        return None   # 前の iframe（読み直す前）の遅れた値: いまの iframe に切り替わった後は受けない（Codex 52）
+    if seq <= int(seen.get(nonce) or 0):
+        return None
+    seen[nonce] = seq
+    seen['_active'] = nonce
+    session_state['_bridge_seen'] = seen
     path = root(session_state)
     phase = value.get('phase')
     if value.get('error'):

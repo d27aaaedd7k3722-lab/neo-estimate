@@ -136,7 +136,7 @@ def main() -> int:
             fails.append(f'store の大きさ上限: n={n4} dropped={dropped4} has_car(W97)={bridge.has_car(root, "W97")}')
         # 上限超えの車種フォルダが届いたら、待ち続けずに「取り込めなかった」と返し、待ち（_bridge_want）を解く
         ss['_bridge_want'] = 'W96'
-        msg3 = bridge.ingest(ss, {'seq': 9, 'phase': 'car', 'car': 'W96', 'files': {'W/W96/W9601.DB': b(b'0123456789ABCDEF')}})
+        msg3 = bridge.ingest(ss, {'seq': 21, 'phase': 'car', 'car': 'W96', 'files': {'W/W96/W9601.DB': b(b'0123456789ABCDEF')}})
         bridge.MAX_FILE_BYTES = _keep
         if '取り込めませんでした' not in (msg3 or '') or ss.get('_bridge_want') != '' or bridge.has_car(root, 'W96'):
             fails.append(f'上限超えの車種フォルダの ingest: {msg3!r} want={ss.get("_bridge_want")!r}')
@@ -167,44 +167,49 @@ def main() -> int:
             fails.append(f'壊れた base64／空ファイル: n5={n5} n6={n6} dropped5={dropped5} dropped6={dropped6}')
         # COM を取り直したら、前の車種フォルダと完了印は消える（別の Addata との混在を防ぐ）
         ss['_bridge_seen'] = None
-        bridge.ingest(ss, {'seq': 11, 'phase': 'com', 'root_name': 'Addata2', 'files': files_of(os.path.join(ADDATA, 'COM'), 'COM', False)})
+        bridge.ingest(ss, {'seq': 22, 'phase': 'com', 'root_name': 'Addata2', 'files': files_of(os.path.join(ADDATA, 'COM'), 'COM', False)})
         if bridge.cars(root) or bridge.has_car(root, 'W99') or not bridge.has_com(root) or os.path.isdir(os.path.join(root, 'W')):
             fails.append(f'COM の取り直しで前の車種フォルダが残る: cars={bridge.cars(root)}')
         # COM の取り直しに失敗（壊れた payload）したら、古い COM のまま「使用中」にならない
-        msg7 = bridge.ingest(ss, {'seq': 12, 'phase': 'com', 'root_name': 'Addata3', 'files': {'COM/KA06_ALL.DB': 'bad*b64', 'COM/AnVer.DB': b(b'x')}})
+        msg7 = bridge.ingest(ss, {'seq': 23, 'phase': 'com', 'root_name': 'Addata3', 'files': {'COM/KA06_ALL.DB': 'bad*b64', 'COM/AnVer.DB': b(b'x')}})
         if bridge.has_com(root) or '取り込めませんでした' not in (msg7 or ''):
             fails.append(f'失敗した COM の取り直しで古い COM が残る: has_com={bridge.has_com(root)} msg={msg7!r}')
         # COM の無いフォルダを選び直した（部品が error 付きの com を送る）: 前の Addata は消えて未接続に戻る
-        bridge.ingest(ss, {'seq': 14, 'phase': 'com', 'root_name': 'Addata5', 'files': files_of(os.path.join(ADDATA, 'COM'), 'COM', False)})
-        msg8 = bridge.ingest(ss, {'seq': 15, 'phase': 'com', 'root_name': 'Desktop', 'files': {}, 'error': 'COM フォルダがありません'})
+        bridge.ingest(ss, {'seq': 24, 'phase': 'com', 'root_name': 'Addata5', 'files': files_of(os.path.join(ADDATA, 'COM'), 'COM', False)})
+        msg8 = bridge.ingest(ss, {'seq': 25, 'phase': 'com', 'root_name': 'Desktop', 'files': {}, 'error': 'COM フォルダがありません'})
         if bridge.has_com(root) or 'COM フォルダがありません' not in (msg8 or ''):
             fails.append(f'COM 無しの選び直しで前の Addata が残る: has_com={bridge.has_com(root)} msg={msg8!r}')
         # 車種フォルダ待ちの途中で COM の無いフォルダを選んでも、待ち（取り置きからの再開）は残す。車種フォルダ側の error は待ちを解く
         ss['_bridge_want'] = 'W54'
-        bridge.ingest(ss, {'seq': 16, 'phase': 'com', 'root_name': 'Desktop', 'files': {}, 'error': 'COM フォルダがありません'})
+        bridge.ingest(ss, {'seq': 26, 'phase': 'com', 'root_name': 'Desktop', 'files': {}, 'error': 'COM フォルダがありません'})
         if ss.get('_bridge_want') != 'W54':
             fails.append('COM の error で車種フォルダ待ちが消えた（取り置きが捨てられて読み直しになる）')
         # COM を受け取っていない間の車種フォルダの error では待ちを解かない
-        bridge.ingest(ss, {'seq': 17, 'phase': 'car', 'car': 'W54', 'files': {}, 'error': 'ない'})
+        bridge.ingest(ss, {'seq': 27, 'phase': 'car', 'car': 'W54', 'files': {}, 'error': 'ない'})
         if ss.get('_bridge_want') != 'W54':
             fails.append('COM の無い間の車種フォルダの error で待ちが消えた')
-        bridge.ingest(ss, {'seq': 18, 'phase': 'com', 'root_name': 'Addata6', 'files': files_of(os.path.join(ADDATA, 'COM'), 'COM', False)})
+        bridge.ingest(ss, {'seq': 28, 'phase': 'com', 'root_name': 'Addata6', 'files': files_of(os.path.join(ADDATA, 'COM'), 'COM', False)})
         # 別の（前の）車種の遅れた error では待ちを解かない。いま待っている車種の error で解く
-        bridge.ingest(ss, {'seq': 19, 'phase': 'car', 'car': 'J87', 'files': {}, 'error': 'ない'})
+        bridge.ingest(ss, {'seq': 29, 'phase': 'car', 'car': 'J87', 'files': {}, 'error': 'ない'})
         if ss.get('_bridge_want') != 'W54':
             fails.append('別の車種の error で待ちが消えた')
-        bridge.ingest(ss, {'seq': 20, 'phase': 'car', 'car': 'W54', 'files': {}, 'error': 'ない'})
+        bridge.ingest(ss, {'seq': 30, 'phase': 'car', 'car': 'W54', 'files': {}, 'error': 'ない'})
         if ss.get('_bridge_want') != '':
             fails.append('待っている車種の error で待ちが解けない')
         # AnVer.DB も COM.CAB も無い COM は「届いた」と見なさない（vendor の部分 Addata の条件と同じ）
-        bridge.ingest(ss, {'seq': 13, 'phase': 'com', 'root_name': 'Addata4', 'files': {'COM/KA06_ALL.DB': b(b'x'), 'COM/KA81.DB': b(b'x')}})
+        bridge.ingest(ss, {'seq': 31, 'phase': 'com', 'root_name': 'Addata4', 'files': {'COM/KA06_ALL.DB': b(b'x'), 'COM/KA81.DB': b(b'x')}})
         if bridge.has_com(root):
             fails.append('AnVer.DB も COM.CAB も無い COM を has_com が通した（vendor は弾く）')
-        msg1 = bridge.ingest(ss, {'seq': 7, 'phase': 'car', 'car': 'W99', 'files': {}})
-        msg2 = bridge.ingest(ss, {'seq': 7, 'phase': 'car', 'car': 'W99', 'files': {}})
+        msg1 = bridge.ingest(ss, {'seq': 32, 'phase': 'car', 'car': 'W99', 'files': {}})
+        msg2 = bridge.ingest(ss, {'seq': 32, 'phase': 'car', 'car': 'W99', 'files': {}})
         if not msg1 or msg2 is not None:
             fails.append(f'ingest の二重処理防止: {msg1!r} / {msg2!r}')
-        if bridge.ingest(ss, {'seq': 8, 'phase': 'car', 'car': 'W98', 'files': {}, 'error': 'ない'}) != 'ない' or ss.get('_bridge_want', '') != '':
+        # 遅れて届いた古い値（seq が小さい）も受けない。別の iframe（nonce 違い）は独立
+        if bridge.ingest(ss, {'seq': 30, 'phase': 'car', 'car': 'W99', 'files': {}}) is not None:
+            fails.append('古い seq の値を受けてしまう')
+        if not bridge.ingest(ss, {'seq': 1, 'nonce': 'other', 'phase': 'car', 'car': 'W99', 'files': {}}):
+            fails.append('別の nonce の seq 1 を受けない')
+        if bridge.ingest(ss, {'seq': 2, 'nonce': 'other', 'phase': 'car', 'car': 'W98', 'files': {}, 'error': 'ない'}) != 'ない' or ss.get('_bridge_want', '') != '':
             fails.append('ingest の error の扱い')
         # 接続の解除: 一時フォルダ・取り置き・待ち・状態が全部消える
         ss2 = {}
@@ -223,6 +228,9 @@ def main() -> int:
         if not bridge.ingest(ss2, dict(com_val, nonce='def')) or not bridge.has_com(bridge.root(ss2)):
             fails.append('別の iframe（nonce 違い）の新しい COM を処理しない')
         shutil.rmtree(bridge.root(ss2), ignore_errors=True)
+        # いまの iframe（nonce 'other'）に切り替わった後、前の iframe（nonce ''）の遅れた値は seq が大きくても受けない
+        if bridge.ingest(ss, {'seq': 40, 'phase': 'car', 'car': 'W98', 'files': {}}) is not None:
+            fails.append('前の iframe の遅れた値を受けてしまう')
         old = os.path.join(tempfile.gettempdir(), bridge.PREFIX + 'old_test')
         os.makedirs(old, exist_ok=True); os.utime(old, (time.time() - 8 * 3600, time.time() - 8 * 3600))
         bridge.sweep(6 * 3600)

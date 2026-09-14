@@ -6968,7 +6968,9 @@ def main():
                 _bmsg = _br.ingest(st.session_state, _bval)
                 # COM を受け取った直後は、部品はまだ com=false の render しか見ていない（render は ingest より先）。
                 # もう一度 rerun して com=true を届ける: 車種フォルダ待ちがあれば部品はその後それを送る（Codex 50）
-                _bridge_rerun = bool(_bmsg and isinstance(_bval, dict) and _bval.get('phase') == 'com' and _br.has_com(_bpath))
+                _bridge_rerun = bool(_bmsg and isinstance(_bval, dict) and _bval.get('phase') == 'com' and _br.has_com(_bpath)
+                                     # 同じ run で「生成」ボタンが押されていたら rerun しない（rerun するとその押下が消える。ボタンの run は最後に rerun する）
+                                     and not st.session_state.get('pdf2neo_run') and not st.session_state.get('pdf2neo_run_beta'))
                 if _br.has_com(_bpath):
                     st.session_state['_bridge_path'] = _bpath
                     st.success(f"PC の Addata（{st.session_state.get('_bridge_root_name') or 'フォルダ'}）を使用中 ／ "
@@ -7462,7 +7464,8 @@ def main():
             st.caption("サイドバーの「事故・保険情報」（証券番号・契約者名・事故日・受付番号・代理店・アジャスター・入出庫日・修理日数）は、"
                        "見積書に印字が無ければ NEO に補われます。"
                        "「費用（Expense）」欄はこの経路では使いません — 見積書に印字された費用だけを写します"
-                       "（印字に無い費用を足すと、原本との照合が崩れるため）。")
+                       "（印字に無い費用を足すと、原本との照合が崩れるため）。Addata なしの「ベタ打ちで生成」だけは、"
+                       "下のチェックを入れたときに限りサイドバーの費用を NEO に入れます。")
             if not _nsk_ready:
                 st.error("❌ pdf-to-neo スキル（vendor/pdf_to_neo）が使えません: " + _nsk_why
                          + "  → `python tools/vendor_sync.py --source <files> --commit <ID>` で取り込み、"
@@ -7480,6 +7483,20 @@ def main():
                            + (f" 取得URLの失敗: {_p2n_url_err}" if _p2n_url_err else "")
                            + " サイドバー「🖥️ PC の Addata をこの画面から使う」で PC の C:\\Addata を選ぶか、"
                            "下の「ベタ打ちで生成」で部品コード無しの NEO を作れます（明細・金額・品名は見積書のとおり）。")
+                _p2n_beta_exp = {'towing': safe_int(st.session_state.get('exp_towing', 0)),
+                                 'rental_car': safe_int(st.session_state.get('exp_rental', 0)),
+                                 'tax_exempt': safe_int(st.session_state.get('exp_exempt', 0))}
+                _p2n_beta_use_exp = False
+                if st.session_state.get('_beta_exp_file_key') != _p2n_file_key:
+                    # 見積が変わったらチェックは外す（前の見積で入れた同意を次の見積に持ち越さない。Codex 52）
+                    st.session_state['pdf2neo_beta_use_exp'] = False
+                    st.session_state['_beta_exp_file_key'] = _p2n_file_key
+                if any(_p2n_beta_exp.values()):
+                    # 前の案件の入力が残っていても黙って足さない（合計が原本と食い違う）。チェックしたときだけ入れる（Codex 51）
+                    _p2n_beta_use_exp = st.checkbox(
+                        f"サイドバーの費用を NEO に入れる（レッカー ¥{_p2n_beta_exp['towing']:,}・代車 ¥{_p2n_beta_exp['rental_car']:,}・"
+                        f"非課税 ¥{_p2n_beta_exp['tax_exempt']:,}）。見積書に印字の無い費用なので、入れると原本の合計とは一致しません",
+                        value=False, key='pdf2neo_beta_use_exp')
                 if not api_key:
                     st.caption("ベタ打ちの読み取りは Gemini を使います。サイドバーの「APIキー設定」に Gemini API キーを入れてください。")
                 elif st.button("✏️ ベタ打ちで生成（Addata なし・部品コード/標準指数は入りません）", key='pdf2neo_run_beta',
@@ -7494,10 +7511,8 @@ def main():
                             model_name=selected_model,
                             template_bytes=st.session_state.get('custom_neo_bytes'),
                             is_tax_inclusive=_p2n_beta_tax,
-                            # サイドバーの費用欄・事故・保険欄（旧経路と同じ扱い。b15bd06 で外す前の呼び方）
-                            expenses={'towing': st.session_state.get('exp_towing', 0),
-                                      'rental_car': st.session_state.get('exp_rental', 0),
-                                      'tax_exempt': st.session_state.get('exp_exempt', 0)},
+                            # 費用はチェックしたときだけ（上）。事故・保険欄は旧経路と同じ扱い（b15bd06 で外す前の呼び方）
+                            expenses=(_p2n_beta_exp if _p2n_beta_use_exp else None),
                             insurance_info={k: st.session_state.get(k, 0 if k == 'repair_days' else '') for k in (
                                 'policy_no', 'contractor_name', 'accept_no', 'accident_date', 'agency_name',
                                 'adjuster_name', 'garage_in_date', 'garage_out_date', 'repair_days', 'note1')},
