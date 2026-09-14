@@ -118,6 +118,10 @@ def subprocess_env(addata_root: Optional[str] = None, neo_check_root: Optional[s
     # vendor は COM.CAB / CHM の展開キャッシュを %LOCALAPPDATA% に置く。無い Linux（Streamlit Cloud）では一時フォルダに
     # 置かせる（配布物 vendor/ の中に書かれると内容ハッシュの照合に落ちて経路が止まる）
     env.setdefault('LOCALAPPDATA', os.path.join(tempfile.gettempdir(), 'neo_skill_cache'))
+    # 生成器の「今日」（est_date の既定・NEO の保存時刻）は datetime.now() = サーバの地方時。Streamlit Cloud は UTC なので
+    # 日本の 0〜9 時に前日の日付になる。Linux では TZ で日本時間にする（Windows は TZ を見ないので触らない）
+    if os.name != 'nt':
+        env.setdefault('TZ', 'Asia/Tokyo')
     if addata_root:
         env['ADDATA_ROOT'] = addata_root
     if neo_check_root:
