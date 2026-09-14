@@ -7236,7 +7236,7 @@ def main():
             '<div style="font-size:18px;font-weight:800;color:#1d4ed8;'
             'letter-spacing:.02em;">📄 見積書（PDF・写真）をここに入れてください</div>'
             '<div style="font-size:13px;color:#334155;margin-top:8px;line-height:1.7;">'
-            '見積書を Claude が<b>印字どおり</b>に写し、ページごとに機械検算して落ちたページだけ読み直します。'
+            '見積書を AI（Claude または Gemini。下で選びます）が<b>印字どおり</b>に写し、ページごとに機械検算して落ちたページだけ読み直します。'
             '部品コード・標準品番・指数・塗装・費用の判断とNEOの生成・検算は '
             '<b>pdf-to-neo スキル</b>（コグニ実機で確かめた判断規則）がそのまま行います。'
             '合格したときだけ、NEO と<b>確認箇所シート（xlsx）</b>を組でお渡しします。'

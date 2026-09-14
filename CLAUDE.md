@@ -40,6 +40,7 @@
 - 合格の条件は vendor の `make_neo.py` と同じ。NEO と確認箇所シート（xlsx）は必ず組で出す
 - 旧経路（`pdf_to_neo_pipeline` / `auto_matching`）は UI から外した。関数は残してある
 - 詳細は `docs/引き継ぎ書.md` §12、方針は files の `docs/pdf-to-neo_アプリ移植ガイド.md`
+- **別 PC の ADDATA**: `C:\Addata`／`D:\Addata` なら設定不要（自動検出）。他の場所はサイドバーのパスか `env_check.py --save`。Cloud は取得URL（`?addata_url=`）。詳細は引き継ぎ書 §12.9
 - **Linux（Community Cloud）で Windows と同じ NEO にする条件**（2026-09-14）: `packages.txt` の `p7zip-full`（塗装指数表 CHM の展開。無いと修正塗装のあるパネルの見積は理由付きで不合格になる）。COM.CAB は純 Python で展開する。展開キャッシュは `LOCALAPPDATA`（無ければ一時フォルダ。`neo_skill/vendor.py subprocess_env` が渡す）で、vendor の中には書かない。詳細は移植ガイド §4-1
 
 ## 変更するときの手順
