@@ -61,6 +61,15 @@ def _nfkc(s) -> str:
     return unicodedata.normalize('NFKC', str(s or ''))
 
 
+def _clean_panel_line(n: str) -> str:
+    """コグニ印刷の塗装明細の書き方（'Rrﾊﾟﾈﾙ修理20d㎡(1/2)' — NFKC 後は ㎡ が m2）を「名前 修理 1/2」の形に寄せる。
+    面積（塗装面積 dm²。20.DB のパネル面積とは別物なので捨てる）と括弧付きの比率を外す（2026-09-14）"""
+    s = re.sub(r'[（(]\s*(1/[123])\s*[）)]', r'\1', n)                 # (1/2) → 1/2
+    s = re.sub(r'[0-9]+(?:\.[0-9]+)?\s*d?m[2²]', '', s)                 # 20d㎡ / 121dm² / 20dm2
+    s = re.sub(r'[0-9]+(?:\.[0-9]+)?\s*d㎡', '', s)
+    return s.strip()
+
+
 def _hw_kana(s: str) -> str:
     """全角カナ → 半角カナ（NFKC は半角→全角なので逆変換を自前で）"""
     t = _nfkc(s)
@@ -1043,6 +1052,18 @@ class Drafter:
                 self.notes.append(f"板金 {it.get('name')} {area}d㎡ 指数 {t} は BANKIN.DB のどのランクとも違う → '#' 手入力")
 
     # ------------------------------------------------------------------ 塗装
+    def _panel_by_code(self, code) -> Optional[dict]:
+        """塗装行に部品コード（4 桁）が写されていれば、明細行と同じくそれで 20.DB のパネルを引く（名前照合より確実。コグニ印刷の塗装明細）"""
+        if not self.pi:
+            return None
+        c = re.sub(r'\D', '', str(code or ''))
+        if len(c) != 4:  # ちょうど 4 桁のときだけ（5 桁以上の品番や OCR の連結値を先頭 4 桁で別パネルにしない。Codex 指摘）
+            return None
+        try:
+            return self.pi.panel(c)  # 明細行と同じボディ対応の引き方（panel_exact だと別ボディの同コード行を掴む。Codex 指摘）
+        except Exception:  # noqa: BLE001  20.DB を引けない車種
+            return None
+
     def _panel_code(self, text: str) -> Optional[dict]:
         if not self.pi:
             return None
@@ -1152,10 +1173,10 @@ class Drafter:
                 if _flag(ln.get('draft'), 'paint.lines[].draft'):  # 文字列 "false" を真に潰さない（Codex 指摘）
                     out[key]['draft'] = True
                 continue
-            m = re.match(r'^(.*?)(取替|新品|交換|修正|修理)\s*(1/[123])?$', n)
+            m = re.match(r'^(.*?)(取替|新品|交換|修正|修理)\s*(1/[123])?$', _clean_panel_line(n))
             if m:
                 pname, mth, ratio = m.group(1), m.group(2), m.group(3) or ''
-                pnl = self._panel_code(pname)
+                pnl = self._panel_by_code(ln.get('code')) or self._panel_code(pname)
                 if pnl:
                     method = '取替' if mth in ('取替', '新品', '交換') else '修理'
                     if method == '修理' and not ratio:

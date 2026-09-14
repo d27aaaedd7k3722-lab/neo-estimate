@@ -224,12 +224,48 @@ class PaintIndex:
         return bool(glob.glob(os.path.join(d, '*.hhc'))
                     and (glob.glob(os.path.join(d, 'html', '*.htm')) or glob.glob(os.path.join(d, 'html', '*.html'))))
 
+    @staticmethod
+    def _extract_chm_hh(hh: str, chm: str, tmp: str) -> bool:
+        """hh.exe -decompile を起動する（Windows 付属。非同期に書くので、揃ったかは呼び出し側が _cache_ok で待つ）。起動できたら True"""
+        if not os.path.isfile(hh):
+            return False
+        try:
+            subprocess.run([hh, '-decompile', tmp, chm], timeout=60)
+            return True
+        except Exception:  # noqa: BLE001  失敗・時間切れ
+            return False
+
+    @staticmethod
+    def _extract_chm_7z(chm: str, tmp: str) -> bool:
+        """7z x で CHM を展開する（Linux / Streamlit Cloud の p7zip、または Windows の 7-Zip。同期）。
+        7z の展開は hh.exe -decompile と同じ .hhc / html/*.htm を作る（内部ファイル #SYSTEM 等が余分に出るが害はない。
+        2026-09-14 に J8200LTB.CHM で 155 ファイル全部一致を確認）"""
+        import com_tables
+        sz = com_tables.find_7z()
+        if not sz:
+            return False
+        try:
+            os.makedirs(tmp, exist_ok=True)
+            r = subprocess.run([sz, 'x', '-y', '-o' + tmp, chm], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+            return r.returncode == 0
+        except Exception:  # noqa: BLE001
+            return False
+
     def _decompile(self, chm: str) -> Optional[str]:
         """CHM を LOCALAPPDATA に展開してそのフォルダを返す。展開済みなら再利用する。
         途中で終わったキャッシュ（.hhc だけ等）はそのまま使わずに作り直す。
         展開は一時フォルダで行い、揃ってから本来の場所へ移すので、同時に 2 つ動いても壊れない"""
-        base = os.path.join(os.environ.get('LOCALAPPDATA', HERE), 'claude_neo_pipeline', 'chm')
-        cache = os.path.join(base, os.path.splitext(os.path.basename(chm))[0])
+        base = os.path.join(os.environ.get('LOCALAPPDATA') or tempfile.gettempdir(), 'claude_neo_pipeline', 'chm')  # LOCALAPPDATA の無い Linux では一時フォルダ（配布物の中に書かない: アプリは vendor の内容ハッシュを照合する）
+        try:  # キャッシュ名に CHM の内容ハッシュを入れる（別の ADDATA の版・置き場の同名 CHM を取り違えない。Linux の共有一時フォルダでも安全。Codex 指摘）
+            import hashlib
+            h = hashlib.sha1()
+            with open(chm, 'rb') as f_:
+                for chunk in iter(lambda: f_.read(1 << 20), b''):
+                    h.update(chunk)
+            ident = '_' + h.hexdigest()[:12]
+        except OSError:  # 読めない CHM は「展開できない」扱い（名前だけのキャッシュに落として別物を掴まない。Codex 指摘）
+            return None
+        cache = os.path.join(base, os.path.splitext(os.path.basename(chm))[0] + ident)
         if self._cache_ok(cache):
             return cache
         hh = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'hh.exe')
@@ -241,19 +277,22 @@ class PaintIndex:
             tmp = tempfile.mkdtemp(dir=base, prefix=os.path.basename(cache) + '.', suffix='.tmp')
         except OSError:
             return cache if self._cache_ok(cache) else None
-        try:
-            subprocess.run([hh, '-decompile', tmp, chm], timeout=60)
-        except Exception:  # noqa: BLE001  hh.exe が無い PC・失敗・時間切れ
-            shutil.rmtree(tmp, ignore_errors=True)
-            return cache if self._cache_ok(cache) else None
-        for _ in range(40):  # hh.exe は非同期で書き終わるので、揃うまで待つ
-            if self._cache_ok(tmp):
-                time.sleep(0.5)
-                break
-            time.sleep(0.25)
+        launched = self._extract_chm_hh(hh, chm, tmp)
+        if launched:
+            for _ in range(40):  # hh.exe は非同期で書き終わるので、揃うまで待つ
+                if self._cache_ok(tmp):
+                    time.sleep(0.5)
+                    break
+                time.sleep(0.25)
         if not self._cache_ok(tmp):
+            # hh.exe が無い（Linux / Streamlit Cloud）か、起動はしたが揃わない（ポリシーで止められる等）→ 7z（p7zip / 7-Zip）で同期展開（Codex 指摘）
             shutil.rmtree(tmp, ignore_errors=True)
-            return cache if self._cache_ok(cache) else self._wait_cache(cache)
+            used_7z = self._extract_chm_7z(chm, tmp)
+            if not used_7z or not self._cache_ok(tmp):
+                shutil.rmtree(tmp, ignore_errors=True)
+                if not launched and not used_7z:  # どの道具も無い: 待っても揃わないので待たない
+                    return cache if self._cache_ok(cache) else None
+                return cache if self._cache_ok(cache) else self._wait_cache(cache)
         if self._cache_ok(cache):  # 展開している間に別プロセスが完成させた → 相手のものを使う（消さない）
             shutil.rmtree(tmp, ignore_errors=True)
             return cache

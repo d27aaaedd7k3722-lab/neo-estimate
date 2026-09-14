@@ -16,11 +16,12 @@ import functools
 import hashlib
 import json
 import os
+import tempfile
 import sys
 from typing import Optional
 
 # 取り込んでいる files（pdf-to-neo ブランチ）のコミット。tools/vendor_sync.py が取り直すときに書き換える
-EXPECTED_COMMIT = '1bd202b9805cd0b1612b9bb8cd7613d7dab6655c'
+EXPECTED_COMMIT = 'e8d6d2883164f0b03f9a34bf1eec0ee2f2e25b10'
 
 APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENDOR_ROOT = os.path.join(APP_ROOT, 'vendor', 'pdf_to_neo')
@@ -114,6 +115,9 @@ def subprocess_env(addata_root: Optional[str] = None, neo_check_root: Optional[s
     env['REPO_ROOT'] = VENDOR_ROOT
     env['PYTHONIOENCODING'] = 'utf-8'
     env.setdefault('PYTHONUTF8', '1')
+    # vendor は COM.CAB / CHM の展開キャッシュを %LOCALAPPDATA% に置く。無い Linux（Streamlit Cloud）では一時フォルダに
+    # 置かせる（配布物 vendor/ の中に書かれると内容ハッシュの照合に落ちて経路が止まる）
+    env.setdefault('LOCALAPPDATA', os.path.join(tempfile.gettempdir(), 'neo_skill_cache'))
     if addata_root:
         env['ADDATA_ROOT'] = addata_root
     if neo_check_root:

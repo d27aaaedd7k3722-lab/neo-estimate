@@ -576,6 +576,9 @@ def test_chm_cache_is_thread_safe():
     sandbox = tempfile.mkdtemp(prefix='chm_thread_')
     old_local = os.environ.get('LOCALAPPDATA')
     os.environ['LOCALAPPDATA'] = sandbox
+    old_win = os.environ.get('WINDIR')
+    os.environ['WINDIR'] = sandbox  # hh.exe は実在するものだけ起動する（無ければ 7z へ）ので、偽物を置く（2026-09-14）
+    open(os.path.join(sandbox, 'hh.exe'), 'wb').write(b'x')
     real_run = _pi.subprocess.run
     seen, lock, gate, out = [], threading.Lock(), threading.Barrier(2, timeout=120), []
     def fake_run(args, **kw):  # hh.exe の代わりに最小限の展開結果を書く
@@ -590,6 +593,7 @@ def test_chm_cache_is_thread_safe():
     _pi.subprocess.run = fake_run
     inst = PaintIndex.__new__(PaintIndex)  # _decompile だけ使うので初期化は要らない
     chm = os.path.join(sandbox, 'DUMMYLTB.CHM')
+    open(chm, 'wb').write(b'dummy chm')  # 実在するファイルにする（読めない CHM は展開不可扱い。2026-09-14）
     try:
         def work():
             try:
@@ -605,6 +609,10 @@ def test_chm_cache_is_thread_safe():
         assert all(isinstance(o, str) and o for o in out) and len(out) == 2, f'展開に失敗している（{out}）'
         assert len(set(out)) == 1, f'公開先が食い違う（{out}）'
     finally:
+        if old_win is None:
+            os.environ.pop('WINDIR', None)
+        else:
+            os.environ['WINDIR'] = old_win
         _pi.subprocess.run = real_run
         if old_local is None:
             os.environ.pop('LOCALAPPDATA', None)

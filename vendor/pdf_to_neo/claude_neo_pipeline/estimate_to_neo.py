@@ -2194,6 +2194,11 @@ class NeoBuilder:
                 name = mp.get('name') or hw(pnl.get('name', ''))[:20].ljust(20)
                 s = {k: (std or {}).get(k) for k in ('new', 's1', 's2', 's3', 'hf')}
                 expect = {'': s['new'], '1/1': s['s1'], '1/2': s['s2'], '1/3': s['s3']}.get(ratio)
+                if expect is None and not new and pi is not None and getattr(pi, 'chm_unavailable', False):
+                    # 修正塗装の標準指数は CHM（車種別補修塗装指数）から取る。展開できない環境で黙って 0 を書くと、
+                    # Windows で作った NEO と TimeStandard*/WageStandard* が変わる（実測: 9 案件中 1 件）。止めて理由を出す
+                    raise ValueError(f"塗装パネル {pnl.get('code')} {pnl.get('name', '')}: 修正塗装の標準指数が取れない。この環境では塗装指数表（CHM）を展開できない"
+                                     "（Windows の hh.exe か 7-Zip（Linux は p7zip-full）が必要）。同じ NEO にならないので作らない")
                 if not t:
                     if expect is None:
                         raise ValueError(f"塗装パネル {pnl.get('code')} {pnl.get('name', '')}: 標準指数が取れず（CHM/係数表に無い）見積の index も無い。paint.panels[].index を指定してください")

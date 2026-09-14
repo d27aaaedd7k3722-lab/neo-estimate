@@ -55,6 +55,7 @@ SELFTEST_TESTS = {'unit_types.py', 'unit_consistency.py', 'unit_guards.py', 'uni
                   'unit_settings.py', 'unit_eva_slot.py', 'unit_link_absorb.py', 'unit_frame.py',
                   'unit_insurance.py',  # files 2026-09-14〜（受付番号・代理店・アジャスター・入出庫日・修理日数）。古いコミットには無いので wanted() は「あれば入れる」
                   'unit_era.py',  # files 2026-09-14〜（元号は改元日で分ける。受付番号・代理店・アジャスター・入出庫日・修理日数）。古いコミットには無いので wanted() は「あれば入れる」
+                  'unit_cab.py',  # files 2026-09-14〜（元号は改元日で分ける。受付番号・代理店・アジャスター・入出庫日・修理日数）。古いコミットには無いので wanted() は「あれば入れる」
                   'unit_handoff.py', 'neo_diff.py'}
 PIPELINE_TESTS = 'claude_neo_pipeline/tests/'
 EXCLUDE_FILE_PREFIX = ('STATUS_',)

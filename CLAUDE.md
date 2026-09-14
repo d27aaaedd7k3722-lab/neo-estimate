@@ -34,12 +34,13 @@
 **コミット固定で取り込んで**そのまま呼ぶ（`neo_skill/`）。アプリが持つのは「見積書を Claude API に読ませ、
 ページごとに検算し、落ちたページだけ読み直す」ところだけ。**`vendor/` 配下は書き換えない**（規則は files で直して取り直す）。
 
-- 取り込んでいるコミット: `vendor/pdf_to_neo/VENDOR_COMMIT.json`（いま `1bd202b9805c`。2026-09-14 に `9136473db9c6` → `f3028a9` → これ と取り直し）
+- 取り込んでいるコミット: `vendor/pdf_to_neo/VENDOR_COMMIT.json`（いま `e8d6d2883164`。2026-09-14 に `9136473db9c6` → `f3028a9` → `1bd202b` → `d43540b` → これ と取り直し）
 - 取り直し: `python tools/vendor_sync.py --source "<files>" --commit <ID>`／改変チェック `--check`
 - 見積書を読む LLM は Claude API（`.env` の `ANTHROPIC_API_KEY`）か Gemini API（`GEMINI_API_KEY`）。両方あれば画面で選ぶ（既定 Claude）、Gemini だけならそれで動く。判断・生成・検算は同じ
 - 合格の条件は vendor の `make_neo.py` と同じ。NEO と確認箇所シート（xlsx）は必ず組で出す
 - 旧経路（`pdf_to_neo_pipeline` / `auto_matching`）は UI から外した。関数は残してある
 - 詳細は `docs/引き継ぎ書.md` §12、方針は files の `docs/pdf-to-neo_アプリ移植ガイド.md`
+- **Linux（Community Cloud）で Windows と同じ NEO にする条件**（2026-09-14）: `packages.txt` の `p7zip-full`（塗装指数表 CHM の展開。無いと修正塗装のあるパネルの見積は理由付きで不合格になる）。COM.CAB は純 Python で展開する。展開キャッシュは `LOCALAPPDATA`（無ければ一時フォルダ。`neo_skill/vendor.py subprocess_env` が渡す）で、vendor の中には書かない。詳細は移植ガイド §4-1
 
 ## 変更するときの手順
 

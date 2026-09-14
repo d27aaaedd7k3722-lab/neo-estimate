@@ -110,8 +110,9 @@ def _page_reading(header: dict, page: dict) -> dict:
     if page.get('marks'):
         sub['marks'] = page['marks']
     rd['pages'] = {str(pg): sub}
-    rd['paint'] = {'lines': list(page.get('paint_lines') or [])} if page.get('paint_lines') else {}
-    rd['expenses'] = list(page.get('expenses') or [])
+    # ページ側の塗装行・費用には page を付ける（Checker がページ小計の別解「明細 + 塗装行 + 費用」に使う）
+    rd['paint'] = {'lines': [dict(l, page=pg) if isinstance(l, dict) else l for l in page.get('paint_lines') or []]} if page.get('paint_lines') else {}
+    rd['expenses'] = [dict(e, page=pg) if isinstance(e, dict) else e for e in page.get('expenses') or []]
     if header.get('labor_rate'):
         rd['labor_rate'] = header['labor_rate']
     return rd
@@ -273,6 +274,9 @@ def merge(case: str, force: bool = False) -> tuple[dict | None, list[str]]:
         for key, wheres in seen.items():
             if len(wheres) > 1:
                 msgs.append(f'{label}の同じ行が {len(wheres)} 回ある（出所 {wheres}）: {key[:80]}。各ページに繰り返し印字される合計欄を写していないか確かめる（二重計上になる）')
+    # 重複検出（上）は page 無しのキーで済ませてから、ページ由来の行に page を付ける（Checker のページ小計の別解に使う。header 由来は付けない）
+    lines = [dict(l, page=w) if (isinstance(l, dict) and w != 'header') else l for l, w in zip(lines, src_lines)]
+    expenses = [dict(e, page=w) if (isinstance(e, dict) and w != 'header') else e for e, w in zip(expenses, src_exp)]
     if lines:
         paint['lines'] = lines
     if paint:

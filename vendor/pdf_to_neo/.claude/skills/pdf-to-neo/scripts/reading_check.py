@@ -247,13 +247,30 @@ class Checker:
                     marks[ch] = marks.get(ch, 0) + 1
             return len(rows), p, w, marks
 
-        def _cmp(where: str, sub: dict, rows: list[dict]) -> None:
+        def _page_extras(pg) -> dict:
+            """そのページに写した塗装行の工賃と費用（集計先別）。ページ小計が塗装・費用の区画を含んで印字される書式（コグニ印刷）の別解に使う"""
+            if pg is None:
+                return {}
+            lines = [l for l in ((self.rd.get('paint') or {}).get('lines') or []) if isinstance(l, dict) and str(l.get('page')) == str(pg)]
+            exps = [e for e in (self.rd.get('expenses') or []) if isinstance(e, dict) and str(e.get('page')) == str(pg)]
+            return {'塗装行': sum(_int(l.get('wage')) or 0 for l in lines),
+                    '費用（部品計）': sum(_int(e.get('amount')) or 0 for e in exps if _in_kind(e) == 'parts'),   # 集計先の語彙は _in_kind に揃える（Codex 指摘）
+                    '費用（作業計）': sum(_int(e.get('amount')) or 0 for e in exps if _in_kind(e) == 'wage')}
+
+        def _cmp(where: str, sub: dict, rows: list[dict], pg=None) -> None:
             n, p, w, marks = _sum(rows)
+            extras = _page_extras(pg)
+            alts = {'parts': [('費用（部品計）',)], 'wage': [('塗装行',), ('費用（作業計）',), ('塗装行', '費用（作業計）')]}
             for key, got, label in (('rows', n, '行数'), ('parts', p, '部品計'), ('wage', w, '工賃計')):
                 exp = _int(sub.get(key))
                 if exp is None:
                     continue
                 if exp != got:
+                    hit = next((names for names in alts.get(key, []) if all(extras.get(nm) for nm in names)
+                                and got + sum(extras[nm] for nm in names) == exp), None)
+                    if hit:  # 印字の小計が、そのページに写した塗装行・費用を含んでいる（コグニ印刷の最終ページ）
+                        self.note(f'{where}: {label} 印字 {exp:,} = 明細 {got:,} + ' + ' + '.join(f'{nm} {extras[nm]:,}' for nm in hit) + '（小計が塗装・費用を含む書式）')
+                        continue
                     self.fail(f'{where}: {label} 印字 {exp:,} / 転記 {got:,}（差 {got - exp:+,}）' + self._hint(got - exp, rows))
                 else:
                     self.note(f'{where}: {label} {got:,} 一致')
@@ -273,7 +290,7 @@ class Checker:
                 if any(r.get('_page') for r in self.rows):
                     self.fail(f'ページ {pg}: 小計があるのに、このページの行が無い（blocks[].page を確認）')
                 continue
-            _cmp(f'ページ {pg}', sub, rows)
+            _cmp(f'ページ {pg}', sub, rows, pg)
 
     def _hint(self, diff: int, rows: list[dict]) -> str:
         """差額が 1 行の金額/工賃、または 1 つの費用と一致すれば、その行の集計先違いを示唆する"""

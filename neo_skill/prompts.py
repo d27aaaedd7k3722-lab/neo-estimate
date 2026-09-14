@@ -105,7 +105,7 @@ def header_task(n_pages: int, vehicle_hint: Optional[dict] = None, source_name: 
 - customer / insurance: 印字されているもの（氏名・登録番号・保険会社・証券番号など）
 - labor_rate: 印字されていればその値。無ければ書かない（プログラムが工賃÷指数で逆算する）
 - paint: 塗料・塗膜・高機能塗装・材料代・材料代割合・塗装工賃計（lines はページ側の paint_lines に書くので、ここでは lines を書かない）
-- expenses: 費用・諸費用（name / amount / in = どの合計に入っているか: 部品計 / 作業計 / 諸費用計 / 非課税）。ページ側にも書く場合はどちらか一方だけ
+- expenses: **ここには書かない**（費用・諸費用は、印字されたページ側の expenses に書く。header とページの両方に書くと「費用の同じ行が 2 回ある」で不合格）
 - totals: 合計欄そのまま（parts / wage / paint / material / expense / taxable / tax / total。印字されている項目だけ。税込印字の見積書は reading_schema.md の規則どおり）
 - index_policy: 非コグニ書式（指数の列が無い・区分語彙が違う）なら "manual"、それ以外は "auto"
 - format: A〜G
@@ -128,7 +128,11 @@ def page_task(page_no: int, n_pages: int, header: dict) -> str:
 3. 金額は数量分。単価しか印字が無ければ price に 単価×数量、comment に `unit=単価`。数量 1 のまま複数個分の金額は印字どおり
 4. 左右・Fr/Rr・上下は印字どおり
 5. 小計・消費税・繰越・合計の行は明細に入れない
-6. このページに塗装行・費用が印字されていれば paint_lines / expenses（in 必須）に。合計欄はここに書かない（header にある）
+6. このページに塗装の区画（外板パネル・バンパ・加算基礎数値・ブース・付加塗装・材料代 など）や費用の区画（ショートパーツ・廃棄費用・
+   アライメント・診断料・写真代 など）が印字されていれば、その行は rows に入れず paint_lines / expenses（in = 印字の集計先: 部品計 / 作業計 /
+   諸費用計 / 非課税）に写す（rows_printed にも数えない）。コグニ印刷ではこれらが明細の表の続きに同じ形で印字される。
+   ページ小計 subtotal は印字どおり書く（塗装・費用を含んだ小計でも検算が受ける）。合計欄はここに書かない（header にある）。
+   費用・塗装行を header に書かない（両方に書くと二重計上で不合格）
 7. 読めない数値は推測せず comment に `?`。確かめてほしい点は `要確認:`。印字された明細コメントだけ `NEO:`
 8. 明細の無いページ（表紙・計算書だけ）は rows_printed: 0、blocks: [{{"title": "", "rows": []}}] にする（blocks を空リストにしない）
 
@@ -170,8 +174,10 @@ totals（見積書の合計欄）は必ず写します — 検算の拠り所で
 def header_retry_task(fails: list, warns: list, previous: dict) -> str:
     """合計欄の検算（全体）に落ちたときの header の読み直し"""
     return f"""全ページを束ねて合計欄と突き合わせたところ、次の点で不合格でした。添付の見積書（全ページ）をもう一度見て、
-header.json（合計欄・費用・塗装・レバーレート）の写しを直してください。明細の行はここでは直しません。
+header.json（合計欄・塗装・レバーレート）の写しを直してください。明細の行はここでは直しません。
 差額と同じ額の行や費用が手掛かりです。合計欄の数字は印字どおりに写します（計算して埋めない）。
+費用（expenses）と塗装行（paint.lines）は header には書きません（印字されたページ側の expenses / paint_lines に写してあります。
+「費用の同じ行が 2 回ある」は header に書いたのが原因なので、header からは消します）。
 
 不合格（FAIL）:
 {chr(10).join('- ' + f for f in fails) or '- （なし）'}

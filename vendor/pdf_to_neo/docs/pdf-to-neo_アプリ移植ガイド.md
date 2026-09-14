@@ -107,16 +107,30 @@ Gemini を使い続ける場合も、指示文・出力形式・読み直しル�
 | 条件 | 内容 | Streamlit Cloud での注意 |
 |---|---|---|
 | ADDATA | コグニの車種データ（毎月更新。版で標準品番・標準指数・部品価格適応日が変わる） | サーバからは利用者 PC の `C:\Addata` は読めない。アプリの「Addata の場所を設定」（ZIP / URL）で渡す |
-| COM.CAB の展開 | 毎月変わる表（DATAUP・Katashiki）は `expand.exe`（Windows）で展開して読む（`com_tables.py`） | Linux には無い → 同梱の予備を使い ★ が出る。**展開済みの COM フォルダを ADDATA と一緒に渡す**か、`cabextract` で展開する処理を足す |
-| 塗装指数（CHM） | 車種ごとの CHM を `hh.exe`（Windows）で展開（`paint_index.py`、キャッシュ `%LOCALAPPDATA%\claude_neo_pipeline\chm`） | Linux には無い → 塗装パネルの標準指数が取れず、修正塗装は見積の指数が必須になる。**展開済みキャッシュを渡す**か Linux 用の展開を足す |
+| COM.CAB の展開 | 毎月変わる表（DATAUP・Katashiki）は `expand.exe`（Windows）で展開して読む（`com_tables.py`） | Linux には無い → **純 Python で展開する**（§4-1。2026-09-14 から） |
+| 塗装指数（CHM） | 車種ごとの CHM を `hh.exe`（Windows）で展開（`paint_index.py`、キャッシュ `%LOCALAPPDATA%\claude_neo_pipeline\chm`） | Linux には無い → **7z（p7zip-full）で展開する**（§4-1）。7z も無ければ修正塗装のあるパネルの見積は理由付きで不合格 |
 | Python | 3.11 以上。生成は標準ライブラリだけ。確認箇所シートは `openpyxl`（無ければ CSV） | `requirements.txt` に `openpyxl` を固定版で足す |
 | 雛形 NEO | `claude_neo_pipeline/reference/template.neo`（顧客情報なし） | そのまま同梱 |
 | 個人情報 | 見積・NEO・確認箇所シートには顧客情報が入る | Community Cloud は 1 プロセスを全利用者で共有。作業フォルダは要求ごとに一時フォルダを作り、終わったら消す |
 
 いちばん簡単で確実なのは、**ADDATA とコグニのある Windows PC でアプリを動かす**（ローカル起動 or 社内サーバ）。
-Cloud で動かすなら、上の 2 つの展開物を ADDATA と一緒に配る仕組みが先に要る。
+Cloud で動かすなら、§4-1 の条件（`packages.txt` の `p7zip-full`）を満たせば Windows と同じ NEO になる（2026-09-14 に 9 案件で確認）。
 
 ---
+
+### 4-1. Linux（Streamlit Community Cloud など）で Windows と同じ NEO にする条件 — 2026-09-14
+
+生成器は 2 か所で Windows 付属のツールを使っていた。Linux では次のように動く（1bd202b の次のコミットから）:
+
+| 段 | Windows | Linux | 無いとどうなるか |
+|---|---|---|---|
+| ADDATA の COM.CAB（毎月変わる DATAUP.DB・Katashiki.DB）の展開 | `expand.exe` | **純 Python**（`com_tables.extract_cab`。MSZIP を zlib で展開。expand.exe と全 53 ファイル一致を確認）→ 7z | 同梱の予備 `reference/`（★ 古い可能性） |
+| 車種別の塗装指数表（CHM）の展開 | `hh.exe -decompile` | **7z**（p7zip の `7z x`。hh.exe と同じ .hhc / html/*.htm ができる） | 修正塗装の標準指数が取れない。そのパネルがある見積は **ValueError で不合格**（黙って 0 を書いて Windows と違う NEO を作らない。実測: 9 案件中 1 件が変わっていた） |
+
+- 7z の探し方: 環境変数 `PDF_TO_NEO_7Z` → PATH の `7z` / `7za` / `7zz` → Windows の Program Files。Streamlit Community Cloud は `packages.txt` に `p7zip-full` を書けば入る。Docker は `apt-get install p7zip-full`
+- 展開キャッシュは `%LOCALAPPDATA%\claude_neo_pipeline\{com,chm}`。無い Linux では一時フォルダ（`tempfile.gettempdir()`）。**配布物の中には書かない**（アプリは vendor の内容ハッシュを照合する）
+- 確かめ方（Windows 上で Linux を模す）: `WINDIR` を存在しないパスに、`PATH` から System32 を外し、`LOCALAPPDATA` を空フォルダにして `make_neo.py` を回し、通常環境の NEO と `neo_diff.py` で比べる。7z ありで 9/9 一致、7z 無しで 8/9 一致＋1 件は理由付きで不合格（2026-09-14）
+- 単体テスト: `claude_neo_pipeline/tests/unit_cab.py`（純 Python の展開 = expand.exe、壊れた CAB は ValueError）
 
 ## 5. 同じ結果になっていることの確かめ方（受け入れテスト）
 

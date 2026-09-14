@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "1bd202b9805cd0b1612b9bb8cd7613d7dab6655c",
- "subject": "fix: 元号を改元日で分ける — 2019-01〜04 が令和 1 になっていた（get_era_info）",
- "synced_at": "2026-09-14T10:07:09",
- "files": 97,
- "tree_sha256": "9c5fd25021084c1219a214ae0683d95e1d638fd5703555e1cc1fc21501e7aa77",
+ "commit": "e8d6d2883164f0b03f9a34bf1eec0ee2f2e25b10",
+ "subject": "fix: 下書きがコグニ印刷の塗装明細（面積・括弧付き比率・部品コード付き）を 20.DB のパネルに対応付けられるように",
+ "synced_at": "2026-09-14T13:22:53",
+ "files": 100,
+ "tree_sha256": "99323cf4d04081b7793f2e9c5c9b71e1fa2f9ef393488b548b15c746179f91b7",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

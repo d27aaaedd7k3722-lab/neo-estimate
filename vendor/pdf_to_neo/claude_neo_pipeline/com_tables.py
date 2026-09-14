@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 import threading
 import time
+import zlib
 from typing import Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -37,6 +39,148 @@ _source = threading.local()  # 表名 → 実際に読んだ場所。スレッ�
 def _cab(root: str) -> Optional[str]:
     p = os.path.join(root or '', 'COM', 'COM.CAB')
     return p if root and os.path.isfile(p) else None
+
+
+def find_7z() -> Optional[str]:
+    """7-Zip の実行ファイル（Linux の p7zip: 7z / 7za / 7zz、Windows の 7-Zip）。無ければ None。
+    環境変数 PDF_TO_NEO_7Z でフルパスを指定できる（Streamlit Cloud は packages.txt の p7zip-full で 7z が PATH に入る）"""
+    p = os.environ.get('PDF_TO_NEO_7Z', '').strip()
+    if p and os.path.isfile(p):
+        return p
+    for name in ('7z', '7za', '7zz'):
+        w = shutil.which(name)
+        if w:
+            return w
+    for cand in (os.path.join(os.environ.get('ProgramFiles', r'C:\Program Files'), '7-Zip', '7z.exe'),
+                 os.path.join(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'), '7-Zip', '7z.exe')):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _cab_checksum(data: bytes, seed: int) -> int:
+    """CAB の検査和（MS-CAB 仕様 / cabextract と同じ: 4 バイトずつ XOR、端数は上位から詰める）"""
+    csum = seed
+    n = len(data) // 4
+    for i in range(n):
+        csum ^= int.from_bytes(data[4 * i:4 * i + 4], 'little')
+    ul = 0
+    for b in data[4 * n:]:
+        ul = (ul << 8) | b
+    return (csum ^ ul) & 0xFFFFFFFF
+
+
+class UnsupportedCab(ValueError):
+    """純 Python では展開できない圧縮方式（LZX / Quantum）。7z に回してよいのはこれだけ"""
+
+
+def _safe_cab_parts(name: str) -> list:
+    """CAB の中のファイル名を展開先の相対パスの部品に分ける。'..'・絶対パス・ドライブ文字・空は ValueError"""
+    parts = [q for q in name.replace('\\', '/').split('/') if q not in ('', '.')]
+    if not parts or '..' in parts or os.path.isabs(name) or any(':' in q for q in parts):
+        raise ValueError(f'CAB の中の安全でない名前: {name!r}')
+    return parts
+
+
+def extract_cab(cab: str, dest: str) -> list:
+    """CAB を純 Python で展開する（MSZIP・無圧縮。COM.CAB は 1 フォルダ MSZIP）。展開したファイル名を返す。
+    CFDATA ブロックごとに 'CK' + raw deflate、LZ77 の窓（32KB）は前ブロックから引き継ぐ（zdict）。
+    expand.exe（Windows 付属）が無い Linux / Streamlit Cloud 用。expand.exe の展開と全 53 ファイル一致を確認（2026-09-14）"""
+    data = open(cab, 'rb').read()
+    if data[:4] != b'MSCF':
+        raise ValueError('CAB ではない: ' + cab)
+    coffFiles, = struct.unpack_from('<I', data, 16)
+    cFolders, cFiles, flags = struct.unpack_from('<HHH', data, 26)
+    pos = 36
+    cbCFFolder = cbCFData = 0
+    if flags & 4:  # 予約領域
+        cbCFHeader, cbCFFolder, cbCFData = struct.unpack_from('<HBB', data, pos)
+        pos += 4 + cbCFHeader
+    for _ in range((2 if flags & 1 else 0) + (2 if flags & 2 else 0)):  # 前後のキャビネット名（文字列）
+        pos = data.index(b'\0', pos) + 1
+    folders = []
+    for _ in range(cFolders):
+        coffCabStart, cCFData, typeCompress = struct.unpack_from('<IHH', data, pos)
+        pos += 8 + cbCFFolder
+        folders.append((coffCabStart, cCFData, typeCompress & 0x000f))
+    files = []
+    pos = coffFiles
+    for _ in range(cFiles):
+        cbFile, uoffFolderStart, iFolder = struct.unpack_from('<IIH', data, pos)
+        pos += 16
+        end = data.index(b'\0', pos)
+        files.append((data[pos:end].decode('cp932', 'replace'), cbFile, uoffFolderStart, iFolder))
+        pos = end + 1
+    for name, _cb, _off, _fi in files:  # 名前の安全性は展開の前（対応外の圧縮方式で 7z に回す前）に見る（Codex 指摘）
+        _safe_cab_parts(name)
+    out = []
+    for fi, (coffCabStart, cCFData, comp) in enumerate(folders):
+        buf = bytearray()
+        p = coffCabStart
+        window = b''
+        for _ in range(cCFData):
+            csum, cbData, cbUncomp = struct.unpack_from('<IHH', data, p)
+            hdr = data[p + 4:p + 8 + cbCFData]
+            p += 8 + cbCFData
+            blk = data[p:p + cbData]
+            p += cbData
+            if len(blk) != cbData:
+                raise ValueError('CFDATA が途中で切れている')
+            if csum and _cab_checksum(bytes(blk), _cab_checksum(bytes(hdr), 0)) != csum:  # csum 0 は「検査和なし」
+                raise ValueError('CFDATA の検査和が合わない（壊れた CAB）')
+            if comp == 1:  # MSZIP
+                if blk[:2] != b'CK':
+                    raise ValueError('MSZIP ブロックの印が違う')
+                d = zlib.decompressobj(-15, zdict=window) if window else zlib.decompressobj(-15)
+                dec = d.decompress(blk[2:]) + d.flush()
+            elif comp == 0:
+                dec = bytes(blk)
+            else:
+                raise UnsupportedCab(f'対応していない圧縮 {comp:#x}（LZX / Quantum）')
+            if len(dec) != cbUncomp:
+                raise ValueError(f'展開サイズが合わない {len(dec)} / {cbUncomp}')
+            buf += dec
+            window = bytes(buf[-32768:])
+        for name, cbFile, off, iFolder in files:
+            if iFolder == fi:
+                parts = _safe_cab_parts(name)
+                if off + cbFile > len(buf):
+                    raise ValueError(f'CAB の中のファイルが展開データの範囲を超える: {name!r}')
+                fp = os.path.join(dest, *parts)
+                os.makedirs(os.path.dirname(fp) or dest, exist_ok=True)
+                with open(fp, 'wb') as f:
+                    f.write(bytes(buf[off:off + cbFile]))
+                out.append(name)
+    return out
+
+
+def _extract_cab_any(cab: str, tmp: str) -> bool:
+    """COM.CAB を tmp に展開する。expand.exe（Windows 付属）→ 純 Python → 7z の順。揃えば True"""
+    exe = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'System32', 'expand.exe')
+    if os.path.isfile(exe):
+        try:
+            r = subprocess.run([exe, cab, '-F:*', tmp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+            if r.returncode == 0 and _ok(tmp):
+                return True
+        except Exception:  # noqa: BLE001  権限・時間切れ → 次の手段
+            pass
+    try:
+        extract_cab(cab, tmp)
+        if _ok(tmp):
+            return True
+    except UnsupportedCab:  # 対応外の圧縮方式だけ 7z に回す
+        pass
+    except Exception:  # noqa: BLE001  検査和・安全でない名前・範囲外・途中で切れた構造（struct.error）… 壊れた CAB は 7z にも渡さない（Codex 指摘）
+        return False
+    sz = find_7z()
+    if sz:
+        try:
+            r = subprocess.run([sz, 'x', '-y', '-o' + tmp, cab], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+            if r.returncode == 0 and _ok(tmp):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+    return False
 
 
 def _ok(d: str) -> bool:
@@ -78,10 +222,7 @@ def com_dir(root: str) -> Optional[str]:
             os.makedirs(base, exist_ok=True)
             tmp = tempfile.mkdtemp(dir=base, prefix='x.', suffix='.tmp')
             try:
-                exe = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'System32', 'expand.exe')
-                r = subprocess.run([exe if os.path.exists(exe) else 'expand', cab, '-F:*', tmp],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-                if r.returncode == 0 and _ok(tmp):   # 失敗・部分展開は公開しない
+                if _extract_cab_any(cab, tmp):   # 失敗・部分展開は公開しない（expand.exe が無い Linux でも純 Python / 7z で展開する）
                     try:
                         os.rename(tmp, cache)   # 置き場所が空なら成功。先に別プロセスが置いていたら失敗する（相手のものを使う）
                     except OSError:
@@ -89,7 +230,7 @@ def com_dir(root: str) -> Optional[str]:
                 out = cache if _ok(cache) else None
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
-    except Exception:  # noqa: BLE001  expand.exe が無い・権限・時間切れ → 予備（reference）で続ける
+    except Exception:  # noqa: BLE001  どの手段でも展開できない・権限・時間切れ → 予備（reference）で続ける
         out = None
     with _lock:
         _memo[key] = (out, time.time())

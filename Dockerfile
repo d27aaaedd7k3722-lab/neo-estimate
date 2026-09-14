@@ -1,6 +1,7 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y poppler-utils libgomp1 curl && rm -rf /var/lib/apt/lists/*
+# p7zip-full: pdf-to-neo スキル（vendor/pdf_to_neo）が塗装指数表（CHM）を展開するのに使う（Linux には hh.exe が無い）
+RUN apt-get update && apt-get install -y poppler-utils libgomp1 curl p7zip-full && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -u 1000 user
 USER user
