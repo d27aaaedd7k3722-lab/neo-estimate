@@ -81,6 +81,11 @@ def has_com(path: Optional[str]) -> bool:
     return os.path.isfile(os.path.join(com, 'KA06_ALL.DB')) and (os.path.isfile(os.path.join(com, 'AnVer.DB')) or os.path.isfile(os.path.join(com, 'COM.CAB')))
 
 
+# 車種フォルダに必ず要る DB の番号。実在の C:\Addata 1,307 車種で 01・11 は全部にあるが、12.DB は 108 車種・15.DB は 69 車種に無い
+# （輸入車・汎用車・旧型）。生成器はその欠落を許容する（12 は属性空、15 は無ければ空）ので、必須は 01（車種）と 11（部品表）だけ
+ESSENTIAL_CAR_DB = ('01', '11')
+
+
 def has_car(path: Optional[str], car: str) -> bool:
     """車種フォルダが丸ごと届いているか: 完了印 ＋ <車種>01.DB（部品表の本体。vendor の is_addata が目印にするのと同じ）。
     PC 側のフォルダが壊れていて 01.DB が無ければ「届いた」と見なさず、待ちを解いて理由付きで不合格にする（Codex 45）"""
@@ -91,7 +96,9 @@ def has_car(path: Optional[str], car: str) -> bool:
     if not os.path.isdir(d):
         return False
     names = {n.lower() for n in os.listdir(d)}
-    return (car.lower() + '01.db') in names
+    # 生成器が読む DB の本体が揃っているか（01 車種・11 部品表）。01 だけでは「届いた」と見なさない
+    # （欠けたまま作ると生成器が黙って汎用値で NEO を作る。Codex hunt D2 2026-09-15）
+    return all((car.lower() + n + '.db') in names for n in ESSENTIAL_CAR_DB)
 
 
 def cars(path: Optional[str]) -> list:

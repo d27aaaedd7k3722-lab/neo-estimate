@@ -16,6 +16,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import tempfile
 import sys
 from typing import Optional
@@ -107,11 +108,15 @@ def is_ready() -> bool:
     return readiness_error() == ''
 
 
+_SECRET_ENV = re.compile(r'(API_?KEY|_TOKEN$|^TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|ANTHROPIC|GEMINI|OPENAI|GOOGLE_API|^AWS_|^AZURE_|HF_TOKEN)', re.I)
+
+
 def subprocess_env(addata_root: Optional[str] = None, neo_check_root: Optional[str] = None) -> dict:
     """vendor のスクリプトを subprocess で呼ぶときの環境変数（このプロセスの os.environ は変えない）。
     REPO_ROOT を vendor に固定し、出力を UTF-8 にする。ADDATA / NEO_check はアプリが決めたものがあれば渡す
     （無ければ skill_env が 設定ファイル → 自動検出 で解決する）"""
-    env = dict(os.environ)
+    # 秘密情報（API キー・トークン・パスワード）は vendor の subprocess に渡さない（検算・生成には要らない。Codex hunt F2）
+    env = {k: v for k, v in os.environ.items() if not _SECRET_ENV.search(k)}
     env['REPO_ROOT'] = VENDOR_ROOT
     env['PYTHONIOENCODING'] = 'utf-8'
     env.setdefault('PYTHONUTF8', '1')

@@ -125,8 +125,13 @@ def main() -> int:
         b = lambda s: base64.b64encode(s).decode()  # noqa: E731
         n3, _t, dropped3 = bridge.store(root, {'../evil.DB': b(b'x'), '/abs/x.DB': b(b'x'), 'KCS/x.DB': b(b'x'),
                                               'W/W99/W9901.DB': b(b'x'), 'W/W99/run.EXE': b(b'x'), 'W/W99/W9902.db': b(b'y'),
+                                              'W/W99/W9911.DB': b(b'x'),
                                               'W/W99/desktop.ini': b(b'x')})   # 種類違いは無視（揃っているかには関係ない）
-        if n3 != 2 or len(dropped3) != 5 or os.path.exists(os.path.join(root, 'evil.DB')) or not bridge.has_car(root, 'W99'):
+        # 01 だけの車種フォルダは「届いた」と見なさない（11 = 部品表が要る。12/15 は無い車種が実在するので必須にしない。Codex hunt D2）
+        bridge.store(root, {'W/W98/W9801.DB': b(b'x')})
+        if bridge.has_car(root, 'W98'):
+            fails.append('01.DB だけの車種フォルダを has_car が真にしている')
+        if n3 != 3 or len(dropped3) != 5 or os.path.exists(os.path.join(root, 'evil.DB')) or not bridge.has_car(root, 'W99'):
             fails.append(f'store の安全性: n={n3} dropped={dropped3} has_car(W99)={bridge.has_car(root, "W99")}')
         # 上限: 1 ファイルの大きさを超えたものがあるフォルダは丸ごと書かない（欠けた Addata で作らない）
         _keep = bridge.MAX_FILE_BYTES
@@ -148,13 +153,14 @@ def main() -> int:
             fails.append('sweep_case_dirs が古い作業フォルダを消さない／新しいものを消した')
         shutil.rmtree(new_case, ignore_errors=True)
         # 完了印の無いフォルダ（途中で切れた取り込み）は has_car が偽 ＝ 欠けた Addata で作らない
-        os.makedirs(os.path.join(root, 'W', 'W98'), exist_ok=True)
-        open(os.path.join(root, 'W', 'W98', 'W9801.DB'), 'wb').write(b'x')
-        if bridge.has_car(root, 'W98') or 'W98' in bridge.cars(root):
+        os.makedirs(os.path.join(root, 'W', 'W97'), exist_ok=True)   # W98 は上で store 済み（完了印あり）なので別の車種コードで
+        open(os.path.join(root, 'W', 'W97', 'W9701.DB'), 'wb').write(b'x')
+        open(os.path.join(root, 'W', 'W97', 'W9711.DB'), 'wb').write(b'x')
+        if bridge.has_car(root, 'W97') or 'W97' in bridge.cars(root):
             fails.append('完了印の無い車種フォルダを揃っていると見なした')
         # 同じ車種を送り直したら丸ごと差し替わる（古いファイルが残らない）
-        bridge.store(root, {'W/W99/W9901.DB': b(b'z')})
-        if sorted(os.listdir(os.path.join(root, 'W', 'W99'))) != ['W9901.DB'] or not bridge.has_car(root, 'W99'):
+        bridge.store(root, {'W/W99/W9901.DB': b(b'z'), 'W/W99/W9911.DB': b(b'z')})
+        if sorted(os.listdir(os.path.join(root, 'W', 'W99'))) != ['W9901.DB', 'W9911.DB'] or not bridge.has_car(root, 'W99'):
             fails.append(f'送り直しで差し替わらない: {os.listdir(os.path.join(root, "W", "W99"))}')
         # <車種>01.DB（部品表の本体）が無いフォルダは「届いた」と見なさない（PC 側のフォルダが壊れている）
         bridge.store(root, {'W/W93/W9305.DB': b(b'x'), 'W/W93/W9300LTB.CHM': b(b'x')})

@@ -5875,7 +5875,7 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     # 読み取り結果が変わるため、入れないと前の mime での結果がそのまま返る。
     _cache_key = (hashlib.md5(file_bytes).hexdigest()
                   + f"_{used_model}_{use_rasterize}_{use_fax_filter}_{use_enhance}_{enable_self_correction}"
-                  + f"_{mime_type}")
+                  + f"_{mime_type}_tax{int(bool(tax_inclusive))}")   # 税区分でプロンプトが変わる（Codex hunt E2）
     def _cb(pct, text):
         """進捗コールバック呼び出し（Noneなら何もしない）"""
         if progress_cb:
@@ -6584,13 +6584,46 @@ def p2n_make(state, addata_root=None, record_profile=None, progress=None):
         if progress:
             progress('下書き → ADDATA 突合せ → NEO 生成 → 検算（pdf-to-neo スキル make_neo.py）')
         mk = _nsk_maker.make_neo(case_dir, 'estimate', no_profile=not record_profile, addata_root=addata_root)
+        # 検算に差があり、工賃欄が空欄（工賃も指数も無い）の行があるときは、その行を 0 円（印字どおり）にして作り直す。
+        # 生成器は空欄に標準指数を補うが、実案件（精算見積・工場見積・コグニ印刷）では空欄 = 0 円のことが多く、
+        # 見積書合計と合わずに不合格になっていた（2026-09-15 実機テスト 6 本中 4 本）。合うときだけ採用し、行名を注意に出す
+        _bw_names = []
+        if not mk.ok and reading and ('検算に差' in str(mk.error or '') or any('検算に差' in str(r) for r in (mk.reasons or []))):
+            _bw = _blank_wage_rows(reading)
+            if _bw:
+                import copy as _copy
+                _rd2 = _copy.deepcopy(reading)
+                for _bi, _ri, _nm in _bw:
+                    _rd2['blocks'][_bi]['rows'][_ri] = _row_with_wage_zero(
+                        _rd2['blocks'][_bi]['rows'][_ri], '要確認: 工賃欄が空欄のため 0 円で作成（標準指数では見積書合計に合わなかった）')
+                _first_report = _nsk_maker.read_text(mk.report_path)
+                _first_repair = _nsk_maker.repair_bundle(case_dir, reading)   # 1 回目の estimate/report と元の reading（再試行で上書きされる前）
+                _nsk_maker.write_reading(case_dir, _rd2)
+                if progress:
+                    progress(f'標準指数では見積書合計に合わないので、工賃欄が空欄の {len(_bw)} 行を 0 円として作り直しています')
+                mk2 = _nsk_maker.make_neo(case_dir, 'estimate', no_profile=not record_profile, addata_root=addata_root, force_draft=True)
+                if mk2.ok:
+                    mk = mk2
+                    _bw_names = [n for _, _, n in _bw]
+                    _rd_info = out.get('read') if isinstance(out.get('read'), dict) else {}
+                    _warns = list(_rd_info.get('warn') or [])
+                    _warns.append(f'工賃欄が空欄の {len(_bw)} 行（' + '、'.join(n[:12] for n in _bw_names[:5]) + ('…' if len(_bw_names) > 5 else '')
+                                  + '）は、標準指数だと見積書合計に合わなかったため、印字どおり 0 円で作りました。確認箇所シートに要確認として載せています')
+                    _rd_info['warn'] = _warns
+                    out['read'] = _rd_info
+                    out['blank_wage_zero'] = _bw_names
+                else:
+                    _nsk_maker.write_reading(case_dir, reading)   # 元の reading に戻す
+                    out['blank_wage_retry'] = {'rows': [n for _, _, n in _bw], 'reasons': list(mk2.reasons or []), 'error': mk2.error}
+                    out['_first_report_md'] = _first_report
+                    out['_first_repair_zip'] = _first_repair
         out['stage'] = 'make'
         out['make'] = {'ok': mk.ok, 'match_line': mk.match_line, 'reasons': list(mk.reasons),
                        'error': mk.error, 'tail': '\n'.join(mk.stdout.splitlines()[-40:])}
-        out['report_md'] = _nsk_maker.read_text(mk.report_path)
+        out['report_md'] = out.pop('_first_report_md', None) or _nsk_maker.read_text(mk.report_path)
         if not mk.ok:
             out['error'] = mk.error
-            out['repair_zip'] = _nsk_maker.repair_bundle(case_dir, reading)
+            out['repair_zip'] = out.pop('_first_repair_zip', None) or _nsk_maker.repair_bundle(case_dir, reading)
             return out
         out['neo_bytes'] = _nsk_maker.read_bytes(mk.neo_path)
         out['review_bytes'] = _nsk_maker.read_bytes(mk.review_path)
@@ -6675,7 +6708,21 @@ def _render_beta_result(_p2n_res, selected_model):
                    + (f"、工賃(税抜) NEO ¥{safe_int(_p2n_v.get('neo_wage_total')):,} / 原本 ¥{safe_int(_p2n_v.get('pdf_wage_total')):,}"
                       if _p2n_v.get('wage_match') is False else "")
                    + "。「プレビューに取り込む」で内容を確認・修正してください。")
+    _p2n_ac = _p2n_res.get('amount_changes') or []
+    if _p2n_ac:
+        st.warning(f"⚠️ 読み取りの後処理で金額の列を {len(_p2n_ac)} 行で動かしました（部品↔工賃など）: "
+                   + ' / '.join(str(x)[:60] for x in _p2n_ac[:4]) + ('…' if len(_p2n_ac) > 4 else '') + "。原本と突き合わせてください")
     _p2n_neo = _p2n_res.get('neo_bytes')
+    # 原本と差がある可能性のある結果（金額調整の行・検証の差・金額列の補正）は、確認のチェックを入れないと落とせない
+    # （プレビュー取り込みで直す道は残す。Codex hunt E1/E4 2026-09-15）
+    _p2n_adj = bool(_p2n_res.get('adjustment_amount')) or any(isinstance(_it, dict) and _it.get('is_adjustment_row') for _it in _p2n_items)
+    _p2n_vfail = bool(_p2n_v.get('verified_against_pdf')) and not _p2n_v.get('ok') and not _p2n_v.get('error')
+    _p2n_needs_ack = _p2n_adj or _p2n_vfail or bool(_p2n_ac)
+    _p2n_ack = True
+    if _p2n_needs_ack and _p2n_neo and not _p2n_res.get('stale'):
+        st.warning("⚠️ この NEO は原本と差がある可能性があります（金額調整の行／検証の差／金額列の補正）。「プレビューに取り込んで修正する」で"
+                   "直すか、内容を確かめた上でチェックを入れてからダウンロードしてください。")
+        _p2n_ack = st.checkbox("差異と警告を確認しました（このままダウンロードする）", key='pdf2neo_beta_ack', value=False)
     if _p2n_neo:
         _p2n_name = st.session_state.get('_pdf2neo_filename')
         if not _p2n_name:
@@ -6683,7 +6730,7 @@ def _render_beta_result(_p2n_res, selected_model):
             st.session_state['_pdf2neo_filename'] = _p2n_name
         st.download_button("📥 NEOファイルをダウンロード（ベタ打ち）", data=_p2n_neo, file_name=_p2n_name,
                            mime="application/octet-stream", key='pdf2neo_dl_beta', width='stretch',
-                           disabled=bool(_p2n_res.get('stale')))   # 入力が変わった結果は落とさせない（Codex hunt A1）
+                           disabled=bool(_p2n_res.get('stale')) or not _p2n_ack)   # 入力が変わった／未確認の結果は落とさせない（Codex hunt A1/E1）
     if st.button("📝 プレビューに取り込んで修正する", key='pdf2neo_to_preview_beta', width='stretch',
                  disabled=bool(_p2n_res.get('stale'))):   # 入力が変わった結果は取り込ませない（Codex 70）
         st.session_state['csv_items'] = _p2n_items
@@ -6825,7 +6872,7 @@ _CASE_INPUT_KEYS = (
     # 添付の書類の読み取りの控えと反映の印
     '_doc_ocr_cache', '_insdoc_applied', '_insdoc_sha', '_insdoc_cleared_sha', '_insdoc_filled', '_insdoc_ocr_id', '_doc_ocr_error',
     # 生成結果・ベタ打ちの費用チェック
-    '_beta_exp_file_key', 'pdf2neo_beta_use_exp', 'pdf2neo_result', '_pdf2neo_filename', 'pdf2neo_vehicle_info',
+    '_beta_exp_file_key', 'pdf2neo_beta_use_exp', 'pdf2neo_beta_ack', 'pdf2neo_result', '_pdf2neo_filename', 'pdf2neo_vehicle_info',
 )
 
 
@@ -6882,7 +6929,7 @@ def _docs_ocr_state(s, api_key, model_name, keys) -> str:
     return '|'.join(out)
 
 
-def _p2n_inputs_signature(file_key, state=None, api_key='', model_name='', beta=False) -> str:
+def _p2n_inputs_signature(file_key, state=None, api_key='', model_name='', beta=False, addata_id='') -> str:
     """生成結果に添える「入力の指紋」: 見積書・添付の書類（内容ハッシュ）・事故/保険欄・費用とそのチェック・税区分・テンプレート。
     画面に出すとき今の指紋と違えば、その結果は前の入力で作ったもの ＝ ダウンロードさせない（別の見積の NEO や、直す前の
     保険欄で作った NEO を落とせてしまう。Codex hunt A1 2026-09-15）"""
@@ -6890,6 +6937,7 @@ def _p2n_inputs_signature(file_key, state=None, api_key='', model_name='', beta=
     parts = [str(file_key or '')]
     _keys = _doc_upload_keys() if state is None else ('vehicle_upload', 'insurance_doc_upload')
     parts.append(_docs_ocr_state(s, api_key, model_name, _keys))   # 読めたか・何が読めたか（Codex 72）
+    parts.append(str(addata_id or ''))   # スキル経路が使った Addata（場所＋データ版。ベタ打ちは ''。Codex hunt F1）
     for _k in _keys:
         _f = s.get(_k)
         try:
@@ -6948,6 +6996,152 @@ def _attached_docs_caption(api_key, model_name) -> str:
         parts.append("事故・保険の書類: " + ("読み取り済み → サイドバーの事故・保険情報と車両の情報に使います" if doc
                                      else "読めていません → 使われません"))
     return "📎 " + " ／ ".join(parts)
+
+
+_ROW_FIELDS = ('code', 'name', 'method', 'parts_no', 'index', 'qty', 'price', 'wage', 'flags', 'comment')   # 短縮記法の列順（reading_schema）
+
+
+def _row_view(row) -> dict:
+    """reading の明細行を dict の形で見る。merge 後の rows は短縮記法の文字列（code|name|method|parts_no|index|qty|price|wage|flags|comment）
+    のことが多い（vendor reading_pages）。dict はそのまま。注記行（flags N / note だけ）は name 無しにする"""
+    def _flags(v):
+        return unicodedata.normalize('NFKC', str(v or '')).upper()   # vendor と同じ（全角・小文字も見る）
+    if isinstance(row, dict):
+        d = dict(row)
+        fl = _flags(d.get('flags'))
+        if 'N' in fl or 'R' in fl or d.get('reserve') or (not d.get('name') and d.get('note')):
+            d['name'] = ''   # 注記行・保留行は対象外
+        if 'M' in fl:
+            d['manual'] = True
+        return d
+    if isinstance(row, str):
+        f = row.split('|')
+        f += [''] * (len(_ROW_FIELDS) - len(f))
+        d = dict(zip(_ROW_FIELDS, f[:len(_ROW_FIELDS)]))
+        fl = _flags(d.get('flags'))
+        if 'N' in fl or 'R' in fl:
+            d['name'] = ''   # 注記行・保留行は対象外
+        d['manual'] = 'M' in fl
+        return d
+    return {}
+
+
+_NEO_COMMENT_RE = re.compile(r'^\s*(?:NEO|ＮＥＯ)\s*[:：]\s*(.*)$', re.S | re.I)   # 印字の明細コメント（生成器は行頭の NEO: を見て NEO に書く。vendor と同じく大文字小文字を問わない）
+
+
+def _row_with_wage_zero(row, note: str):
+    """明細行に wage: 0 と要確認コメントを入れて返す（dict / 短縮記法の文字列どちらも）。
+    既存のコメントが `NEO:`（印字の明細コメント ＝ NEO に書く）なら、その前に注記を付けると生成器の行頭一致が外れて
+    NEO から消えるので、dict 行にして neo_comment（印字）と comment（注記）に分ける（レビュー 2026-09-15）"""
+    if isinstance(row, dict):
+        d = dict(row)
+    else:
+        f = str(row).split('|')
+        f += [''] * (len(_ROW_FIELDS) - len(f))
+        d = {k: v for k, v in zip(_ROW_FIELDS, f[:len(_ROW_FIELDS)]) if v != ''}
+        d.setdefault('name', f[1])
+    d['wage'] = 0
+    cur = str(d.get('comment') or '')
+    m = _NEO_COMMENT_RE.match(cur)
+    if m and not d.get('neo_comment'):
+        d['neo_comment'] = m.group(1).strip()
+        d['comment'] = note
+    else:
+        d['comment'] = note + ((' / ' + cur) if cur else '')
+    return d
+
+
+def _blank_wage_rows(reading) -> list:
+    """工賃欄がある書式で、工賃も指数も無い明細行（注記行・保留行・手入力行を除く）を [(block, row, name)] で返す。
+    生成器はこの行に標準指数を補うが、実案件（精算見積・工場見積・コグニ印刷）では空欄 = 0 円のことが多く、
+    見積書合計と合わずに不合格になる（2026-09-15 実機テスト: タンク +858・ハイエース +6,160・カローラ +15,379・シエンタ +117,040）"""
+    rows = []
+    for bi, blk in enumerate((reading or {}).get('blocks') or []):
+        for ri, row in enumerate((blk or {}).get('rows') or []):
+            d = _row_view(row)
+            if str(d.get('name') or '').strip():
+                rows.append((bi, ri, d))
+    def _has(v):
+        # 数字を含むときだけ「値あり」。'-'・'**'（印字の印だけ）・空白は空欄扱い（vendor も '-' を空欄とみなす。タンク・カローラで発覚）
+        return v not in (None, '') and bool(re.search(r'\d', str(v)))
+    if not any(_has(r.get('wage')) or _has(r.get('index')) for _, _, r in rows):
+        return []   # 工賃欄自体が無い書式（標準に任せる。判断規則）
+    def _std_fill(r):
+        # 生成器が標準指数を補う行だけ（部品代のある取替行は生成器が元々 0 円にする ＝ 対象外。要確認の水増しを避ける）
+        m = unicodedata.normalize('NFKC', str(r.get('method') or '')).strip()
+        return not (_has(r.get('price')) and m in ('', '取替', '交換', '部品'))
+    return [(bi, ri, str(r.get('name') or '')) for bi, ri, r in rows
+            if not _has(r.get('wage')) and not _has(r.get('index')) and not r.get('manual') and _std_fill(r)]
+
+
+def _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_model, _pdf_tax_sel, fallback=False):
+    """ベタ打ち（旧経路 run_pdf_to_neo_pipeline）の生成ボタンとその処理。Addata が決まらないとき（本来の置き場）と、
+    スキル経路が不合格・車種未収録で NEO が出なかったときの逃げ道（fallback=True。2026-09-15 実機テスト: ボルボ V40 は
+    車種マスタに無く汎用車種の生成で例外、精算見積 4 本は検算差で不合格 → 以前は行き止まりだった）の 2 か所から呼ぶ"""
+    _p2n_beta_exp = {'towing': safe_int(st.session_state.get('exp_towing', 0)),
+                     'rental_car': safe_int(st.session_state.get('exp_rental', 0)),
+                     'tax_exempt': safe_int(st.session_state.get('exp_exempt', 0))}
+    st.caption(_attached_docs_caption(api_key, selected_model))
+    _p2n_beta_use_exp = False
+    if st.session_state.get('_beta_exp_file_key') != _p2n_file_key:
+        # 見積が変わったらチェックは外す（前の見積で入れた同意を次の見積に持ち越さない。Codex 52）
+        st.session_state['pdf2neo_beta_use_exp'] = False
+        st.session_state['_beta_exp_file_key'] = _p2n_file_key
+    if any(_p2n_beta_exp.values()):
+        # 前の案件の入力が残っていても黙って足さない（合計が原本と食い違う）。チェックしたときだけ入れる（Codex 51）
+        _p2n_beta_use_exp = st.checkbox(
+            f"サイドバーの費用を NEO に入れる（レッカー ¥{_p2n_beta_exp['towing']:,}・代車 ¥{_p2n_beta_exp['rental_car']:,}・"
+            f"非課税 ¥{_p2n_beta_exp['tax_exempt']:,}）。見積書に印字の無い費用なので、入れると原本の合計とは一致しません",
+            value=False, key='pdf2neo_beta_use_exp')
+    if not api_key:
+        st.caption("ベタ打ちの読み取りは Gemini を使います。サイドバーの「APIキー設定」に Gemini API キーを入れてください。")
+        return
+    _label = ("✏️ ベタ打ちで作る（部品コード・標準指数なし。明細・金額は見積書のとおり、合計に合わせる金額調整の行が入ることがあります）"
+              if fallback else "✏️ ベタ打ちで生成（Addata なし・部品コード/標準指数は入りません）")
+    if st.button(_label, key='pdf2neo_run_beta', width='stretch'):
+        st.session_state.pop('pdf2neo_result', None)
+        st.session_state.pop('_pdf2neo_filename', None)
+        st.session_state.pop('pdf2neo_beta_ack', None)   # 前の結果の「差異を確認した」チェックを次の結果に持ち越さない
+        _p2n_beta_tax = ('内税' in str(_pdf_tax_sel) or '税込' in str(_pdf_tax_sel))
+        _p2n_beta_vd, _p2n_beta_doc = _attached_docs_ocr(api_key, selected_model)
+        _p2n_beta_vi = _doc_hints.vehicle_info_for_legacy(_p2n_beta_vd, _p2n_beta_doc)
+        _p2n_beta_ins = _sidebar_insurance_values()
+        for _k, _v in _fresh_doc_fill(_p2n_beta_doc).items():
+            if not str(_p2n_beta_ins.get(_k) or '').strip():
+                _p2n_beta_ins[_k] = _v
+        with st.spinner("見積書を読んでベタ打ちの NEO を作っています…（1〜3 分）"):
+            _p2n_beta = run_pdf_to_neo_pipeline(
+                _p2n_bytes, api_key,
+                # 添付の車検証・書類の車両/顧客情報。無ければ None（旧経路は見積書を車検証として読もうとして空になる）
+                vehicle_info=_p2n_beta_vi or None,
+                mime_type=get_mime_type(_p2n_file.name),
+                model_name=selected_model,
+                template_bytes=st.session_state.get('custom_neo_bytes'),
+                is_tax_inclusive=_p2n_beta_tax,
+                # 費用はチェックしたときだけ（上）。事故・保険欄は旧経路と同じ扱い（b15bd06 で外す前の呼び方）
+                expenses=(_p2n_beta_exp if _p2n_beta_use_exp else None),
+                insurance_info=_p2n_beta_ins,
+            )
+        if not isinstance(_p2n_beta, dict):
+            _p2n_beta = {'ok': False, 'error': 'ベタ打ち生成が想定外の値を返しました'}
+        _p2n_beta['legacy_beta'] = True
+        _p2n_beta['fallback_from_skill'] = bool(fallback)
+        _p2n_beta['inputs_sig'] = _p2n_inputs_signature(_p2n_file_key, api_key=api_key, model_name=selected_model, beta=True)
+        st.session_state['pdf2neo_tax_inclusive'] = _p2n_beta_tax
+        st.session_state['pdf2neo_result'] = _p2n_beta
+        st.rerun()
+
+
+def _p2n_addata_identity(root) -> str:
+    """生成に使う Addata の同一性（場所＋データ版）。指紋に入れて、Addata を切り替え・外した後に前の結果を落とさせない（Codex hunt F1）"""
+    if not root:
+        return ''
+    try:
+        from neo_skill import bridge as _brg
+        ver = _brg.version(str(root)) or ''
+    except Exception:  # noqa: BLE001
+        ver = ''
+    return f"{os.path.normpath(str(root))}|{ver}"
 
 
 def _attached_docs_ocr(api_key, model_name=None, progress=None):
@@ -7785,7 +7979,7 @@ def main():
                                               st.session_state.get('tax_override', '税抜き（外税）'))
         _pdf_tax_idx = 1 if ('内税' in str(_saved_pdf_tax) or '税込' in str(_saved_pdf_tax)) else 0
         _pdf_tax_sel = st.radio(
-            "💴 見積書の金額表記（下の CSV 取り込みで使います。PDF→NEO は見積書の合計欄から自動判定）",
+            "💴 見積書の金額表記（CSV 取り込みとベタ打ちで使います。pdf-to-neo スキルの経路は見積書の合計欄から自動判定）",
             options=_pdf_tax_options,
             index=_pdf_tax_idx,
             horizontal=True,
@@ -7909,6 +8103,7 @@ def main():
             _p2n_file.seek(0)
             # この見積の同一性（車種フォルダ待ちの取り置きが別の見積で再開されないよう照合する）
             _p2n_file_key = f"{_p2n_file.name}|{len(_p2n_bytes)}|{hashlib.sha256(_p2n_bytes).hexdigest()}"
+            _p2n_beta_ui_shown = False   # この run でベタ打ちの UI を描いたか（Addata なしの枝で立てる。結果の下の逃げ道と二重に描かない）
             st.caption(f"📄 {_p2n_file.name}（{len(_p2n_bytes):,} bytes）")
             st.caption("サイドバーの「事故・保険情報」（証券番号・契約者名・事故日・受付番号・代理店・アジャスター・入出庫日・修理日数）は、"
                        "見積書に印字が無ければ NEO に補われます。"
@@ -7932,54 +8127,8 @@ def main():
                            + (f" 取得URLの失敗: {_p2n_url_err}" if _p2n_url_err else "")
                            + " サイドバー「🖥️ PC の Addata をこの画面から使う」で PC の C:\\Addata を選ぶか、"
                            "下の「ベタ打ちで生成」で部品コード無しの NEO を作れます（明細・金額・品名は見積書のとおり）。")
-                _p2n_beta_exp = {'towing': safe_int(st.session_state.get('exp_towing', 0)),
-                                 'rental_car': safe_int(st.session_state.get('exp_rental', 0)),
-                                 'tax_exempt': safe_int(st.session_state.get('exp_exempt', 0))}
-                st.caption(_attached_docs_caption(api_key, selected_model))
-                _p2n_beta_use_exp = False
-                if st.session_state.get('_beta_exp_file_key') != _p2n_file_key:
-                    # 見積が変わったらチェックは外す（前の見積で入れた同意を次の見積に持ち越さない。Codex 52）
-                    st.session_state['pdf2neo_beta_use_exp'] = False
-                    st.session_state['_beta_exp_file_key'] = _p2n_file_key
-                if any(_p2n_beta_exp.values()):
-                    # 前の案件の入力が残っていても黙って足さない（合計が原本と食い違う）。チェックしたときだけ入れる（Codex 51）
-                    _p2n_beta_use_exp = st.checkbox(
-                        f"サイドバーの費用を NEO に入れる（レッカー ¥{_p2n_beta_exp['towing']:,}・代車 ¥{_p2n_beta_exp['rental_car']:,}・"
-                        f"非課税 ¥{_p2n_beta_exp['tax_exempt']:,}）。見積書に印字の無い費用なので、入れると原本の合計とは一致しません",
-                        value=False, key='pdf2neo_beta_use_exp')
-                if not api_key:
-                    st.caption("ベタ打ちの読み取りは Gemini を使います。サイドバーの「APIキー設定」に Gemini API キーを入れてください。")
-                elif st.button("✏️ ベタ打ちで生成（Addata なし・部品コード/標準指数は入りません）", key='pdf2neo_run_beta',
-                               width='stretch'):
-                    st.session_state.pop('pdf2neo_result', None)
-                    st.session_state.pop('_pdf2neo_filename', None)
-                    _p2n_beta_tax = ('内税' in str(_pdf_tax_sel) or '税込' in str(_pdf_tax_sel))
-                    _p2n_beta_vd, _p2n_beta_doc = _attached_docs_ocr(api_key, selected_model)
-                    _p2n_beta_vi = _doc_hints.vehicle_info_for_legacy(_p2n_beta_vd, _p2n_beta_doc)
-                    _p2n_beta_ins = _sidebar_insurance_values()
-                    for _k, _v in _fresh_doc_fill(_p2n_beta_doc).items():
-                        if not str(_p2n_beta_ins.get(_k) or '').strip():
-                            _p2n_beta_ins[_k] = _v
-                    with st.spinner("見積書を読んでベタ打ちの NEO を作っています…（1〜3 分）"):
-                        _p2n_beta = run_pdf_to_neo_pipeline(
-                            _p2n_bytes, api_key,
-                            # 添付の車検証・書類の車両/顧客情報。無ければ None（旧経路は見積書を車検証として読もうとして空になる）
-                            vehicle_info=_p2n_beta_vi or None,
-                            mime_type=get_mime_type(_p2n_file.name),
-                            model_name=selected_model,
-                            template_bytes=st.session_state.get('custom_neo_bytes'),
-                            is_tax_inclusive=_p2n_beta_tax,
-                            # 費用はチェックしたときだけ（上）。事故・保険欄は旧経路と同じ扱い（b15bd06 で外す前の呼び方）
-                            expenses=(_p2n_beta_exp if _p2n_beta_use_exp else None),
-                            insurance_info=_p2n_beta_ins,
-                        )
-                    if not isinstance(_p2n_beta, dict):
-                        _p2n_beta = {'ok': False, 'error': 'ベタ打ち生成が想定外の値を返しました'}
-                    _p2n_beta['legacy_beta'] = True
-                    _p2n_beta['inputs_sig'] = _p2n_inputs_signature(_p2n_file_key, api_key=api_key, model_name=selected_model, beta=True)
-                    st.session_state['pdf2neo_tax_inclusive'] = _p2n_beta_tax
-                    st.session_state['pdf2neo_result'] = _p2n_beta
-                    st.rerun()
+                _p2n_beta_ui_shown = True
+                _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_model, _pdf_tax_sel)
             else:
                 # 読み手: 両方のキーがあれば選べる（既定は Claude。移植ガイド §3-4 が「同じ精度を狙うなら Claude が近い」）。
                 # 片方だけならそれを使う。指示文・検算・読み直し・生成は同じなので、違うのは読み取りの精度だけ
@@ -8042,7 +8191,8 @@ def main():
                                 label=("✅ 合格" if _p2n_out.get('ok') else "❌ 不合格（下の理由をご確認ください）"),
                                 state=('complete' if _p2n_out.get('ok') else 'error'), expanded=False)
                     if isinstance(_p2n_out, dict):
-                        _p2n_out['inputs_sig'] = _p2n_inputs_signature(_p2n_file_key, api_key=api_key, model_name=selected_model)
+                        _p2n_out['inputs_sig'] = _p2n_inputs_signature(_p2n_file_key, api_key=api_key, model_name=selected_model,
+                                                                       addata_id=_p2n_addata_identity(_p2n_addata))
                     st.session_state['pdf2neo_result'] = _p2n_out
                     st.rerun()
                 st.caption(_attached_docs_caption(api_key, selected_model))
@@ -8109,7 +8259,8 @@ def main():
                             label=("✅ 合格" if _p2n_out.get('ok') else "❌ 不合格（下の理由をご確認ください）"),
                             state=('complete' if _p2n_out.get('ok') else 'error'), expanded=False)
                     if isinstance(_p2n_out, dict):
-                        _p2n_out['inputs_sig'] = _p2n_inputs_signature(_p2n_file_key, api_key=api_key, model_name=selected_model)
+                        _p2n_out['inputs_sig'] = _p2n_inputs_signature(_p2n_file_key, api_key=api_key, model_name=selected_model,
+                                                                       addata_id=_p2n_addata_identity(_p2n_addata))
                     st.session_state['pdf2neo_result'] = _p2n_out
                     st.rerun()
 
@@ -8120,10 +8271,15 @@ def main():
             st.session_state['_bridge_want'] = ''
 
         _p2n_res = st.session_state.get('pdf2neo_result')
+        # Addata が外れた後（接続解除・掃除・URL 失敗）に不合格の結果が残っていると、Addata なしの枝でもベタ打ちを描く。
+        # 同じ run で 2 回描くとウィジェットのキーが重複して落ちるので、描いた印を見る（レビュー 2026-09-15）
+        _p2n_offer_beta = (isinstance(_p2n_res, dict) and not _p2n_res.get('legacy_beta') and not _p2n_res.get('ok')
+                           and _p2n_file is not None and bool(api_key) and not locals().get('_p2n_beta_ui_shown'))
         if isinstance(_p2n_res, dict) and _p2n_res.get('inputs_sig'):
             # 生成したあとに入力（見積書・添付・事故/保険欄・費用・税区分・テンプレート）が変わっていたら、前の入力の結果 ＝ 落とさせない
-            if _p2n_res['inputs_sig'] != _p2n_inputs_signature(_p2n_early_key, api_key=api_key, model_name=selected_model,
-                                                              beta=bool(_p2n_res.get('legacy_beta'))):
+            _p2n_is_beta = bool(_p2n_res.get('legacy_beta'))
+            if _p2n_res['inputs_sig'] != _p2n_inputs_signature(_p2n_early_key, api_key=api_key, model_name=selected_model, beta=_p2n_is_beta,
+                                                              addata_id='' if _p2n_is_beta else _p2n_addata_identity(find_addata_dir())):
                 _p2n_res = dict(_p2n_res, stale=True)
                 st.warning("⚠️ 生成したあとに 見積書・添付の書類・事故/保険情報・費用 のどれかが変わりました。下の結果は前の入力で作ったもので、"
                            "ダウンロードは止めています。生成ボタンを押して作り直してください。")
@@ -8174,6 +8330,10 @@ def main():
                     st.caption(_p2n_mk['error'])
                 if _p2n_mk.get('match_line'):
                     st.caption(_p2n_mk['match_line'])
+                if _p2n_res.get('blank_wage_retry'):
+                    _p2n_bwr = _p2n_res['blank_wage_retry']
+                    st.caption(f"工賃欄が空欄の {len(_p2n_bwr.get('rows') or [])} 行を 0 円にして作り直しても合いませんでした: "
+                               + ' / '.join(str(r)[:80] for r in (_p2n_bwr.get('reasons') or [])[:3]))
                 if _p2n_res.get('repair_zip'):
                     st.download_button(
                         "🧰 修正用ファイル一式をダウンロード（pages/・reading.json・report.md）",
@@ -8220,6 +8380,13 @@ def main():
                         st.markdown(_p2n_res['report_md'])
             else:
                 st.error(f"❌ {_p2n_res.get('error') or '変換できませんでした'}")
+            if _p2n_offer_beta:
+                # スキル経路で NEO が出なかった（検算差・車種未収録・生成の例外）。部品コード無しのベタ打ちで作る道を出す
+                # （2026-09-15 実機テスト: 以前はここで行き止まりだった。連鎖の外に置く: 中に挟むと合格結果に誤エラーが出る）
+                st.markdown("---")
+                st.info("ℹ️ pdf-to-neo スキルの経路では NEO を作れませんでした。部品コード・標準指数の無い **ベタ打ち** で作る手もあります"
+                        "（明細・金額・品名は見積書のとおり。合計に合わせる金額調整の行が入ることがあるので、結果の警告を確かめてください）。")
+                _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_early_key, api_key, selected_model, _pdf_tax_sel, fallback=True)
 
         # ================================================================
         # STEP 1-B: 車検証・テンプレートNEO（任意）

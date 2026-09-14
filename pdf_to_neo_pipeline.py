@@ -2030,6 +2030,8 @@ def process_pdf_to_neo(pdf_path,
                         ocr_meta_first = {}
                     out["ocr_used"] = True
                     out["ocr_meta"] = ocr_meta_first
+                    # 後処理で金額の列を動かした行（validate_and_correct_items）。画面で警告し、ダウンロード前の確認に使う（Codex hunt E4）
+                    out["amount_changes"] = list((ocr_meta_first or {}).get("_amount_changes") or []) if isinstance(ocr_meta_first, dict) else []
                     log.append(f"OCR estimate OK ({len(items)} items)")
 
                     # Iter5 (v3): car_name 正規化ヘルパ
@@ -2704,7 +2706,10 @@ def process_pdf_to_neo(pdf_path,
     # Iter9: 成功結果をキャッシュ
     # OCRが途中で失敗した結果をキャッシュすると、クォータ回復後に
     # 同じPDFを処理しても中身の欠けたNEOが返り続ける。
-    if cache_key and out.get("ok") and out.get("neo_bytes") and not out.get("ocr_incomplete"):
+    # 検証に通った・金額調整の無い結果だけ控える（検証に落ちた .neo を控えると、次に正しく読めるはずの再実行でも前の .neo が返る。Codex hunt E3）
+    if (cache_key and out.get("ok") and out.get("neo_bytes") and not out.get("ocr_incomplete")
+            and (out.get("verify") or {}).get("ok") is True
+            and not any(isinstance(it, dict) and it.get("is_adjustment_row") for it in (out.get("items") or []))):
         if len(_PIPELINE_CACHE) >= _PIPELINE_CACHE_MAX:
             _PIPELINE_CACHE.pop(next(iter(_PIPELINE_CACHE)))
         _PIPELINE_CACHE[cache_key] = copy.deepcopy(out)

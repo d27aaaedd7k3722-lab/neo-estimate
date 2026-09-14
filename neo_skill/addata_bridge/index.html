@@ -47,12 +47,16 @@
     // NotFoundError = フォルダやファイルが無い。それ以外（NotReadableError・NotAllowedError 等）は読めない ＝ コグニセブンが
     // 開いていてファイルを掴んでいる、権限が無い、など。原因ごとに次にやることを書く
     const name = (e && e.name) || '';
+    if (name === 'Error' && e.message) return e.message;   // 上限（大きさ・数）のエラーは理由そのもの
     if (name === 'NotFoundError') return `${what}がありません`;
     if (name === 'NotAllowedError' || name === 'SecurityError') return `${what}を読む許可がありません（ダイアログで「ファイルを表示」を許可してください）`;
     return `${what}を読めませんでした（コグニセブンが開いているとファイルを掴んで読めないことがあります。閉じてからもう一度選んでください）: ` + name;
   }
-  async function readFile(handle) {
-    const f = await handle.getFile();
+  // Python 側（neo_skill/bridge.py）と同じ上限。読む前にファイルの大きさ・種類で弾く（巨大なファイルを丸ごと読んで
+  // base64 にしてから送ると、ブラウザと共有サーバのメモリを食い潰す。Codex hunt D3 2026-09-15）
+  const MAX_FILE_BYTES = 32 * 1024 * 1024, MAX_MESSAGE_BYTES = 128 * 1024 * 1024, MAX_FILES = 400;
+  const ALLOWED_EXT = /\.(db|cab|chm|txt)$/i;
+  async function readFile(f) {
     const buf = await f.arrayBuffer();
     // base64（大きなファイルでも呼び出しスタックを溢れさせない）
     const bytes = new Uint8Array(buf);
@@ -65,10 +69,16 @@
   async function collect(dir, prefix, skipRe) {
     const files = {};
     let total = 0;
+    let count = 0;
     for await (const [name, h] of dir.entries()) {
       if (h.kind !== 'file') continue;
       if (skipRe && skipRe.test(name)) continue;
-      const r = await readFile(h);
+      if (!ALLOWED_EXT.test(name) && name.includes('.')) continue;   // desktop.ini 等は読まない（拡張子なしの COM/AdVer は Python 側と同じく許す）
+      const f = await h.getFile();
+      if (f.size > MAX_FILE_BYTES) throw new Error(`${name} が大きすぎます（${(f.size / 1048576).toFixed(0)}MB。上限 32MB）`);
+      if (total + f.size > MAX_MESSAGE_BYTES) throw new Error(`${prefix} の合計が上限（128MB）を超えます`);
+      if (++count > MAX_FILES) throw new Error(`${prefix} のファイル数が上限（${MAX_FILES}）を超えます`);
+      const r = await readFile(f);
       files[prefix + '/' + name] = r.b64;
       total += r.size;
     }

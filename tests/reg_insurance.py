@@ -358,8 +358,7 @@ chk("_p2n_deferred_rerun'] = True" in _kd and 'st.rerun()' not in _kd.split("_p2
     '9z: 書類を残す枝で uploader を描く前に st.rerun() している（書類が消える）')
 chk("st.session_state.pop('_p2n_deferred_rerun', False)" in inspect.getsource(app), '9z2: 保留した描き直し（_p2n_deferred_rerun）が無い')
 chk('fv.name' not in inspect.getsource(app._attached_docs_caption) and 'fd.name' not in inspect.getsource(app._attached_docs_caption), '9x: 添付の案内にファイル名を出している（Codex 72）')
-_n9i = (_app_src.count("['inputs_sig'] = _p2n_inputs_signature(_p2n_file_key, api_key=api_key, model_name=selected_model)")
-        + _app_src.count("['inputs_sig'] = _p2n_inputs_signature(_p2n_file_key, api_key=api_key, model_name=selected_model, beta=True)"))
+_n9i = _app_src.count("['inputs_sig'] = _p2n_inputs_signature(_p2n_file_key, api_key=api_key, model_name=selected_model,")   # ベタ打ち 1 ＋ スキル経路 2（addata_id 付き）
 chk(_n9i == 3, f'9i: 結果に指紋を添える箇所が 3 か所ではない: {_n9i}')
 chk("_p2n_res = dict(_p2n_res, stale=True)" in _app_src and _app_src.count("disabled=bool(_p2n_res.get('stale'))") == 6,
     '9j: 指紋が違う結果のダウンロード・プレビュー取り込み・修正用 ZIP を止めていない（3 つのダウンロード＋プレビュー＋修正用 ZIP 2 つ）')
@@ -372,6 +371,74 @@ chk(app._p2n_inputs_signature('f1', _st9) == app._p2n_inputs_signature('f1', dic
     '9o2: スキル経路はテンプレート・税区分の選択を見ない（Codex 78）')
 chk(app._p2n_inputs_signature('f1', _st9, beta=True) != app._p2n_inputs_signature('f1', dict(_st9, pdf_tax_radio='税込み（内税）'), beta=True), '9o3: ベタ打ちは税区分が違えば指紋が違う')
 chk(_app_src.count('st.caption(_attached_docs_caption(api_key, selected_model))') == 2, '9k: 添付の案内が読めたかで出ていない（2 か所）')
+
+# ── 10. 実機テスト（2026-09-15）とバグハント D/E/F の採用分 ──────────────────
+# R1: 工賃欄が空欄の行
+_rd = {'blocks': [{'rows': [{'name': '左 ﾍｯﾄﾞﾗﾝﾌﾟ', 'method': '脱着'}, {'name': 'ﾊﾞﾝﾊﾟ', 'method': '取替', 'index': 1.2, 'wage': 10000, 'price': 30000},
+                            {'name': 'ｸﾘｯﾌﾟ', 'price': 100}, {'note': 'メモ'}, {'name': '手入力', 'manual': True}]}]}
+chk([n for _, _, n in app._blank_wage_rows(_rd)] == ['左 ﾍｯﾄﾞﾗﾝﾌﾟ'], f'10a: 工賃も指数も無い行の抽出（部品代のある取替行は生成器が 0 円にするので対象外）: {app._blank_wage_rows(_rd)!r}')
+chk(app._blank_wage_rows({'blocks': [{'rows': [{'name': 'A', 'method': '取替', 'price': 1}, {'name': 'B', 'method': '脱着'}]}]}) == [],
+    '10b: 工賃欄自体が無い書式では抽出しない（標準に任せる）')
+chk(app._blank_wage_rows({}) == [] and app._blank_wage_rows(None) == [], '10c: 空')
+# 短縮記法（merge 後の rows は文字列）: code|name|method|parts_no|index|qty|price|wage|flags|comment
+_rd_s = {'blocks': [{'rows': ['|左 ﾍｯﾄﾞﾗﾝﾌﾟ|脱着|||||||', '0010|ﾊﾞﾝﾊﾟ|取替||1.20|1|30000|10000||', '|ｸﾘｯﾌﾟ|取替|||1|100|||',
+                            '|注記です|||||||N|', '|手入力品|取替|||1|500||M|', '|保留|取替||||||R|']}]}
+chk([n for _, _, n in app._blank_wage_rows(_rd_s)] == ['左 ﾍｯﾄﾞﾗﾝﾌﾟ'], f'10c2: 短縮記法の行の抽出: {app._blank_wage_rows(_rd_s)!r}')
+_z = app._row_with_wage_zero('|左 ﾍｯﾄﾞﾗﾝﾌﾟ|脱着|||||||', '要確認: X')
+chk(isinstance(_z, dict) and _z['wage'] == 0 and _z['comment'] == '要確認: X' and _z['name'] == '左 ﾍｯﾄﾞﾗﾝﾌﾟ' and _z['method'] == '脱着' and 'price' not in _z,
+    f'10c3: 短縮記法の行に wage 0 とコメント（dict 行に）: {_z!r}')
+_zn = app._row_with_wage_zero('|ﾌﾞﾁﾙﾃｰﾌﾟ|脱着|||||||NEO:※JAS在庫使用', '要確認: X')
+chk(_zn.get('neo_comment') == '※JAS在庫使用' and _zn['comment'] == '要確認: X' and _zn['wage'] == 0, f'10c3b: NEO: 付きの印字コメントを neo_comment に分ける: {_zn!r}')
+_zd2 = app._row_with_wage_zero({'name': 'A', 'method': '脱着', 'comment': 'ＮＥＯ： 印字'}, '要確認: X')
+chk(_zd2.get('neo_comment') == '印字' and _zd2['comment'] == '要確認: X', f'10c3c: 全角 ＮＥＯ： も分ける: {_zd2!r}')
+_zd = app._row_with_wage_zero({'name': 'A', 'method': '脱着', 'comment': 'c'}, '要確認: X')
+chk(_zd['wage'] == 0 and _zd['comment'] == '要確認: X / c', f'10c4: dict に wage 0 とコメント: {_zd!r}')
+chk(app._blank_wage_rows({'blocks': [{'rows': ['|A|取替|||1|100|||', '|B|脱着|||||||']}]}) == [], '10c5: 短縮記法でも工賃欄自体が無い書式は抽出しない')
+# レビュー 2026-09-15: '-'・'**'（印字の印だけ）は空欄扱い、dict の保留行（R / reserve）は対象外
+_rd_m = {'blocks': [{'rows': ['|左 ﾍｯﾄﾞﾗﾝﾌﾟ|脱着|||||**||', '|右 ﾍｯﾄﾞﾗﾝﾌﾟ|脱着|||||-||', '0010|ﾊﾞﾝﾊﾟ|取替||1.20|1|30000|10000||',
+                            {'name': '保留 dict', 'method': '取替', 'flags': 'R'}, {'name': '保留2', 'method': '取替', 'reserve': True}]}]}
+chk([n for _, _, n in app._blank_wage_rows(_rd_m)] == ['左 ﾍｯﾄﾞﾗﾝﾌﾟ', '右 ﾍｯﾄﾞﾗﾝﾌﾟ'], f'10c6: 印だけの工賃欄と保留行: {app._blank_wage_rows(_rd_m)!r}')
+_src_mk0 = inspect.getsource(app.p2n_make)
+chk('_first_report' in _src_mk0 and '_first_repair' in _src_mk0 and "out.pop('_first_report_md', None)" in _src_mk0, '10d2: 再試行に失敗したとき 1 回目の報告文・修正用 ZIP を返していない')
+chk('_p2n_beta_ui_shown' in _app_src and "not locals().get('_p2n_beta_ui_shown')" in _app_src, '10e2: 同じ run で 2 回ベタ打ち UI を描く（Addata が外れた後）')
+chk('blank_wage_retry' in _app_src.split('def _render_beta_result')[0] and "_p2n_res.get('blank_wage_retry')" in _app_src, '10d3: 再試行の失敗を画面に出していない')
+# レビュー 2 周目: 「ベタ打ちで作る」は if/elif の連鎖（最後の else = 変換できませんでした）の後ろに置く（中に挟むと合格結果に誤エラー）
+chk(_app_src.find('if _p2n_offer_beta:') > _app_src.find("st.error(f\"❌ {_p2n_res.get('error') or '変換できませんでした'}\")")
+    and _app_src.find('if _p2n_offer_beta:') - _app_src.find("st.error(f\"❌ {_p2n_res.get('error') or '変換できませんでした'}\")") < 200,
+    '10e3: ベタ打ちの逃げ道が結果の if/elif 連鎖の外（最後の else の直後）に無い')
+chk('_p2n_beta_ui_shown = False' in _app_src, '10e4: _p2n_beta_ui_shown を初期化していない')
+_src_mk = inspect.getsource(app.p2n_make)
+chk('_blank_wage_rows(reading)' in _src_mk and 'force_draft=True' in _src_mk and "write_reading(case_dir, reading)" in _src_mk,
+    '10d: p2n_make が工賃欄空欄の行を 0 円にして force_draft で作り直していない／失敗時に元へ戻していない')
+# R2: ベタ打ちの逃げ道
+chk(_app_src.count('_beta_generate_ui(') == 3 and 'fallback=True' in _app_src and '_p2n_offer_beta' in _app_src,
+    f"10e: ベタ打ちの UI が共通化されて 2 か所（Addata なし／スキル経路の不合格）から呼ばれていない: {_app_src.count('_beta_generate_ui(')}")
+# E1/E4: 差がある結果のダウンロードは確認してから
+_src_rb = inspect.getsource(app._render_beta_result)
+chk("key='pdf2neo_beta_ack'" in _src_rb and 'or not _p2n_ack' in _src_rb and 'amount_changes' in _src_rb, '10f: ベタ打ちの結果に確認チェックのゲートが無い')
+chk("'pdf2neo_beta_ack'" in _app_src.split('_CASE_INPUT_KEYS = (')[1].split(')')[0] and "pop('pdf2neo_beta_ack'" in inspect.getsource(app._beta_generate_ui),
+    '10g: 確認チェックが次の結果・次の案件に持ち越される')
+# E2/E3
+chk('_tax{int(bool(tax_inclusive))}' in inspect.getsource(app.analyze_estimate), '10h: OCR 結果キャッシュのキーに税区分が無い')
+chk('(out.get("verify") or {}).get("ok") is True' in inspect.getsource(P.process_pdf_to_neo) and 'it.get("is_adjustment_row") for it in (out.get("items")' in inspect.getsource(P.process_pdf_to_neo),
+    '10i: 検証に落ちた結果をパイプラインのキャッシュに残している')
+chk('out["amount_changes"]' in inspect.getsource(P.process_pdf_to_neo), '10j: 金額列の補正を結果に載せていない')
+# F1: 指紋に Addata
+chk(app._p2n_inputs_signature('f1', _st9, addata_id='C:/Addata|2026/09') != app._p2n_inputs_signature('f1', _st9, addata_id=''), '10k: Addata が違えば指紋が違う')
+chk(_app_src.count('addata_id=_p2n_addata_identity(_p2n_addata)') == 2 and "addata_id='' if _p2n_is_beta else _p2n_addata_identity(find_addata_dir())" in _app_src,
+    '10l: スキル経路の結果と照合に Addata の同一性が入っていない')
+# F2: vendor の subprocess に秘密情報を渡さない
+from neo_skill import vendor as _vend
+os.environ['NEO_TEST_API_KEY'] = 'x'; os.environ['NEO_TEST_PLAIN'] = 'y'
+_env = _vend.subprocess_env()
+chk('NEO_TEST_API_KEY' not in _env and _env.get('NEO_TEST_PLAIN') == 'y' and 'PATH' in _env and _env.get('REPO_ROOT'),
+    '10m: subprocess_env が秘密情報を落としていない／必要な変数を落としている')
+for _k in ('ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENAI_API_KEY', 'AWS_SECRET_ACCESS_KEY', 'GITHUB_TOKEN'):
+    chk(bool(_vend._SECRET_ENV.search(_k)), f'10m2: {_k} が秘密情報として弾かれない')
+os.environ.pop('NEO_TEST_API_KEY', None); os.environ.pop('NEO_TEST_PLAIN', None)
+# D3: 部品側の上限
+_html = open(os.path.join(R, 'neo_skill', 'addata_bridge', 'index.html'), encoding='utf-8').read()
+chk('f.size > MAX_FILE_BYTES' in _html and 'MAX_MESSAGE_BYTES' in _html and 'ALLOWED_EXT.test(name)' in _html, '10n: 部品が読む前にファイルの大きさ・種類で弾いていない')
 
 print('REG_INSURANCE:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
