@@ -3574,7 +3574,12 @@ def _addata_from_url(url):
 # `_pdfium_lock_mod` は**入れてはいけない**。pdfium のロックを
 # プロセス全体で1つにするためだけのモジュールで、読み直すと別のロックが
 # できて共有の意味が消える（Cヒープが壊れてプロセスごと落ちる）。
-_APP_MODULES = ('neo_rules', 'neo_header', 'addata_locator', 'addata_settings',
+# neo_skill.* を先に（app が neo_skill を import する。依存の順: vendor → prompts → llm → doc_hints → _runner → reader → maker → bridge）。
+# 入れていなかったため、本番（Streamlit Cloud は push 後もプロセスが残る）で app.py だけ新しくなり import 済みの
+# neo_skill/reader.py が古いまま「read_estimate() got an unexpected keyword argument 'customer_hint'」になった（2026-09-15）
+_APP_MODULES = ('neo_skill.vendor', 'neo_skill.prompts', 'neo_skill.llm', 'neo_skill.doc_hints', 'neo_skill._runner',
+                'neo_skill.reader', 'neo_skill.maker', 'neo_skill.bridge',
+                'neo_rules', 'neo_header', 'addata_locator', 'addata_settings',
                 '_addata_db_search', '_grade_identifier',
                 'addata_vehicle_resolver', 'app', 'auto_matching',
                 'pdf_to_neo_pipeline')
@@ -7144,6 +7149,16 @@ def _p2n_addata_identity(root) -> str:
     return f"{os.path.normpath(str(root))}|{ver}"
 
 
+def _nsk_code_stamp() -> str:
+    """いま読み込まれている neo_skill/reader.py の中身の印（8 文字）。本番で古いモジュールが残っていないかを画面で確かめる
+    （sync_app_modules が差し替えた後は手元の `python -c` の値と一致する）"""
+    try:
+        from neo_skill import reader as _r
+        return _file_digest(_r.__file__)[:8]
+    except Exception:  # noqa: BLE001
+        return '?'
+
+
 def _attached_docs_ocr(api_key, model_name=None, progress=None):
     """STEP 1-B に添付した車検証（vehicle_upload）と事故・保険の書類（insurance_doc_upload）を Gemini で読み、
     (車検証の dict, 書類の dict) を返す。読めなかったものは {}。同じファイルは内容ハッシュでセッションに控えて二度読まない。
@@ -7970,7 +7985,7 @@ def main():
             '<b>pdf-to-neo スキル</b>（コグニ実機で確かめた判断規則）がそのまま行います。'
             '合格したときだけ、NEO と<b>確認箇所シート（xlsx）</b>を組でお渡しします。'
             '合計を合わせるための金額調整はしません。</div>'
-            + (f'<div style="font-size:11px;color:#64748b;margin-top:6px;">スキル: commit {_nsk_commit}</div>' if _nsk_commit else '')
+            + (f'<div style="font-size:11px;color:#64748b;margin-top:6px;">スキル: commit {_nsk_commit} ／ アプリ側 neo_skill: {_nsk_code_stamp()}</div>' if _nsk_commit else '')
             + '</div>', unsafe_allow_html=True)
         # 税区分のラジオは下の CSV 取り込みが session_state['tax_override'] を読むので残す。
         # この経路（PDF→NEO）は見積書の合計欄から税込印字を見分ける（reading_schema.md）ので使わない。

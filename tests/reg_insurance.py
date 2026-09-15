@@ -440,6 +440,14 @@ os.environ.pop('NEO_TEST_API_KEY', None); os.environ.pop('NEO_TEST_PLAIN', None)
 _html = open(os.path.join(R, 'neo_skill', 'addata_bridge', 'index.html'), encoding='utf-8').read()
 chk('f.size > MAX_FILE_BYTES' in _html and 'MAX_MESSAGE_BYTES' in _html and 'ALLOWED_EXT.test(name)' in _html, '10n: 部品が読む前にファイルの大きさ・種類で弾いていない')
 
+# ── 11. 本番でモジュールが古いまま残らないこと（2026-09-15 read_estimate() got an unexpected keyword argument 'customer_hint'）──
+_mods = ('neo_skill.vendor', 'neo_skill.prompts', 'neo_skill.llm', 'neo_skill.doc_hints', 'neo_skill._runner', 'neo_skill.reader', 'neo_skill.maker', 'neo_skill.bridge')
+chk(all(m in app._APP_MODULES for m in _mods), f'11: neo_skill のモジュールが _APP_MODULES に無い: {[m for m in _mods if m not in app._APP_MODULES]}')
+chk(all(app._APP_MODULES.index(m) < app._APP_MODULES.index('app') for m in _mods), '11b: neo_skill は app より先に読み直す')
+chk(all(app._APP_MODULES.index(_mods[i]) < app._APP_MODULES.index(_mods[i + 1]) for i in range(len(_mods) - 1)), '11c: neo_skill の読み直しの順が依存の順ではない')
+import neo_skill.reader as _nr
+chk(len(app._nsk_code_stamp()) == 8 and app._nsk_code_stamp() == app._file_digest(_nr.__file__)[:8], '11d: 画面に出す neo_skill の印が reader.py の指紋と違う')
+
 print('REG_INSURANCE:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
     print('  -', f)
