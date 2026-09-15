@@ -7194,9 +7194,13 @@ def _p2n_addata_identity(root) -> str:
 def _nsk_code_stamp() -> str:
     """いま読み込まれている neo_skill/reader.py の中身の印（8 文字）。本番で古いモジュールが残っていないかを画面で確かめる
     （sync_app_modules が差し替えた後は手元の `python -c` の値と一致する）"""
-    try:
+    try:   # reader.py だけでなく neo_skill の全モジュールの中身から作る（どれを直しても本番で版が変わったと分かる。2026-09-15）
         from neo_skill import reader as _r
-        return _file_digest(_r.__file__)[:8]
+        _d = os.path.dirname(_r.__file__)
+        _h = hashlib.sha256()
+        for _n in sorted(x for x in os.listdir(_d) if x.endswith('.py')):
+            _h.update(_n.encode('utf-8') + b'\0' + _file_digest(os.path.join(_d, _n)).encode('ascii'))
+        return _h.hexdigest()[:8]
     except Exception:  # noqa: BLE001
         return '?'
 

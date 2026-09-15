@@ -15,6 +15,7 @@
 """
 import inspect
 import os
+import hashlib
 import sqlite3
 import sys
 import tempfile
@@ -456,7 +457,11 @@ chk(all(m in app._APP_MODULES for m in _mods), f'11: neo_skill のモジュー�
 chk(all(app._APP_MODULES.index(m) < app._APP_MODULES.index('app') for m in _mods), '11b: neo_skill は app より先に読み直す')
 chk(all(app._APP_MODULES.index(_mods[i]) < app._APP_MODULES.index(_mods[i + 1]) for i in range(len(_mods) - 1)), '11c: neo_skill の読み直しの順が依存の順ではない')
 import neo_skill.reader as _nr
-chk(len(app._nsk_code_stamp()) == 8 and app._nsk_code_stamp() == app._file_digest(_nr.__file__)[:8], '11d: 画面に出す neo_skill の印が reader.py の指紋と違う')
+_nd = os.path.dirname(_nr.__file__)
+_nh = hashlib.sha256()
+for _nn in sorted(x for x in os.listdir(_nd) if x.endswith('.py')):
+    _nh.update(_nn.encode('utf-8') + b'\0' + app._file_digest(os.path.join(_nd, _nn)).encode('ascii'))
+chk(len(app._nsk_code_stamp()) == 8 and app._nsk_code_stamp() == _nh.hexdigest()[:8], '11d: 画面に出す neo_skill の印が neo_skill 全モジュールの指紋と違う（2026-09-15: reader.py だけ → 全モジュール）')
 
 print('REG_INSURANCE:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
