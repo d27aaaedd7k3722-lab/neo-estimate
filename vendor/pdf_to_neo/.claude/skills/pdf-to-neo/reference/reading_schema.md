@@ -99,6 +99,10 @@ flags: `M` = manual（ADDATA に無い品目）、`R` = reserve（保留）、`N
 
 `"target_total": 715000`（税込）を reading に書くと、draft_estimate が 課税小計 = 指定額 − 消費税（10% 四捨五入）を満たす額を求め、**塗装材料代** = 課税小計 − 部品計 − 工賃計 − 塗装工賃計 − 内板骨格 − 費用 − 値引 を `paint.material` に入れ、`totals` も指定額で作る。条件: `paint.panels` の詳細塗装であること、工賃未確定の行（wage/index とも無い取替・脱着・脱着修理）が無いこと。消費税は `tax_round`（既定 四捨五入。切り捨て・切り上げの工場はその設定）で解く。指定レートは `labor_rate` に書き、明細は index だけ写す。
 
+塗装が一式（`paint.panels` なし）の見積で「塗装で調整」なら `"target_adjust": "paint"` を足す（draft が生成器で塗装一式の額を決める。2026-09-15）。
+協定で動く合計欄（`totals.wage` / `paint` / `paint_total`、`paint.total`、小計）は協定後の値に直す（直さないと紙上検算が止まる。判断規則 10-14 の 5）。
+方法の候補と数字は `agree_calc.py <作業フォルダ> --target <協定額>` で出す。
+
 **損保が「○○の工賃で調整」と指定してきたとき**は、`target_total` を書くだけでは足りない。
 手順の正本は `judgment_rules.md` の **10-14**（工場見積そのままで先に検算 → 指定行の指数を 0.1 刻みで動かす →
 ページ小計とブロック小計の両方を直す → 残る端数を `target_total` に任せる → 前後の値を報告）。そちらに従う
@@ -175,7 +179,9 @@ flags: `M` = manual（ADDATA に無い品目）、`R` = reserve（保留）、`N
 
 | `hints` | `{"eva_codes": ["U"], "eva_exclude": ["T"], "note": "…"}` | 装備の採用・除外（`eva_exclude` は draft の自動採用を外す） |
 | `note` | `"…"` | 転記メモ（merge で header に通る。生成には使わない） |
-| `target_total` | `715000` | 協定額（税込）。塗装材料代で自動調整する |
+| `target_total` | `715000` | 協定額（税込）。塗装材料代（パネル明細の塗装）で自動調整する。reading にあると、NEO の合計がこの額でなければ make_neo が不合格にする（判断規則 10-14） |
+| `target_adjust` | `"paint"` | 協定額の端数を何で吸収するか。既定 `"material"`（塗装材料代。パネル明細の塗装）、`"paint"`（塗装一式の額。損保の「塗装で調整」） |
+| `target_total_replaces_material` | `true` | 工場見積に印字された材料代を協定額合わせで動かしてよい（損保の指示があるときだけ） |
 | `adas` | `[{"name": "フロントカメラエーミング", "time": 1.0, "wage": 8000}]` | ADAS のエーミング作業（生成器の `estimate['adas']` にそのまま渡る） |
 | `insurance` | `{"company": …, "policy_no": …, "contractor": …, "accident_date": "20260901", "accept_no": …, "agency": …, "adjuster": …, "garage_in": "20260903", "garage_out": …, "repair_days": 5}` | 速報・案件情報。draft がそのまま estimate に渡し、生成器が Insurance / FileInfo / XML に書く（`estimate_schema.md`）。日付は YYYYMMDD。`factory` は「半角カナ略称 電話番号（ハイフン無し）」、画像鑑定は「写真鑑定」、長い `contractor` は 20 バイトで切った形（判断規則 10-28。`corpus_lookup.py factory <電話>` で過去の書き方を引く） |
 | `_merged_from` | — | `reading_pages.py merge` が付ける（何ページを束ねたか） |

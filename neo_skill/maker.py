@@ -129,6 +129,21 @@ def _safe_name(name: str) -> str:
     return s or 'estimate'
 
 
+def _kill_tree(proc) -> None:
+    """subprocess のプロセス木を止める（timeout 時）。失敗しても例外にしない"""
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/T', '/F', '/PID', str(proc.pid)], capture_output=True, timeout=30)
+        else:
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:  # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def make_neo(case_dir: str, name: str, *, no_profile: bool = False, allow_neo_total: bool = False,
              force_draft: bool = False, skip_check: bool = False, timeout: float = 900.0,
              addata_root: Optional[str] = None, neo_check_root: Optional[str] = None) -> MakeResult:
@@ -147,15 +162,26 @@ def make_neo(case_dir: str, name: str, *, no_profile: bool = False, allow_neo_to
         args.append('--force-draft')
     if skip_check:
         args.append('--skip-check')
+    # 子（make_neo.py）は孫（run_case.py 等）を起動する。timeout で子だけ殺すと孫が生き残って作業フォルダを掴む／書き戻すので、
+    # プロセスグループごと止める（Windows: taskkill /T、POSIX: killpg。バグハント G6）
+    _grp = ({'creationflags': getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)} if os.name == 'nt' else {'start_new_session': True})
     try:
-        p = subprocess.run(args, cwd=vendor.VENDOR_ROOT, env=vendor.subprocess_env(addata_root, neo_check_root),
-                           capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return MakeResult(False, -2, '', case_dir, name, error=f'make_neo.py が {int(timeout)} 秒で終わらなかった')
+        proc = subprocess.Popen(args, cwd=vendor.VENDOR_ROOT, env=vendor.subprocess_env(addata_root, neo_check_root),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', **_grp)
     except OSError as e:
         return MakeResult(False, -3, '', case_dir, name, error=f'make_neo.py を起動できない: {e}')
-    out = (p.stdout or '') + (('\n[stderr]\n' + p.stderr) if p.stderr and p.returncode != 0 else '')
-    res = MakeResult(p.returncode == 0, p.returncode, out, case_dir, name)
+    try:
+        so, se = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            proc.communicate(timeout=15)
+        except Exception:  # noqa: BLE001
+            pass
+        return MakeResult(False, -2, '', case_dir, name, error=f'make_neo.py が {int(timeout)} 秒で終わらなかった')
+    rc = proc.returncode
+    out = (so or '') + (('\n[stderr]\n' + se) if se and rc != 0 else '')
+    res = MakeResult(rc == 0, rc, out, case_dir, name)
     neo = os.path.join(case_dir, f'{name}.neo')
     ng = os.path.join(case_dir, f'{name}.ng.neo')
     res.neo_path = neo if (res.ok and os.path.isfile(neo)) else None

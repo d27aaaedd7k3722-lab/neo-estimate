@@ -35,7 +35,7 @@ skill_env.apply()  # ADDATA / NEO_check / 雛形 の場所を環境変数に（P
 FILES = skill_env.FILES  # リポジトリ root（ジャンクション経由・別フォルダからの実行でも解決）
 sys.path.insert(0, os.path.join(FILES, 'claude_neo_pipeline'))
 
-from estimate_to_neo import _code4, _fit, AddataParts, BUMPER_DISPOSAL, DISPOSAL, NeoBuilder, bankin_time, hw, material_default, r10, BUMPER_ONLY_KEYS, is_manual_panel  # noqa: E402
+from estimate_to_neo import _code4, _fit, AddataParts, BUMPER_DISPOSAL, DISPOSAL, NeoBuilder, bankin_time, hw, material_default, r10, BUMPER_ONLY_KEYS, is_bumper_only_paint, is_manual_panel  # noqa: E402
 from paint_index import PaintIndex  # noqa: E402
 
 BANKIN_YES = {'A': [1, 1, 1], 'B': [1, 0, 0], 'C': [0, 0, 0]}
@@ -1015,7 +1015,9 @@ class Drafter:
                                   + '/'.join(sorted(self.parts.name20_by_ref.get(ref, ()))) + f'（{why}）。品番が無いので別の部品を選んでいないか確かめる')
             elif '名称近似' in why or 'ブロック内' in why:
                 self.notes.append(f"名称照合で決定: {name} → {ref} {'/'.join(sorted(self.parts.name20_by_ref.get(ref, ())))}（{why}）")
-            _moved_by_price = '単価' in (why or '').split(' ← ')[0]
+            # 工賃・指数のある主作業の行は、単価で決めた（残した）行でも部位の文脈を動かす（後に続く付属の小物はその部位のもの。
+            # 左ﾌﾛﾝﾄﾌｪﾝﾀﾞﾊﾟﾈﾙ 取替の後のｸﾘｯﾌﾟ ×12 がフードのｸﾘｯﾌﾟになっていた。2026-09-15 アプリの実機テスト）
+            _moved_by_price = '単価' in (why or '').split(' ← ')[0] and not ((wage or 0) > 0 or (index or 0) > 0)
             if not _moved_by_price or not ctx_block or self.parts.block_of(ref) == ctx_block:
                 # 単価で**別の部位ブロック**の ref に直した行（同じ品番の小物が別ブロックにある）だけは、後続行の部位文脈を動かさない（同じブロック・文脈が空なら通常どおり更新。Codex 指摘）
                 ctx_block = self.parts.block_of(ref) or ctx_block
@@ -1599,15 +1601,26 @@ class Drafter:
             return None
         target = int(float(target_raw))
         paint = est.get('paint') or {}
+        adjust = str(self.rd.get('target_adjust') or 'material').strip()
+        if adjust not in ('material', 'paint'):
+            self.notes.append(f'★ target_total {target:,}: target_adjust は "material"（塗装材料代で）か "paint"（塗装一式の額で）。"{adjust}" は使えない')
+            return None
+        if adjust == 'paint' and _flag(paint.get('auto_panels'), 'paint.auto_panels') and paint.get('panels'):
+            # 塗装一式に auto_panels を付けてパネルを起こした案件: 塗装費用は起こしたパネルの材料代で合わせる（下の材料代の経路。Codex 指摘）
+            self.notes.append(f'target_total {target:,}: auto_panels で起こしたパネルの塗装なので、「塗装で調整」は材料代で合わせる')
+            adjust = 'material'
+        if adjust == 'paint':
+            return self._target_by_paint_total(est, target)
+        if not (paint.get('panels') or is_bumper_only_paint(paint)):   # バンパだけの詳細塗装（panels: []）も材料代で調整できる（agree_calc と同じ判定。Codex 指摘）
+            self.notes.append(f'★ target_total {target:,}: 塗装の詳細（panels）が無いので材料代で調整できない。塗装一式の額で合わせるなら reading に "target_adjust": "paint"'
+                              '（損保の「塗装で調整」）。方法の候補は agree_calc.py で')
+            return None
         _mat_printed = _num((self.rd.get('paint') or {}).get('material'))
         if _mat_printed != '' and float(_mat_printed) > 0 and not _flag(self.rd.get('target_total_replaces_material'), 'target_total_replaces_material'):
             # 工場見積に材料代が印字されているなら、協定額合わせで材料代を動かすのは「工場の数字を動かす」ことになる。
             # 損保が「材料代で調整」と明示した案件だけ reading に target_total_replaces_material: true を書いて通す（Codex 指摘 2026-09-12）
             self.notes.append(f'★ target_total {target:,}: 工場見積に材料代 {int(float(_mat_printed)):,} が印字されているので材料代では調整しない。'
                               '損保の指示で材料代を動かすなら reading に "target_total_replaces_material": true を書く')
-            return None
-        if not paint.get('panels'):
-            self.notes.append(f'target_total {target:,}: 塗装の詳細（panels）が無いので材料代で調整できない。paint を詳細にするか手で合わせる')
             return None
         unknown = [it.get('name') for it in (est.get('items') or []) if not it.get('manual') and not it.get('reserve')
                    and it.get('wage') is None and it.get('index') is None and it.get('method') in ('取替', '脱着', '脱着修理')]
@@ -1655,6 +1668,68 @@ class Drafter:
                 'frame': int(tt.get('frame') or 0), 'expense_parts': int(tt.get('expense_parts') or 0), 'expense_wage': int(tt.get('expense_wage') or 0),
                 'expense': int(tt.get('expense_parts') or 0) + int(tt.get('expense_wage') or 0), 'discount': int(tt.get('discount') or 0),
                 'taxable': S, 'tax': _tax(S), 'total': target}  # 消費税は tax_round と同じ計算単位（Codex e18）
+
+    def _tax_fn(self, est: dict):
+        _tr = str(est.get('tax_round') or '四捨五入')  # 生成器と同じ消費税の計算単位（Setting.tx_ArrangeFlag）
+        return _tr, ((lambda s_: (s_ * 10) // 100) if _tr == '切り捨て' else ((lambda s_: -((-s_ * 10) // 100)) if _tr == '切り上げ' else (lambda s_: (s_ * 10 + 50) // 100)))
+
+    def _target_by_paint_total(self, est: dict, target: int) -> Optional[dict]:
+        """reading.target_adjust = "paint": 塗装が一式（パネル明細なし）の見積で、協定額に合わせて**塗装一式の額**（paint.total）を動かす
+        （損保の「塗装で調整」。2026-09-14 アウディ・ハイエースは手計算だった）。一式の塗装は 一式の額 ＋ 材料代（固定）で課税小計に入るので、
+        生成器で今の課税小計を実測し、差をそのまま一式の額に足す → もう一度実測して協定額になることを確かめる"""
+        paint = est.get('paint') or {}
+        if paint.get('panels') or is_bumper_only_paint(paint):
+            self.notes.append(f'★ target_total {target:,}: 塗装がパネル明細なので target_adjust "paint" は使えない（材料代で合わせる: target_adjust を消す）')
+            return None
+        try:
+            pt0 = int(float(_num(paint.get('total')) or 0))
+        except ValueError:
+            pt0 = 0
+        if pt0 <= 0:
+            self.notes.append(f'★ target_total {target:,}: 塗装一式の額（paint.total）が無いので塗装で調整できない')
+            return None
+        unknown = [it.get('name') for it in (est.get('items') or []) if not it.get('manual') and not it.get('reserve')
+                   and it.get('wage') is None and it.get('index') is None and it.get('method') in ('取替', '脱着', '脱着修理')]
+        if unknown:
+            self.notes.append(f'target_total {target:,}: 工賃未確定（wage/index とも無い取替・脱着）の行 {len(unknown)} 件があるので調整しない: {unknown[:5]}')
+            return None
+        _tr, _tax = self._tax_fn(est)
+        ex_nt = sum(_money_or(e.get('amount'), name='非課税費用の金額') for e in (est.get('expenses') or []) if _flag(e.get('taxfree'), 'expenses[].taxfree'))
+        base = int((target - ex_nt) / 1.1)
+        S = next((s_ for s_ in range(base - 3, base + 4) if s_ + _tax(s_) + ex_nt == target), None)
+        if S is None:
+            self.notes.append(f'target_total {target:,}: 消費税 10% {_tr}で合計がその額になる課税小計が無い（agree_calc.py で届く丸めを確かめ、tax_round を書く）')
+            return None
+        import copy
+
+        def probe(total: int) -> dict:
+            pe = copy.deepcopy(est)
+            pe['paint']['total'] = total
+            pe.pop('totals', None)
+            _, rep = self.nb.build(pe, pe['vehicle'], hints=pe.get('hints'), labor_rate=pe.get('labor_rate'), est_date=pe.get('est_date'), insurance=pe.get('insurance'))
+            return rep['totals']
+        try:
+            tt0 = probe(pt0)
+            new_total = pt0 + (S - int(tt0.get('subtotal') or 0))
+            if new_total <= 0:
+                self.notes.append(f'target_total {target:,}: 塗装一式が {new_total:,} 円（0 以下）になる。塗装だけでは合わせられない')
+                return None
+            tt = probe(new_total)
+        except Exception as e:  # noqa: BLE001
+            self.notes.append(f'target_total {target:,}: 生成器の試算に失敗（{e}）。調整しない')
+            return None
+        if int(tt.get('subtotal') or 0) != S:
+            self.notes.append(f'target_total {target:,}: 塗装一式を {new_total:,} にしても課税小計が {int(tt.get("subtotal") or 0):,}（目標 {S:,}）。調整しない')
+            return None
+        paint['total'] = new_total
+        paint['_total_from_target'] = True   # 協定額に合わせて決めた塗装一式（生成器は _ で始まるキーを読まない）
+        mat = int(tt.get('paint_material') or 0)
+        pw = int(tt.get('paint') or 0) - mat
+        self.notes.append(f'target_total {target:,}: 塗装一式 {pt0:,} → {new_total:,}（{new_total - pt0:+,}）で課税小計 {S:,}・消費税 {_tax(S):,}（{_tr}）')
+        return {'parts': int(tt.get('parts') or 0), 'wage': int(tt.get('wage') or 0), 'paint': pw, 'material': mat, 'paint_total': pw + mat,
+                'frame': int(tt.get('frame') or 0), 'expense_parts': int(tt.get('expense_parts') or 0), 'expense_wage': int(tt.get('expense_wage') or 0),
+                'expense': int(tt.get('expense_parts') or 0) + int(tt.get('expense_wage') or 0), 'discount': int(tt.get('discount') or 0),
+                'taxable': S, 'tax': _tax(S), 'total': target}
 
     def totals(self, items: list[dict], paint: Optional[dict], expenses: list[dict]) -> dict:
         t = {k: (_money_or(v, None, name=f'合計欄の {k}') if (isinstance(v, str) and k not in ('neo_total_reason', 'tolerance_reason', 'note')) else v) for k, v in (self.rd.get('totals') or {}).items()}  # 印字どおりの '95,000' を数値に（下流の int() が落ちない）

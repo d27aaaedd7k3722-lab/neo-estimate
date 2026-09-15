@@ -185,6 +185,81 @@ def main() -> int:
         fails.append('書式 C で index_policy を外した注意が出ている')
     shutil.rmtree(case, ignore_errors=True)
 
+    # ── 14: header の est_date / labor_rate / wage_round / tax_round と、page の rows_printed / marks / subtotal の型（バグハント G1/G2/G3/G5）
+    h14 = json.loads(json.dumps(HEADER))
+    h14['est_date'] = '令和8年9月13日'
+    h14['labor_rate'] = '8,000円'
+    h14['issuer'] = {'name': 'テスト工場', 'tel': '000-0000-0000'}
+    h14['wage_round'] = 100
+    h14['tax_round'] = '切り捨て'
+    h14['target_total'] = 700000
+    h14['discount'] = {'amount': 5000}
+    _notes14 = []
+    out14 = reader._normalise_header(h14, None, None, None, notes=_notes14)
+    if out14.get('est_date') != '20260913':
+        fails.append(f"14a: est_date の和暦が YYYYMMDD にならない: {out14.get('est_date')!r}")
+    if out14.get('labor_rate') != 8000:
+        fails.append(f"14b: labor_rate '8,000円' が 8000 にならない: {out14.get('labor_rate')!r}")
+    if not isinstance(out14.get('issuer'), str) or 'テスト工場' not in out14['issuer']:
+        fails.append(f"14c: issuer の dict が文字列にならない: {out14.get('issuer')!r}")
+    if 'wage_round' in out14 or 'tax_round' in out14 or 'target_total' in out14 or out14.get('discount') != {'amount': 5000} or len(_notes14) != 3:
+        fails.append(f"14d: wage_round / tax_round が落ちない・注意が出ない: {out14.keys()} {_notes14}")
+    try:
+        reader._normalise_header(dict(HEADER, est_date='2026年'), None, None, None)
+        fails.append('14e: 8 桁にならない est_date が形の FAIL にならない')
+    except reader.PageShapeError:
+        pass
+    try:   # 年月だけ（日 00）は生成器が date(…, 0) で落ちるので形の FAIL（レビュー 2026-09-15）
+        reader._normalise_header(dict(HEADER, est_date='令和8年9月'), None, None, None)
+        fails.append('14e2: 年月だけの est_date が形の FAIL にならない')
+    except reader.PageShapeError:
+        pass
+    _ch = {'name': 'ｹﾝｼｮｳ', 'address': '三重県四日市市日永1-1', 'prefecture': '三重県', 'municipality': '四日市市', 'address_other': '日永1-1'}
+    _o1 = reader._normalise_header(dict(HEADER, customer={'name': 'ｹﾝｼｮｳ ﾀﾛｳ'}), None, None, _ch)
+    if (_o1['customer'].get('municipality'), _o1['customer'].get('address_other')) != ('四日市市', '日永1-1'):
+        fails.append(f"14j: 印字に住所が無いのに車検証の構造化住所が渡らない: {_o1['customer']}")
+    _o2 = reader._normalise_header(dict(HEADER, customer={'name': 'ｹﾝｼｮｳ ﾀﾛｳ', 'address': '福岡県北九州市小倉北区1-1'}), None, None, _ch)
+    if _o2['customer'].get('municipality') or _o2['customer'].get('address') != '福岡県北九州市小倉北区1-1':
+        fails.append(f"14k: 印字の住所があるのに車検証の構造化住所を足している: {_o2['customer']}")
+    if reader._normalise_header(dict(HEADER, est_date=20260913), None, None, None).get('est_date') != '20260913':
+        fails.append('14f: 数値の est_date を 8 桁の文字列にしない')
+    for bad_page in ({'page': 1, 'rows_printed': '二', 'blocks': [{'title': '', 'rows': ROWS}]},
+                     {'page': 1, 'rows_printed': 2, 'marks': {'$': 'one'}, 'blocks': [{'title': '', 'rows': ROWS}]},
+                     {'page': 1, 'rows_printed': 2, 'subtotal': {'parts': [45000]}, 'blocks': [{'title': '', 'rows': ROWS}]}):
+        try:
+            reader._normalise_page(bad_page, 1)
+            fails.append(f'14g: 数値でない rows_printed / marks / subtotal が形の FAIL にならない: {bad_page}')
+        except reader.PageShapeError:
+            pass
+    ok_page = reader._normalise_page({'page': 1, 'rows_printed': '2', 'marks': {'$': '1', '#': None}, 'subtotal': {'parts': '45,000', 'wage': 16000.0},
+                                      'blocks': [{'title': '', 'rows': ROWS}]}, 1)
+    if ok_page.get('rows_printed') != 2 or ok_page.get('marks') != {'$': 1} or ok_page.get('subtotal') != {'parts': 45000, 'wage': 16000}:
+        fails.append(f"14h: 数字の文字列・float・None の正規化が違う: {ok_page.get('rows_printed')!r} {ok_page.get('marks')!r} {ok_page.get('subtotal')!r}")
+    if ok_page['blocks'][0]['rows'] is not ok_page['blocks'][0]['rows'] or reader._normalise_page({'page': 2, 'blocks': []}, 2)['blocks'][0]['rows'] is reader.EMPTY_BLOCKS[0]['rows']:
+        fails.append('14i: 空ブロックの rows が module 定数を共有している')
+
+    # ── 15: 注記行だけのページは pages/ に残さず、注記は直前の明細ページの末尾へ（バグハント G4）
+    note_page = {'page': 2, 'rows_printed': 0, 'subtotal': {}, 'marks': {}, 'blocks': [{'title': '', 'rows': ['|インテリジェントクリアランスソナー|||||||N|']}]}
+    hdr15, pages15 = reader._pages_for_merge(HEADER, [PAGE_OK, note_page])
+    if len(pages15) != 1 or pages15[0]['page'] != 1:
+        fails.append(f'15a: 注記行だけのページが pages/ に残る: {[p.get("page") for p in pages15]}')
+    elif not any(reader._is_note_row(r) for r in pages15[0]['blocks'][-1]['rows']):
+        fails.append('15b: 注記行が直前の明細ページの末尾に繋がれていない')
+    if reader._is_note_row({'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'price': 45000, 'note': '装備: ソナー付'}) \
+            or not reader._is_note_row({'note': 'ソナー付'}) or not reader._is_note_row('|ソナー|||||||Ｎ|') \
+            or not reader._is_note_row({'name': 'ｿﾅｰ', 'flags': 'ｎ'}):
+        fails.append('15f: 注記行の判定が vendor と違う（note 付きの明細 dict 行／全角 Ｎ）')
+    if reader._has_rows(note_page) or not reader._has_rows(PAGE_OK):
+        fails.append('15c: _has_rows が注記行を明細に数えている')
+    case = tempfile.mkdtemp(prefix='reg_reader_')
+    fake = FakeReader([HEADER, PAGE_OK, note_page])
+    res = reader.read_estimate(blank_pdf(2), reader=fake, case_dir=case, source_name='test.pdf')
+    if not res.ok:
+        fails.append(f'15d: 注記行だけの 2 ページ目があると読み取りが ok にならない: {res.fails()}')
+    if fake.calls != 3:
+        fails.append(f'15e: 注記行だけのページで読み直しが走った（呼び出し {fake.calls} 回）')
+    shutil.rmtree(case, ignore_errors=True)
+
     # ── 4: 合計欄が合わない（header の totals が違う）。header 読み直し・ページ読み直しでも同じ → ok=False で止まる
     case = tempfile.mkdtemp(prefix='reg_reader_')
     bad_header = json.loads(json.dumps(HEADER))

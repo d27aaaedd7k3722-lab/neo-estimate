@@ -22,7 +22,7 @@ import sys
 from typing import Optional
 
 # 取り込んでいる files（pdf-to-neo ブランチ）のコミット。tools/vendor_sync.py が取り直すときに書き換える
-EXPECTED_COMMIT = '09e60d0f48f82a0a81ebd4b3bb33281cad9d8b57'
+EXPECTED_COMMIT = '2820e1c86f3c59dc33cefd4ff465d30eee5c58f0'
 
 APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENDOR_ROOT = os.path.join(APP_ROOT, 'vendor', 'pdf_to_neo')
@@ -109,6 +109,14 @@ def is_ready() -> bool:
 
 
 _SECRET_ENV = re.compile(r'(API_?KEY|_TOKEN$|^TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|ANTHROPIC|GEMINI|OPENAI|GOOGLE_API|^AWS_|^AZURE_|HF_TOKEN)', re.I)
+# 子プロセスに渡す環境変数は許可リスト（拒否リストだけだと DATABASE_URL・PRIVATE_KEY・HTTPS_PROXY の認証付き URL 等を取りこぼす。
+# バグハント G7/J8）。vendor が読むのは ADDATA_* / NEO_* / REPO_ROOT / COGNI_* / PDF_TO_NEO* / KATASHIKI_DB / SELFTEST_SECONDS と
+# Python・OS の基本（PATH・TEMP・LOCALAPPDATA・WINDIR・LANG・TZ …）だけ
+_ALLOW_ENV = re.compile(r'^(PATH|PATHEXT|COMSPEC|SYSTEMROOT|SYSTEMDRIVE|WINDIR|TEMP|TMP|TMPDIR|HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|APPDATA|LOCALAPPDATA|'
+                        r'PROGRAMDATA|PROGRAMFILES|PROGRAMFILES\(X86\)|PROGRAMW6432|COMMONPROGRAMFILES|COMMONPROGRAMFILES\(X86\)|ALLUSERSPROFILE|PUBLIC|OS|'
+                        r'USERNAME|COMPUTERNAME|NUMBER_OF_PROCESSORS|PROCESSOR_[A-Z0-9_]+|LANG|LANGUAGE|LC_[A-Z]+|TZ|PYTHON[A-Z0-9_]*|VIRTUAL_ENV|'
+                        r'CONDA[A-Z0-9_]*|SSL_CERT_FILE|SSL_CERT_DIR|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|NEO_[A-Z0-9_]+|ADDATA_[A-Z0-9_]+|REPO_ROOT|'
+                        r'COGNI_[A-Z0-9_]+|PDF_TO_NEO[A-Z0-9_]*|KATASHIKI_DB|SELFTEST_SECONDS)$', re.I)
 
 
 def subprocess_env(addata_root: Optional[str] = None, neo_check_root: Optional[str] = None) -> dict:
@@ -116,7 +124,7 @@ def subprocess_env(addata_root: Optional[str] = None, neo_check_root: Optional[s
     REPO_ROOT を vendor に固定し、出力を UTF-8 にする。ADDATA / NEO_check はアプリが決めたものがあれば渡す
     （無ければ skill_env が 設定ファイル → 自動検出 で解決する）"""
     # 秘密情報（API キー・トークン・パスワード）は vendor の subprocess に渡さない（検算・生成には要らない。Codex hunt F2）
-    env = {k: v for k, v in os.environ.items() if not _SECRET_ENV.search(k)}
+    env = {k: v for k, v in os.environ.items() if _ALLOW_ENV.match(k) and not _SECRET_ENV.search(k)}
     env['REPO_ROOT'] = VENDOR_ROOT
     env['PYTHONIOENCODING'] = 'utf-8'
     env.setdefault('PYTHONUTF8', '1')

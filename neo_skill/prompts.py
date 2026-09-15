@@ -80,11 +80,11 @@ def build_system_prompt() -> str:
 
 
 HEADER_TEMPLATE = {
-    'source': '', 'issuer': '', 'est_date': '', 'format': '',
+    'source': '', 'issuer': '', 'est_date': '', 'format': '',   # est_date は YYYYMMDD の 8 桁
     'vehicle': {'model_code': '', 'serial_no': '', 'desig': '', 'category': '', 'reg_date': '', 'color_code': ''},
     'customer': {'name': '', 'reg_no': '', 'postal': '', 'address': ''}, 'insurance': {'company': ''},
     'labor_rate': None,
-    'paint': {}, 'expenses': [],
+    'paint': {},
     'totals': {'parts': None, 'wage': None, 'paint': None, 'material': None, 'expense': None, 'taxable': None, 'tax': None, 'total': None},
 }
 
@@ -108,10 +108,12 @@ def header_task(n_pages: int, vehicle_hint: Optional[dict] = None, source_name: 
 書くキー（無いものは省く。値が読めないキーは空文字か null）: {', '.join(HEADER_KEYS)}
 - source: "{source_name or 'estimate.pdf'} 書式X"（書式は format_catalog.md の A〜G）
 - vehicle: 登録番号・車台番号・型式・型式指定/類別・初度登録（reg_date は "R4.3" のような印字どおり）・カラーNo・グレード名・エンジン・排気量のうち印字されているもの
+- est_date: 見積日を YYYYMMDD の 8 桁で（例 20260913。令和8年9月13日・2026/9/13 のような印字は変換する。無ければ書かない）
 - customer: お客様（宛名）の氏名・登録番号・郵便番号（postal）・住所（address）のうち印字されているもの。工場（発行元）の住所は issuer に書き、customer には入れない
 - insurance: 印字されているもの（保険会社・証券番号など）
 - labor_rate: 印字されていればその値。無ければ書かない（プログラムが工賃÷指数で逆算する）
 - wage_round / tax_round: 書かない（工賃の丸め単位・消費税の端数処理は、印字の工賃と合計欄からプログラムが判定する。推測で書くとコグニの設定が変わる）
+- target_total: 書かない（協定額は人が入れるもの。見積書の印字どおりに写す）。discount は合計欄に印字された値引き（−）・割増（＋）だけ（{{"parts": -5000, "wage": 0}}）
 - paint: 塗料・塗膜・高機能塗装・材料代・材料代割合・塗装工賃計（lines はページ側の paint_lines に書くので、ここでは lines を書かない）
 - expenses: **ここには書かない**（費用・諸費用は、印字されたページ側の expenses に書く。header とページの両方に書くと「費用の同じ行が 2 回ある」で不合格）
 - totals: 合計欄そのまま（parts / wage / paint / material / expense / taxable / tax / total。印字されている項目だけ。税込印字の見積書は reading_schema.md の規則どおり）
@@ -128,7 +130,7 @@ def page_task(page_no: int, n_pages: int, header: dict) -> str:
     fmt = header.get('format') or ''
     rate = header.get('labor_rate')
     return f"""添付は見積書の {page_no} ページ目（全 {n_pages} ページ）です。このページの**明細**を pages/page_{page_no}.json の形で書いてください。
-書式は {fmt or '未分類（format_catalog.md で判断）'}{f'、レバーレート {rate} 円' if rate else ''}。
+書式は {fmt or '未分類（format_catalog.md で判断）'}{f'、レバーレート {rate:,} 円' if isinstance(rate, int) and rate > 0 else ''}。
 
 手順（参照文書 3 の 8 項目どおり）:
 1. まず rows_printed（このページに印字された明細行数。注記行・小計行・繰越行は数えない）、印字されていればページ小計 subtotal（parts / wage）、印の数 marks（$ # * @ の個数）を書く

@@ -2017,6 +2017,10 @@ def process_pdf_to_neo(pdf_path,
                     # ここを PDF 固定にすると、画像を PDF として送って読み取れない。
                     res = analyze_estimate(api_key, pdf_bytes, source_mime or "application/pdf",
                                            model_name=_ocr_model or None,
+                                           # 自己修復ループ（印字小計に合わせて明細を読み直す）は使わない: 明細の金額が黙って変わり、
+                                           # 調整行・検証差・金額列の補正のどれにも掛からず確認無しに落とせた（バグハント K2）。
+                                           # 合計の差は調整行＋警告＋確認チェックに任せる
+                                           enable_self_correction=False,
                                            # 税込表記であることをモデルに伝える
                                            tax_inclusive=bool(is_tax_inclusive))
                     if isinstance(res, dict) and "items" in res:
@@ -2351,6 +2355,16 @@ def process_pdf_to_neo(pdf_path,
                 if _grand_ok:
                     log.append(f"[total_match] 総合計{pdf_g}と明細合算{_s0}が一致 → "
                                f"部品計/工賃計との差は小計対象外の行によるものとみなし調整しない")
+            # 総合計の印字が無い書式で、部品計が値引き「後」で印字されているとき（値引き行の合算後と一致）は調整しない
+            # （値引き前提の _enforce_total_match が値引きを二重に引く。バグハント K3）
+            if (pdf_p > 0 or pdf_w > 0) and not _grand_ok and pdf_g <= 0:
+                _dsum = sum(abs(_to_int(it.get('wage', 0))) + abs(_to_int(it.get('parts_amount', 0))) for it in (items or []) if _is_discount_row(it))
+                if _dsum > 0:
+                    _net0 = _sum_items_outtax(items)
+                    _tol_n = max(int(round((pdf_p + pdf_w) * 0.01)), 100)
+                    if abs((pdf_p + pdf_w) - _net0) <= _tol_n:
+                        _grand_ok = True
+                        log.append(f"[total_match] 部品計+工賃計 {pdf_p + pdf_w} は値引き後の明細合算 {_net0} と一致 → 調整しない（値引き行 {_dsum}）")
             if (pdf_p > 0 or pdf_w > 0) and not _grand_ok:
                 # v12 iter_006: tolerance を 2% / 1000円 に再拡大
                 # （iter_005 でも 2.3% 差で M6=1 残ったため許容差を広げる）

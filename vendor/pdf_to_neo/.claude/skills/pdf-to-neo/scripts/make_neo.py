@@ -11,6 +11,8 @@
   - inspect_estimate.py を実行して要確認を表示（報告 JSON は <案件フォルダ>/inspect.json）
   - run_case.py で NEO を生成し検算。run_case が合格（exit 0 = 項目差分が totals.tolerance 内・合計一致）かつ「見積書合計との一致: OK」かつ未照合行なし のときだけ合格。
     totals.neo_total で通す案件（工場書式の円未満計上）は --allow-neo-total
+  - 協定額: reading に target_total があるのに、できた NEO の合計がその額でなければ不合格（調整が効いていない。方法の候補は agree_calc.py。判断規則 10-14）
+  - 過去 NEO の手掛かり: corpus_lookup.py の索引があれば、工場名の書き方の違い・同じ車種と合計の過去 NEO を確認箇所シートに足す（合否には関わらない）
   - 装備監査: 生成器が選んだ装備で決まる標準品番と印字品番を突き合わせ、別の装備なら一致する行があれば ★ で警告（option_audit.py）
   - 印の照合: reading の行に印字の印（$ # * / 短縮記法の flags 列）があれば、生成 NEO の WageByManual と突き合わせて違いを表示（コグニ印刷の再現度）
   - 報告文: <案件フォルダ>/report.md に 車両・合計表・手入力行・判断点・要確認 をまとめる（亮平さんへの報告の下書き）
@@ -18,13 +20,14 @@
     NEO の明細コメントには人向けのメモを書かず、このシートで渡す（review_sheet.py。openpyxl が無ければ CSV）
   - 合格し --deliver があれば <deliver>/<name>_claude.neo と <name>_claude_確認箇所.xlsx（または .csv）にコピー（既存ファイルは上書きせず _2, _3 … を付ける）
   - 合格したら工場の設定（レート・丸め・書式・費用の集計先）を <NEO_CHECK_ROOT>/_profiles/factory_profiles.json に記録（PC ごと・git に入れない。--no-profile で記録しない）
-終了コード: 0 合格 / 1 不合格（検算差・未照合・例外）
+終了コード: 0 合格 / 1 不合格（検算差・未照合・前後左右の食い違い・低照合率・意図との食い違い・確認箇所シートなし・協定額に合わない・例外）
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -279,6 +282,30 @@ def main() -> int:
         print(price_ng + '  → 納品は止めないが、ref と車両を一度確かめること')
     ok = (rc == 0 and ('見積書合計との一致: OK' in out or neo_total_ok)
           and not unmatched_n and not low_match and not side_ng)  # 未照合が 1 行でもあれば合格にしない（allow_unmatched は生成を続けるためだけの逃げ道）
+    # 協定額（reading.target_total）があるのに、できた NEO の合計がその額でない = 調整が効かなかった（塗装一式なのに target_adjust が無い・
+    # 材料代が印字されているのに target_total_replaces_material が無い・0 以下になる 等。_draft_notes に理由）。工場見積どおりの NEO を
+    # 協定の NEO として納品しないよう不合格にする（2026-09-15）
+    target_ng = ''
+    try:
+        _rd0 = json.load(open(reading, encoding='utf-8-sig')) if os.path.exists(reading) else {}
+    except (OSError, ValueError):
+        _rd0 = {}
+    import unicodedata as _ud
+    _tg = _ud.normalize('NFKC', str((_rd0 or {}).get('target_total') or '')).replace(',', '').replace('¥', '').replace('円', '').replace(' ', '').strip()
+    if _tg and _tg not in ('0', '0.0'):
+        try:
+            _tgt = int(float(_tg))
+        except ValueError:
+            _tgt = None
+            target_ng = f'target_total「{(_rd0 or {}).get("target_total")}」を金額として読めない（725000 のように数字で書く）'   # 読めないまま素通りさせない（Codex 指摘）
+            print('★ ' + target_ng)
+        _m = re.findall(r'小計 -?\d+ 税 -?\d+ 合計 (-?\d+)', out)
+        _got = int(_m[-1]) if _m else None
+        if _tgt is not None and _got != _tgt:
+            target_ng = (f'協定額 target_total {_tgt:,} 円に対して、できた NEO の合計が {_got if _got is None else format(_got, ",")} 円'
+                         '（調整が効いていない。上の _draft_notes の target_total の行を見る。agree_calc.py で方法を確かめる）')
+            print('★ ' + target_ng)
+    ok = ok and not target_ng
 
     # 4) 印の照合と報告文（生成器をこのプロセスで呼ぶ。NEO は書かない。失敗しても合否には影響しない）
     marks: list[str] = []
@@ -369,6 +396,8 @@ def main() -> int:
             _why.append('見積の名称と照合先で前後・左右が食い違う（ref の取り違え。判断規則 10-9）')
         if review_ng:
             _why.append('確認箇所シートが作れなかった（上の例外を直す。判断規則 10-22）')
+        if target_ng:
+            _why.append('協定額（target_total）に合っていない')
         if intent_ng:
             _why.append('できあがった NEO が下書きの意図と違う（行数・部品コード・数量・金額・工賃・コメント。上の「意図との突き合わせ」）')
         print('不合格: ' + ' / '.join(_why or ['理由不明']) + '。reading/estimate を直して再実行'); return 1

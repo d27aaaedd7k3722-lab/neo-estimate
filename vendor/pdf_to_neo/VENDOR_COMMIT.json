@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "09e60d0f48f82a0a81ebd4b3bb33281cad9d8b57",
- "subject": "docs/fix: レートが決まらない要確認文に試した丸め単位と 10 円の倍数でない技術料を出す（レビュー指摘）、HANDOFF に 1 円単位の工場を追記",
- "synced_at": "2026-09-15T10:28:25",
- "files": 105,
- "tree_sha256": "f2622030265f463dada68a0b86bb92d87c7f03f02a5fb54bf53231f6c4b2191d",
+ "commit": "2820e1c86f3c59dc33cefd4ff465d30eee5c58f0",
+ "subject": "fix: 部位の文脈は工賃のある主作業で動かす（単価で決めた行でも）— 次の行が未照合のとき 3 行前の部位が残り、サイドメンバ修理がフードヒンジに化けていた。言い換え ｴﾑﾌﾞﾚﾑ → ｴﾝﾌﾞﾚﾑ",
+ "synced_at": "2026-09-15T16:19:42",
+ "files": 108,
+ "tree_sha256": "a14b1000d1d3eb2ae6c898e546051810dea1da7cf0b9c6d9d23e3bec9fac27bc",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

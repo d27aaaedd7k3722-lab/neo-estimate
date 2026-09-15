@@ -44,7 +44,7 @@ python .claude/skills/pdf-to-neo/scripts/make_neo.py <作業フォルダ> --name
 
 - 作業フォルダに `reading.json`（または `pages/header.json` + `pages/page_N.json`）を置いて呼ぶ
 - 出てくるもの: `<name>.neo` / `<name>_確認箇所.xlsx`（openpyxl が無い環境では `<name>_確認箇所.csv`）/ `report.md` / `estimate.json` / `inspect.json` / `reading_check.json`
-- 終了コード 0 = 合格。1 = 不合格（検算差・未照合・前後左右の食い違い・低照合率・できあがった NEO が下書きの意図と違う（`intent_check.py`）・確認箇所シートが作れない・例外）。
+- 終了コード 0 = 合格。1 = 不合格（検算差・未照合・前後左右の食い違い・低照合率・できあがった NEO が下書きの意図と違う（`intent_check.py`）・確認箇所シートが作れない・reading に協定額 `target_total` があるのに NEO の合計がその額でない・例外）。
   **この実行で作った NEO は、不合格なら `<name>.ng.neo` に隔離される**（run_case の検算で落ちたときも、make_neo 側の関門で落ちたときも）
 - ただし**前回の実行で合格した `<name>.neo` は消されずに残る**。アプリは要求ごとに新しい作業フォルダ（一時フォルダ）で呼び、
   **終了コード 0 のときだけ** `<name>.neo` と確認箇所シート（`<name>_確認箇所.xlsx` か `.csv`。拡張子を決め打ちしない）を組で渡す（ファイルがあるかどうかで合否を判断しない）
@@ -60,6 +60,7 @@ python .claude/skills/pdf-to-neo/scripts/make_neo.py <作業フォルダ> --name
 | 突合せ | `inspect_estimate.main(estimate_path, out_json)` | 戻り値は終了コード（0/1）。要確認（★）は `out_json` の `warnings` に書かれる |
 | 生成・検算 | `run_case.main(estimate_path, out_neo)`（CLI は `run_case.py <estimate.json> <out.neo>`） | 戻り値 True = 合格（NEO を `out_neo` に置く）/ False（`.ng.neo` に隔離）。検算 11 項目と ★ は標準出力。**`NeoBuilder().build()` は NEO のバイト列と行を返すだけで検算・関門を通らないので、合否には使わない** |
 | 意図との突き合わせ | `intent_check.check(estimate, neo_path)` | `{'hard': [...], 'soft': [...], 'rows'}`。hard が 1 件でもあれば不合格（make_neo と同じ） |
+| 協定の候補（任意） | `agree_calc.analyse(case_dir, 協定額)` → `agree_calc.report(res, method)`（`case_dir/estimate.json` を読む。工場見積そのままで合格した後に呼ぶ。NEO は書かない） | `{'taxable_for': {丸め: 課税小計}, 'delta', 'options': {'rate', 'index', 'material' / 'paint', 'frame'}}`。画面で方法を選ばせ、reading に書いて make_neo を再実行する（判断規則 10-14） |
 | 過去 NEO の手掛かり（任意） | `corpus_lookup.hints(est, 生成した.neo)`（索引 `<NEO_CHECK_ROOT>/_zdocs/corpus_index.json` を `corpus_lookup.py build` で作っておく。無ければ `[]`） | 確認箇所シートの行と同じ形の dict のリスト（工場名の書き方が過去 NEO と違う・同じ車種と合計の過去 NEO がある）。make_neo は `extra` に足す。合否には使わない |
 | 確認箇所シート | `review_sheet.collect(est, rows, inspect_warn, check, audit_lines, run_out, extra=hard+soft+過去 NEO)` → `review_sheet.write(path, entries, est, rows, rep)`（rows は `run_case._rows_in_source_order(rep['rows'])` で見積の並びに戻したもの） | xlsx（openpyxl が無ければ .csv）のパス |
 | 答え合わせ（任意・納品後） | `neo_compare.compare(neo_compare.load(納品した.neo), neo_compare.load(確報に使った.neo))` → `neo_compare.report(res)` | `{'rows', 'matched', 'diffs', 'only_mine', 'only_other', 'style', 'totals'}`。合否には使わない（振り返り用。判断規則 10-24） |

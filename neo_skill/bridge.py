@@ -138,6 +138,7 @@ def _clear_all(path: str) -> None:
         p = os.path.join(path, name)
         if os.path.isdir(p) and (name == 'COM' or name == MARKER_DIR or name.endswith('.part') or (len(name) == 1 and name.isalpha())):
             shutil.rmtree(p, ignore_errors=True)
+    forget_vendor_cache(path)   # 前の COM の展開キャッシュも（新しい COM は mtime が違うので別の鍵になる）
 
 
 def store(path: str, files: dict) -> tuple:
@@ -174,37 +175,67 @@ def store(path: str, files: dict) -> tuple:
             continue
         final = os.path.join(path, *dparts)
         tmp = final + '.part'
-        shutil.rmtree(tmp, ignore_errors=True)
-        os.makedirs(tmp, exist_ok=True)
         written = 0
         broken = False
-        for name, b64 in items:
-            try:
-                data = base64.b64decode(b64, validate=True)   # 文字の混入は壊れているとみなす（validate=False は黙って捨てる）
-                if not data:
-                    raise ValueError('empty')
-            except Exception:  # noqa: BLE001
-                dropped.append('/'.join(dparts + (name,))[:60])
-                broken = True
-                break
-            with open(os.path.join(tmp, name), 'wb') as f:
-                f.write(data)
-            written += 1
-            total += len(data)
-        if broken or not written:
+        try:   # 書けない（権限・ディスク満杯）ときはそのグループを壊れた扱いにし、完了印を付けない（欠けた Addata で作らない。J5）
             shutil.rmtree(tmp, ignore_errors=True)
+            os.makedirs(tmp, exist_ok=True)
+            for name, b64 in items:
+                try:
+                    data = base64.b64decode(b64, validate=True)   # 文字の混入は壊れているとみなす（validate=False は黙って捨てる）
+                    if not data:
+                        raise ValueError('empty')
+                except Exception:  # noqa: BLE001
+                    dropped.append('/'.join(dparts + (name,))[:60])
+                    broken = True
+                    break
+                with open(os.path.join(tmp, name), 'wb') as f:
+                    f.write(data)
+                written += 1
+                total += len(data)
+            if broken or not written:
+                shutil.rmtree(tmp, ignore_errors=True)
+                continue
+            marker_dir = os.path.join(path, MARKER_DIR)
+            os.makedirs(marker_dir, exist_ok=True)
+            marker = os.path.join(marker_dir, dparts[-1] + '.ok')
+            if os.path.exists(marker):
+                os.remove(marker)
+            shutil.rmtree(final, ignore_errors=True)
+            os.replace(tmp, final)
+            with open(marker, 'w', encoding='utf-8') as f:
+                f.write(str(written))
+        except OSError as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            dropped.append('/'.join(dparts)[:40] + f'（書き込み失敗 {type(e).__name__}）')
             continue
-        marker_dir = os.path.join(path, MARKER_DIR)
-        os.makedirs(marker_dir, exist_ok=True)
-        marker = os.path.join(marker_dir, dparts[-1] + '.ok')
-        if os.path.exists(marker):
-            os.remove(marker)
-        shutil.rmtree(final, ignore_errors=True)
-        os.replace(tmp, final)
-        with open(marker, 'w', encoding='utf-8') as f:
-            f.write(str(written))
         n += written
+    _cap_car_dirs(path)
     return n, total, dropped
+
+
+MAX_CAR_DIRS = 6   # 1 セッションに残す車種フォルダの数（古いものから消す。溜め続けると一時領域が尽きる。J7）
+
+
+def _cap_car_dirs(path: str) -> None:
+    """文字/車種 のフォルダが MAX_CAR_DIRS を超えたら、古い（mtime の小さい）ものと完了印を消す"""
+    try:
+        cars = []
+        for letter in os.listdir(path):
+            d = os.path.join(path, letter)
+            if len(letter) == 1 and letter.isalpha() and os.path.isdir(d):
+                for car in os.listdir(d):
+                    cd = os.path.join(d, car)
+                    if os.path.isdir(cd) and not cd.endswith('.part'):
+                        cars.append((os.path.getmtime(cd), cd, car))
+        cars.sort()
+        for _m, cd, car in cars[:max(0, len(cars) - MAX_CAR_DIRS)]:
+            shutil.rmtree(cd, ignore_errors=True)
+            mk = os.path.join(path, MARKER_DIR, car + '.ok')
+            if os.path.exists(mk):
+                os.remove(mk)
+    except OSError:
+        pass
 
 
 def ingest(session_state, value) -> Optional[str]:
@@ -242,18 +273,23 @@ def ingest(session_state, value) -> Optional[str]:
             session_state['_bridge_want'] = ''
         session_state['_bridge_msg'] = str(value['error'])[:200]
         return session_state['_bridge_msg']
+    if phase not in ('com', 'car'):   # 部品からの値の形が違う（型・長さ）ものは扱わない（J6）
+        session_state['_bridge_msg'] = f'取り込みを無視しました（phase={str(phase)[:20]!r}）'
+        return session_state['_bridge_msg']
+    if not isinstance(value.get('files'), dict):
+        value = dict(value, files={})
     if phase == 'com':
         _clear_all(path)   # 前の COM・車種フォルダ・完了印を消してから受ける（別のフォルダ・別の版と混ぜない。失敗したら古い COM を使わない）
     n, total, dropped = store(path, value.get('files') or {})
     why = f"（{len(dropped)} 件が上限超え・壊れている・Addata の形でない: {', '.join(dropped[:3])}）" if dropped else ''
     if phase == 'com':
-        session_state['_bridge_root_name'] = str(value.get('root_name') or '')
+        session_state['_bridge_root_name'] = str(value.get('root_name') or '')[:64]
         if has_com(path):
             msg = f"COM を取り込みました（{n} ファイル・{total / 1048576:.1f}MB）"
         else:
             msg = f"COM を取り込めませんでした{why}"
     elif phase == 'car':
-        car = str(value.get('car') or '')
+        car = str(value.get('car') or '')[:32]
         if has_car(path, car):
             msg = f"車種 {car} のフォルダを取り込みました（{n} ファイル・{total / 1048576:.1f}MB）"
         else:
@@ -280,7 +316,9 @@ def disconnect(session_state) -> None:
             pass
     bid = session_state.get('_bridge_id')
     if bid:
-        shutil.rmtree(os.path.join(tempfile.gettempdir(), PREFIX + str(bid)), ignore_errors=True)
+        _p = os.path.join(tempfile.gettempdir(), PREFIX + str(bid))
+        shutil.rmtree(_p, ignore_errors=True)
+        forget_vendor_cache(_p)   # 解除後は _bridge_id も消え sweep() が二度と見ないので、ここで消す（レビュー 2026-09-15）
     # _bridge_seen は残す: 部品は次の rerun でも最後に送った値（同じ seq・nonce）を返すので、消すとその古い COM を新しい値と
     # 見なして黙って再接続してしまう（Codex 47）。選び直せば seq が進み、iframe を読み直せば nonce が変わるので処理される
     for k in ('_bridge_path', '_bridge_id', '_bridge_want', '_bridge_msg', '_bridge_root_name'):
@@ -305,8 +343,40 @@ def version(path: Optional[str]) -> str:
         return ''
 
 
+def _vendor_cache_bases() -> list:
+    """vendor が COM.CAB を展開するキャッシュの置き場の候補（subprocess の LOCALAPPDATA = neo_skill.vendor.subprocess_env と同じ決め方＋予備）"""
+    out = []
+    for b in (os.environ.get('LOCALAPPDATA'), os.path.join(tempfile.gettempdir(), 'neo_skill_cache'), tempfile.gettempdir()):
+        if b and b not in out:
+            out.append(b)
+    return out
+
+
+def forget_vendor_cache(path: str) -> int:
+    """この橋渡しフォルダ（root）用に vendor が作った COM.CAB の展開キャッシュを消す。消した数を返す。
+    橋渡しは root が毎回 addata_bridge_<乱数> なので、root を消すときに一緒に消さないと展開が溜まり続ける
+    （この PC で 123 個・約 700MB。バグハント J2）。鍵は vendor の com_tables と同じ sha1(normcase(abspath(root)))[:8]"""
+    import hashlib
+    try:
+        rid = hashlib.sha1(os.path.normcase(os.path.abspath(str(path))).encode('utf-8')).hexdigest()[:8]
+    except Exception:  # noqa: BLE001
+        return 0
+    n = 0
+    for base in _vendor_cache_bases():
+        d = os.path.join(base, 'claude_neo_pipeline', 'com')
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            if name.startswith(rid + '_'):
+                shutil.rmtree(os.path.join(d, name), ignore_errors=True)
+                n += 1
+    return n
+
+
 def sweep(max_age_sec: float = 6 * 3600.0) -> int:
-    """古い橋渡しフォルダを消す（セッションが終わっても残るため）。消した数を返す"""
+    """古い橋渡しフォルダを消す（セッションが終わっても残るため）。消した数を返す。そのフォルダ用の vendor の展開キャッシュも消す"""
     base = tempfile.gettempdir()
     n = 0
     now = time.time()
@@ -321,6 +391,7 @@ def sweep(max_age_sec: float = 6 * 3600.0) -> int:
         try:
             if now - os.path.getmtime(p) > max_age_sec:
                 shutil.rmtree(p, ignore_errors=True)
+                forget_vendor_cache(p)
                 n += 1
         except OSError:
             pass

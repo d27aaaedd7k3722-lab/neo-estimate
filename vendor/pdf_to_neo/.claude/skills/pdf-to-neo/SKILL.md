@@ -29,6 +29,7 @@ description: 工場見積 PDF（どの書式でも）＋車検証から、コグ
 | `scripts/make_neo.py` | 案件フォルダを渡すと 下書き → 突合せ → NEO 生成 → 検算 → 印字の印との照合 → 報告文（report.md）→ 確認箇所シート（xlsx）→ 納品コピー を 1 コマンドで行う |
 | `scripts/intent_check.py` | できあがった NEO を読み戻し、estimate.json（下書きの意図）と 1 行ずつ突き合わせる（部品コード・数量・金額・工賃・コメント・名称・顧客名）。make_neo が呼び、食い違いは不合格、欄で切れた名称などは確認箇所シートの 要確認 |
 | `scripts/corpus_lookup.py` | 亮平さんの過去 NEO（Z:\ドキュメント）の索引。`build` で作る / 足す（初回数分、以後は新しい NEO だけ）、`factory <電話>` で工場名の過去の書き方、`same --car --total` で同じ案件らしい NEO。make_neo が索引を自動で引き、工場名の書き方の違い・同じ案件の NEO を確認箇所シートに出す（判断規則 10-28） |
+| `scripts/agree_calc.py` | **協定額に合わせる調整の候補計算**（読むだけ）。協定額を渡すと、消費税の丸めで届くか・レバーレートならいくら（残り何円）・どの行の指数を何段・材料代／塗装一式をいくら・骨格の基本を外すといくら を生成器の試算で出し、reading の書き方も示す（手順 6-2・判断規則 10-14） |
 | `scripts/neo_compare.py` | 納品した NEO と、あとで確報・協定に使われた NEO（コグニで直したもの・別アプリのもの）を明細単位で突き合わせ、品番の違い・数量の違い・足された行・削られた行を出す（読むだけ。手順 9 の答え合わせ） |
 | `scripts/pdf_pages.py` | 見積 PDF をページごとの拡大画像（上下に分けたもの）と文字層に切り分ける。転記の下ごしらえ |
 | `scripts/review_sheet.py` | 確認箇所シート（xlsx: 確認箇所 / 手入力の行 / 下書きの判断 / 合計）を作る。make_neo が呼ぶ（openpyxl が無い PC は CSV） |
@@ -90,6 +91,25 @@ python .claude/skills/pdf-to-neo/scripts/env_check.py --save --install-skill
 | 合計が 1 円合わない | 工場が 10 円単位で丸めている | `neo_total`・`tolerance`・`tolerance_reason` の 3 点。判断規則 10-5 |
 | レバーレートが分からない | 指数の印字が無い書式 | 速報の「工賃単価」→ 無ければ `guess_labor_rate.py`。判断規則 10-6 |
 | 二輪・輸入車が特定できない | コグニ非収録 | 汎用車種 Z10 で作る（明細は全行 `manual` でよい） |
+
+## 全体の流れ（最初にこれを見る）
+
+| 段 | すること | コマンド・置き場 | 次へ進む条件 |
+|---|---|---|---|
+| 0 | 作業フォルダを作る・過去 NEO の索引を新しくする | `<NEO_CHECK_ROOT>/<損保>_C<nn>_<車名>/`（顧客情報を含むので git の外）、`corpus_lookup.py build`（数十秒） | フォルダがある |
+| 1 | 入力を揃える（工場見積 PDF・車検証／速報・既存 NEO・損害区分決定の指示） | 元案件フォルダ（共有ドライブ）は読むだけ | 最新の見積と指示（協定額・調整方法）が分かった |
+| 2 | PDF をページ画像にして読み、書式を決める | `pdf_pages.py`、`reference/format_catalog.md` | 合計欄が電卓でつながった |
+| 3 | 車両を特定する | make_neo が自動（候補が複数のときだけ §3 を手で） | confirmed / high |
+| 4 | **印字どおり**にページ単位で写す（判断しない） | `pages/header.json`・`page_N.json` → `reading_pages.py validate` → `merge` | 全ページ合格 |
+| 5 | 下書き → 突合せ → 生成 → 検算 | `make_neo.py <作業フォルダ> --name <顧客>_<車名>` | 「合格」 |
+| 6 | 要確認・★・`_draft_notes` を判断規則で潰し、合格まで繰り返す | reading を直して make_neo を再実行 | 合格・要確認に理由が言える |
+| 6-2 | **協定のとき**: 工場見積どおりで合格させてから、指示の方法で協定額に合わせる | `agree_calc.py <作業フォルダ> --target <協定額>` → reading に方法を書く → make_neo | 合格（協定額の関門も通る） |
+| 7 | コグニ実機で確かめる（新書式・新車種・`#` 多数・骨格/ADAS/付加塗装） | `make_neo.py ... --open` | 画面が見積と一致 |
+| 8 | 納品する | `make_neo.py ... --deliver "<元案件フォルダ>"` → SendUserFile | NEO と確認箇所シートの組を渡した |
+| 9 | 記録する・答え合わせ・回帰に登録 | 日誌、`neo_compare.py`、`regress_cases.py --only <作業フォルダ名> --update` | 日誌に書いた |
+
+**迷ったら**: 読み取りの誤りは段 4（reading）で直す。判断（部品コード・左右・数量・レート・塗装の解釈）はスクリプトに任せ、結果を段 6 で確かめる。
+合計を合わせるために明細を動かすのは、段 6-2 で損保の指示がある行だけ。
 
 ## 手順（全 9 段）
 
@@ -207,10 +227,7 @@ PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/make_neo.py "<NE
 - `report.md` ができる（不合格でも書かれるので、合格の行と合わせて読む）（車両・合計表・手入力行・判断点・要確認・印字の印との照合・紙上検算・装備監査）。**報告はこれを元に書く**。コグニ印刷（書式 A）で右端の印（$ # *）を flags に写しておくと、生成 NEO の印との差が出る（差ゼロ = コグニで作ったのと同じ書式）
 - 工場が塗装を「一式」でしか出していない見積書は、reading の paint に `auto_panels: true` を足すと
   **明細からパネルを起こしてコグニと同じ塗装明細に組み直す**（差は材料代で埋まり、塗装費用計と合計は動かない。10-15）
-- 協定額（「○○円の NEO にして」）は reading に `target_total`（税込）を書くだけ。塗装材料代で自動調整される（`reference/reading_schema.md`、`judgment_rules.md` 10-2）。
-  損保が「○○の工賃で調整」と指示してきたときは、**先に工場見積そのままで検算を通してから**その行の指数を 0.1 刻みで動かして寄せ、
-  残る端数だけを `target_total` に任せる。明細を動かした案件は小計も協定後の値に直す
-  （ページ小計は `pages["N"]`、ブロック小計は `blocks[].subtotal`。両方書いているなら両方。`judgment_rules.md` 10-14）
+- 協定額（損害区分決定が「協定」・「○○円の NEO にして」）は **手順 6-2**。まず工場見積そのままで合格させる
 - reading.json を直したら再実行（reading.json が estimate.json より新しければ自動で再下書き。script を直した後は `--force-draft`）
 - 個別に動かすとき: `draft_estimate.py <reading.json> [<estimate.json>]`、`inspect_estimate.py <estimate.json>`（`--json <出力先>` で機械可読の結果を保存）、`run_case.py <estimate.json> <out.neo>`
   - **`estimate.json` を直に書く（reading.json を通さない）ときの注意**: 生成器は費用の
@@ -219,8 +236,10 @@ PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/make_neo.py "<NE
     非課税費用は `"taxfree": true` と書く（2026-09-12 明記）
 - 案件フォルダには `estimate.json` / `<name>.neo` のほかに `reading_check.json`（紙上検算の結果）・`inspect.json`（突合せ）・`report.md`・`pages/status.json` が書かれる。merge は reading.json に `_merged_from` を足す
 - `make_neo.py` のオプション: `--name` `--deliver` `--force-draft`（script を直したとき）`--skip-check`（紙上検算の FAIL を承知で進む）`--force-pages`（ページの不合格を承知で merge）`--skip-inspect` `--no-report` `--no-profile`（工場プロファイルに記録しない）`--allow-neo-total` `--open`
-- **`make_neo.py` が不合格にする条件は 4 つ**: 検算に差がある / 未照合行が残る /
-  前後・左右が食い違う行がある（ref の取り違え。10-9-2）/ 照合率が低い（手入力に逃げた行が多い。10-7）。
+- **`make_neo.py` が不合格にする条件**: 検算に差がある / 未照合行が残る /
+  前後・左右が食い違う行がある（ref の取り違え。10-9-2）/ 照合率が低い（手入力に逃げた行が多い。10-7）/
+  できた NEO が下書きの意図と違う（意図との突き合わせ）/ 確認箇所シートが作れない /
+  **reading に協定額（`target_total`）があるのに NEO の合計がその額でない**（調整が効いていない。手順 6-2）。
   いずれも reading.json を直して再実行する。
   なお `run_case.py` 単体で止まるのは前の 3 つで、低照合率は警告止まり（`make_neo.py` が合否に使う）——
   **生成器を直接呼ぶときは自分で確かめる**
@@ -262,6 +281,34 @@ PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/make_neo.py "<NE
 - 生成後に明細を目視する（リサイクル部品の行は置換後の姿で出る: 名称はリサイクル名、品番は「リサイクル部品」、工賃は -1）（`rep['rows']` を表示: PartsNo / PartsNoStandard / Time / TimeStandard / WageByManual / ConstructGroup）。`#` の行が見積書の「標準と違う指数」の行と一致していること
 - 見積書の指数が 15.DB の単独値と同じでも、連動・吸収を含む組合せ標準と違えば生成器は `#` にする（工場のコグニは入力順で計算するため）。これは正常。`report.md` の「手入力の行」に「← 連動・吸収込みの組合せ標準と差」と出るので、報告では「連動分の差」と書く（`judgment_rules.md` 6-4）
 
+### 6-2. 協定額に合わせる（損害区分決定が「協定」のとき。判断規則 10-14 が正本）
+
+1. **工場見積そのままの reading で make_neo を合格させる**（読み取りの誤りと協定調整を分けるため。飛ばさない）
+2. 損害区分決定の文面から **協定額（税込）** と **調整の方法**（下の表）を読む。「レッカー込み」などの「込み」は、その費用が見積に入っているか確かめ、
+   入っていなければ reading の `expenses` に足してから計算する（`in` の書き方は reading_schema）
+3. 候補を計算する（読むだけ。数秒）:
+
+```bash
+PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/agree_calc.py "<NEO_CHECK_ROOT>/<案件>" --target 725000 [--method rate|index|material|paint|frame]
+```
+
+4. 指示の方法で reading を直す（下の表の「reading の書き方」）。**協定で動く合計欄**（`totals.wage` / `paint` / `paint_total`、塗装一式の `paint.total`、
+   ページ小計・ブロック小計）も協定後の値に直す（agree_calc が値を出す。直さないと紙上検算が止まる。印字の値は `note` へ）。
+   **指示の無い行は動かさない**。方法が文面から決められないときは、
+   agree_calc の候補（レート何円・どの行を何段・材料代いくら）を添えて亮平さんに方法を確かめる（2026-09-14 カローラ）
+5. make_neo を再実行 → 合格を確かめる。reading に `target_total` があると、**NEO の合計が協定額でなければ不合格**になる
+   （方法の書き忘れ・印字の材料代を動かす許可の書き忘れ・0 以下になる、が主な原因。`_draft_notes` の target_total の行に理由）
+6. 動かした前後の値と理由（損保の指示）を報告と確認箇所シートに書く
+
+| 指示の言い方（例） | 方法 | reading の書き方 | 例 |
+|---|---|---|---|
+| 「レバーレート X 円で」「レートで調整」 | レバーレートを変える（指数 × 新レート） | 直下に `"labor_rate": X`、行・塗装は `index` だけ（`wage` を消す。技術料だけの書式は 技術料 ÷ 工場レート を index に）。端数は下の材料代／塗装一式で | カローラ 2026-09-14（7,960 円） |
+| 「○○の工賃で調整」「工賃で調整」 | 指定行の指数を 0.1 刻みで（行の指定が無ければ、工場が指数を手入力した行のうち工賃の大きい行） | その行の `index` と `wage`、ページ小計・ブロック小計も協定後の値に。端数は下で | ハイエース 2026-09-10・09-14 |
+| 「骨格基本指数を使わずに鈑金に振る」 | 内板骨格の基本修正を外し、差を指定の鈑金行へ | `frame` に `"basic": false`、鈑金行の `index`・`wage`・小計 | JPN タクシー 2026-09-14 |
+| 「塗装で調整」（塗装が一式） | 塗装一式の額を動かす | 直下に `"target_total": 協定額, "target_adjust": "paint"` | アウディ 2026-09-14 |
+| 端数・「材料代で調整」（塗装がパネル明細） | 塗装材料代を動かす | 直下に `"target_total": 協定額`。見積に材料代が印字されていれば `"target_total_replaces_material": true` も | N-BOX 2026-09-07 |
+| （丸めで届かないとき） | 消費税の丸めを変える | `"tax_round": "切り捨て"`（または `"切り上げ"`）。agree_calc が届く丸めを出す。NEO の消費税設定が工場と変わるので報告に書く | JPN タクシー（切り捨て） |
+
 ### 7. コグニ実機で確認する（新しい書式・新しい車種・`#` が多い案件・骨格/ADAS/付加塗装を含む案件では必須。それ以外は省略可）
 
 ```bash
@@ -286,6 +333,8 @@ computer-use では `コグニセブン`（AudaMenu）と、同じフォルダ�
 - 日誌 `~/.claude/brain/05_日誌/YYYY-MM-DD.md` に案件名・車両・判断点・出力先を追記
 - **答え合わせ**: あとで案件フォルダに確報・協定に使った NEO（`<登録番号>_見積.neo` など、納品した `_claude` 以外）が置かれたら、`python .claude/skills/pdf-to-neo/scripts/neo_compare.py <納品した.neo> <その NEO>` で突き合わせる（既存ファイルは開くだけ）。「品番の違い」は見積書でどちらが正しいか確かめる。「相手の側だけ」「納品の側だけ」は協定で足した・削った行か、読み落としかを見分ける。読み落とし・規則の違いが見つかったら `reference/judgment_rules.md` に書く（2026-09-13 の結果は 10-24）
 - 新しい書式・新しい判断規則が出たら `reference/format_catalog.md` / `reference/judgment_rules.md` に追記（このスキル自体を育てる）
+- **回帰に登録する**: 納品した案件（とくに新しい書式・協定の方法を使った案件）は `python .claude/skills/pdf-to-neo/scripts/regress_cases.py --only <作業フォルダ名> --update`
+  で正解（`expected_estimate.json`）を作る。以後 script を直すたびにこの案件も再下書きして比べる（作業フォルダ名は `<損保>_C<nn>_<車名>`。顧客名を入れない）
 - 生成器の不具合や規則の追加が必要なら codex-loop で修正し、`claude_neo_pipeline/tests/verify_all.sh` を通す（実機保存 NEO との総当たり比較は `claude_neo_pipeline/tests/audit_cogni_files.py`、AnSMB の 142 桁一致は `audit_cogni_files.py --ansmb`）
 
 ## 絶対に守ること

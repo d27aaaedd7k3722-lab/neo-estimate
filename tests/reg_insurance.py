@@ -46,6 +46,7 @@ INS = {
     'accident_date': '20260901',
     'agency_name': '検証火災海上',
     'adjuster_name': 'ｹﾝｼｮｳｱｼﾞｬｽﾀｰ',
+    'factory_name': '写真鑑定',
     'garage_in_date': '20260902',
     'garage_out_date': '20260910',
     'repair_days': 8,
@@ -124,6 +125,7 @@ WANT_INS = {
     'Insurance.AccidentDate': '20260901',
     'Insurance.AgencyName': '検証火災海上',
     'Insurance.AdjusterName': 'ｹﾝｼｮｳｱｼﾞｬｽﾀｰ',
+    'Insurance.ConsultantFactory': '写真鑑定',   # 立会工場（画像鑑定は「写真鑑定」。2026-09-15）
 }
 WANT_CUST = {
     'Customer.Name1': 'ｹﾝｼｮｳﾀﾛｳ',
@@ -226,11 +228,16 @@ chk(('insurance_hint=_sidebar_insurance_hint()' in _ui)
     or ('insurance_hint=_p2n_ihint' in _ui and '_p2n_ihint = ' in _pre
         and ('_sidebar_insurance_hint()' in _pre or ('_insurance_hint_now(' in _pre and '_sidebar_insurance_hint()' in _now_src))),
     '4f: 画面が run_pdf_to_neo_skill に事故・保険情報（insurance_hint）を渡していない')
+_vals_src = inspect.getsource(app._sidebar_insurance_values)
+chk("'factory_name'" in _vals_src, '4i: ベタ打ち（旧経路）に渡す insurance_info に立会工場（factory_name）が無い')
+_upd_src = inspect.getsource(app._update_em_db_impl) if hasattr(app, '_update_em_db_impl') else inspect.getsource(app.update_em_db)
+chk('if factory_name:' in _upd_src and "('ConsultantFactory', factory_name)" not in _upd_src,
+    '4j: 立会工場が空でも ConsultantFactory を書いてテンプレートの値を消している')
 _hint_src = inspect.getsource(app._sidebar_insurance_hint)
-for _k in ('accept_no', 'policy_no', 'contractor_name', 'agency_name', 'adjuster_name',
+for _k in ('accept_no', 'policy_no', 'contractor_name', 'agency_name', 'adjuster_name', 'factory_name',
            'garage_in_date', 'garage_out_date', 'repair_days', 'accident_date'):
     chk(_k in _hint_src, f'4g: 画面が渡す事故・保険情報に {_k} が含まれていない')
-for _k in ('accept_no', 'agency', 'adjuster', 'garage_in', 'garage_out', 'repair_days'):
+for _k in ('accept_no', 'agency', 'adjuster', 'factory', 'garage_in', 'garage_out', 'repair_days'):
     chk(f"'{_k}'" in _hint_src, f'4h: reading.insurance のキー {_k}（生成器が読む名前）で渡していない')
 
 # ── 5. 保険情報を変えたら、作り直した .neo も変わること ────────────────
@@ -305,7 +312,7 @@ chk(_u == {'accept_no': 'A2'} and _n == {'accept_no': 'A2'}, f'8e: 利用者が�
 
 # ── 9. 見積書が変わったら案件の入力を消す／結果に入力の指紋（Codex hunt A1/A2/A3 2026-09-15）──
 _src9 = inspect.getsource(app._reset_case_inputs)
-for _k in ('policy_no', 'contractor_name', 'accept_no', 'adjuster_post', 'exp_towing', '_doc_ocr_cache', '_insdoc_filled',
+for _k in ('policy_no', 'contractor_name', 'accept_no', 'adjuster_post', 'factory_name', 'exp_towing', '_doc_ocr_cache', '_insdoc_filled',
            'pdf2neo_result', '_beta_exp_file_key', 'pdf2neo_beta_use_exp'):
     chk(_k in inspect.getsource(app).split('_CASE_INPUT_KEYS = (')[1].split(')')[0], f'9: _CASE_INPUT_KEYS に {_k} が無い')
 chk("'form_seq'" in _src9 and "'upload_seq'" in _src9 and '_bridge_pending' in _src9, '9b: _reset_case_inputs が入力欄・uploader・取り置きを作り直していない')
@@ -400,19 +407,22 @@ _rd_m = {'blocks': [{'rows': ['|左 ﾍｯﾄﾞﾗﾝﾌﾟ|脱着|||||**||', '
 chk([n for _, _, n in app._blank_wage_rows(_rd_m)] == ['左 ﾍｯﾄﾞﾗﾝﾌﾟ', '右 ﾍｯﾄﾞﾗﾝﾌﾟ'], f'10c6: 印だけの工賃欄と保留行: {app._blank_wage_rows(_rd_m)!r}')
 _src_mk0 = inspect.getsource(app.p2n_make)
 chk('_first_report' in _src_mk0 and '_first_repair' in _src_mk0 and "out.pop('_first_report_md', None)" in _src_mk0, '10d2: 再試行に失敗したとき 1 回目の報告文・修正用 ZIP を返していない')
-chk('_p2n_beta_ui_shown' in _app_src and "not locals().get('_p2n_beta_ui_shown')" in _app_src, '10e2: 同じ run で 2 回ベタ打ち UI を描く（Addata が外れた後）')
+chk('_p2n_beta_ui_shown = False' in _app_src and 'not _p2n_beta_ui_shown' in _app_src and "locals().get('_p2n_beta_ui_shown')" not in _app_src, '10e2: 同じ run で 2 回ベタ打ち UI を描く（Addata が外れた後）。印は locals() でなく変数で見る（バグハント H7）')
 chk('blank_wage_retry' in _app_src.split('def _render_beta_result')[0] and "_p2n_res.get('blank_wage_retry')" in _app_src, '10d3: 再試行の失敗を画面に出していない')
 # レビュー 2 周目: 「ベタ打ちで作る」は if/elif の連鎖（最後の else = 変換できませんでした）の後ろに置く（中に挟むと合格結果に誤エラー）
-chk(_app_src.find('if _p2n_offer_beta:') > _app_src.find("st.error(f\"❌ {_p2n_res.get('error') or '変換できませんでした'}\")")
-    and _app_src.find('if _p2n_offer_beta:') - _app_src.find("st.error(f\"❌ {_p2n_res.get('error') or '変換できませんでした'}\")") < 200,
+# 2026-09-15 午後: 逃げ道のベタ打ちで作った結果の下にも作り直しの入口を置いた（_render_beta_result の直後）。連鎖の後ろのものは最後の出現で見る
+chk(_app_src.rfind('if _p2n_offer_beta:') > _app_src.find("st.error(f\"❌ {_p2n_res.get('error') or '変換できませんでした'}\")")
+    and _app_src.rfind('if _p2n_offer_beta:') - _app_src.find("st.error(f\"❌ {_p2n_res.get('error') or '変換できませんでした'}\")") < 200,
     '10e3: ベタ打ちの逃げ道が結果の if/elif 連鎖の外（最後の else の直後）に無い')
+_i_rb = _app_src.rfind('_render_beta_result(_p2n_res, selected_model)')   # 定義ではなく呼び出し（最後の出現）
+chk(_i_rb > 0 and 0 < _app_src.find('if _p2n_offer_beta:', _i_rb) - _i_rb < 120, '10e5: 逃げ道のベタ打ちの結果の下に作り直しの入口が無い（H2/K4）')
 chk('_p2n_beta_ui_shown = False' in _app_src, '10e4: _p2n_beta_ui_shown を初期化していない')
 _src_mk = inspect.getsource(app.p2n_make)
 chk('_blank_wage_rows(reading)' in _src_mk and 'force_draft=True' in _src_mk and "write_reading(case_dir, reading)" in _src_mk,
     '10d: p2n_make が工賃欄空欄の行を 0 円にして force_draft で作り直していない／失敗時に元へ戻していない')
 # R2: ベタ打ちの逃げ道
-chk(_app_src.count('_beta_generate_ui(') == 3 and 'fallback=True' in _app_src and '_p2n_offer_beta' in _app_src,
-    f"10e: ベタ打ちの UI が共通化されて 2 か所（Addata なし／スキル経路の不合格）から呼ばれていない: {_app_src.count('_beta_generate_ui(')}")
+chk(_app_src.count('_beta_generate_ui(') == 4 and 'fallback=True' in _app_src and '_p2n_offer_beta' in _app_src,   # 定義 + Addata なし + 不合格の下 + 逃げ道の結果の下
+    f"10e: ベタ打ちの UI が共通化されて 3 か所（Addata なし／スキル経路の不合格／逃げ道の結果の下）から呼ばれていない: {_app_src.count('_beta_generate_ui(')}")
 # E1/E4: 差がある結果のダウンロードは確認してから
 _src_rb = inspect.getsource(app._render_beta_result)
 chk("key='pdf2neo_beta_ack'" in _src_rb and 'or not _p2n_ack' in _src_rb and 'amount_changes' in _src_rb, '10f: ベタ打ちの結果に確認チェックのゲートが無い')

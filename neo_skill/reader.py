@@ -21,9 +21,11 @@ import json
 import os
 import subprocess
 import time
+import re
 import unicodedata
 from typing import Callable, Optional
 
+from . import doc_hints as _dh
 from . import llm as llm_mod
 from . import maker, prompts, vendor
 
@@ -148,6 +150,34 @@ class PageShapeError(ValueError):
     値の問題ではなく形の問題なので、読み直しの FAIL 文言として LLM に返す（読み取り全体は止めない）"""
 
 
+def _as_int(v) -> Optional[int]:
+    """数値・数字の文字列（'2', '45,000', '４５０００', '2.0'）を int に。bool・配列・数字の無い文字列は None"""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(v) if v.is_integer() else None
+    if isinstance(v, str):
+        t = unicodedata.normalize('NFKC', v).replace(',', '').replace('円', '').strip()
+        if re.fullmatch(r'-?\d+(\.0+)?', t):
+            return int(float(t))
+    return None
+
+
+_BLANK_MARKS = ('-', '－', '―', '—', 'ー', '―', '―')
+
+
+def _is_blank_print(cur) -> bool:
+    """印字が空白だけ・ハイフンだけ（'－'）は「印字なし」（ヒントで補ってよい。バグハント G9）"""
+    if cur in (None, ''):
+        return True
+    if isinstance(cur, str):
+        t = cur.strip()
+        return (not t) or t in _BLANK_MARKS
+    return False
+
+
 def _normalise_page(page: dict, page_no: int) -> dict:
     """LLM の出力を page_N.json の形に揃える（値には触らない。欠けたキーを補い、page 番号を固定する）。
     明細の無いページは blocks を空リストにせず 1 つの空ブロックにする（vendor の validate_page は
@@ -165,13 +195,15 @@ def _normalise_page(page: dict, page_no: int) -> dict:
         bad.append('blocks の各要素は {"title": …, "rows": […]} のオブジェクト（行は rows の中に書く。文字列や配列を直に並べない）')
     p['blocks'] = [b for b in (blocks or []) if isinstance(b, dict)] if isinstance(blocks, list) else []
     for b in p['blocks']:
+        if b.get('rows') is None:   # "rows": null は空の配列に（注記行の付け替えで None に足さない。レビュー 2026-09-15）
+            b['rows'] = []
         if b.get('rows') is not None and not isinstance(b.get('rows'), list):
             bad.append('blocks[].rows は配列')
             b['rows'] = []
         elif b.get('rows') and not all(isinstance(r, (str, dict)) for r in b['rows']):  # 行は "code|name|method|…" の文字列か dict 行（reading_schema.md）
             bad.append('blocks[].rows の各要素は "code|name|method|parts_no|index|qty|price|wage|flags|comment" の文字列（または {"name": …} のオブジェクト）。配列や数値で書かない')
             b['rows'] = [r for r in b['rows'] if isinstance(r, (str, dict))]
-    p['blocks'] = p['blocks'] or [dict(b) for b in EMPTY_BLOCKS]
+    p['blocks'] = p['blocks'] or [{'title': '', 'rows': []}]   # 毎回作る（module 定数のリストを共有しない。バグハント G10）
     for k, shape in (('subtotal', '{"parts": …, "wage": …} のオブジェクト'), ('marks', '{"$": n, "#": n} のオブジェクト')):
         v = p.get(k)
         if v in (None, '', [], {}):
@@ -191,6 +223,28 @@ def _normalise_page(page: dict, page_no: int) -> dict:
         elif not all(isinstance(x, dict) for x in v):  # 文字列の要素は vendor の検算が .get() で落ちて読み取り全体が止まる（Codex 指摘）
             bad.append(f'{k} の各要素はオブジェクト（{{"name": …, "amount": …}}。文字列で書かない）')
             p[k] = [x for x in v if isinstance(x, dict)]
+    # rows_printed・subtotal・marks の値は数値でないと、vendor の検算が黙って飛ぶ（rows_printed / subtotal）か
+    # プロセスごと落ちて読み直しに回らない（marks の int()）。形の FAIL にして読み直させる（バグハント G2/G3）
+    rp = p.get('rows_printed')
+    if rp not in (None, ''):
+        n_ = _as_int(rp)
+        if n_ is None:
+            bad.append('rows_printed は整数（このページに印字された明細行数）')
+        else:
+            p['rows_printed'] = n_
+    for k in ('subtotal', 'marks'):
+        fixed = {}
+        for kk, vv in (p.get(k) or {}).items():
+            if vv in (None, '') or (k == 'subtotal' and _is_blank_print(vv)):   # 小計の '-'・'－' は「印字なし」（vendor の _num と同じ）
+                continue
+            if k == 'subtotal' and isinstance(vv, str):
+                vv = vv.replace('¥', '').replace('￥', '').replace(' ', '').replace('　', '')   # '¥45,000'・'45 000' は数値（vendor と同じ）
+            n_ = _as_int(vv)
+            if n_ is None:
+                bad.append(f'{k}.{kk} は数値（文字列や配列で書かない）')
+                continue
+            fixed[str(kk)] = n_
+        p[k] = fixed
     if bad:
         raise PageShapeError('page_' + str(page_no) + '.json の形が違う: ' + ' / '.join(bad))
     return p
@@ -201,12 +255,17 @@ def _apply_hint(header: dict, key: str, hint: Optional[dict]) -> None:
     if not hint:
         return
     v = dict(header.get(key) or {})
+    printed_addr = not _is_blank_print(v.get('address'))   # 見積書に住所の印字があったか（hint を当てる前に見る。レビュー 2026-09-15）
     for k, val in hint.items():
         cur = v.get(k)
         # 顧客名・所有者欄の「同上」「***」は印字ではなく穴（車検証の値で埋める。使用者欄の '同上' は正しい値。Codex hunt B1）
         if key == 'customer' and k in ('name', 'owner', 'owner_name') and isinstance(cur, str) \
                 and (cur.strip() in ('同上', '***', '＊＊＊') or (cur.strip() and set(cur.strip()) <= set('*＊'))):
             cur = ''
+        if _is_blank_print(cur):
+            cur = ''
+        if key == 'customer' and k in ('prefecture', 'municipality', 'address_other') and printed_addr:
+            continue   # 見積書に住所の印字がある: 車検証の構造化住所（都道府県/市区郡/以降）で上書きしない（印字が正。バグハント I2）
         if val not in (None, '') and not cur:
             v[k] = val
     if v:
@@ -222,7 +281,7 @@ HEADER_OBJECTS = tuple(('paint', k) for k in ('base', 'booth', 'bumper_front', '
 
 
 def _normalise_header(h: dict, vehicle_hint: Optional[dict], insurance_hint: Optional[dict],
-                      customer_hint: Optional[dict] = None) -> dict:
+                      customer_hint: Optional[dict] = None, notes: Optional[list] = None) -> dict:
     """header.json の形に揃える。値には触らない（null・空の項目は「書かなかった」として落とすだけ）。
     形が違うキー（配列で来た totals / vehicle / paint、expenses / adas のオブジェクトでない要素）は **落とさず** PageShapeError
     （ask_header が理由を返して読み直させる）。落として続けると、vendor の Checker は totals 無しを WARN にしかしないので
@@ -255,6 +314,44 @@ def _normalise_header(h: dict, vehicle_hint: Optional[dict], insurance_hint: Opt
             v = v.get(key) if isinstance(v, dict) else None
         if v not in (None, '', [], {}) and not isinstance(v, dict):
             bad.append('.'.join(path) + ' は {"index": …, "wage": …} のオブジェクト（文字列や配列で書かない）')
+    # 文字列の欄が dict / 配列で来たら文字列に潰す（issuer が {"name": …} で来ると vendor が落ちる。バグハント G1）
+    for k in ('source', 'issuer', 'format', 'note'):
+        v = out.get(k)
+        if isinstance(v, dict):
+            out[k] = ' '.join(str(x) for x in v.values() if x not in (None, ''))
+        elif isinstance(v, list):
+            out[k] = ' '.join(str(x) for x in v if x not in (None, ''))
+        elif v is not None and not isinstance(v, str):
+            out[k] = str(v)
+    # est_date は YYYYMMDD の 8 桁（生成器は est_date[:4] を年として使うので、数値や '2026/9/13'・和暦のままだと落ちる。バグハント G1）
+    if out.get('est_date') not in (None, ''):
+        d8 = _dh.date8_full(str(out['est_date']))   # 年月だけ（日 00）は '' → 形の FAIL（レビュー 2026-09-15）
+        if len(d8) == 8:
+            out['est_date'] = d8
+        else:
+            bad.append('est_date は YYYYMMDD の 8 桁（例 20260913。和暦や区切り付きの印字は変換して書く。無ければ空）')
+    # labor_rate は数値（'8,000円' は 8000 に。数字が無ければ書かなかった扱い = 生成器が逆算）
+    if out.get('labor_rate') not in (None, ''):
+        lr = _as_int(out['labor_rate'])
+        if lr is None:
+            m_ = re.search(r'\d[\d,]*', unicodedata.normalize('NFKC', str(out['labor_rate'])))
+            lr = int(m_.group(0).replace(',', '')) if m_ else None
+        if lr and lr > 0:
+            out['labor_rate'] = lr
+        else:
+            out.pop('labor_rate', None)
+    # wage_round / tax_round は読み手が推測で書いても使わない（印字の工賃と合計欄から vendor が判定する。index_policy と同じ歯止め。G5）
+    for k in ('wage_round', 'tax_round'):
+        if out.get(k) not in (None, ''):
+            if notes is not None:
+                notes.append(f'読み手が書いた {k}={out[k]!r} は使わず、印字の工賃・合計欄から判定した（推測で書くとコグニの設定が変わる）')
+            out.pop(k, None)
+    # target_total（協定額）は人が reading に書く指示。読み手が写すと生成器が協定調整を始め、合わなければ「協定額に合っていない」で
+    # 不合格になる（files f66558f の関門）。アプリの読み手からは受けない。discount は印字された値引き・割増の欄なので残す（レビュー 2026-09-15）
+    if out.get('target_total') not in (None, '', {}, []):
+        if notes is not None:
+            notes.append('読み手が書いた target_total は使わない（協定額は人が reading に書くもの。見積書どおりに作る）')
+        out.pop('target_total', None)
     if bad:
         raise PageShapeError('header.json の形が違う: ' + ' / '.join(bad))
     # 空の totals 項目（null）は落とす（reading_check は「書いた項目」だけを突き合わせる）
@@ -273,8 +370,27 @@ def _normalise_header(h: dict, vehicle_hint: Optional[dict], insurance_hint: Opt
     return out
 
 
+def _is_note_row(r) -> bool:
+    """注記行か（vendor の draft_estimate._expand_row・reading_check と同じ基準）。文字列行は 9 番目の欄（flags）を NFKC・大文字にして N、
+    dict 行は flags に N（NFKC）か「note があって name が無い」。note 付きでも name のある dict 行は明細（レビュー 2026-09-15: 明細を注記と
+    取り違えるとページごと外れて merge が落ちていた）"""
+    if isinstance(r, str):
+        parts = [x.strip() for x in r.split('|')]
+        return len(parts) > 8 and 'N' in unicodedata.normalize('NFKC', parts[8]).upper()
+    if isinstance(r, dict):
+        fl = unicodedata.normalize('NFKC', str(r.get('flags') or '')).upper()
+        return 'N' in fl or (bool(r.get('note')) and not r.get('name'))
+    return False
+
+
 def _has_rows(page: dict) -> bool:
-    return any((b.get('rows') or []) for b in (page.get('blocks') or []) if isinstance(b, dict))
+    """明細（注記行以外）が 1 行でもあるか。注記行だけのページを pages/ に残すと vendor の Checker が
+    「小計があるのに行が無い」で必ず不合格にする（バグハント G4）"""
+    return any(not _is_note_row(r) for b in (page.get('blocks') or []) if isinstance(b, dict) for r in (b.get('rows') or []))
+
+
+def _note_rows(page: dict) -> list:
+    return [r for b in (page.get('blocks') or []) if isinstance(b, dict) for r in (b.get('rows') or []) if _is_note_row(r)]
 
 
 def _pages_for_merge(header: dict, pages: list) -> tuple:
@@ -286,10 +402,21 @@ def _pages_for_merge(header: dict, pages: list) -> tuple:
     検算・読み直し・画面表示は PDF の実ページ番号のまま行い、ここでは書き出す形だけを変える"""
     hdr = copy.deepcopy(header)
     out = []
+    pending_notes: list = []   # 明細の無いページの注記行（装備注記）: 直前の明細ページの末尾に繋ぐ（無ければ次の明細ページの先頭）
     for p in pages:
         if _has_rows(p):
-            out.append(copy.deepcopy(p))
+            q = copy.deepcopy(p)
+            if pending_notes and q.get('blocks'):
+                q['blocks'][0].setdefault('rows', [])[0:0] = pending_notes
+                pending_notes = []
+            out.append(q)
             continue
+        notes_ = copy.deepcopy(_note_rows(p))
+        if notes_:
+            if out and out[-1].get('blocks'):
+                out[-1]['blocks'][-1].setdefault('rows', []).extend(notes_)
+            else:
+                pending_notes.extend(notes_)
         if p.get('paint_lines'):
             paint = hdr.get('paint') if isinstance(hdr.get('paint'), dict) else {}
             paint.setdefault('lines', []).extend(copy.deepcopy(p['paint_lines']))
@@ -386,7 +513,7 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
         黙って値を落として合計欄の検算なしで進まない。Codex 指摘 2026-09-14）。
         JSON オブジェクトでない返事（配列・文字列）は _ask_json が 1 回言い直させる"""
         def normalise(raw):
-            h = _normalise_header(raw, vehicle_hint, insurance_hint, customer_hint)
+            h = _normalise_header(raw, vehicle_hint, insurance_hint, customer_hint, notes=guard_notes)
             if not isinstance(h.get('totals'), dict) or not h['totals']:
                 raise PageShapeError('totals（見積書の合計欄）が無い。合計欄は必ず写す（検算の拠り所）')
             return h
@@ -428,7 +555,7 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
                 tr.attempts += 1
                 v = run('validate', header=header, page=page) if page else {'ok': False, 'fail': [shape_err], 'warn': [], 'rows': 0}
             if not page:  # 上限まで形が直らなかった。空ページとして持ち、不合格の理由に残す
-                page = _normalise_page({'page': pg, 'rows_printed': raw.get('rows_printed') if isinstance(raw, dict) else None, 'blocks': []}, pg)
+                page = _normalise_page({'page': pg, 'rows_printed': _as_int(raw.get('rows_printed')) if isinstance(raw, dict) else None, 'blocks': []}, pg)
             tr.ok, tr.rows, tr.fail, tr.warn = bool(v.get('ok')), int(v.get('rows') or 0), list(v.get('fail') or []), list(v.get('warn') or [])
             pages.append(page)
             res.traces.append(tr)
@@ -475,9 +602,11 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
             m = run('merge', case_dir=case_dir)
             rd, check = m.get('reading'), (m.get('check') or {})
             res.merge_messages = list(m.get('messages') or [])
-        if guard_notes:   # 戻した理由は合計欄の検算の注意と同じ列に（app は check.warn を「読み取りの注意」に出す）
+        _extra = list(guard_notes) + [m_ for m_ in (res.merge_messages or []) if m_]   # merge の注意（重複行など）も合格時に見える所へ（G11）
+        if _extra:   # 戻した理由は合計欄の検算の注意と同じ列に（app は check.warn を「読み取りの注意」に出す）
             check = dict(check or {})
-            check['warn'] = list(check.get('warn') or []) + guard_notes
+            _w0 = list(check.get('warn') or [])
+            check['warn'] = _w0 + [x for i_, x in enumerate(_extra) if x not in _w0 and x not in _extra[:i_]]   # 重複を出さない
         res.check = check or {}
         res.reading = rd
         res.ok = bool(rd) and not (check or {}).get('fail') and all(t.ok for t in res.traces)

@@ -55,7 +55,7 @@
 
 | キー | 出所 |
 |---|---|
-| customer.name / reg_no / postal / address / kilometer / term_date / owner / phone | 車検証（使用者名・住所・登録番号・有効期間満了日・所有者）と見積書（走行距離）。郵便番号は車検証に無いので空でよい |
+| customer.name / reg_no / postal / address / prefecture / municipality / address_other / kilometer / term_date / owner / phone | 車検証（使用者名・住所・登録番号・有効期間満了日・所有者）と見積書（走行距離）。郵便番号は車検証に無いので空でよい |
 | customer.owner_name / user_name | **NEO の所有者欄・使用者欄に入るのはこの 2 つだけ**。`owner` は車検証の所有者を控えるメモで NEO には書かれない（コグニ運用では所有者欄に顧客名を入れることが多い。実機 cogni_R1/R2）。所有者を出したい案件だけ `owner_name` に書く |
 | insurance.company / policy_no / contractor / accident_date / presence_date / factory | 案件フォルダ名（損保）・速報 PDF。分からない項目は空文字。`factory` は「工場名 電話番号」 |
 | insurance.accept_no / agency / adjuster / garage_in / garage_out / repair_days | 事故受付番号（FileInfo.AcceptNo・XML・AnSvMail）／代理店（Insurance.AgencyName）／アジャスター（Insurance.AdjusterName・XML）／入庫日・出庫日（YYYYMMDD → FileInfo.GarageIn*/GarageOut*。XML には書かない: 実機 178 本で日付があっても空）／修理日数（Insurance.RepairDays、無ければ -1）。無ければ従来どおり空（2026-09-14） |

@@ -91,11 +91,11 @@ def parse_json_reply(text: str) -> dict:
     except ValueError:
         i, j = t.find('{'), t.rfind('}')
         if i < 0 or j <= i:
-            raise LLMError('返事に JSON が無い: ' + t[:200])
+            raise LLMError('返事に JSON が無い: ' + t[:80])   # 返事の先頭（顧客名を含み得る）は短く（G14）
         try:
             v = json.loads(t[i:j + 1])
         except ValueError as e:
-            raise LLMError(f'返事の JSON が壊れている（{e}）: ' + t[:200])
+            raise LLMError(f'返事の JSON が壊れている（{e}）: ' + t[:80])
     if not isinstance(v, dict):
         raise LLMError('返事の JSON がオブジェクトでない')
     return v
@@ -143,6 +143,17 @@ class GeminiReader:
         return out
 
     @staticmethod
+    def _status_code(e) -> Optional[int]:
+        """SDK の例外から HTTP 状態コードを取る（google.genai.errors.APIError.code。無ければ None）"""
+        for attr in ('code', 'status_code'):
+            v = getattr(e, attr, None)
+            if isinstance(v, int) and 100 <= v <= 599:
+                return v
+        resp = getattr(e, 'response', None)
+        v = getattr(resp, 'status_code', None)
+        return v if isinstance(v, int) else None
+
+    @staticmethod
     def _fatal(msg: str) -> bool:
         """待っても通らないエラー（モデル無し・上限・不正な要求・認証）は即座に諦める（app.py の call_gemini と同じ流儀）"""
         m = msg.upper()
@@ -159,18 +170,25 @@ class GeminiReader:
                                          max_output_tokens=self.max_tokens, response_mime_type='application/json')
         last: Optional[Exception] = None
         r = None
-        for attempt in range(3):
+        waits = (1, 2, 4, 8, 15)   # 429（分あたり上限）はページ数ぶん連続で呼ぶ経路で起きやすい: 待って続ける（G12）
+        for attempt in range(len(waits) + 1):
             try:
                 r = self.client.models.generate_content(model=self.model, contents=parts, config=config)
                 break
-            except Exception as e:  # noqa: BLE001  SDK の例外型は版で変わるので文言で判断
+            except Exception as e:  # noqa: BLE001  SDK の例外型は版で変わるので code があればそれ、無ければ文言で判断
                 msg = str(e)
-                if self._fatal(msg):
+                code = self._status_code(e)
+                busy = code == 429 or 'RESOURCE_EXHAUSTED' in msg.upper()
+                if busy:
+                    if attempt >= len(waits):
+                        raise LLMError(f'Gemini API の利用上限（429）が続いています（{self.model}）。しばらく待ってからやり直してください: {msg[:200]}')
+                elif (code in (400, 401, 403, 404)) or (code is None and self._fatal(msg)):
                     raise LLMError(f'Gemini API エラー（{self.model}）: {msg[:300]}')
                 last = e
-                time.sleep(1 + attempt)
+                if attempt < len(waits):
+                    time.sleep(waits[attempt] * (2 if busy else 1))
         if r is None:
-            raise LLMError(f'Gemini API に 3 回失敗（{self.model}）: {last}')
+            raise LLMError(f'Gemini API に失敗（{self.model}）: {last}')
         self.calls += 1
         try:
             text = r.text or ''

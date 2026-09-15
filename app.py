@@ -53,6 +53,7 @@ import unicodedata
 import traceback
 import pandas as pd
 import hashlib
+import hmac
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
 # コグニセブンの「既存見積」一覧が読む先頭424Bの管理領域を書くために使う
@@ -147,6 +148,11 @@ try:
     ANTHROPIC_API_KEY = st.secrets.get('ANTHROPIC_API_KEY', os.environ.get('ANTHROPIC_API_KEY', ''))
 except Exception:
     ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+# 合言葉（任意）: st.secrets / 環境変数 APP_PASSCODE があるときだけ入場を求める（公開 URL で所有者の API キーが無制限に使われないように。バグハント J4）
+try:
+    APP_PASSCODE = str(st.secrets.get('APP_PASSCODE', os.environ.get('APP_PASSCODE', '')) or '')
+except Exception:
+    APP_PASSCODE = str(os.environ.get('APP_PASSCODE', '') or '')
 GEMINI_MODEL      = "gemini-3.5-flash"          # フォールバック（動的に上書きされる）
 CONFIDENCE_THRESHOLD = 0.6
 
@@ -2036,6 +2042,7 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
     agency_name   = cp932_trim(insurance_info.get('agency_name', ''), 20)
     adjuster_name = cp932_trim(insurance_info.get('adjuster_name', ''), 20)
     adjuster_post = cp932_trim(insurance_info.get('adjuster_post', ''), 20)   # 支店・所属（Insurance.AdjusterPost）
+    factory_name  = cp932_trim(insurance_info.get('factory_name', ''), 30)   # 立会工場（Insurance.ConsultantFactory。vendor と同じ 30 バイト）
     accept_no     = cp932_trim(insurance_info.get('accept_no', ''), 37)
     accident_date = _normalize_date8(insurance_info.get('accident_date', ''))
     garage_in     = _normalize_date8(insurance_info.get('garage_in_date', ''))
@@ -2055,6 +2062,13 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
     for _col, _val in (('PolicyNo', policy_no), ('ContractorName', contractor),
                        ('AgencyName', agency_name), ('AdjusterName', adjuster_name), ('AdjusterPost', adjuster_post)):
         if _val or not merge_mode:
+            _ins_updates.append(f'{_col}=?')
+            _ins_values.append(_val)
+    if factory_name:   # 立会工場は入れたときだけ書く（空ならテンプレートの値を残す。以前からこの欄には触れていなかった。レビュー 2026-09-15）
+        _ins_updates.append('ConsultantFactory=?')
+        _ins_values.append(factory_name)
+    if not merge_mode:   # 過去案件の NEO をテンプレートにしても、立会日・協定日・立会者は前の案件のまま残さない（バグハント I5）
+        for _col, _val in (('PresenceDate', '00000000'), ('PresenceEraYear', '0000'), ('AgreedDate', '00000000'), ('AgreedEraYear', '0000'), ('ConsultantName', '')):
             _ins_updates.append(f'{_col}=?')
             _ins_values.append(_val)
     if repair_days > 0:
@@ -2182,10 +2196,10 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
         # 備考・グレードがそのまま新しい見積に残る（立会者名は個人情報）。
         # マージモードでは空値はスキップされるので、テンプレート保持は壊れない。
         'CustomerName2':        '',
-        'TicketNo':             '',
+        'TicketNo':             cp932_trim(ins.get('policy_no', ''), 20),        # 証券番号（vendor と同じ。DB の Insurance.PolicyNo と揃える）
         'Note2':                '',
         'Note3':                '',
-        'ii_CustomerName':      '',
+        'ii_CustomerName':      cp932_trim(ins.get('contractor_name', ''), 20),  # 契約者（vendor と同じ。DB の Insurance.ContractorName と揃える）
         'ii_PresenceDate':      '',
         'ii_AgreedDate':        '',
         'ii_RepairDays':        '',
@@ -3716,6 +3730,17 @@ def _version_skew_message(names):
             % '・'.join(names))
 
 
+def _defer_sidebar_rerun():
+    """サイドバーの処理から st.rerun() を直に呼ばない: まだ描いていない本文の uploader（見積書・車検証・書類）の値が捨てられる
+    （Streamlit の仕様。バグハント H3: Addata を選んだだけで見積書と書類が全部消えていた）。旗を立てて main の最後で rerun する"""
+    st.session_state['_sidebar_rerun'] = True
+
+
+def _consume_sidebar_rerun():
+    if st.session_state.pop('_sidebar_rerun', False):
+        st.rerun()
+
+
 def _load_pipeline():
     """版を揃えたうえで `pdf_to_neo_pipeline` を返す。揃わなければ断る。
 
@@ -4370,10 +4395,10 @@ TASK_PROMPTS["shaken_ocr"] = """<task_execution>
 読み取り対象フィールドと対応する記載欄:
 - customer_name: 使用者の氏名又は名称（***の場合は所有者名で代替）
 - owner_name: 所有者の氏名又は名称
-- postal_no: 所有者の住所から郵便番号を推定（不明なら""）
-- prefecture: 所有者の住所 → 都道府県
-- municipality: 所有者の住所 → 市区町村
-- address_other: 所有者の住所 → 町名・番地以降
+- postal_no: 車検証に印字された郵便番号（印字が無ければ ""。住所から推測しない）
+- prefecture: 使用者の住所（使用者欄が *** なら所有者の住所） → 都道府県
+- municipality: 使用者の住所（同上） → 市区町村
+- address_other: 使用者の住所（同上） → 町名・番地以降
 - car_reg_department: 自動車登録番号の地名部分（例: "北九州", "品川", "福岡"）
 - car_reg_division: 自動車登録番号の分類番号（例: "346"） → 半角数字で出力（コグニの NEO と同じ）
 - car_reg_business: 自動車登録番号のひらがな（例: "の"） → 全角ひらがなで出力
@@ -6562,6 +6587,10 @@ def p2n_read(pdf_bytes, file_name, api_key, mime_type='application/pdf',
             if _left:
                 out['cleanup_warning'] = f'作業フォルダを消せませんでした。手で削除してください: {_left}'
         return out
+    except BaseException:   # RerunException（生成中に画面を触った）など: 読みかけの作業フォルダ（reading.json 入り）を残さない（H8）
+        if case_dir:
+            _nsk_maker.remove_case_dir(case_dir)
+        raise
 
 
 def p2n_make(state, addata_root=None, record_profile=None, progress=None):
@@ -6722,7 +6751,10 @@ def _render_beta_result(_p2n_res, selected_model):
     # （プレビュー取り込みで直す道は残す。Codex hunt E1/E4 2026-09-15）
     _p2n_adj = bool(_p2n_res.get('adjustment_amount')) or any(isinstance(_it, dict) and _it.get('is_adjustment_row') for _it in _p2n_items)
     _p2n_vfail = bool(_p2n_v.get('verified_against_pdf')) and not _p2n_v.get('ok') and not _p2n_v.get('error')
-    _p2n_needs_ack = _p2n_adj or _p2n_vfail or bool(_p2n_ac)
+    # 印字の合計が読めず突き合わせできなかった／検証が例外で欠けた／ページ境界の行を統合した結果も、確認してから（バグハント K6）
+    _p2n_unverified = (not _p2n_v.get('verified_against_pdf')) or bool(_p2n_v.get('error'))
+    _p2n_dedup = bool(_p2n_res.get('dedup_merged'))
+    _p2n_needs_ack = _p2n_adj or _p2n_vfail or bool(_p2n_ac) or _p2n_unverified or _p2n_dedup
     _p2n_ack = True
     if _p2n_needs_ack and _p2n_neo and not _p2n_res.get('stale'):
         st.warning("⚠️ この NEO は原本と差がある可能性があります（金額調整の行／検証の差／金額列の補正）。「プレビューに取り込んで修正する」で"
@@ -6798,6 +6830,7 @@ def _sidebar_insurance_hint():
         'agency': str(st.session_state.get('agency_name', '') or '').strip(),
         'adjuster': str(st.session_state.get('adjuster_name', '') or '').strip(),
         'adjuster_post': str(st.session_state.get('adjuster_post', '') or '').strip(),   # 支店・所属（Insurance.AdjusterPost）
+        'factory': str(st.session_state.get('factory_name', '') or '').strip(),   # 立会工場（Insurance.ConsultantFactory。画像鑑定は「写真鑑定」）
         'company': str(st.session_state.get('agency_name', '') or '').strip(),   # 「保険会社・代理店名」の欄（記録用）
         'garage_in': _normalize_date8(st.session_state.get('garage_in_date', '')),
         'garage_out': _normalize_date8(st.session_state.get('garage_out_date', '')),
@@ -6817,7 +6850,7 @@ def _sidebar_insurance_values():
     """旧経路（ベタ打ち・Step 4）に渡す insurance_info（サイドバーの値そのまま）"""
     return {k: st.session_state.get(k, 0 if k == 'repair_days' else '') for k in (
         'policy_no', 'contractor_name', 'accept_no', 'accident_date', 'agency_name',
-        'adjuster_name', 'adjuster_post', 'garage_in_date', 'garage_out_date', 'repair_days', 'note1')}
+        'adjuster_name', 'adjuster_post', 'factory_name', 'garage_in_date', 'garage_out_date', 'repair_days', 'note1')}
 
 
 def _fresh_doc_fill(doc):
@@ -6872,12 +6905,12 @@ def _doc_fill_plan(att_fill, prev_filled, current) -> tuple:
 
 _CASE_INPUT_KEYS = (
     # サイドバーの事故・保険情報と費用
-    'policy_no', 'contractor_name', 'accept_no', 'accident_date', 'agency_name', 'adjuster_name', 'adjuster_post',
+    'policy_no', 'contractor_name', 'accept_no', 'accident_date', 'agency_name', 'adjuster_name', 'adjuster_post', 'factory_name',
     'garage_in_date', 'garage_out_date', 'repair_days', 'note1', 'exp_towing', 'exp_rental', 'exp_exempt',
     # 添付の書類の読み取りの控えと反映の印
     '_doc_ocr_cache', '_insdoc_applied', '_insdoc_sha', '_insdoc_cleared_sha', '_insdoc_filled', '_insdoc_ocr_id', '_doc_ocr_error',
     # 生成結果・ベタ打ちの費用チェック
-    '_beta_exp_file_key', 'pdf2neo_beta_use_exp', 'pdf2neo_beta_ack', 'pdf2neo_result', '_pdf2neo_filename', 'pdf2neo_vehicle_info',
+    '_beta_exp_file_key', 'pdf2neo_beta_use_exp', '_beta_use_exp_val', 'pdf2neo_beta_ack', 'pdf2neo_result', '_pdf2neo_filename', 'pdf2neo_vehicle_info',
 )
 
 
@@ -6956,9 +6989,13 @@ def _p2n_inputs_signature(file_key, state=None, api_key='', model_name='', beta=
         return v
     parts.append(repr([(k, _sv(k)) for k in (
         'policy_no', 'contractor_name', 'accept_no', 'accident_date', 'agency_name',
-        'adjuster_name', 'adjuster_post', 'garage_in_date', 'garage_out_date', 'repair_days', 'note1')]))
+        'adjuster_name', 'adjuster_post', 'factory_name', 'garage_in_date', 'garage_out_date', 'repair_days', 'note1')]))
     # 費用の額はベタ打ちでチェックが入っているときだけ NEO に入る ＝ それ以外（スキル経路・チェック無し）は額を変えても結果は同じ（Codex 75/77）
-    _use_exp = bool(beta) and bool(s.get('pdf2neo_beta_use_exp'))
+    # ウィジェットの値があればそれ（その run の最新。結果の下でチェックを切り替えた run でも陳腐化を見逃さない）、
+    # 描かれていない run では控え（_beta_use_exp_val。消えたウィジェットの値で結果を陳腐化させない。H1、レビュー 2026-09-15）
+    _use_exp = bool(beta) and bool(s['pdf2neo_beta_use_exp'] if 'pdf2neo_beta_use_exp' in s else s.get('_beta_use_exp_val'))
+    _exp_any = any(safe_int(s.get(k, 0)) for k in ('exp_towing', 'exp_rental', 'exp_exempt'))
+    _use_exp = _use_exp and _exp_any   # 費用が全部 0 ならチェックの有無で結果は変わらない（チェックボックスも描かれない。レビュー 2026-09-15）
     parts.append(repr((_use_exp, safe_int(s.get('exp_towing', 0)) if _use_exp else 0,
                        safe_int(s.get('exp_rental', 0)) if _use_exp else 0, safe_int(s.get('exp_exempt', 0)) if _use_exp else 0)))
     # 税区分の選択とテンプレート NEO はベタ打ちだけが使う（スキル経路は見積書の合計欄から判定し、テンプレートも使わない。Codex 78）
@@ -7091,6 +7128,7 @@ def _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_mo
     if st.session_state.get('_beta_exp_file_key') != _p2n_file_key:
         # 見積が変わったらチェックは外す（前の見積で入れた同意を次の見積に持ち越さない。Codex 52）
         st.session_state['pdf2neo_beta_use_exp'] = False
+        st.session_state['_beta_use_exp_val'] = False
         st.session_state['_beta_exp_file_key'] = _p2n_file_key
     if any(_p2n_beta_exp.values()):
         # 前の案件の入力が残っていても黙って足さない（合計が原本と食い違う）。チェックしたときだけ入れる（Codex 51）
@@ -7098,6 +7136,9 @@ def _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_mo
             f"サイドバーの費用を NEO に入れる（レッカー ¥{_p2n_beta_exp['towing']:,}・代車 ¥{_p2n_beta_exp['rental_car']:,}・"
             f"非課税 ¥{_p2n_beta_exp['tax_exempt']:,}）。見積書に印字の無い費用なので、入れると原本の合計とは一致しません",
             value=False, key='pdf2neo_beta_use_exp')
+    # チェックの値はウィジェットとは別のキーに控える（このブロックを描かない run ではウィジェットの値が消え、指紋が食い違って
+    # 結果が陳腐化・行き止まりになる。バグハント H1）
+    st.session_state['_beta_use_exp_val'] = bool(_p2n_beta_use_exp)
     if not api_key:
         st.caption("ベタ打ちの読み取りは Gemini を使います。サイドバーの「APIキー設定」に Gemini API キーを入れてください。")
         return
@@ -7118,7 +7159,7 @@ def _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_mo
             _p2n_beta = run_pdf_to_neo_pipeline(
                 _p2n_bytes, api_key,
                 # 添付の車検証・書類の車両/顧客情報。無ければ None（旧経路は見積書を車検証として読もうとして空になる）
-                vehicle_info=_p2n_beta_vi or None,
+                vehicle_info=(_p2n_beta_vi or {}),
                 mime_type=get_mime_type(_p2n_file.name),
                 model_name=selected_model,
                 template_bytes=st.session_state.get('custom_neo_bytes'),
@@ -7126,6 +7167,7 @@ def _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_mo
                 # 費用はチェックしたときだけ（上）。事故・保険欄は旧経路と同じ扱い（b15bd06 で外す前の呼び方）
                 expenses=(_p2n_beta_exp if _p2n_beta_use_exp else None),
                 insurance_info=_p2n_beta_ins,
+                force_beta=True,
             )
         if not isinstance(_p2n_beta, dict):
             _p2n_beta = {'ok': False, 'error': 'ベタ打ち生成が想定外の値を返しました'}
@@ -7207,7 +7249,7 @@ def _attached_docs_ocr(api_key, model_name=None, progress=None):
 
 def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=None,
                            is_tax_inclusive=False, expenses=None,
-                           mime_type='application/pdf', insurance_info=None, vehicle_info=None):
+                           mime_type='application/pdf', insurance_info=None, vehicle_info=None, force_beta=False):
     """見積書PDFから直接NEOファイルを生成する。
 
     pdf_to_neo_pipeline.process_pdf_to_neo をStreamlitから安全に呼ぶための薄いラッパ。
@@ -7243,8 +7285,10 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
         else:
             template_path = TEMPLATE_PATH
 
-        addata_root = find_addata_dir()
-        mode_override = None if addata_root else 'A'
+        # ベタ打ち（force_beta）は Addata を渡さずモード A に固定する。Addata があると旧経路がモード B/C で品番・部品コードを
+        # 書き換え（品名に ※）、「部品コード無し」の表示と食い違う NEO を検証 OK で落とせた（バグハント K1/H5/J1）
+        addata_root = '' if force_beta else find_addata_dir()
+        mode_override = 'A' if (force_beta or not addata_root) else None
 
         # APIキーは引数で直接渡す。os.environ に書くと、プロセスを共有する
         # 他の利用者のセッションからも読めてしまう（キーの流用・課金事故）。
@@ -7278,7 +7322,8 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
             # 中身が違う .neo が出ていた。
             insurance_info=insurance_info or None,
             # 添付の車検証・書類から読んだ車両/顧客情報（無ければ None → パイプラインは見積書を車検証として読もうとして空になる）
-            vehicle_info=vehicle_info or None,
+            # ベタ打ちは添付が無ければ {}（None だと旧経路が見積書を車検証として読み、余分な API 呼び出しと「車検証OCR失敗」が出る。K5）
+            vehicle_info=(vehicle_info if force_beta else (vehicle_info or None)),
         )
         if not isinstance(result, dict):
             return {'ok': False, 'error': 'PDF→NEO変換が想定外の値を返しました'}
@@ -7301,6 +7346,15 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded"
     )
+    if APP_PASSCODE and not st.session_state.get('_passcode_ok'):
+        st.markdown("### 🔒 合言葉")
+        _pc = st.text_input("このアプリの合言葉を入力してください", type="password", key="app_passcode_input")
+        if st.button("入る", key="app_passcode_btn"):
+            if hmac.compare_digest(str(_pc or '').strip().encode('utf-8'), APP_PASSCODE.strip().encode('utf-8')):   # str だと ASCII 以外で TypeError
+                st.session_state['_passcode_ok'] = True
+                st.rerun()
+            st.error("合言葉が違います")
+        st.stop()
     st.markdown("""
     <style>
     *, *::before, *::after { box-sizing: border-box; }
@@ -7529,7 +7583,7 @@ def main():
                     if st.button("🔌 PC の Addata との接続を解除", key='bridge_disconnect',
                                  help="この画面に送った車種マスタ・車種フォルダを消し、他の設定（ZIP・パス・取得URL・自動検出）に戻します"):
                         _br.disconnect(st.session_state)
-                        st.rerun()
+                        _defer_sidebar_rerun()
                 if _bmsg:
                     st.caption(_bmsg)
                 if st.session_state.get('_bridge_want'):
@@ -7542,7 +7596,7 @@ def main():
                 st.caption(f"PC の Addata 連携を表示できません: {_be}")
                 _bridge_rerun = False
         if _bridge_rerun:
-            st.rerun()
+            _defer_sidebar_rerun()
         addata_status = find_addata_dir()
         if addata_status:
             _ka06 = find_ka06_path(addata_status)
@@ -7602,7 +7656,10 @@ def main():
                     "使いたい方を指定するか、古い方を消してください。")
             if st.button("🗑️ Addataを解除", key='addata_clear_btn'):
                 _discard_uploaded_addata()
-                st.rerun()
+                # ZIP の uploader を別のウィジェットにして空にする（以前は st.rerun() が描く前の uploader の値を捨てていたので解除できていた。
+                # rerun を本文の後に遅らせたので、同じ run で残った ZIP を展開し直さないように。レビュー 2026-09-15）
+                st.session_state['_addata_zip_nonce'] = int(st.session_state.get('_addata_zip_nonce', 0) or 0) + 1
+                _defer_sidebar_rerun()
         else:
             st.warning("Addata 未検出 — 見積 PDF は「ベタ打ちで生成」（部品コード・標準指数なし）になります。"
                        "部品コードまで入れるなら、上の「🖥️ PC の Addata をこの画面から使う」で PC の C:\\Addata を選んでください")
@@ -7700,7 +7757,7 @@ def main():
                 st.session_state['_addata_widget_nonce'] = _w + 1
                 _addata_url_forget_failure()
                 st.session_state.pop('_addata_dir_warn', None)
-                st.rerun()
+                _defer_sidebar_rerun()
 
             if _save:
                 _d = safe_str(_in_dir).strip()
@@ -7752,9 +7809,9 @@ def main():
                             st.error('❌ %s' % st.session_state.get(
                                 '_addata_url_error', '取得できませんでした'))
                         else:
-                            st.rerun()
+                            _defer_sidebar_rerun()
                     else:
-                        st.rerun()
+                        _defer_sidebar_rerun()
 
             if st.session_state.get('_addata_dir_warn'):
                 st.warning('⚠️ ' + st.session_state['_addata_dir_warn'])
@@ -7771,7 +7828,7 @@ def main():
             _addata_zip = st.file_uploader(
                 "Addata の ZIP",
                 type=['zip'],
-                key='addata_zip_upload',
+                key=f"addata_zip_upload_{int(st.session_state.get('_addata_zip_nonce', 0) or 0)}",
                 help="アップロードできるZIPは200MBまでです。"
                      "セッション内でのみ保持し、他の利用者からは見えません。",
             )
@@ -7794,7 +7851,7 @@ def main():
                     st.session_state[_ADDATA_UPLOAD_KEY] = _root
                     st.session_state['_addata_upload_label'] = _why
                     st.session_state['_addata_zip_id'] = _zip_id
-                    st.rerun()
+                    _defer_sidebar_rerun()
                 else:
                     import shutil as _sh
                     _sh.rmtree(_dest, ignore_errors=True)
@@ -7840,6 +7897,11 @@ def main():
         adjuster_post   = st.text_input("支店・所属（アジャスター）", value=st.session_state.get('adjuster_post', ''),
                                         key=f'adjuster_post_input_{_fseq}', max_chars=20,
                                         help="速報報告書の支店名・サービスセンター名など。NEO の保険欄（アジャスター所属）に入ります")
+        factory_name    = st.text_input("立会工場（協定の相手）", value=st.session_state.get('factory_name', ''),
+                                        key=f'factory_name_input_{_fseq}', max_chars=30,
+                                        placeholder="例: ｶｰﾎﾞﾃﾞｰ○○ 09XXXXXXXX ／ 写真鑑定",
+                                        help="NEO の保険欄の立会工場（ConsultantFactory）。工場は「半角カナの略称＋半角スペース＋ハイフン無しの電話番号」、"
+                                             "写真だけの案件（画像鑑定）は「写真鑑定」と書きます（過去 NEO の書き方）。半角 30 文字（全角 15 文字）まで")
         with st.expander("入庫・出庫・修理日数", expanded=False):
             garage_in_date  = st.text_input("入庫日（YYYYMMDD）", value=st.session_state.get('garage_in_date', ''),
                                             key=f'garage_in_input_{_fseq}')
@@ -7860,6 +7922,7 @@ def main():
             ('accept_no', accept_no), ('accident_date', accident_date),
             ('policy_no', policy_no), ('contractor_name', contractor_name),
             ('agency_name', agency_name), ('adjuster_name', adjuster_name), ('adjuster_post', adjuster_post),
+            ('factory_name', factory_name),
             ('garage_in_date', garage_in_date), ('garage_out_date', garage_out_date),
             ('repair_days', repair_days), ('note1', note1),
         ]:
@@ -8113,6 +8176,7 @@ def main():
                 st.caption("書類の読み取りには Gemini API キーが必要です（サイドバーの「APIキー設定」）")
         if st.session_state.pop('_p2n_deferred_rerun', False):
             st.rerun()   # 書類の uploader を描き終えたので、サイドバーの入力欄（form_seq）と案内を描き直す
+        _p2n_beta_ui_shown = False   # この run でベタ打ちの UI を描いたか（locals() で見ない。バグハント H7）
         if _p2n_file is not None:
             _p2n_bytes = _p2n_file.read()
             _p2n_file.seek(0)
@@ -8153,11 +8217,14 @@ def main():
                 if api_key:
                     _p2n_choices.append(('gemini', f"Gemini（{selected_model}）"))
                 if len(_p2n_choices) > 1:
-                    _p2n_pick = st.radio("🤖 見積書を読む AI", options=[c[1] for c in _p2n_choices], index=0,
+                    _p2n_labels = [c[1] for c in _p2n_choices]
+                    _p2n_prev = st.session_state.get('_p2n_reader_label')   # 書類添付の rerun でラジオが描かれる前に状態が捨てられても選択を保つ（H6）
+                    _p2n_pick = st.radio("🤖 見積書を読む AI", options=_p2n_labels, index=(_p2n_labels.index(_p2n_prev) if _p2n_prev in _p2n_labels else 0),
                                          horizontal=True, key='pdf2neo_reader',
                                          help="判断・生成・検算は同じです。読み取りの精度だけが変わります。"
                                               "読み取り結果の行（初回検算合格・読み直し回数）で比べられます。")
                     _p2n_kind = next(c[0] for c in _p2n_choices if c[1] == _p2n_pick)
+                    st.session_state['_p2n_reader_label'] = _p2n_pick
                 else:
                     _p2n_kind = _p2n_choices[0][0]
                     st.caption(f"読み取りに使う AI: {_p2n_choices[0][1]}")
@@ -8213,6 +8280,10 @@ def main():
                 st.caption(_attached_docs_caption(api_key, selected_model))
                 if st.button("🚀 見積書からNEOを生成", key='pdf2neo_run', type="primary",
                              width='stretch'):
+                    _p2n_skew = sync_app_modules()   # push 後にプロセスが残る本番で古い neo_skill を使わない（ベタ打ちと同じ扱い。バグハント H4）
+                    if _p2n_skew:
+                        st.error(_version_skew_message(_p2n_skew))
+                        st.stop()
                     st.session_state.pop('pdf2neo_result', None)
                     _p2n_stale = st.session_state.pop('_bridge_pending', None)
                     if _p2n_stale:
@@ -8288,8 +8359,9 @@ def main():
         _p2n_res = st.session_state.get('pdf2neo_result')
         # Addata が外れた後（接続解除・掃除・URL 失敗）に不合格の結果が残っていると、Addata なしの枝でもベタ打ちを描く。
         # 同じ run で 2 回描くとウィジェットのキーが重複して落ちるので、描いた印を見る（レビュー 2026-09-15）
-        _p2n_offer_beta = (isinstance(_p2n_res, dict) and not _p2n_res.get('legacy_beta') and not _p2n_res.get('ok')
-                           and _p2n_file is not None and bool(api_key) and not locals().get('_p2n_beta_ui_shown'))
+        _p2n_offer_beta = (isinstance(_p2n_res, dict) and _p2n_file is not None and bool(api_key) and not _p2n_beta_ui_shown
+                           and ((not _p2n_res.get('legacy_beta') and not _p2n_res.get('ok'))
+                                or bool(_p2n_res.get('fallback_from_skill'))))   # 逃げ道で作った後も、入力を直したら作り直せる（H2/K4）
         if isinstance(_p2n_res, dict) and _p2n_res.get('inputs_sig'):
             # 生成したあとに入力（見積書・添付・事故/保険欄・費用・税区分・テンプレート）が変わっていたら、前の入力の結果 ＝ 落とさせない
             _p2n_is_beta = bool(_p2n_res.get('legacy_beta'))
@@ -8300,6 +8372,12 @@ def main():
                            "ダウンロードは止めています。生成ボタンを押して作り直してください。")
         if _p2n_res and _p2n_res.get('legacy_beta'):
             _render_beta_result(_p2n_res, selected_model)
+            if _p2n_offer_beta:
+                # スキル経路が不合格で、逃げ道のベタ打ちで作った結果: 事故・保険欄・費用・税区分を直したらここから作り直す
+                # （結果が陳腐化するとダウンロードは止まるので、作り直す入口が要る。H2/K4、レビュー 2026-09-15）
+                st.markdown("---")
+                st.caption("入力（事故・保険欄・費用・税区分・添付の書類）を直したときは、ここからベタ打ちで作り直せます。")
+                _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_early_key, api_key, selected_model, _pdf_tax_sel, fallback=True)
         elif _p2n_res:
             _p2n_rd = _p2n_res.get('read') or {}
             _p2n_mk = _p2n_res.get('make') or {}
@@ -8460,7 +8538,7 @@ def main():
                     st.session_state['custom_neo_bytes'] = _neo_bytes_read
                     st.session_state['custom_neo_name']  = custom_neo_file.name
                     st.success(f"✅ {custom_neo_file.name} ({len(_neo_bytes_read):,} bytes)")
-                st.caption("📋 テンプレートの工場名・証券番号等はそのまま引き継ぎます。画面で入力しなかった項目（使用者名・車台番号・事故受付番号など）もテンプレートの値が残るため、別の案件として出す項目は入力し直してください")
+                st.caption("📋 テンプレートの工場名・車種の設定は引き継ぎます。立会工場はサイドバーに入れたときだけ書き換えます。" "見積書 PDF からのベタ打ちでは、証券番号・契約者・代理店・アジャスター・受付番号・備考をサイドバーの値で上書きし（空なら空）、立会日・協定日・立会者は空にします。" "CSV 取り込み → プレビュー → NEO 生成（ステップ④）では、空欄の項目はテンプレートの値が残るので、別の案件として出す項目は入力し直してください")
             elif st.session_state.get('custom_neo_bytes'):
                 _saved_name = st.session_state.get('custom_neo_name', 'テンプレートNEO')
                 _saved_size = len(st.session_state['custom_neo_bytes'])
@@ -10044,6 +10122,7 @@ def main():
             'agency_name':      st.session_state.get('agency_name', ''),
             'adjuster_name':    st.session_state.get('adjuster_name', ''),
             'adjuster_post':    st.session_state.get('adjuster_post', ''),
+            'factory_name':     st.session_state.get('factory_name', ''),
             'garage_in_date':   st.session_state.get('garage_in_date', ''),
             'garage_out_date':  st.session_state.get('garage_out_date', ''),
             'repair_days':      st.session_state.get('repair_days', 0),
@@ -10254,8 +10333,8 @@ def main():
                     'pdf_parts', 'pdf_wages',
                     # 事故・保険情報
                     'policy_no', 'contractor_name', 'accept_no', 'accident_date',
-                    'agency_name', 'adjuster_name', 'adjuster_post', 'garage_in_date', 'garage_out_date',
-                    'repair_days', 'note1',
+                    'agency_name', 'adjuster_name', 'adjuster_post', 'factory_name', 'garage_in_date', 'garage_out_date',
+                    'repair_days', 'note1', '_beta_use_exp_val', '_p2n_reader_label',
                     # 添付の書類の読み取り（車検証・事故/保険の書類）の控え。残すと次の案件に前の値が付く／同じ書類を入れ直しても埋まらない
                     '_doc_ocr_cache', '_insdoc_applied', '_insdoc_sha', '_insdoc_cleared_sha', '_insdoc_filled', '_insdoc_ocr_id',
                     '_doc_ocr_error', '_beta_exp_file_key',
@@ -10305,3 +10384,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    _consume_sidebar_rerun()   # サイドバーで頼まれた描き直し（本文の uploader を描き終えてから）

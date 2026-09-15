@@ -52,13 +52,72 @@ def neo_diff(a: str, b: str) -> str:
     return ((p.stdout or '') + (p.stderr or '')).strip()
 
 
+def test_forget_vendor_cache():
+    """J2: 橋渡しの root 用の COM 展開キャッシュだけを消す（他の Addata のキャッシュは残す）"""
+    import hashlib as _h
+    import tempfile as _tf
+    from neo_skill import bridge as br
+    base = _tf.mkdtemp(prefix='reg_vcache_')
+    old = os.environ.get('LOCALAPPDATA')
+    os.environ['LOCALAPPDATA'] = base
+    try:
+        root = os.path.join(_tf.gettempdir(), 'addata_bridge_regtest_x')
+        rid = _h.sha1(os.path.normcase(os.path.abspath(root)).encode('utf-8')).hexdigest()[:8]
+        com = os.path.join(base, 'claude_neo_pipeline', 'com')
+        os.makedirs(os.path.join(com, rid + '_923701_1789000000'))
+        os.makedirs(os.path.join(com, 'deadbeef_923701_1789000000'))
+        n = br.forget_vendor_cache(root)
+        left = sorted(os.listdir(com))
+        assert n == 1 and left == ['deadbeef_923701_1789000000'], (n, left)
+    finally:
+        if old is None:
+            os.environ.pop('LOCALAPPDATA', None)
+        else:
+            os.environ['LOCALAPPDATA'] = old
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_ingest_shape_and_caps():
+    """バグハント J6/J7: 部品からの値の形（files が dict でない・phase が未知・長い root_name）で落ちない。車種フォルダは MAX_CAR_DIRS まで"""
+    import tempfile as _tf
+    from neo_skill import bridge as br
+    ss = {'_bridge_id': 'regtest_%d' % os.getpid()}
+    root = br.root(ss)
+    try:
+        assert br.ingest(ss, {'seq': 1, 'phase': 'car', 'car': 'W10', 'files': ['a', 'b']}) is not None   # list の files → 空として扱い落ちない
+        assert br.ingest(ss, {'seq': 2, 'phase': 'zzz', 'files': {}}) and '無視' in ss.get('_bridge_msg', ''), ss.get('_bridge_msg')
+        br.ingest(ss, {'seq': 3, 'phase': 'com', 'root_name': 'x' * 500, 'files': {}})
+        assert len(ss.get('_bridge_root_name', '')) <= 64, len(ss.get('_bridge_root_name', ''))
+        # 車種フォルダの上限: W10〜W18 を順に作ると古いものから消える
+        import base64 as _b64
+        payload = _b64.b64encode(b'x' * 10).decode('ascii')
+        for i in range(10, 19):
+            car = 'W%d' % i
+            br.store(root, {'W/%s/%s01.DB' % (car, car): payload, 'W/%s/%s11.DB' % (car, car): payload})
+            time.sleep(0.02)
+        cars = sorted(os.listdir(os.path.join(root, 'W'))) if os.path.isdir(os.path.join(root, 'W')) else []
+        assert len(cars) == br.MAX_CAR_DIRS and 'W18' in cars and 'W10' not in cars, cars
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> int:
     fails = []
+    for _fn in (test_forget_vendor_cache, test_ingest_shape_and_caps):   # ADDATA・NEO_check が無くても回る単体の確認（レビュー 2026-09-15）
+        try:
+            _fn()
+            print('ok  ', _fn.__name__)
+        except AssertionError as e:
+            fails.append(f'{_fn.__name__}: {e}')
     if not os.path.isfile(os.path.join(ADDATA, 'COM', 'KA06_ALL.DB')):
-        print('reg_bridge: ADDATA が無いので省略'); return 0
+        for f in fails:
+            print('*** FAILED:', f)
+        print('reg_bridge: ADDATA が無いので以降は省略'); return 1 if fails else 0
     cases = [d for d in sorted(glob.glob(os.path.join(NC, '*'))) if os.path.isfile(os.path.join(d, 'reading.json'))]
     if not cases:
-        print('reg_bridge: NEO_check に reading.json の案件が無いので省略'); return 0
+        for f in fails:
+            print('*** FAILED:', f)
+        print('reg_bridge: NEO_check に reading.json の案件が無いので以降は省略'); return 1 if fails else 0
 
     ss = {}  # st.session_state の代わり
     root = bridge.root(ss)

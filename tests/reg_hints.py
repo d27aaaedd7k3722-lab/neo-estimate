@@ -221,6 +221,29 @@ def test_summary():
     chk(dh.summary({}, {}) == '', 'summary 空')
 
 
+def test_hunt_2026_09_15_b():
+    """バグハント I（2026-09-15 午後）: 車検証 OCR の kilometer=0 が速報の走行距離を隠す／郵便番号の正規化／
+    車検証の構造化住所をそのまま渡す／和暦の '/' 区切り／型式指定・類別の桁あふれ"""
+    h = dh.customer_hint({'customer_name': 'ケンショウ', 'kilometer': 0, 'term_date': ''}, {'mileage': '15,345km', 'term_date': '2028/12/14'})
+    chk(h.get('kilometer') == '15345', f'I1: 車検証の kilometer=0 が書類の走行距離を隠す: {h}')
+    chk(h.get('term_date') == '20281214', f'I1: 車検証の term_date が空でも書類の有効期限を使わない: {h}')
+    chk(dh.postal_text('〒 510-0001') == '510-0001' and dh.postal_text('５１０－０００１') == '510-0001' and dh.postal_text('5100001') == '510-0001',
+        'I7: 郵便番号の正規化（〒・全角・ハイフン無し）')
+    chk(dh.postal_text('510-00') == '' and dh.postal_text('') == '', 'I7: 7 桁にならない郵便番号は空')
+    h2 = dh.customer_hint({'customer_name': 'ケンショウ', 'prefecture': '三重県', 'municipality': '四日市市', 'address_other': '日永1-1', 'postal_no': '〒510-0001'})
+    chk((h2.get('prefecture'), h2.get('municipality'), h2.get('address_other')) == ('三重県', '四日市市', '日永1-1'), f'I2: 構造化住所がそのまま渡らない: {h2}')
+    chk(h2.get('address') == '三重県四日市市日永1-1' and h2.get('postal') == '510-0001', f'I2/I7: address / postal: {h2}')
+    h3 = dh.customer_hint({'customer_name': 'ケンショウ', 'prefecture': '福岡県', 'municipality': '北九州市小倉北区', 'address_other': '検証町1-2-3'})
+    chk((h3.get('municipality'), h3.get('address_other')) == ('北九州市', '小倉北区検証町1-2-3'), f'I2: 政令市の区は以降側: {h3}')
+    chk(dh.date8('R9/10/26') == '20271026' and dh.date8('令和9/10/26') == '20271026', f"I12: 和暦の '/' 区切り: {dh.date8('R9/10/26')!r} {dh.date8('令和9/10/26')!r}")
+    v = dh.vehicle_hint({'car_model_designation': '12345-0002', 'car_category_number': '0001'})
+    chk('desig' not in v and v.get('category') == '0001', f'I12: 型式指定の桁あふれを写している: {v}')
+    v2 = dh.vehicle_hint({'car_reg_date': ''}, {'first_reg': '2025-12-01'})
+    chk(bool(v2.get('reg_date')), f'I1: 車検証に無い初度登録を書類から取らない: {v2}')
+    lg = dh.vehicle_info_for_legacy({'customer_name': '同上', 'owner_name': ''}, {'owner': 'ケンショウ', 'contractor': 'ケンショウ'})
+    chk(bool(lg.get('customer_name')) and lg.get('customer_name') != '同上', f'I6: 使用者「同上」＋書類の所有者で顧客名が同上のまま: {lg}')
+
+
 if __name__ == '__main__':
     sys.stdout.reconfigure(encoding='utf-8')
     for name, fn in sorted(globals().items()):

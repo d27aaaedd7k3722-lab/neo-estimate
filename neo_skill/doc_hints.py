@@ -186,7 +186,7 @@ def date8(s, allow_yy: bool = False) -> str:
     m = re.match(r'^(\d{2})[-/.](\d{1,2})[-/.](\d{1,2})$', t)   # '25.10.26'（保険書類の 2 桁年は 2000 年代。1 桁年は元号か分からないので受けない。Codex hunt B3）
     if m and allow_yy:   # 事故日など保険書類の日付だけ。車検証の初度登録は元号抜けの '25.10.26'（平成 25 年）と区別できないので受けない（Codex 74）
         return _valid(2000 + int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    m = re.match(r'^(令和|平成|昭和|R|H|S)\s*(\d{1,2}|元)[.年](\d{1,2})(?:[.月](\d{1,2})?)?日?$', t)
+    m = re.match(r'^(令和|平成|昭和|R|H|S)\s*(\d{1,2}|元)[.年/](\d{1,2})(?:[.月/](\d{1,2})?)?日?$', t)
     if m:
         era = m.group(1)[0]
         y = 1 if m.group(2) == '元' else int(m.group(2))
@@ -287,21 +287,33 @@ def vehicle_hint(vd: Optional[dict], doc: Optional[dict] = None) -> dict:
     model = _get(vd, 'car_model') or _get(vd, 'model_code') or _get(doc, 'model')
     desig = re.sub(r'\D', '', _nfkc(_get(vd, 'car_model_designation') or _get(doc, 'desig')))
     cat = re.sub(r'\D', '', _nfkc(_get(vd, 'car_category_number') or _get(doc, 'category')))
+    if len(desig) > 5 or len(cat) > 4:   # 桁あふれ（'12345-0002' のような書き方）は写さない（要確認は resolver が出す。バグハント I12）
+        desig, cat = (desig if len(desig) <= 5 else ''), (cat if len(cat) <= 4 else '')
     out = {
         'model_code': strip_emission_prefix(model) if model else '',
         'serial_no': _nfkc(_get(vd, 'car_serial_no') or _get(doc, 'serial_no')).upper(),
         'desig': desig.zfill(5) if desig else '',   # 型式指定番号は 5 桁（Codex 70）
         'category': cat.zfill(4) if cat else '',
-        'reg_date': reg_date_wareki(_get(vd, 'car_reg_date') or _get(doc, 'first_reg')),
+        'reg_date': reg_date_wareki(_get(vd, 'car_reg_date')) or reg_date_wareki(_get(doc, 'first_reg')),   # 解析後の値で書類に落とす（I1）
         'color_code': _nfkc(_get(vd, 'color_code') or _get(doc, 'color_code')).upper(),
     }
     return {k: v for k, v in out.items() if v}
 
 
+def postal_text(v) -> str:
+    """郵便番号を 'NNN-NNNN' に（〒・空白・全角を除く。7 桁にならなければ ''。推測値や壊れた値を NEO に入れない。バグハント I7）"""
+    t = re.sub(r'[〒\s\-‐－ー]', '', _nfkc(v))
+    m = re.fullmatch(r'(\d{3})(\d{4})', t)
+    return f'{m.group(1)}-{m.group(2)}' if m else ''
+
+
 def customer_hint(vd: Optional[dict], doc: Optional[dict] = None) -> dict:
     """reading.customer に補う値（NEO の顧客欄: 名前・登録番号・住所・有効期限・所有者・走行距離）"""
     user, owner = _name(vd, doc)
-    km = parse_km(_get(vd, 'kilometer') or _get(doc, 'mileage'))
+    km = parse_km(_get(vd, 'kilometer'))
+    if km.lstrip('0') == '':   # 車検証 OCR の kilometer は読めないと 0（'0' は真なので or では落ちない）: 書類の走行距離を使う（バグハント I1）
+        km = parse_km(_get(doc, 'mileage'))
+    pref, muni, other = split_address(_get(vd, 'prefecture'), _get(vd, 'municipality'), _get(vd, 'address_other'))
     out = {
         'name': user,
         'owner': owner,
@@ -311,8 +323,10 @@ def customer_hint(vd: Optional[dict], doc: Optional[dict] = None) -> dict:
         'user_name': user if (owner and user and owner != user) else '',
         'reg_no': reg_no_text(vd, doc),
         'address': address_text(vd),
-        'postal': _nfkc(_get(vd, 'postal_no')),
-        'term_date': date8_full(_get(vd, 'term_date') or _get(doc, 'term_date')),
+        # 車検証の構造化住所（生成器は 1 本の住所を正規表現で分けるので「四日市市」を切り違える。あればそのまま使う。I2）
+        'prefecture': pref, 'municipality': muni, 'address_other': other,
+        'postal': postal_text(_get(vd, 'postal_no')),
+        'term_date': date8_full(_get(vd, 'term_date')) or date8_full(_get(doc, 'term_date')),
         'kilometer': km.lstrip('0') or ('0' if km else ''),
     }
     return {k: v for k, v in out.items() if v}
@@ -400,6 +414,8 @@ def vehicle_info_for_legacy(vd: Optional[dict], doc: Optional[dict] = None) -> d
             out[key] = val
 
     user, owner = _name(vd, doc)
+    if str(out.get('customer_name') or '').strip() in ('同上', '***', '＊＊＊') or set(str(out.get('customer_name') or '').strip()) <= set('*＊'):
+        out['customer_name'] = ''   # 穴（同上・***）は書類の名前で埋める（車検証の所有者が読めず書類にあるとき。バグハント I6）
     fill('customer_name', user)
     fill('owner_name', owner)
     dep, div, biz, ser = parse_reg_no(reg_no_text(vd, doc))

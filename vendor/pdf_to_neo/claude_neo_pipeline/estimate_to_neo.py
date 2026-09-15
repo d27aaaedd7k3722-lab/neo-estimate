@@ -39,6 +39,26 @@ DISPOSAL = {  # AnDefine.ini [WorkSheet] Repair0-9 の真値
 DISPOSAL_NAME = {0: '取替', 1: '脱着', 2: '修理', 3: '脱着修理', 4: '点検調整', 5: '分解調整', 6: '板金'}  # 4 はコグニ保存版で '点検調整'（NONE_dc.neo 2026-09-05）
 
 
+# 登録番号「地名 分類番号 かな 一連番号」の分割。分類番号は 2〜3 桁のほか、英字入り（30A・3ZX。2018 年〜の希望番号）と
+# 旧式の 1 桁（'5'）も受ける（実機 NEO の CarRegNoDivision は半角数字 + 英字。アプリ側 doc_hints._REG_SPLIT と同じ。2026-09-15）
+REG_NO_RE = re.compile(r'^\s*(\S+?)\s*(\d[0-9A-Z]{0,2})\s*([ぁ-んア-ン])\s*[\-‐]?\s*(\d{1,4})\s*$')
+
+
+def split_address_text(addr: str) -> tuple:
+    """1 本の住所文字列を コグニと同じ 都道府県 / 市区郡 / 以降 に分ける（AddressOther1 は 30 バイト）。
+    市区郡は最短一致なので「四日市市」「蒲郡市」のような名前は切り違える — 車検証 OCR など構造化された住所は
+    customer.prefecture / municipality / address_other で渡せば、この分割を使わない（write_ansvem）"""
+    addr = unicodedata.normalize('NFKC', addr or '')
+    m_ = re.match(r'^(.{2,3}?[都道府県])(.*)$', addr); pref, rest = (m_.group(1), m_.group(2)) if m_ else ('', addr)
+    m_ = re.match(r'^((?:.{1,8}?(?:市|区|郡|町|村))+?)(.*)$', rest)
+    muni, other = (m_.group(1), m_.group(2)) if m_ else ('', rest)
+    if len(muni.encode('cp932w', 'replace')) > 30 or not other:
+        muni, other = '', rest
+    return pref, muni, other
+
+
+
+
 def r10(x: float) -> int:
     """工賃の丸め（Setting.wb_Round の単位で四捨五入。既定 10 円。塗装・内板骨格・付加塗装の工賃に使う）
     1.9×8750=16,625 → 16,630（Python の round は偶数丸めなので使わない）。wage_round=100 のときは塗装側も 100 円丸め（コグニの wb_Round は工賃全体の設定。
@@ -643,6 +663,7 @@ class AddataParts:
         ('ﾊﾞﾝﾊﾟｰﾌｴｲｽ', 'ﾊﾞﾝﾊﾟｶﾊﾞｰ'), ('ﾊﾞﾝﾊﾟﾌｴｲｽ', 'ﾊﾞﾝﾊﾟｶﾊﾞｰ'), ('ﾊﾞﾝﾊﾟｶﾊﾞｰ', 'ﾊﾞﾝﾊﾟﾌｴｲｽ'), ('ﾚｲﾝﾌｵｰｽﾒﾝﾄ', 'ﾘｲﾝﾎｰｽ'), ('ﾚｲﾝﾌｵｰｽ', 'ﾘｲﾝﾎｰｽ'), ('ﾋﾞｰﾑ', 'ﾘｲﾝﾎｰｽ'),
         ('ｴﾝﾌﾞﾚﾑ', 'ｴﾝﾌﾞﾚﾑ(H)'), ('ｽﾃｱﾘﾝｸﾞ', 'ｽﾃｱﾘﾝｸﾞﾎｲｰﾙ'), ('ｺﾝﾃﾞﾝｻｰ', 'ｺﾝﾃﾞﾝｻ'), ('ﾚｼｰﾊﾞｰ', 'ﾚｼｰﾊﾞ'), ('ｾﾂﾄ', ''), ('補機一式', ''), ('一式', ''),
         ('ｸｰﾗｰｶﾞｽ', 'ﾌﾛﾝｶﾞｽ'), ('ｴｱｺﾝｶﾞｽ', 'ﾌﾛﾝｶﾞｽ'),   # エアコンの冷媒（ADDATA は ﾌﾛﾝｶﾞｽ。2026-09-14 スペーシア）
+        ('ｴﾑﾌﾞﾚﾑ', 'ｴﾝﾌﾞﾚﾑ'),   # エムブレム（別表記・読み取りの揺れ）→ ADDATA は ｴﾝﾌﾞﾚﾑ（2026-09-15 スペーシア FAX の読み取りで未照合）
     ]
 
     @staticmethod
@@ -2996,19 +3017,18 @@ class NeoBuilder:
             cur.execute('UPDATE CarSearchEVA SET EVariationName=?, EVariationOrder=? WHERE RecordNo=?', (opts.get(code, ''), f'{i + 1:02d}', i + 1))
         # Customer
         reg = cust.get('reg_no', '')
-        m = re.match(r'^\s*(\S+?)\s*(\d{2,3})\s*([ぁ-んア-ン])\s*[\-‐]?\s*(\d{1,4})\s*$', unicodedata.normalize('NFKC', reg))
+        m = REG_NO_RE.match(unicodedata.normalize('NFKC', reg))
         dep, div, biz, ser = (m.groups() if m else ('', '', '', ''))
         reg_date = car.get('ps_CarRegDate', '')
         era, ey = nc.get_era_info(reg_date) if reg_date else ('令和', '')
         term = cust.get('term_date', '') or '00000000'
         tera, tey = nc.get_era_info(term) if term != '00000000' else ('令和', '')
         # 住所はコグニと同じく 都道府県 / 市区郡 / 以降 に分割（AddressOther1 は 30 バイト）
-        addr = unicodedata.normalize('NFKC', cust.get('address', '') or '')
-        m_ = re.match(r'^(.{2,3}?[都道府県])(.*)$', addr); pref, rest = (m_.group(1), m_.group(2)) if m_ else ('', addr)
-        m_ = re.match(r'^((?:.{1,8}?(?:市|区|郡|町|村))+?)(.*)$', rest)
-        muni, other = (m_.group(1), m_.group(2)) if m_ else ('', rest)
-        if len(muni.encode('cp932w', 'replace')) > 30 or not other:
-            muni, other = '', rest
+        _st = {k: unicodedata.normalize('NFKC', str(cust.get(k) or '')).strip() for k in ('prefecture', 'municipality', 'address_other')}
+        if any(_st.values()):   # 車検証 OCR などの構造化された住所はそのまま（市区郡の名前に 市/郡 を含む住所を切り違えない。2026-09-15）
+            pref, muni, other = _st['prefecture'], _st['municipality'], _st['address_other']
+        else:
+            pref, muni, other = split_address_text(cust.get('address', '') or '')
         cur.execute('''UPDATE Customer SET Name1=?,Name2='',Name3='',Owner='様',PostalNo=?,Prefecture=?,Municipality=?,AddressOther1=?,AddressOther2='',Phone=?,Fax='',
                        CarRegNoDepartment=?,CarRegNoDivision=?,CarRegNoBusiness=?,CarRegNoSerial=?,CarSerialNo=?,CarMouldNo=?,CarKindNo=?,UserName=?,OwnerName=?,
                        TermDate=?,TermEra=?,TermEraYear=?,CarRegDate=?,CarRegEra=?,CarRegEraYear=?,Kilometer=?''',
@@ -3016,7 +3036,7 @@ class NeoBuilder:
                      dep, div, biz, ser, car.get('ps_CarSerialNo', ''), car.get('ps_CarMouldNo', ''), car.get('ps_CarKindNo', ''),
         # 所有者・使用者欄に入るのは owner_name / user_name だけ。customer.owner は車検証の所有者を控えるメモで、
         # コグニ運用では所有者欄に顧客名を入れることが多い（実機 cogni_R1/R2）ため自動では採用しない
-                     cust.get('user_name', '同上'), cust.get('owner_name', cust.get('name', '')), term, tera, tey, reg_date, era, ey, int(cust.get('kilometer') or 0)))
+                     _fit(cust.get('user_name', '同上'), 20), _fit(cust.get('owner_name', cust.get('name', '')), 20), term, tera, tey, reg_date, era, ey, int(cust.get('kilometer') or 0)))
         # Insurance / FileInfo / Setting
         def _date8(v):
             """YYYYMMDD 以外（空・区切り付きで 8 桁にならないもの）は ''。区切り付きでも数字が 8 桁なら受ける。
@@ -3088,7 +3108,7 @@ class NeoBuilder:
     def build_xml(xml: bytes, car: dict, cust: dict, ins: dict, total: int, est_date: str) -> bytes:
         t = xml.decode('cp932', 'replace')
         reg = car.get('ps_CarRegDate', '')
-        m = re.match(r'^\s*(\S+?)\s*(\d{2,3})\s*([ぁ-んア-ン])\s*[\-‐]?\s*(\d{1,4})\s*$', unicodedata.normalize('NFKC', cust.get('reg_no', '')))
+        m = REG_NO_RE.match(unicodedata.normalize('NFKC', cust.get('reg_no', '')))
         dep, div, biz, ser = (m.groups() if m else ('', '', '', ''))
         vals = {'CustomerName1': cust.get('name', ''), 'CustomerName2': '', 'AdjusterName': ins.get('adjuster', ''), 'AcceptNo': ins.get('accept_no', ''), 'TicketNo': ins.get('policy_no', ''),
                 'AccidentDate': (f"{ins['accident_date'][:4]}/{ins['accident_date'][4:6]}/{ins['accident_date'][6:8]}" if ins.get('accident_date') else ''),
@@ -3475,7 +3495,7 @@ class NeoBuilder:
         # AnSvMail.ini（ネオメール連携）: テンプレートの顧客・証券情報を必ず置換（実 NEO 保存版と同形）
         if 'AnSvMail.ini' in files:
             cust = estimate.get('customer', {}); ins = insurance or {}
-            m = re.match(r'^\s*(\S+?)\s*(\d{2,3})\s*([ぁ-んア-ン])\s*[\-‐]?\s*(\d{1,4})\s*$', unicodedata.normalize('NFKC', cust.get('reg_no', '')))
+            m = REG_NO_RE.match(unicodedata.normalize('NFKC', cust.get('reg_no', '')))
             dep, div, biz, ser = (m.groups() if m else ('', '', '', ''))
             mail = '\r\n'.join(['[General]', 'Signature=NEOMAIL2', '[Audaneo2]', f"CustomerName={ins.get('contractor', '')}",
                                 f'CarNoDepartment={dep}', f'CarNoDivision={div}', f'CarNoBusiness={biz}', f'CarNoSerial={ser}',
@@ -3497,7 +3517,7 @@ class NeoBuilder:
         neo = nc.repack_neo(tpl, files, mgmt, entries)
         # 先頭 424B の管理領域（既存見積一覧のサマリ）を今回の見積の値で書き直す
         cust = estimate.get('customer', {}); ins = insurance or {}
-        m = re.match(r'^\s*(\S+?)\s*(\d{2,3})\s*([ぁ-んア-ン])\s*[\-‐]?\s*(\d{1,4})\s*$', unicodedata.normalize('NFKC', cust.get('reg_no', '')))
+        m = REG_NO_RE.match(unicodedata.normalize('NFKC', cust.get('reg_no', '')))
         carno = m.groups() if m else ('', '', '', '')
         neo = nh.apply(neo, agreed=_fit(ins.get('factory', ''), 30), name1=_fit(cust.get('name', ''), 30), car_name=car['CarNameByUser'],
                        created=datetime.date(int(est_date[:4]), int(est_date[4:6]), int(est_date[6:8])),

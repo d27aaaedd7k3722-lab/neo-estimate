@@ -72,6 +72,7 @@ cmd なら `%USERPROFILE%`。迷ったら**絶対パスをそのまま書く**�
 | 4 | `reading.json` に**印字どおり**写す（判断はしない） | reading_schema.md |
 | 5 | `make_neo.py` で 下書き → 突合せ → 生成 → 検算 | SKILL.md §5 |
 | 6 | `_draft_notes` と ★ を判断規則で 1 つずつ解決し、検算が全部 OK になるまで繰り返す | judgment_rules.md |
+| 6-2 | **協定のとき**: 工場見積どおりで合格させてから、`agree_calc.py` で候補を出し、損保の指示の方法（レート／指定行の工賃／骨格→鈑金／塗装一式／材料代）で協定額に合わせる。reading に `target_total` があると NEO の合計がその額でなければ不合格 | SKILL.md §6-2・判断規則 10-14 |
 | 7 | コグニ実機で開いて確認する（**この文書の §5-1 の理由で重要**） | checklist.md |
 | 8 | 納品する（NEO と**確認箇所シート** `<name>_claude_確認箇所.xlsx`（openpyxl が無い PC では `.csv`）を一緒に。人向けのメモは NEO の明細コメントに書かない） | SKILL.md §8・判断規則 10-22 |
 | 9 | 日誌と判断規則に記録する | SKILL.md §9 |
