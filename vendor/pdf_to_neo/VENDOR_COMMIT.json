@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "3551419b6f0630eb1665c305d51348b356fc0511",
- "subject": "feat: insurance.adjuster_post（アジャスターの支店・所属）を NEO の Insurance.AdjusterPost に書く（速報報告書の「支店」。アプリの書類 OCR 用）",
- "synced_at": "2026-09-14T21:30:52",
- "files": 101,
- "tree_sha256": "283a01fef0908e2837157f27f4f8303366fc59287efc60f91d40ef62d39c5a52",
+ "commit": "09e60d0f48f82a0a81ebd4b3bb33281cad9d8b57",
+ "subject": "docs/fix: レートが決まらない要確認文に試した丸め単位と 10 円の倍数でない技術料を出す（レビュー指摘）、HANDOFF に 1 円単位の工場を追記",
+ "synced_at": "2026-09-15T10:28:25",
+ "files": 105,
+ "tree_sha256": "f2622030265f463dada68a0b86bb92d87c7f03f02a5fb54bf53231f6c4b2191d",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

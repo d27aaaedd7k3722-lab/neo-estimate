@@ -32,7 +32,7 @@ from typing import Optional
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
-from draft_estimate import PARTS_NAME_BYTES, ROW_FIELDS, SMALL_WORDS, _cp932_len, _flag, _hw_kana, _num, _side_of, detect_wage_round, expand_row, hw, infer_labor_rate, labor_pairs, rate_score  # noqa: E402
+from draft_estimate import PARTS_NAME_BYTES, ROW_FIELDS, is_small_name, _cp932_len, _flag, _hw_kana, _num, _side_of, detect_wage_round, expand_row, hw, infer_labor_rate, labor_pairs, rate_score  # noqa: E402
 from estimate_to_neo import is_bumper_only_paint  # noqa: E402  （draft_estimate の import で claude_neo_pipeline が sys.path に入る）
 
 def _profiles_path() -> str:
@@ -228,9 +228,8 @@ class Checker:
                 by_pn.setdefault(pn, []).append(r)
 
         def _small(r: dict) -> bool:  # クリップ・ボルト等の小物や安価品は左右で同じ品番が普通
-            n = _hw_kana(r.get('name') or '')
             unit = (_int(r.get('price')) or 0) // max(1, _int(r.get('qty')) or 1)
-            return any(w in n for w in SMALL_WORDS) or 0 < unit < 1000
+            return is_small_name(r.get('name') or '', unit) or 0 < unit < 1000   # ｸﾘｯﾌﾟ（小書き）も小物（2026-09-14 まで ｸﾘﾂﾌﾟ としか比べていなかった）
 
         def _plain(r: dict) -> str:
             return re.sub(r'^(右|左|RH|LH|R/H|L/H|R\.|L\.)\s*', '', _hw_kana(r.get('name') or '')).replace(' ', '')

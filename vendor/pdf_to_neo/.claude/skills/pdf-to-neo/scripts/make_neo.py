@@ -321,10 +321,20 @@ def main() -> int:
             print('意図との突き合わせで例外:', type(e).__name__, e)
     intent_ng = bool(intent['hard'])
     ok = ok and not intent_ng
+    # 6) 過去 NEO の索引（corpus_lookup.py build で作る。無ければ何もしない）: 工場名の書き方が過去と違う・同じ案件らしい NEO がある → 確認箇所シートへ
+    corpus_rev: list = []
+    if ok and rep:
+        try:
+            import corpus_lookup
+            corpus_rev = corpus_lookup.hints(est, stage if os.path.exists(stage) else '')
+            for _e in corpus_rev:
+                print(f"  [過去 NEO] {_e['text']}")
+        except Exception as e:  # noqa: BLE001  手掛かりなので合否には影響させない
+            print('過去 NEO の索引を引けなかった（合否には影響しない）:', type(e).__name__, e)
     review_path = ''
     if rep:
         try:
-            review_path = write_review(case, name, est, rows, rep, inspect_json, check, audit_lines, out, intent['hard'] + intent['soft'])
+            review_path = write_review(case, name, est, rows, rep, inspect_json, check, audit_lines, out, intent['hard'] + intent['soft'] + corpus_rev)
             print('確認箇所シート:', review_path)
         except Exception as e:  # noqa: BLE001
             print('確認箇所シートの生成で例外:', type(e).__name__, e)

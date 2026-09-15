@@ -8,6 +8,7 @@
   5〜9. 壊れた JSON の言い直し / 読み直し上限 / 保険情報の補い / 作業フォルダの後始末 / プロセスを汚さないこと
   10. 明細の無いページ（表紙・計算書）は blocks を空ブロックにして検算を通す（vendor の validate_page は空リストを FAIL にする）
   11. 不合格のとき、人が直すための一式（pages/・reading.json）を zip にできる
+  13. 読み手が index_policy=manual と書いても区分がコグニ語彙（または区分の印字なし）なら auto に戻す（「部品」があれば残す）
 
     python tests/reg_reader.py
 終了コード: 0 全部 OK / 1 失敗
@@ -114,6 +115,16 @@ def main() -> int:
         fails.append('読み直しの指示文に FAIL の文言（rows_printed）が入っていない')
     if len(fake.prompts) >= 3 and '行を消したり金額を動かしたりしない' not in fake.prompts[2]:
         fails.append('読み直しの指示文に「合計合わせをしない」が入っていない')
+    # header の指示文: お客様の郵便番号・住所を雛形に持ち、工賃の丸め・消費税の端数処理は推測で書かせない（2026-09-15 スペーシア FAX 見積:
+    # 住所が NEO に入らず、tax_round の推測で Setting.tx_ArrangeFlag が変わっていた）
+    if fake.prompts:
+        _h = fake.prompts[0]
+        if '"postal"' not in _h or '"address"' not in _h:
+            fails.append('header の雛形に customer.postal / customer.address が無い')
+        if 'wage_round / tax_round: 書かない' not in _h:
+            fails.append('header の指示文に「wage_round / tax_round は書かない」が無い')
+        if '工場（発行元）の住所は issuer' not in _h:
+            fails.append('header の指示文に「工場の住所は customer に入れない」が無い')
     if not os.path.isfile(os.path.join(case, 'pages', 'page_1.json')) or not os.path.isfile(os.path.join(case, 'pages', 'header.json')):
         fails.append('pages/ が書かれていない')
     if os.path.isfile(os.path.join(case, 'reading.json')):
@@ -130,6 +141,48 @@ def main() -> int:
             fails.append('NEO と確認箇所シートが組で出ていない')
         if not os.path.isfile(os.path.join(case, 'reading.json')):
             fails.append('make_neo が pages/ から reading.json を作っていない')
+    shutil.rmtree(case, ignore_errors=True)
+
+    # ── 13: 読み手が index_policy=manual と書いても、区分がコグニ語彙（取替/脱着 …）か区分の印字が無ければ auto に戻し、注意に出す。
+    #        書式 C の目印「部品」があれば読み手の判断を残す（2026-09-15 スペーシア FAX 見積）
+    case = tempfile.mkdtemp(prefix='reg_reader_')
+    h_manual = json.loads(json.dumps(HEADER))
+    h_manual['index_policy'] = 'manual'
+    fake = FakeReader([h_manual, PAGE_OK])
+    res = reader.read_estimate(pdf, reader=fake, case_dir=case, source_name='test.pdf')
+    if res.header.get('index_policy'):
+        fails.append(f"コグニ語彙なのに index_policy=manual が残っている: {res.header.get('index_policy')}")
+    if not any('index_policy=manual を外して' in w for w in (res.check.get('warn') or [])):
+        fails.append(f'index_policy を外した注意が check.warn に無い: {res.check.get("warn")}')
+    try:
+        with io.open(os.path.join(case, 'pages', 'header.json'), encoding='utf-8') as fh:
+            hj = json.load(fh)
+        if hj.get('index_policy'):
+            fails.append('pages/header.json に index_policy=manual が残っている')
+    except OSError as e:
+        fails.append(f'pages/header.json が読めない: {e}')
+    if not res.ok:
+        fails.append(f'index_policy を外した後に読み取りが ok にならない: {res.fails()}')
+    shutil.rmtree(case, ignore_errors=True)
+    case = tempfile.mkdtemp(prefix='reg_reader_')
+    page_b = json.loads(json.dumps(PAGE_OK))
+    page_b['blocks'][0]['rows'] = ['|Rrﾊﾞﾝﾊﾟ||71501-TY0-000ZZ|1.00|1|45000|8000||', '|Rrﾊﾞﾝﾊﾟ|||1.00|1||8000||']   # 区分の列が無い書式
+    fake = FakeReader([h_manual, page_b])
+    res = reader.read_estimate(pdf, reader=fake, case_dir=case, source_name='test.pdf')
+    if res.header.get('index_policy'):
+        fails.append('区分が全行空欄なのに index_policy=manual が残っている')
+    if not any('区分の印字が無い' in w for w in (res.check.get('warn') or [])):
+        fails.append(f'区分空欄で index_policy を外した注意が無い: {res.check.get("warn")}')
+    shutil.rmtree(case, ignore_errors=True)
+    case = tempfile.mkdtemp(prefix='reg_reader_')
+    page_c = json.loads(json.dumps(PAGE_OK))
+    page_c['blocks'][0]['rows'] = ['|Rrﾊﾞﾝﾊﾟ|部品|71501-TY0-000ZZ|1.00|1|45000|8000||', ROWS[1]]
+    fake = FakeReader([h_manual, page_c])
+    res = reader.read_estimate(pdf, reader=fake, case_dir=case, source_name='test.pdf')
+    if res.header.get('index_policy') != 'manual':
+        fails.append('区分「部品」（書式 C）なのに index_policy=manual を外した')
+    if any('index_policy=manual を外して' in w for w in (res.check.get('warn') or [])):
+        fails.append('書式 C で index_policy を外した注意が出ている')
     shutil.rmtree(case, ignore_errors=True)
 
     # ── 4: 合計欄が合わない（header の totals が違う）。header 読み直し・ページ読み直しでも同じ → ok=False で止まる

@@ -60,8 +60,8 @@ python .claude/skills/pdf-to-neo/scripts/make_neo.py <作業フォルダ> --name
 | 突合せ | `inspect_estimate.main(estimate_path, out_json)` | 戻り値は終了コード（0/1）。要確認（★）は `out_json` の `warnings` に書かれる |
 | 生成・検算 | `run_case.main(estimate_path, out_neo)`（CLI は `run_case.py <estimate.json> <out.neo>`） | 戻り値 True = 合格（NEO を `out_neo` に置く）/ False（`.ng.neo` に隔離）。検算 11 項目と ★ は標準出力。**`NeoBuilder().build()` は NEO のバイト列と行を返すだけで検算・関門を通らないので、合否には使わない** |
 | 意図との突き合わせ | `intent_check.check(estimate, neo_path)` | `{'hard': [...], 'soft': [...], 'rows'}`。hard が 1 件でもあれば不合格（make_neo と同じ） |
-| 確認箇所シート | `review_sheet.collect(est, rows, inspect_warn, check, audit_lines, run_out, extra=hard+soft)` → `review_sheet.write(path, entries, est, rows, rep)`（rows は `run_case._rows_in_source_order(rep['rows'])` で見積の並びに戻したもの） | xlsx（openpyxl が無ければ .csv）のパス |
-
+| 過去 NEO の手掛かり（任意） | `corpus_lookup.hints(est, 生成した.neo)`（索引 `<NEO_CHECK_ROOT>/_zdocs/corpus_index.json` を `corpus_lookup.py build` で作っておく。無ければ `[]`） | 確認箇所シートの行と同じ形の dict のリスト（工場名の書き方が過去 NEO と違う・同じ車種と合計の過去 NEO がある）。make_neo は `extra` に足す。合否には使わない |
+| 確認箇所シート | `review_sheet.collect(est, rows, inspect_warn, check, audit_lines, run_out, extra=hard+soft+過去 NEO)` → `review_sheet.write(path, entries, est, rows, rep)`（rows は `run_case._rows_in_source_order(rep['rows'])` で見積の並びに戻したもの） | xlsx（openpyxl が無ければ .csv）のパス |
 | 答え合わせ（任意・納品後） | `neo_compare.compare(neo_compare.load(納品した.neo), neo_compare.load(確報に使った.neo))` → `neo_compare.report(res)` | `{'rows', 'matched', 'diffs', 'only_mine', 'only_other', 'style', 'totals'}`。合否には使わない（振り返り用。判断規則 10-24） |
 
 B で組むときも、**合否の判定は `make_neo.py` の `main()` と同じ条件**にすること（部分的に真似ると関門が抜ける）。
@@ -87,6 +87,7 @@ B で組むときも、**合否の判定は `make_neo.py` の `main()` と同じ
 部品コードの推測、左右の分割、数量の読み替え、区分の言い換え、レバーレートの決定、塗装パネルの組み立て、費用の分類 —— **すべて `draft_estimate.py` がする**。
 LLM は「紙に書いてあるとおり」だけを出す。人が読んで気になった点は comment に書き、確かめてほしい点は `要確認:` で始める
 （確認箇所シートの 要確認 になる）。見積書に**印字された**明細コメントだけ `NEO:` を付ける（NEO の明細コメントになる。それ以外は NEO に書かない）。
+部品名の語順も印字どおりにする（「グリル ラジエータ」を「ラジエータグリル」に直さない）。逆順の名前は照合側（`AddataParts.find_ref` の語順入替）が引き直す（判断規則 10-27）。
 
 ### 3-3. 読み直しのループ（このセッションと同じ進め方）
 

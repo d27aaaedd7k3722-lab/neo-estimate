@@ -82,7 +82,7 @@ def build_system_prompt() -> str:
 HEADER_TEMPLATE = {
     'source': '', 'issuer': '', 'est_date': '', 'format': '',
     'vehicle': {'model_code': '', 'serial_no': '', 'desig': '', 'category': '', 'reg_date': '', 'color_code': ''},
-    'customer': {'name': '', 'reg_no': ''}, 'insurance': {'company': ''},
+    'customer': {'name': '', 'reg_no': '', 'postal': '', 'address': ''}, 'insurance': {'company': ''},
     'labor_rate': None,
     'paint': {}, 'expenses': [],
     'totals': {'parts': None, 'wage': None, 'paint': None, 'material': None, 'expense': None, 'taxable': None, 'tax': None, 'total': None},
@@ -108,13 +108,15 @@ def header_task(n_pages: int, vehicle_hint: Optional[dict] = None, source_name: 
 書くキー（無いものは省く。値が読めないキーは空文字か null）: {', '.join(HEADER_KEYS)}
 - source: "{source_name or 'estimate.pdf'} 書式X"（書式は format_catalog.md の A〜G）
 - vehicle: 登録番号・車台番号・型式・型式指定/類別・初度登録（reg_date は "R4.3" のような印字どおり）・カラーNo・グレード名・エンジン・排気量のうち印字されているもの
-- customer / insurance: 印字されているもの（氏名・登録番号・保険会社・証券番号など）
+- customer: お客様（宛名）の氏名・登録番号・郵便番号（postal）・住所（address）のうち印字されているもの。工場（発行元）の住所は issuer に書き、customer には入れない
+- insurance: 印字されているもの（保険会社・証券番号など）
 - labor_rate: 印字されていればその値。無ければ書かない（プログラムが工賃÷指数で逆算する）
+- wage_round / tax_round: 書かない（工賃の丸め単位・消費税の端数処理は、印字の工賃と合計欄からプログラムが判定する。推測で書くとコグニの設定が変わる）
 - paint: 塗料・塗膜・高機能塗装・材料代・材料代割合・塗装工賃計（lines はページ側の paint_lines に書くので、ここでは lines を書かない）
 - expenses: **ここには書かない**（費用・諸費用は、印字されたページ側の expenses に書く。header とページの両方に書くと「費用の同じ行が 2 回ある」で不合格）
 - totals: 合計欄そのまま（parts / wage / paint / material / expense / taxable / tax / total。印字されている項目だけ。税込印字の見積書は reading_schema.md の規則どおり）
-- index_policy: 非コグニ書式（指数の列が無い・区分語彙が違う）なら "manual"、それ以外は "auto"
-- format: A〜G
+- index_policy: 区分の語彙がコグニと違う書式（日産系 FAX の「部品」など。format_catalog.md の C）だけ "manual"。指数の欄が空欄でも、技術料だけの書式でも、区分が 取替/脱着/修理/板金 ならコグニ系の書式なので書かない（auto）
+- format: A〜G。指数の列が**あって空欄**なら B（他システム印刷。コグニ利用工場の概算見積は指数を隠して印字することがある）、指数の列**自体が無く**技術料だけなら F
 
 雛形:
 {json.dumps(HEADER_TEMPLATE, ensure_ascii=False, indent=1)}{hint}

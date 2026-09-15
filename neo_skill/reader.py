@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import time
+import unicodedata
 from typing import Callable, Optional
 
 from . import llm as llm_mod
@@ -300,6 +301,49 @@ def _pages_for_merge(header: dict, pages: list) -> tuple:
     return hdr, out
 
 
+# コグニの区分語彙（estimate_to_neo.DISPOSAL のうちコグニ帳票で使われる語 ＋ 書式 B の「塗装」）。「部品」は日産系 FAX（書式 C）の目印なので入れない
+_COGNI_METHODS = {'取替', '脱着', '修理', '脱着修理', '脱着板金', '脱着鈑金', '板金', '鈑金', '点検', '調整', '点検調整', '分解調整', '塗装'}
+
+
+def _row_methods(pages: list) -> set:
+    """pages の明細行（"code|name|method|…" の文字列か dict）から区分の集合（NFKC・空白除去。空欄は数えない）"""
+    out: set = set()
+    for p in pages or []:
+        if not isinstance(p, dict):
+            continue
+        for b in p.get('blocks') or []:
+            if not isinstance(b, dict):
+                continue
+            for r in b.get('rows') or []:
+                if isinstance(r, str):
+                    parts = r.split('|')
+                    m = parts[2] if len(parts) > 2 else ''
+                elif isinstance(r, dict):
+                    m = r.get('method') or ''
+                else:
+                    continue
+                m = unicodedata.normalize('NFKC', str(m)).replace(' ', '').strip()
+                if m:
+                    out.add(m)
+    return out
+
+
+def _index_policy_guard(header: dict, pages: list) -> Optional[str]:
+    """読み手が index_policy=manual と書いたが、区分の語彙がコグニのものなら auto に戻す（戻す理由の文を返す。戻さないなら None）。
+    manual は書式 C（日産系 FAX。区分に「部品」等、コグニと違う語彙）だけ（reading_schema.md / format_catalog.md）。指数欄が空欄・
+    技術料だけの見積で manual にすると、連動・吸収の標準が 0 になる行が手入力工賃（標準なし）で書かれ、スキル（Claude）の読みと
+    NEO が変わる（2026-09-15 スペーシア FAX 見積: ヘッドランプ・フードヒンジの標準指数が消えた）。区分にコグニ以外の語（部品・交換・
+    取付・修正 など）が 1 つでもあれば読み手の判断を残す。区分が全行空欄（作業区分の列が無い書式 F など）は「語彙が違う」証拠ではないので外す"""
+    if str(header.get('index_policy') or '').strip().lower() != 'manual':
+        return None
+    methods = _row_methods(pages)
+    if not methods <= _COGNI_METHODS:
+        return None
+    vocab = ('区分が ' + '・'.join(sorted(methods)) + ' のコグニ語彙') if methods else '区分の印字が無い'
+    return ('index_policy=manual を外して auto にした（' + vocab + '。manual は日産系 FAX のように'
+            '区分の語彙が違う書式だけ。指数欄が空欄でも技術料だけでも、コグニ語彙なら標準指数と突き合わせて写す）')
+
+
 def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str = '',
                   vehicle_hint: Optional[dict] = None, insurance_hint: Optional[dict] = None, max_retries: int = 3,
                   customer_hint: Optional[dict] = None,
@@ -312,6 +356,7 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
         return _runner(op, addata_root=addata_root, **kw)
 
     usage = _Usage()
+    guard_notes: list = []   # index_policy を戻した理由（check.warn に載せて画面の「読み取りの注意」に出す）
     res = ReadResult(False, case_dir)
     t0 = time.time()
     try:
@@ -388,6 +433,11 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
             pages.append(page)
             res.traces.append(tr)
         res.pages = pages
+        _g = _index_policy_guard(header, pages)
+        if _g:
+            header = {k: v for k, v in header.items() if k != 'index_policy'}; res.header = header
+            if _g not in guard_notes:
+                guard_notes.append(_g)
         maker.write_pages(case_dir, *_pages_for_merge(header, pages))
         # 3) 束ねて合計欄を検算
         m = run('merge', case_dir=case_dir)
@@ -416,10 +466,18 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
                         new_pages.append(page)
                 pages = new_pages
                 res.pages = pages
+            _g = _index_policy_guard(header, pages)
+            if _g:
+                header = {k: v for k, v in header.items() if k != 'index_policy'}; res.header = header
+                if _g not in guard_notes:
+                    guard_notes.append(_g)
             maker.write_pages(case_dir, *_pages_for_merge(header, pages))
             m = run('merge', case_dir=case_dir)
             rd, check = m.get('reading'), (m.get('check') or {})
             res.merge_messages = list(m.get('messages') or [])
+        if guard_notes:   # 戻した理由は合計欄の検算の注意と同じ列に（app は check.warn を「読み取りの注意」に出す）
+            check = dict(check or {})
+            check['warn'] = list(check.get('warn') or []) + guard_notes
         res.check = check or {}
         res.reading = rd
         res.ok = bool(rd) and not (check or {}).get('fail') and all(t.ok for t in res.traces)

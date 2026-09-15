@@ -177,7 +177,7 @@ flags: `M` = manual（ADDATA に無い品目）、`R` = reserve（保留）、`N
 | `note` | `"…"` | 転記メモ（merge で header に通る。生成には使わない） |
 | `target_total` | `715000` | 協定額（税込）。塗装材料代で自動調整する |
 | `adas` | `[{"name": "フロントカメラエーミング", "time": 1.0, "wage": 8000}]` | ADAS のエーミング作業（生成器の `estimate['adas']` にそのまま渡る） |
-| `insurance` | `{"company": …, "policy_no": …, "contractor": …, "accident_date": "20260901", "accept_no": …, "agency": …, "adjuster": …, "garage_in": "20260903", "garage_out": …, "repair_days": 5}` | 速報・案件情報。draft がそのまま estimate に渡し、生成器が Insurance / FileInfo / XML に書く（`estimate_schema.md`）。日付は YYYYMMDD |
+| `insurance` | `{"company": …, "policy_no": …, "contractor": …, "accident_date": "20260901", "accept_no": …, "agency": …, "adjuster": …, "garage_in": "20260903", "garage_out": …, "repair_days": 5}` | 速報・案件情報。draft がそのまま estimate に渡し、生成器が Insurance / FileInfo / XML に書く（`estimate_schema.md`）。日付は YYYYMMDD。`factory` は「半角カナ略称 電話番号（ハイフン無し）」、画像鑑定は「写真鑑定」、長い `contractor` は 20 バイトで切った形（判断規則 10-28。`corpus_lookup.py factory <電話>` で過去の書き方を引く） |
 | `_merged_from` | — | `reading_pages.py merge` が付ける（何ページを束ねたか） |
 
 行の印は短縮記法の `flags`（`$ # * @` と M 手入力 / R 保留 / N 注記）か、dict 行の `mark` に書く。

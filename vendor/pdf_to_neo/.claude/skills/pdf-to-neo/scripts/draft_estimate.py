@@ -55,6 +55,34 @@ def part_names() -> dict:
 EXTRA_ALIASES = [('ﾌｴﾝﾀﾞｰﾗｲﾅｰ', 'ﾌｴﾝﾀﾞｽﾌﾟﾗﾂｼﾕｼｰﾙﾄﾞ'), ('ﾌｴﾝﾀﾞﾗｲﾅ', 'ﾌｴﾝﾀﾞｽﾌﾟﾗﾂｼﾕｼｰﾙﾄﾞ'), ('ﾌｴﾝﾀﾞﾗｲﾅ', 'ﾌｴﾝﾀﾞﾌﾟﾛﾃｸﾀ'),
                  ('ﾌﾛﾝﾄｶﾞﾗｽ', 'ｳｲﾝﾄﾞｼｰﾙﾄﾞｶﾞﾗｽ'), ('ﾃｰﾙﾗﾝﾌﾟ', 'ﾘﾔｺﾝﾋﾞﾈｰｼﾖﾝﾗﾝﾌﾟ'), ('ﾊﾞﾝﾊﾟｰ', 'ﾊﾞﾝﾊﾟ')]  # トヨタ: フェンダライナ = フェンダスプラッシュシールド
 SMALL_WORDS = ('ｸﾘﾂﾌﾟ', 'ﾘﾃｰﾅ', 'ｸﾞﾛﾒﾂﾄ', 'ｽｸﾘﾕ', 'ﾎﾞﾙﾄ', 'ﾅﾂﾄ', 'ﾋﾟｰｽ', 'ｼｰﾙ', 'ｶﾊﾞｰ', 'ﾌﾞﾗｹﾂﾄ', 'ｽﾃｰ', 'ｸﾂｼﾖﾝ', 'ﾊﾟﾂﾄﾞ', 'ﾓｰﾙ', 'ｼｰﾙﾄﾞ', 'ｶﾞｰﾄﾞ', 'ﾌﾟﾛﾃｸﾀ')
+# 名称照合の減点（候補にだけある小物語）は、norm_name 済み（長音を除く）の名前と比べるので長音の無い語だけ使う。長音を除くと
+# ｼｰﾙ → ｼﾙ（ｻｲﾄﾞｼﾙ）・ｽﾃｰ → ｽﾃ（ｽﾃｯﾌﾟ）・ﾋﾟｰｽ → ﾋﾟｽ（ﾋﾟｽﾄﾝ）のように大物に当たる（2026-09-15 検証）
+SMALL_WORDS_N = tuple(w for w in SMALL_WORDS if 'ｰ' not in w)
+
+
+# 小物の判定に使う語（カバー・モール・シールド・ガード・プロテクタは バンパカバー・ウインドシールドガラス のような大物にも付くので入れない）
+SMALL_CORE = ('ｸﾘﾂﾌﾟ', 'ﾘﾃｰﾅ', 'ｸﾞﾛﾒﾂﾄ', 'ｽｸﾘﾕ', 'ﾎﾞﾙﾄ', 'ﾅﾂﾄ', 'ﾋﾟｰｽ', 'ｼｰﾙ', 'ｸﾂｼﾖﾝ', 'ﾊﾟﾂﾄﾞ', 'ﾌﾞﾗｹﾂﾄ', 'ｽﾃｰ', 'ﾌｱｽﾅ', 'ﾜﾂｼﾔ')
+
+
+def is_small_name(name: str, unit: int = 0) -> bool:
+    """クリップ・リテーナ・グロメット等の小物の名前か。半角化・小書き → 大書き（長音は残す）にして、名前の**最後の語**が小物の語で終わるか
+    （「名詞 修飾」の逆順の名前なら先頭の語が小物の語か）で決める。部分一致だと ﾌﾛﾝﾄﾊﾞﾝﾊﾟｶﾊﾞｰ・ｳｲﾝﾄﾞｼｰﾙﾄﾞｶﾞﾗｽ・ｻｲﾄﾞｼﾙ まで小物になる（2026-09-15 Codex・検証）。
+    語末の長音（ﾘﾃｰﾅｰ・ﾜｯｼｬｰ）・「類／等／一式」・×12 は落として比べる。unit（1 個あたりの金額）が 3,000 円を超える行は小物にしない（ｴﾝｼﾞﾝﾏｳﾝﾃｨﾝｸﾞｸｯｼｮﾝ 等）"""
+    if unit and unit > 3000:
+        return False
+    t = hw(name or '').translate(str.maketrans('ｧｨｩｪｫｬｭｮｯ', 'ｱｲｳｴｵﾔﾕﾖﾂ')).upper().replace('-', 'ｰ')
+    t = re.sub(r'\(.*?\)|（.*?）', ' ', t)
+    t = re.sub(r'[×X*]\d+', ' ', t)
+    toks = [x for x in t.split() if not re.fullmatch(r'NO\.?\d+|#\d+|\d+|ASSY\.?|SUB|付属品', x)]
+    toks = [re.sub(r'(類|等|一式)$', '', x).rstrip('ｰ') for x in toks]
+    toks = [x for x in toks if x]
+    if toks and re.fullmatch(r'左|右|LH|RH|[LR]', toks[0]):
+        toks = toks[1:]
+    if not toks:
+        return False
+    words = [w.rstrip('ｰ') for w in SMALL_CORE]
+    head = re.sub(r'^(左|右|LH|RH)', '', toks[0])
+    return any(''.join(toks).endswith(w) for w in words) or (len(toks) > 1 and head in words)
 
 
 def _nfkc(s) -> str:
@@ -491,7 +519,7 @@ class Drafter:
             c = self.parts.norm_name(n20)
             c1 = re.sub(r'^[LR](?=[^A-Z])', '', c) if s20 else c
             s = difflib.SequenceMatcher(None, c1, n0).ratio()
-            s -= 0.3 * sum(1 for w in SMALL_WORDS if w in c1 and w not in n0)  # 候補にだけある小物語（クリップ等）は別部品
+            s -= 0.3 * sum(1 for w in SMALL_WORDS_N if w in c1 and w not in n0)  # 候補にだけある小物語（クリップ等）は別部品
             best = max(best, s)
         return best
 
@@ -508,9 +536,16 @@ class Drafter:
         if not u0 or price == u0 * qty:
             return ref, why, qty, ''
         s0 = self._name_sim(name, ref, side)
+        if s0 < 0 and not side:   # 左右の無い名前（ｸﾘｯﾌﾟ）と片側だけの部品（L ｸﾘﾂﾌﾟ）: その側で測る（-1 のままだと数量の読み替えが止まり別の部位に替わる。2026-09-15 検証）
+            _s_ref = {_side20(x) for x in self.parts.name20_by_ref.get(ref, ()) if _side20(x)}
+            if len(_s_ref) == 1:
+                s0 = self._name_sim(name, ref, next(iter(_s_ref)))
         colored = ref in (self.raw83 or {})  # 色別部品は色で単価が変わるので数量の読み替えはしない
         n0 = price // u0 if (qty == 1 and price % u0 == 0) else 0
-        div_ok = (not colored) and 2 <= n0 <= self.QTY_FROM_PRICE_MAX and u0 <= self.QTY_FROM_PRICE_UNIT_MAX
+        # 名前だけで決めた行（may_switch）は、名前がほぼ同じ（0.9 以上）部品のときだけ数量を読み替える。名前が近いだけの別部品を
+        # 標準単価の倍数で 2 個・3 個にしない（部品コード・品番で決まった行はこれまでどおり。2026-09-14 Codex 指摘）
+        div_ok = ((not colored) and 2 <= n0 <= self.QTY_FROM_PRICE_MAX and u0 <= self.QTY_FROM_PRICE_UNIT_MAX
+                  and (not may_switch or s0 >= 0.99 or (s0 >= 0.9 and is_small_name(name))))   # 名前だけの行は、名前が同じか、小物で 0.9 以上のときだけ
         self._price_check = (f'金額 {price:,} 円が標準単価 {u0:,} 円のちょうど {n0} 倍。数量 {n0} の可能性がある（標準単価 {self.QTY_FROM_PRICE_UNIT_MAX:,} 円を超える部品なので自動では直さない）'
                              if (not colored and 2 <= n0 <= self.QTY_FROM_PRICE_MAX and u0 > self.QTY_FROM_PRICE_UNIT_MAX) else '')
         blk0 = self.parts.block_of(ref)
@@ -541,7 +576,10 @@ class Drafter:
                 if s < 0.85:
                     continue
                 u = self._std_unit(r)
-                if u and price % u == 0 and (price // u == 1 or (2 <= price // u <= self.QTY_FROM_PRICE_MAX and u <= self.QTY_FROM_PRICE_UNIT_MAX)):  # 数量を変えるのは小物だけ（Codex 指摘）
+                # 数量も変える（2 個以上）のは、名前がほぼ同じ（0.9 以上）で、小物か同じ部位の部品のときだけ（名前が近いだけの別部品を
+                # 金額の倍数で数量化しない。2026-09-15 Codex 指摘）
+                _qty_ok = s >= 0.9 and (is_small_name(name) or self.parts.block_of(r) in (blk0, ctx_block))
+                if u and price % u == 0 and (price // u == 1 or (2 <= price // u <= self.QTY_FROM_PRICE_MAX and u <= self.QTY_FROM_PRICE_UNIT_MAX and _qty_ok)):  # 数量を変えるのは小物だけ（Codex 指摘）
                     key = (round(s, 3), 1 if self.parts.block_of(r) in (blk0, ctx_block) else 0, -r)
                     if best is None or key > best[0]:
                         best = (key, r, u)
@@ -552,6 +590,25 @@ class Drafter:
                     f'部品コード {ref:04d} → {r_b:04d}' + (f'、数量 1 → {n_b}' if n_b > 1 else '') + f'（金額 {price:,} = 標準単価 {u_b:,} × {n_b}）')
         return ref, why, qty, ''
 
+    def _price_candidates(self, name: str, side: str, price: int, qty: int, ctx_block: str, limit: int = 3) -> str:
+        """名称で決まらなかった行に、この車の標準単価が見積の単価と同じ部品を名前の近い順に最大 3 つ挙げる（find_ref_by_price を手で回す手間を省く）。
+        左右が食い違う部品は除く。候補が多すぎる（10 超）単価は偶然の一致が多いので、名前が 0.5 以上近いものだけ"""
+        if not price or price <= 0 or qty <= 0 or price % qty:
+            return ''
+        unit = price // qty
+        refs = [r for r in self._refs_by_price().get(unit, ()) if self._std_unit(r) == unit]
+        scored = []
+        for r in refs:
+            sim = self._name_sim(name, r, side)
+            for rn in self.parts.reordered_names(name):
+                sim = max(sim, self._name_sim(rn, r, side))
+            if sim < 0 or (len(refs) > 10 and sim < 0.5):
+                continue
+            scored.append((round(sim, 2), 1 if (ctx_block and self.parts.block_of(r) == ctx_block) else 0, -r, r))
+        scored.sort(reverse=True)
+        return ' / '.join(f"{r:04d} {'/'.join(sorted(x.strip() for x in self.parts.name20_by_ref.get(r, ())))}（標準 {unit:,} 円・名前 {sim:.2f}）"
+                          for sim, _b, _n, r in scored[:limit])
+
     # ------------------------------------------------------------------ 明細
     def _refs_in_block(self, block: str) -> list[int]:
         return [r for r, b in self.parts.block_by_ref.items() if b == block]
@@ -560,12 +617,18 @@ class Drafter:
         """ブロック内の 12.DB 名称と照合（言い換え辞書込み）。左右は名称の先頭 L/R と一致するものだけ"""
         if not block:
             return None, 0.0
-        n0 = self.parts.norm_name(name)
-        variants = list(self.parts._name_variants(n0))
+        variants = list(self.parts._name_variants(name))
         for a, b in EXTRA_ALIASES:
             for base in list(variants):
                 if a in base and base.replace(a, b) not in variants:
                     variants.append(base.replace(a, b))
+        rot = []   # 「名詞 修飾」の逆順（ｸﾞﾘﾙ ﾗｼﾞｴｰﾀ）を並べ替えた名前。find_ref と同じく完全一致（0.99 以上）のときだけ使う（近いだけでは別部品。Codex 指摘）
+        for rn in self.parts.reordered_names(name):
+            for v in self.parts._name_variants(rn):
+                if v not in variants and v not in rot:
+                    rot.append(v)
+        n_orig = len(variants)
+        variants += rot
         best, best_s = None, 0.0
         for ref in self._refs_in_block(block):
             for n20 in self.parts.name20_by_ref.get(ref, ()):
@@ -576,11 +639,13 @@ class Drafter:
                 if not side and side20:
                     continue
                 c1 = re.sub(r'^[LR](?=[^A-Z])', '', c) if side20 else c
-                for v in variants:
+                for vi, v in enumerate(variants):
                     v1 = re.sub(r'^[LR](?=[^A-Z])', '', v)
                     s = difflib.SequenceMatcher(None, c1, v1).ratio()
                     # 候補にだけ含まれる小物語（クリップ・リテーナ・グロメット…）は別部品の可能性が高いので減点
-                    s -= 0.3 * sum(1 for w in SMALL_WORDS if w in c1 and w not in v1)
+                    s -= 0.3 * sum(1 for w in SMALL_WORDS_N if w in c1 and w not in v1)
+                    if vi >= n_orig and s < 0.99:
+                        continue
                     if s > best_s:
                         best, best_s = ref, s
         return best, best_s
@@ -627,6 +692,13 @@ class Drafter:
             if ref not in self.parts.name20_by_ref:
                 continue
             n20 = sorted(self.parts.name20_by_ref.get(ref, ()))
+            # 部品コードの意味は車種で違うことがある（全車種で ﾋﾟﾝ の 8685 が、カローラ W44 では ﾌﾗﾝｼﾞﾎﾞﾙﾄ）。その名前の全車種の票の 30% 以上が
+            # このコードに集まっている（ﾎﾞﾝﾈｯﾄ → 0600 ﾌｰﾄﾞﾊﾟﾈﾙ、ﾄﾞｱﾐﾗｰ → 2450）か、この車の名称と包含関係にあるときだけ採る。票が割れている名前
+            # （ﾋﾟﾝ は 12 コードに分散、8685 は 9/53 票）で名称も違うコードは採らない（2026-09-15 検証。文字の重なりでは ｸﾘｯﾌﾟ → ｽｸﾘﾕ を通してしまった）
+            _share = cnt / max(1, sum(cands.values()))
+            _c20 = [_nn(x, strip_side=True) for x in n20 + [(self.parts.p12.get(ref) or {}).get('name', '')] if x]
+            if _share < 0.3 and _c20 and not any(key in c or c in key for c in _c20 if c):
+                continue
             s20 = {_side20(x) for x in n20 if _side20(x)}
             if side == 'R' and s20 == {'L'}:
                 ref = self.parts.pair_right.get(ref, ref)
@@ -758,8 +830,13 @@ class Drafter:
         used: set[int] = set()
         cur_title = None
         title_blocks: dict[str, str] = {}
+        # 主作業（工賃・指数のある行）に見積上の左右が書かれていたら、その部位（ADDATA のブロック）の左右の集合に足す。左右の無い小物（クリップ 12 個）は、
+        # 同じ部位の主作業の左右が 1 種類のときだけそれを引き継ぐ（左右両方の作業のあとは引き継がない）。見出しが変わったら捨てる（2026-09-14 スペーシア）
+        grp_sides: dict[str, set] = {}
+        grp_unknown: set = set()   # 部位の分からない主作業（手入力・未照合）の左右。どの部位の引き継ぎにも加える（Codex 指摘）
         for row in rows_flat:
             if row.get('_block_title') != cur_title:  # 新しいブロック: 見出しから部位文脈を作り直す（前ブロックの ref を引きずらない）
+                grp_sides, grp_unknown = {}, set()
                 cur_title = row.get('_block_title')
                 if cur_title not in title_blocks:
                     title_blocks[cur_title] = self._title_block(cur_title) if (cur_title and not self.generic) else ''
@@ -824,6 +901,10 @@ class Drafter:
                 item['reserve'] = True
             if row.get('manual') or self.generic:
                 item['manual'] = True
+                if (wage or 0) > 0 or (index or 0) > 0:   # 手入力の主作業にも左右があれば、どの部位の作業か分からないので全部の部位の集合に足す（引き継ぎを弱める側に倒す）
+                    _sd = _side_of(name_raw) or _side_of(row.get('_block_title') or '')
+                    if _sd:
+                        grp_unknown.add(_sd)
                 out.append(item)
                 continue
             # ref 決定
@@ -838,6 +919,12 @@ class Drafter:
                     code_in = _code4(_c_raw)
                 except ValueError as _e:
                     raise ValueError(f'reading の行 {name_raw!r}: {_e}') from None
+            # 左右の無い小物は、同じ部位の主作業が片側だけならその側の部品（左フェンダの取替に付くクリップは左）。印字の部品コード・品番のある行は印字どおり
+            _gs = grp_sides.get(ctx_block) or set()
+            if _gs:   # 部位の分からない主作業の左右は、その部位に左右の書かれた主作業があるときだけ加える（引き継ぎを弱めるだけ。検証で指摘）
+                _gs = _gs | grp_unknown
+            inh = next(iter(_gs)) if (not side and ctx_block and len(_gs) == 1 and is_small_name(name_raw, (price // qty) if price > 0 and qty > 0 else 0)
+                                      and not str(row.get('code') or '').strip() and not pn) else ''
             # コグニ印刷（書式 A）の部品コードは find_ref の code 引数で解決する（12.DB を正に検証。無効なら品番/名称に落ちる）
             ref, why = self.parts.find_ref(code_in, pn, name, context_block=ctx_block, price=(price // max(1, qty) if price else None),
                                            qty=(qty if qty > 1 else None), year=self.year)
@@ -852,13 +939,30 @@ class Drafter:
                         why = f'品番一致（ブロック {ctx_block} 内の未使用候補 {pick} ← 全体照合は {ref}）'
                         ref = pick
             if ref is not None and not pn and not code_in and ctx_block and self.parts.block_of(ref) != ctx_block:
-                # 品番の無い行が他ブロックに飛んだ → 同ブロック内の名称照合を優先
+                # 品番の無い行が他ブロックに飛んだ → 同ブロック内の名称照合を優先（左右なしで当たらなければ、直前の主作業の左右で）
                 ref2, s2 = self._match_in_block(name, ctx_block, side)
-                if ref2 is not None and s2 >= 0.55:
+                if inh and (ref2 is None or s2 < 0.55):
+                    ref2, s2 = self._match_in_block(name, ctx_block, inh)
+                    if s2 < 0.8:   # 引き継いだ左右で探し直した弱い候補では置き換えない（R ｻｲﾄﾞﾀｰﾝｼｸﾞﾅﾙﾗﾝﾌﾟ 0.62 に化けた。2026-09-15 検証）
+                        ref2, s2 = None, 0.0
+                # ただし、名前が完全に一致した部品の標準単価が印字の単価とぴったり合い、同じ部位の候補とは合わないときは替えない
+                # （ｷｬｯﾌﾟ ﾌﾛﾝﾄﾊﾞﾝﾊﾟ 1,600 円 → Fﾊﾞﾝﾊﾟｷﾔﾂﾌﾟ 1,600 円を Fｸﾞﾘﾙｷﾔﾂﾌﾟ 800 円にしない。2026-09-14）
+                _unit = price // qty if price > 0 and qty > 0 and price % qty == 0 else 0
+                #   同名・同単価の部品が部位ごとにある小物（ｸﾘﾂﾌﾟ 等）や、完全一致が複数（「（N 候補）」）の行は、従来どおり部位の文脈を優先する
+                _keep = (_unit and ref2 is not None and s2 >= 0.55 and AddataParts._why_score(re.sub(r'^語順入替「.*?」\s*', '', why or '')) >= 1.0
+                         and '候補）' not in (why or '') and not is_small_name(name_raw)
+                         and self._std_unit(ref, pn) == _unit and self._std_unit(ref2, pn) != _unit)
+                if _keep and ref2 != ref:   # 残した行は「単価で決めた行」と同じく、次の行の部位の文脈を動かさない（下の _moved_by_price）
+                    why = f'単価一致({_unit:,} 円・名称一致) ← {why}'
+                elif ref2 is not None and s2 >= 0.55:
                     why = f'ブロック内名称照合({s2:.2f}) ← 全体照合は {ref}'
                     ref = ref2
             if ref is None and ctx_block:
                 ref2, s2 = self._match_in_block(name, ctx_block, side)
+                if inh and (ref2 is None or s2 < 0.55):
+                    ref2, s2 = self._match_in_block(name, ctx_block, inh)
+                    if s2 < 0.8:
+                        ref2, s2 = None, 0.0
                 if ref2 is not None and s2 >= 0.55:
                     ref, why = ref2, f'ブロック内名称照合({s2:.2f})'
             if not pn and not code_in:  # 品番も部品コードも無い行: 別名辞書（全車種の 12.DB 名称）でコードを引き、名称近似の結果と突き合わせる
@@ -873,12 +977,22 @@ class Drafter:
                 # 数量 1 のまま複数個分の金額（クリップ 1,300 円 = 100 円 × 13）は、find_ref の価格整合（標準の 2.2 倍超は別部品）で落ちる。
                 # 価格を外して名称で引き直し、標準単価の整数倍（小物）なら採る（数量は下の _price_fit が直す。Codex 指摘）
                 ref_np, why_np = self.parts.find_ref('', pn, name, context_block=ctx_block, price=None, qty=None, year=self.year)
-                if ref_np is not None and ref_np not in (self.raw83 or {}):
+                # 名前が完全に同じ部品か、同じ部位の小物で名前がほぼ同じ（0.9 以上）ときだけ。名前が近いだけの別部品（TV アンテナフィルム 6,000 円 →
+                # リヤドアのフィルム 100 円 × 60 個）を数量で合わせない（2026-09-14 スペーシア）
+                _w_np = re.sub(r'^語順入替「.*?」\s*', '', why_np or '')
+                _np_ok = _w_np.startswith('名称一致') or (AddataParts._why_score(_w_np) >= 0.9 and is_small_name(name)
+                                                        and (not ctx_block or self.parts.block_of(ref_np) == ctx_block))
+                if ref_np is not None and ref_np not in (self.raw83 or {}) and _np_ok:
                     u_np = self._std_unit(ref_np, pn)
                     if u_np and u_np <= self.QTY_FROM_PRICE_UNIT_MAX and price % u_np == 0 and 2 <= price // u_np <= self.QTY_FROM_PRICE_MAX:
                         ref, why = ref_np, f'{why_np}（金額が標準単価 {u_np:,} 円の {price // u_np} 倍）'
             if ref is None:
-                self.notes.append(f'未照合: {name} {pn}（manual にした。ADDATA にある品目なら code を指定）')
+                if side and ((wage or 0) > 0 or (index or 0) > 0):   # 照合できなかった主作業も、左右があればどの部位の引き継ぎにも加える
+                    grp_unknown.add(side)
+                _hint = self._price_candidates(name, side, price, qty, ctx_block)
+                self.notes.append(f'未照合: {name} {pn}（manual にした。ADDATA にある品目なら code を指定）' + (f' 候補: {_hint}' if _hint else ''))
+                if _hint:
+                    self._rev('要確認', '未照合の候補', f'ADDATA に単価が同じ部品がある: {_hint}。同じ部品なら reading の code に書く（違えば手入力のまま）', row=row, item=item)
                 item['manual'] = True
                 out.append(item)
                 continue
@@ -886,7 +1000,7 @@ class Drafter:
                 # 1,000 円以下の小物に 1 万円以上の技術料（2026-09-13 ランクル: エンジンサービスラベル 200 円に 19,200 円 = 次の行の工賃と同額）
                 self._rev('要確認', '小物に大きな工賃', f'部品代 {price:,} 円の行に技術料 {wage:,} 円。別の行の工賃を写し間違えていないか、工場の書き間違いでないか確かめる（印字どおりに入れた）', row=row, item=item)
             if price > 0 and dcode == 0 and not row.get('reserve') and not row.get('recycle'):
-                ref0 = ref
+                ref0, qty0 = ref, qty
                 ref, why, qty2, did = self._price_fit(ref, why, name_raw, side, price, qty, pn, may_switch=not (code_in or pn), ctx_block=ctx_block)
                 if getattr(self, '_price_check', '') and not did:
                     self._rev('要確認', '数量の可能性', self._price_check, row=row, item=item)
@@ -895,7 +1009,7 @@ class Drafter:
                         item['qty'] = qty = qty2
                         item['_qty_from_price'] = True
                     self.notes.append(f'{name_raw}: {did}')
-                    self._rev('判断', '数量' if ref == ref0 else '部品コード', did, row=row, item=item, code=f'{ref:04d}')
+                    self._rev('要確認' if (qty2 >= 20 and qty2 != qty0) else '判断', '数量' if ref == ref0 else '部品コード', did, row=row, item=item, code=f'{ref:04d}')   # 20 個以上に読み替えたら人が見る
             if not code_in and not pn and '辞書' not in (why or ''):  # 品番も部品コードも無い行（汎用小物など）は名称だけが根拠なので必ず見せる
                 self.notes.append(f'名称だけで決めた: {name} → {ref} '
                                   + '/'.join(sorted(self.parts.name20_by_ref.get(ref, ()))) + f'（{why}）。品番が無いので別の部品を選んでいないか確かめる')
@@ -906,6 +1020,11 @@ class Drafter:
                 # 単価で**別の部位ブロック**の ref に直した行（同じ品番の小物が別ブロックにある）だけは、後続行の部位文脈を動かさない（同じブロック・文脈が空なら通常どおり更新。Codex 指摘）
                 ctx_block = self.parts.block_of(ref) or ctx_block
             used.add(ref)
+            if (wage or 0) > 0 or (index or 0) > 0:   # 主作業の行: 見積に書かれた左右（行名・見出し）をその部位の集合に足す。左右の書かれていない行
+                # （バックドアヒンジ 調整 → ADDATA の左側 ref）は足さない = 引き継ぎの根拠にしない（2026-09-14 回帰 JPN タクシー）
+                _b = self.parts.block_of(ref) or ''
+                if side and _b:
+                    grp_sides.setdefault(_b, set()).add(side)
             item['code'] = f'{ref:04d}'
             item['_ref_why'] = why  # どうやって ref を決めたか。run_case が「名称近似 × 価格不一致」を絞るのに使う
             if ref:  # 名称と部品コードの左右・前後が食い違っていないか（印字のコードを写し間違えると静かに反対側の部品ができる）
@@ -941,6 +1060,18 @@ class Drafter:
             n20 = sorted(self.parts.name20_by_ref.get(ref, ()))
             left_only = bool(n20) and all(_side20(s) == 'L' for s in n20)
             has_labor = bool(item.get('wage')) or bool(item.get('index'))
+            if not side and inh and left_only and ref in self.parts.pair_right:   # 直前の主作業が片側だけ: 分けずにその側 1 行（右なら右 ref へ）
+                if inh == 'R':   # 右 ref へ。使用済みの記録も右にそろえる（未使用候補の選択がずれないように。Codex 指摘）
+                    used.discard(ref)
+                    ref = self.parts.pair_right[ref]
+                    used.add(ref)
+                    item['code'] = f'{ref:04d}'
+                item['name'] = ('右' if inh == 'R' else '左') + re.sub(r'^(右|左)\s*', '', name)   # 左右分割の行と同じく名前に側を付ける（突合せが「右と分けることを検討」と言わない）
+                if qty >= 2:
+                    _sd = '右' if inh == 'R' else '左'
+                    self.notes.append(f'左右分割せず: {name} ×{qty} は直前の作業が{_sd}側だけなので{_sd}の部品 1 行（両側なら reading で 2 行に）')
+                out.append(item)
+                continue
             if not side and left_only and qty >= 2 and qty % 2 == 0 and ref in self.parts.pair_right and has_labor:
                 self.notes.append(f'左右分割せず: {name} ×{qty} は工賃/指数があるので 1 行のまま（左右に分けるなら reading で 2 行に）')
             if not side and left_only and qty >= 2 and qty % 2 == 0 and ref in self.parts.pair_right and not has_labor and not item.get('_qty_from_price'):
@@ -1013,7 +1144,15 @@ class Drafter:
         if not wages:
             return
         hits, unit = [], self.wage_round or 10
-        for unit in ((self.wage_round,) if (self.wage_round or 10) != 10 else (10, 100)):  # 工賃の丸め単位も分からないので 10 円 → 100 円の順に試す（Codex 指摘）
+        if (self.wage_round or 10) != 10:
+            units = (self.wage_round,)
+        elif any(w % 10 for w in wages):
+            # 10 円の倍数でない技術料（13,716 = 1.8 × 7,620）がある = 工場のコグニは 1 円単位の設定。10 円 / 100 円丸めでは
+            # どのレートでも説明できず、レートが決まらないまま生成器が 100 円刻みの推定（7,600）で作ってしまう（2026-09-15 スペーシア FAX 見積）
+            units = (1,)
+        else:
+            units = (10, 100)   # 工賃の丸め単位も分からないので 10 円 → 100 円の順に試す（Codex 指摘）
+        for unit in units:
             hits = [r for r, _ in guess(wages, unit=unit)]
             if hits:
                 break
@@ -1021,7 +1160,11 @@ class Drafter:
             self.wage_round = unit
             self.notes.append(f'工賃の丸め単位 {unit} 円（技術料が 0.1 刻みの指数 × レートの {unit} 円丸めでだけ説明できる）→ estimate.wage_round')
         if not hits:
-            self._rev('要確認', 'レバーレート', f'技術料 {len(wages)} 種類を 0.1 刻みの指数で説明できるレートが無い。速報の工賃単価か工場に確かめて reading の labor_rate に書く')
+            odd = [w for w in wages if w % 10]
+            tried = ' / '.join(f'{u} 円' for u in units)
+            self._rev('要確認', 'レバーレート', f'技術料 {len(wages)} 種類を 0.1 刻みの指数で説明できるレートが無い（試した丸め単位 {tried}'
+                      + (f'。10 円の倍数でない技術料 {", ".join(f"{w:,}" for w in odd[:4])} があるので 1 円丸めだけを試した。写し間違いなら直す' if odd else '')
+                      + '）。速報の工賃単価か工場に確かめて reading の labor_rate に書く')
             return
         pick, why = hits[0], ''
         if len(hits) > 1:

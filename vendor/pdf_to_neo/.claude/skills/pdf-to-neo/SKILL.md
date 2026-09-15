@@ -28,6 +28,7 @@ description: 工場見積 PDF（どの書式でも）＋車検証から、コグ
 | `scripts/pick_grade.py` | グレードが決まらない案件を、部品金額と ADDATA 標準価格の一致数で絞る |
 | `scripts/make_neo.py` | 案件フォルダを渡すと 下書き → 突合せ → NEO 生成 → 検算 → 印字の印との照合 → 報告文（report.md）→ 確認箇所シート（xlsx）→ 納品コピー を 1 コマンドで行う |
 | `scripts/intent_check.py` | できあがった NEO を読み戻し、estimate.json（下書きの意図）と 1 行ずつ突き合わせる（部品コード・数量・金額・工賃・コメント・名称・顧客名）。make_neo が呼び、食い違いは不合格、欄で切れた名称などは確認箇所シートの 要確認 |
+| `scripts/corpus_lookup.py` | 亮平さんの過去 NEO（Z:\ドキュメント）の索引。`build` で作る / 足す（初回数分、以後は新しい NEO だけ）、`factory <電話>` で工場名の過去の書き方、`same --car --total` で同じ案件らしい NEO。make_neo が索引を自動で引き、工場名の書き方の違い・同じ案件の NEO を確認箇所シートに出す（判断規則 10-28） |
 | `scripts/neo_compare.py` | 納品した NEO と、あとで確報・協定に使われた NEO（コグニで直したもの・別アプリのもの）を明細単位で突き合わせ、品番の違い・数量の違い・足された行・削られた行を出す（読むだけ。手順 9 の答え合わせ） |
 | `scripts/pdf_pages.py` | 見積 PDF をページごとの拡大画像（上下に分けたもの）と文字層に切り分ける。転記の下ごしらえ |
 | `scripts/review_sheet.py` | 確認箇所シート（xlsx: 確認箇所 / 手入力の行 / 下書きの判断 / 合計）を作る。make_neo が呼ぶ（openpyxl が無い PC は CSV） |
@@ -104,6 +105,7 @@ python .claude/skills/pdf-to-neo/scripts/env_check.py --save --install-skill
 - **車検証**: 「自動車検査証記録事項」PDF（`YYYYMMDDhhmmss_<登録番号>.pdf`）か、速報 PDF（`【速報】…pdf`）の中の車検証ページ
 - 無いものがあれば、あるもので進め、欠けた項目（型式指定・類別・初度登録・カラー）は報告に書く
 - **案件フォルダに既存の NEO（立会で作ったもの）があれば必ず見る**。`python claude_neo_pipeline/tests/neo_diff.py <生成.neo> <既存.neo>` で全列を突き合わせると、合計・名称・作業区分の入れ方が確認できる（既存ファイルは開くだけ。上書き・削除は禁止）
+- 過去 NEO の索引を新しくしておく: `python .claude/skills/pdf-to-neo/scripts/corpus_lookup.py build`（新しい NEO だけ読むので数十秒。初回は数分）。make_neo が工場名の過去の書き方と、同じ案件を人が先に作った NEO の有無を自動で確認箇所シートに出す（判断規則 10-28）。索引が無い PC では何も出ないだけ
 
 PDF は Read ツールで開く（画像 PDF でも Vision で読める。`pypdf` の文字層は FAX だとゼロなので当てにしない）。
 3 ページ以上・品番の細かい見積は、先に `python .claude/skills/pdf-to-neo/scripts/pdf_pages.py <PDF> <NEO_CHECK_ROOT>/<案件>/pages/img --top 0.2 --bottom 0.9` でページを上下に分けた拡大画像にしてから読む（読み違いが減り、ページ全体を何度も開き直さずに済む）。
@@ -228,7 +230,7 @@ PYTHONIOENCODING=utf-8 python .claude/skills/pdf-to-neo/scripts/make_neo.py "<NE
 
 | 出力 | 対応 |
 |---|---|
-| 未照合 | 同ブロックの 12.DB 名称一覧（出力の `name20`）から正しい ref を探して `code` に入れる。ADDATA に無い品目**だけ** `manual: true`（品番や指数の印字が無いことは手入力の理由にならない。判断規則 10-7） |
+| 未照合 | 注記の「候補:」（この車の標準単価が印字の単価と同じ部品）を先に見る。同じ部品ならその部品コードを `code` に入れる。無ければ同ブロックの 12.DB 名称一覧（出力の `name20`）から正しい ref を探して `code` に入れる。ADDATA に無い品目**だけ** `manual: true`（品番や指数の印字が無いことは手入力の理由にならない。判断規則 10-7） |
 | 名称近似で決定 | 12.DB 名称と品番一覧を見て確認。違えば `code` を指定 |
 | 左側 ref に数量 2 以上 | 右側 ref と 1 行ずつに分ける（左右別行がコグニ流。合計は変わらない） |
 | 見積 ≠ 標準 | そのままでよい（`#` 手入力になる）。標準と一致するなら `#` は付かず標準行になる |

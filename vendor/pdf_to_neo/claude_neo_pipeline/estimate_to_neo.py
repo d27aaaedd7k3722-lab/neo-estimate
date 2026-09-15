@@ -642,10 +642,50 @@ class AddataParts:
         ('ﾘﾔｹﾞｰﾄ', 'ﾊﾞﾂｸﾄﾞｱ'), ('ｸｵｰﾀｰ', 'ｸｵｰﾀ'), ('ﾘﾔﾌｴﾝﾀﾞ', 'ｸｵｰﾀﾊﾟﾈﾙ'), ('ｻｲﾄﾞｼﾙ', 'ﾛﾂｶﾊﾟﾈﾙ'), ('ﾛﾂｶﾊﾟﾈﾙ', 'ｻｲﾄﾞｼﾙﾊﾟﾈﾙ'),
         ('ﾊﾞﾝﾊﾟｰﾌｴｲｽ', 'ﾊﾞﾝﾊﾟｶﾊﾞｰ'), ('ﾊﾞﾝﾊﾟﾌｴｲｽ', 'ﾊﾞﾝﾊﾟｶﾊﾞｰ'), ('ﾊﾞﾝﾊﾟｶﾊﾞｰ', 'ﾊﾞﾝﾊﾟﾌｴｲｽ'), ('ﾚｲﾝﾌｵｰｽﾒﾝﾄ', 'ﾘｲﾝﾎｰｽ'), ('ﾚｲﾝﾌｵｰｽ', 'ﾘｲﾝﾎｰｽ'), ('ﾋﾞｰﾑ', 'ﾘｲﾝﾎｰｽ'),
         ('ｴﾝﾌﾞﾚﾑ', 'ｴﾝﾌﾞﾚﾑ(H)'), ('ｽﾃｱﾘﾝｸﾞ', 'ｽﾃｱﾘﾝｸﾞﾎｲｰﾙ'), ('ｺﾝﾃﾞﾝｻｰ', 'ｺﾝﾃﾞﾝｻ'), ('ﾚｼｰﾊﾞｰ', 'ﾚｼｰﾊﾞ'), ('ｾﾂﾄ', ''), ('補機一式', ''), ('一式', ''),
+        ('ｸｰﾗｰｶﾞｽ', 'ﾌﾛﾝｶﾞｽ'), ('ｴｱｺﾝｶﾞｽ', 'ﾌﾛﾝｶﾞｽ'),   # エアコンの冷媒（ADDATA は ﾌﾛﾝｶﾞｽ。2026-09-14 スペーシア）
     ]
 
-    def _name_variants(self, n: str) -> list[str]:
-        """正規化名に言い換えを 1 段ずつ適用した候補集合（元の名称を先頭に）"""
+    @staticmethod
+    def _prep(s: str) -> str:
+        """norm_name と共通の前処理: 半角化・括弧内除去・先頭の連番除去・ホンダ系のカンマ書式の並べ替え（'ﾌｴｲｽ, ﾌﾛﾝﾄﾊﾞﾝﾊﾟｰ' → 'ﾌﾛﾝﾄﾊﾞﾝﾊﾟｰﾌｴｲｽ'）"""
+        t = hw(s)
+        t = re.sub(r'\(.*?\)|（.*?）|\[.*?\]', '', t)
+        t = re.sub(r'^\s*\d+\s+', '', t)  # 先頭の連番 '1 ', '23 '
+        if ',' in t:  # ホンダ系ディーラー形式 'ﾌｴｲｽ, ﾌﾛﾝﾄﾊﾞﾝﾊﾟｰ' / 'ﾊﾟﾈﾙCOMP., L. ﾌﾛﾝﾄﾌｴﾝﾀﾞｰ' → 'L ﾌﾛﾝﾄﾌｴﾝﾀﾞｰ ﾊﾟﾈﾙ'
+            head, tail = t.split(',', 1)
+            side = ''
+            m = re.match(r'^\s*([LR])\.\s*', tail)
+            if m:
+                side = m.group(1); tail = tail[m.end():]
+            t = f'{side}{tail.strip()}{head.strip()}'
+        return t
+
+    @classmethod
+    def _light(cls, s: str) -> str:
+        """言い換えを当てるための軽い正規化: 前処理（_prep）・小書きを大書きに・空白・長音・記号を除く。
+        norm_name と違い ﾌﾛﾝﾄ/ﾘﾔ/左/右 は残す（norm_name の後だと 右ﾌｪﾝﾀﾞ と ﾘﾔﾌｪﾝﾀﾞ がどちらも Rﾌｴﾝﾀﾞ になり、言い換えを当て分けられない）"""
+        t = cls._prep(s or '')
+        t = t.translate(str.maketrans('ｧｨｩｪｫｬｭｮｯ', 'ｱｲｳｴｵﾔﾕﾖﾂ'))
+        return re.sub(r'[\s\-ｰ‐･・、,.:]', '', t).upper()
+
+    _ALIASES_LIGHT: Optional[list] = None
+
+    @classmethod
+    def _aliases_light(cls) -> list:
+        """ALIASES を _light で正規化した組"""
+        if cls._ALIASES_LIGHT is None:
+            out = []
+            for a, b in cls.ALIASES:
+                al, bl = cls._light(a), cls._light(b)
+                if al and al != bl and (al, bl) not in out:
+                    out.append((al, bl))
+            cls._ALIASES_LIGHT = out
+        return cls._ALIASES_LIGHT
+
+    def _name_variants(self, name: str, normalized: bool = False) -> list[str]:
+        """見積の名称（正規化済みでも可）に言い換えを 1 段ずつ適用した候補集合（元の名称を先頭に）。これまでどおり norm_name 後の名前に当てる
+        （長音入り・ﾌﾛﾝﾄ 入りの言い換えはここでは当たらない。それらは _strict_variants で完全一致のときだけ使う）"""
+        n = name if normalized else self.norm_name(name)   # 正規化済み（find_ref の n0）はそのまま（norm_name を 2 回かけない）
         out = [n]
         for a, b in self.ALIASES:
             for base in list(out):
@@ -654,6 +694,119 @@ class AddataParts:
                     if v and v not in out:
                         out.append(v)
         return out[:24]
+
+    def _strict_variants(self, name: str) -> list[str]:
+        """_name_variants では当たらなかった言い換え（ﾃｰﾙｹﾞｰﾄ → ﾊﾞｯｸﾄﾞｱ、ﾘﾔﾌｪﾝﾀﾞ → ｸｵｰﾀﾊﾟﾈﾙ、ｸｰﾗｰｶﾞｽ → ﾌﾛﾝｶﾞｽ など）を、
+        前後・左右の語を残した形（_light）に当てて norm_name した候補。**12.DB 名と完全一致したときだけ**使う（近似に使うと ｺｱｻﾎﾟｰﾄ → ﾗｼﾞｴｰﾀ本体、
+        ﾌﾛﾝﾄｶﾞﾗｽﾓｰﾙ → ｳｲﾝﾄﾞｼｰﾙﾄﾞｶﾞﾗｽ のような別部品に当たる。2026-09-15 検証 520 件）。先頭の左右（左/右/LH/RH）は外して作る"""
+        base_old = set(self._name_variants(name))
+        # 左右の書き方（左/右/LH/RH/R/H/R./R/F の R/、RF・LR の先頭の左右、'R ' など）は全部外す。前後（ﾘﾔ・Rr・RF の F）は残す
+        # （R. ﾊﾞﾝﾊﾟｰﾌｪｲｽ の R を残すと Rﾊﾞﾝﾊﾟｶﾊﾞ = リヤに完全一致する。Codex 指摘）
+        t = re.sub(r'^\s*(?:左|右|LH|RH|[LR]/H|[LR]\.|[LR]/(?=[FR])|[LR](?=[FR](?:\s|[ｦ-ﾟ]))|[LR](?=\s))\s*', '', hw(name or ''))
+        lights = [self._light(t)]
+        for a, b in self._aliases_light():
+            for base in list(lights):
+                if a in base:
+                    v = base.replace(a, b)
+                    if v and v not in lights:
+                        lights.append(v)
+        out = []
+        for v in lights[1:]:
+            nv = self.norm_name(v)
+            if nv and nv not in base_old and nv not in out:
+                out.append(nv)
+        return out[:12]
+
+    _ROT_SIDE = re.compile(r'^(左|右|LH|RH|[LR]/H|[LR][FR]?|[LR]/[FR]|[LR]\.|Fr|Rr|FR|RR)$')   # 左右・コグニ式の前後（Fr/Rr）は先頭のまま
+    _ROT_TAIL = re.compile(r'^(NO\.?\d+|#\d+|\d+|ASSY\.?|ｱｯｼ|ｱﾂｼ|ｱｯｾﾝﾌﾞﾘ|SUB-?ASSY|SUB|COMP\.?|ｺﾝﾌﾟ|付属品|[×xX*]\d+|M\d+)$', re.I)
+
+    @classmethod
+    def reordered_names(cls, name: str) -> list[str]:
+        """「名詞 修飾」の順（スズキ系の部品表: 'ｸﾞﾘﾙ ﾗｼﾞｴｰﾀ' / 'ﾊﾟﾈﾙ ﾌﾛﾝﾄﾌｰﾄﾞ' / 'ｶﾞｰﾆｯｼｭ ｶｳﾘﾝｸﾞﾄｯﾌﾟ ｾﾝﾀ'）を ADDATA の順（ﾗｼﾞｴｰﾀｸﾞﾘﾙ）に並べ替えた候補。
+        先頭の左右（左/右/LH/RH/RF/R. …。末尾にあれば先頭へ）・先頭の連番・括弧（末尾へ）・NO.2・ASSY・付属品・×10 などは並べ替えない。
+        空白で 2 語以上に分かれない名前は []（2026-09-14 スペーシア）"""
+        t = hw(name or '').strip()
+        parens = re.findall(r'\([^()]*\)|（[^（）]*）', t)            # 括弧は空白入りでも 1 つのまま末尾へ
+        t = re.sub(r'\([^()]*\)|（[^（）]*）', ' ', t)
+        t = re.sub(r'^\s*\d+\s+', '', t)                            # 先頭の連番
+        toks = t.split()
+        if toks:   # 左右が語にくっついている（LHﾊﾟﾈﾙ ﾌｪﾝﾀﾞ）ときも先頭の左右として切り出す
+            m_ = (re.match(r'^(左|右|LH|RH|Fr|Rr|FR|RR|[LR][FR]|[LR]/[FR]|[FLR])(?=[ｦ-ﾟァ-ヶ])', toks[0])
+                  or re.match(r'^(左|右|LH|RH)(?=[A-Za-z])', toks[0]))   # Rrｶﾊﾞｰ・RFﾓｰﾙ・Fﾓｰﾙ・Lﾊﾟﾈﾙ も（Codex 指摘）
+            if m_:
+                toks = [m_.group(1), toks[0][m_.end():]] + toks[1:]
+        glued_one = bool(toks) and toks[0] in ('F', 'L', 'R') and not re.match(r'^\s*[FLR]\s', t)   # くっついた 1 文字（Rﾊﾞﾝﾊﾟ の R はリヤかもしれない）は置き換えない
+        pre = ''
+        if glued_one:
+            pre = toks.pop(0)
+        elif toks and cls._ROT_SIDE.match(toks[0]):
+            pre = toks.pop(0)
+        elif len(toks) > 1 and cls._ROT_SIDE.match(toks[-1]):
+            pre = toks.pop()
+        pre = pre if glued_one else {'LH': '左', 'RH': '右', 'L/H': '左', 'R/H': '右', 'L': '左', 'R': '右'}.get(pre, pre)
+        tail = [x for x in toks if cls._ROT_TAIL.match(x)]             # NO.2・ASSY などは途中にあっても末尾へ（並べ替えない）
+        toks = [x for x in toks if not cls._ROT_TAIL.match(x)]
+        tail += parens
+        if len(toks) < 2:
+            return []
+        if glued_one:   # くっついていた 1 文字は元どおり次の語に付けて返す（Fﾓｰﾙ ﾄﾞｱ → Fﾄﾞｱ ﾓｰﾙ）
+            joiner = ''
+        else:
+            joiner = None
+        cands = [toks[1:] + toks[:1]]            # 先頭の名詞を末尾へ（ﾊﾟﾈﾙ ﾌﾛﾝﾄﾌｰﾄﾞ → ﾌﾛﾝﾄﾌｰﾄﾞ ﾊﾟﾈﾙ）
+        if len(toks) >= 3:
+            cands.append(list(reversed(toks)))    # 全部逆順（ﾗﾍﾞﾙ ｴｱﾊﾞｯｸﾞ ｻｲﾄﾞ → ｻｲﾄﾞ ｴｱﾊﾞｯｸﾞ ﾗﾍﾞﾙ）
+        out = []
+        for c in cands:
+            sep_ = joiner if joiner is not None else (' ' if pre and not re.match(r'^(左|右)$', pre) else '')
+            s_ = (pre + sep_ + ' '.join(c + tail)).strip()
+            if s_ not in out and c != toks:
+                out.append(s_)
+        return out
+
+    @staticmethod
+    def _fr_word(name: str) -> str:
+        """名前（括弧の中も含む）に前後を表す語があれば 'F' / 'R'。両方・無しは ''（左右の R/L とは区別して ﾌﾛﾝﾄ/ﾘﾔ/Fr/Rr だけ見る）"""
+        t = hw(name or '')
+        f = bool(re.search(r'ﾌﾛﾝﾄ|(^|[^A-Za-z])(Fr|FR)(?![a-z])', t))
+        r = bool(re.search(r'ﾘﾔ|ﾘｱ|(^|[^A-Za-z])(Rr|RR)(?![a-z])', t))
+        return 'F' if f and not r else ('R' if r and not f else '')
+
+    @staticmethod
+    def _why_score(why: str) -> float:
+        """find_ref の根拠文 → 名称の確からしさ（名称一致 = 1.0、名称近似(0.76) = 0.76、それ以外（未一致など）= 0）"""
+        if (why or '').startswith('名称一致'):
+            return 1.0
+        m = re.match(r'名称近似\(([\d.]+)\)', why or '')
+        return float(m.group(1)) if m else 0.0
+
+    def find_ref(self, code: str, parts_no: str, name: str, context_block: str = '', price: Optional[int] = None, qty: Optional[int] = None, year: str = '') -> tuple[Optional[int], str]:
+        """PDF の部品コード → 品番 → 名称 の順で ref_no を決める（_find_ref_core）。名称で決まらない・近似止まりのときは、
+        「名詞 修飾」の逆順の名前を並べ替えて引き直す（2026-09-14 スペーシア）。並べ替えた名前は、完全一致するか、元の名前で決まらず
+        名前が 0.75 以上近く**標準単価が印字の単価とぴったり合う**ときだけ採る（名前が近いだけでは採らない: 普通の語順の名前を並べ替えた候補は
+        12 件中 12 件が別部品だった。2026-09-15 検証）。括弧の修飾（ﾚｶﾛ 等）まで合っている元の近似は動かさない"""
+        ref, why = self._find_ref_core(code, parts_no, name, context_block, price, qty, year)
+        s0 = self._why_score(why) if ref is not None else 0.0
+        if ref is not None and (s0 >= 1.0 or not (why or '').startswith('名称')):
+            return ref, why   # 部品コード・品番・名称の完全一致は動かさない
+        q = self._qual(name)
+        if ref is not None and q and q in {self._qual(n) for n in (self.name20_by_ref.get(ref) or ())}:
+            return ref, why   # 括弧の修飾まで合った近似（11.DB の名称欄は 20 字で切れていて、並べ替えた完全一致は修飾を見分けられない）
+        est_fr = self._fr_word(name)
+        for rn in self.reordered_names(name):
+            r2, w2 = self._find_ref_core('', parts_no, rn, context_block, price, qty, year)
+            if r2 is None or (w2 or '').startswith(('部品コード', '品番')):
+                continue
+            # 候補の前後は 11.DB 名称欄の 2 文字目（1 文字目は左右 L/R/空白。_rank_refs と同じ読み方。RF = 右前・LR = 左後）。
+            # 名前（括弧の中も）の前後と候補の前後が違う（ﾓｰﾙ ﾄﾞｱ (ﾌﾛﾝﾄ ﾛｱ) → Rﾄﾞｱﾓｰﾙ）は採らない（Codex 指摘）
+            c_frs = {n[1] for n in (self.name20_by_ref.get(r2) or ()) if len(n) > 1 and n[1] in ('F', 'R')}
+            if est_fr and c_frs and est_fr not in c_frs:
+                continue
+            s2 = self._why_score(w2)
+            unit_ok = bool(price) and any(int(v.get('price') or 0) == int(price) for v in (self.by_ref.get(r2) or []))
+            if (s2 >= 1.0 and s2 > s0) or (ref is None and s2 >= 0.75 and unit_ok):
+                return r2, f'語順入替「{rn}」 {w2}'
+        return ref, why
 
     def _pick_ref_by_context(self, refs: list[int], name: str, context_block: str) -> int:
         """品番が同じ複数 ref から 1 つ選ぶ: 直前行と同じ部位ブロック → 見積名称に最も近い 12.DB 名 → 先頭"""
@@ -784,13 +937,13 @@ class AddataParts:
     @staticmethod
     def _side_of(name: str) -> str:
         t = hw(name or '')
-        if re.search(r'(^|[\s,])(RH|R\.|R(?=[\sｦ-ﾟ])|R/?[FR](?=[\s,ｦ-ﾟ]|$))|右', t):  # RH / R. / R ﾌｪﾝﾀﾞ / RF / RR / R/F
+        if re.search(r'(^|[\s,])(RH|R/H|R\.|R(?=[\sｦ-ﾟ])|R/?[FR](?=[\s,ｦ-ﾟ]|$))|右', t):  # RH / R/H / R. / R ﾌｪﾝﾀﾞ / RF / RR / R/F（R/H は 2026-09-15 検証で追加）
             return 'R'
-        if re.search(r'(^|[\s,])(LH|L\.|L(?=[\sｦ-ﾟ])|L/?[FR](?=[\s,ｦ-ﾟ]|$))|左', t):
+        if re.search(r'(^|[\s,])(LH|L/H|L\.|L(?=[\sｦ-ﾟ])|L/?[FR](?=[\s,ｦ-ﾟ]|$))|左', t):
             return 'L'
         return ''
 
-    def find_ref(self, code: str, parts_no: str, name: str, context_block: str = '', price: Optional[int] = None, qty: Optional[int] = None, year: str = '') -> tuple[Optional[int], str]:
+    def _find_ref_core(self, code: str, parts_no: str, name: str, context_block: str = '', price: Optional[int] = None, qty: Optional[int] = None, year: str = '') -> tuple[Optional[int], str]:
         """PDF の部品コード → 品番 → 名称 の順で ref_no を決める。戻り値 (ref_no, 根拠)
         名称照合は 表記ゆれ辞書（ALIASES）・左右（12.DB の左右ペア）・部位文脈（直前行の部位ブロック）・価格整合で絞る。
         同一品番の複数 ref は `_rank_refs`（左右・前後・括弧内修飾・数量・部位・12.DB 行順）で選ぶ。'〜付属品' 行は本体部品の ref（脱着行）"""
@@ -853,7 +1006,8 @@ class AddataParts:
         import difflib
         side = self._side_of(name)
         strip_side = lambda t: re.sub(r'^(LH|RH|[LR])(?=[^A-Z])', '', t)  # 12.DB の名称は左右を持たない
-        variants = [strip_side(v) for v in self._name_variants(n0)]
+        variants = [strip_side(v) for v in self._name_variants(n0, normalized=True)]
+        strict = self._strict_variants(name)
         scored = []  # (score, ref, 12.DB 名, variant index)
         for ref, rec in self.p12.items():
             cand = strip_side(self.norm_name(rec['name']))
@@ -873,6 +1027,12 @@ class AddataParts:
                         sc = max(sc, sc2 - 0.01)  # 接頭辞を無視した一致は僅かに劣後（部位文脈で F/R を決める）
                 if sc > best_v:
                     best_v, best_i = sc, vi
+            if best_v < 1.0 and strict:   # 新しく当たるようになった言い換えは、12.DB 名そのもの（R = リヤを外さない形）と完全一致したときだけ
+                cand_raw = self.norm_name(rec['name'])
+                for si, v in enumerate(strict):
+                    if cand_raw == v or (cand_raw[:1] == 'F' and cand_raw[1:] == v):
+                        best_v, best_i = 1.0, len(variants) + si
+                        break
             if best_v >= 0.75:
                 q_est = self._qual(name); q20 = {self._qual(n) for n in (self.name20_by_ref.get(ref) or set())}
                 if q_est and q_est in q20:
@@ -919,16 +1079,7 @@ class AddataParts:
     @staticmethod
     def norm_name(s: str) -> str:
         """部品名の正規化: 半角化・Fr→F/Rr→R/左→L/右→R・括弧内除去・小書き仮名を大書きに・長音/記号除去"""
-        t = hw(s)
-        t = re.sub(r'\(.*?\)|（.*?）|\[.*?\]', '', t)
-        t = re.sub(r'^\s*\d+\s+', '', t)  # 先頭の連番 '1 ', '23 '
-        if ',' in t:  # ホンダ系ディーラー形式 'ﾌｴｲｽ, ﾌﾛﾝﾄﾊﾞﾝﾊﾟｰ' / 'ﾊﾟﾈﾙCOMP., L. ﾌﾛﾝﾄﾌｴﾝﾀﾞｰ' → 'L ﾌﾛﾝﾄﾌｴﾝﾀﾞｰ ﾊﾟﾈﾙ'
-            head, tail = t.split(',', 1)
-            side = ''
-            m = re.match(r'^\s*([LR])\.\s*', tail)
-            if m:
-                side = m.group(1); tail = tail[m.end():]
-            t = f'{side}{tail.strip()}{head.strip()}'
+        t = AddataParts._prep(s)
         t = t.replace('ﾌﾛﾝﾄ', 'F').replace('ﾘﾔ', 'R').replace('ﾘｱ', 'R').replace('Fr', 'F').replace('Rr', 'R').replace('FR', 'F').replace('RR', 'R')
         t = t.replace('左', 'L').replace('右', 'R')
         t = t.translate(str.maketrans('ｧｨｩｪｫｬｭｮｯ', 'ｱｲｳｴｵﾔﾕﾖﾂ'))
