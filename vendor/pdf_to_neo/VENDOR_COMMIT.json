@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "68ed6205c0c6a8f3047e3f1edff07e265bfe15dc",
- "subject": "fix: 部品代の空欄を印字の部品計で 0 円と決める・区分の欄の但し書きで区分を取り違えない（Gemini で読むと部品計が +9,400 円になっていた）",
- "synced_at": "2026-09-16T15:49:46",
+ "commit": "2c8b5dabf636a5ee7e16cfa69d6e57a3f3742840",
+ "subject": "feat: 事故番号・受付番号を NEO の証券番号の欄にも入れる（証券番号の印字が無い案件）",
+ "synced_at": "2026-09-16T16:34:58",
  "files": 108,
- "tree_sha256": "29d53ad6d16d1ee17c3c3a378cdab44396f652a9a6a8986854fb140446dfcfcf",
+ "tree_sha256": "18d0780c9432a6ef92ca423709f3e351bec9cee62c30c3f6d93a1154dd556662",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

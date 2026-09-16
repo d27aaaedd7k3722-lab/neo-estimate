@@ -637,6 +637,22 @@ def _reg_no_part(value, digits: bool = False, strip_hyphen: bool = False, kana: 
     return s
 
 
+def policy_no_or_accept(ins, existing: str = '', merge_mode: bool = False) -> str:
+    """証券番号の欄（Insurance.PolicyNo / ヘッダ XML の TicketNo）に入れる値。
+    読めた証券番号が無ければ、事故番号・受付番号をそこにも入れる（2026-09-16 亮平さん指示: 認識した事故番号 OR 受付番号は
+    必ず NEO の証券番号の欄に出す。速報報告書に証券番号が印字されない案件が多い）。受付番号の欄（FileInfo.AcceptNo）は別に残る。
+    ただし**マージモード**（カスタムのテンプレート NEO の値を残す経路）で、テンプレートに証券番号があるなら空を返して残す
+    ＝ 本物の証券番号を事故番号で塗り替えない。スキル経路は draft_estimate.Drafter._insurance が同じ規則"""
+    d = ins or {}
+    pol = safe_str(d.get('policy_no', '')).strip()
+    if pol:
+        return pol
+    acc = safe_str(d.get('accept_no', '')).strip()
+    if acc and merge_mode and safe_str(existing).strip():
+        return ''
+    return acc
+
+
 def cp932_trim(value, max_bytes: int) -> str:
     """コグニセブンの列幅（CP932のバイト数）に収まるよう切り詰める。
 
@@ -2271,7 +2287,11 @@ def _update_em_db_impl(conn, cust, insurance_info, estimated_date,
     ''', (estimated_date, est_era, est_era_year))
     # コグニセブンの列幅に合わせて切り詰める。SQLite は TEXT(n) を強制しないため
     # ここで守らないと、桁あふれした値がそのまま入る。
-    policy_no     = cp932_trim(insurance_info.get('policy_no', ''), 20)
+    try:   # マージモードでテンプレートに残っている証券番号（これがあるなら事故番号で塗り替えない）
+        _tpl_policy = safe_str((cur.execute('SELECT PolicyNo FROM Insurance').fetchone() or ('',))[0])
+    except sqlite3.Error:
+        _tpl_policy = ''
+    policy_no     = cp932_trim(policy_no_or_accept(insurance_info, _tpl_policy, merge_mode), 20)
     contractor    = cp932_trim(insurance_info.get('contractor_name', ''), 20)
     agency_name   = cp932_trim(insurance_info.get('agency_name', ''), 20)
     adjuster_name = cp932_trim(insurance_info.get('adjuster_name', ''), 20)
@@ -2491,7 +2511,7 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
         # 備考・グレードがそのまま新しい見積に残る（立会者名は個人情報）。
         # マージモードでは空値はスキップされるので、テンプレート保持は壊れない。
         'CustomerName2':        '',
-        'TicketNo':             cp932_trim(ins.get('policy_no', ''), 20),        # 証券番号（vendor と同じ。DB の Insurance.PolicyNo と揃える）
+        'TicketNo':             cp932_trim(policy_no_or_accept(ins, read_xml_tag(text, 'TicketNo'), merge_mode), 20),   # 証券番号（vendor と同じ。DB の Insurance.PolicyNo と揃える。空なら事故番号・受付番号）
         'Note2':                '',
         'Note3':                '',
         'ii_CustomerName':      cp932_trim(ins.get('contractor_name', ''), 20),  # 契約者（vendor と同じ。DB の Insurance.ContractorName と揃える）

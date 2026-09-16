@@ -1827,6 +1827,26 @@ class Drafter:
         except ValueError:
             return 0
 
+    POLICY_NO_BYTES = 20    # Insurance.PolicyNo（証券番号）。生成器はここで切る
+
+    def _insurance(self) -> dict:
+        """保険欄。**証券番号の欄が空のときは、読めた事故番号・受付番号をそこにも入れる**
+        （2026-09-16 亮平さん指示: 認識した事故番号 OR 受付番号は必ず NEO の証券番号の欄に出す。
+        速報報告書には証券番号が印字されない案件が多く、コグニでも人が同じ番号を証券番号の欄に入れている）。
+        受付番号の欄（FileInfo.AcceptNo）はそのまま残す（消さない）"""
+        ins = dict(self.rd.get('insurance') or {})
+        acc = str(ins.get('accept_no') or '').strip()
+        pol = str(ins.get('policy_no') or '').strip()
+        if acc and not pol:
+            ins['policy_no'] = acc
+            over = _cp932_len(acc) > self.POLICY_NO_BYTES
+            self.notes.append(f'証券番号の印字が無いので、事故番号・受付番号 {acc} を証券番号の欄にも入れた（受付番号の欄はそのまま）'
+                              + (f'。{self.POLICY_NO_BYTES} バイトを超えるので証券番号の欄では切り詰められる' if over else ''))
+            if over:
+                self._rev('要確認', '証券番号', f'事故番号・受付番号 {acc} は証券番号の欄（{self.POLICY_NO_BYTES} バイト）に入りきらないので'
+                                          '切り詰めて書いた。受付番号の欄には全部入っている')
+        return self._fit_texts(ins, ('factory',), '保険')
+
     def _printed_parts(self) -> int:
         """見積書に印字された部品計（読めなければ 0）"""
         try:
@@ -1958,7 +1978,7 @@ class Drafter:
         est: dict = {
             'source': self.rd.get('source', ''), 'issuer': self.rd.get('issuer', ''), 'est_date': self.rd.get('est_date', ''),
             'vehicle': self.vehicle, 'customer': self._fit_texts(self.rd.get('customer') or {}, ('name', 'owner_name', 'user_name'), '顧客'),
-            'insurance': self._fit_texts(self.rd.get('insurance') or {}, ('factory',), '保険'),
+            'insurance': self._insurance(),
             'labor_rate': self.labor,
         }
         if getattr(self, 'wage_round', 10) != 10:

@@ -161,6 +161,26 @@ for col, want in list(WANT_INS.items()) + list(WANT_CUST.items()):
     else:
         chk(got == want, f'1: プレビュー経由 {col} が {got!r}（期待 {want!r}）')
 
+# 証券番号の欄が空なら、事故番号・受付番号をそこにも入れる（2026-09-16 亮平さん指示。スキル経路は
+# draft_estimate.Drafter._insurance が同じことをする）。受付番号の欄は消さない
+_ins_acc = dict(INS); _ins_acc.pop('policy_no')
+_v_acc = em_values(app.generate_neo_file(TPL, CUST, [dict(i) for i in ITEMS], 0, _ins_acc, {}, False, False, False)[0])
+chk(_v_acc.get('Insurance.PolicyNo') == 'ZZ-2026-0001',
+    f"1b: 証券番号が空のとき事故番号が証券番号に入らない: {_v_acc.get('Insurance.PolicyNo')!r}")
+chk(_v_acc.get('FileInfo.AcceptNo') == 'ZZ-2026-0001',
+    f"1b: 受付番号の欄が消えた: {_v_acc.get('FileInfo.AcceptNo')!r}")
+_nb_pol = app.generate_neo_file(TPL, CUST, [dict(i) for i in ITEMS], 0, INS, {}, False, False, False)[0]
+_v_pol = em_values(_nb_pol)
+chk(_v_pol.get('Insurance.PolicyNo') == 'ZZPOLICY123',
+    f"1b: 証券番号が読めているのに上書きした: {_v_pol.get('Insurance.PolicyNo')!r}")
+# マージモード（カスタムのテンプレート NEO を使う経路）では、テンプレートに残っている本物の証券番号を
+# 事故番号で塗り替えない（レビュー指摘 2026-09-16）。テンプレートが空なら今までどおり事故番号を入れる
+_v_mg = em_values(app.generate_neo_file(_nb_pol, CUST, [dict(i) for i in ITEMS], 0, _ins_acc, {}, False, False, True)[0])
+chk(_v_mg.get('Insurance.PolicyNo') == 'ZZPOLICY123',
+    f"1c: マージモードでテンプレートの証券番号を事故番号で上書きした: {_v_mg.get('Insurance.PolicyNo')!r}")
+chk(_v_mg.get('FileInfo.AcceptNo') == 'ZZ-2026-0001',
+    f"1c: マージモードで受付番号が入っていない: {_v_mg.get('FileInfo.AcceptNo')!r}")
+
 # ── 2. 一発生成の経路 = pipeline を通る道 ──────────────────────────
 # ここが今回の不具合。process_pdf_to_neo が insurance_info を受けず、
 # generate_neo_file には空の辞書が固定で渡されていた。

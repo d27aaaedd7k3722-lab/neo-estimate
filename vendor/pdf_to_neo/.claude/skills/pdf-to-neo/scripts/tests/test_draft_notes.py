@@ -506,6 +506,27 @@ def test_wage_round_1_and_material_rounding():
     assert 'material' not in de.Drafter(rd).build()['paint']        # 10 円丸めと一致すれば割合モード
 
 
+def test_accept_no_goes_to_the_policy_no_field():
+    """速報報告書の事故番号・受付番号は、証券番号の欄が空なら証券番号にも入れる（2026-09-16 亮平さん指示）。
+    受付番号の欄（FileInfo.AcceptNo）は消さない"""
+    def build(ins):
+        rd = {'source': 't', 'issuer': '', 'est_date': '20260909', 'format': 'A', 'labor_rate': 8000, 'vehicle': dict(VEH),
+              'blocks': [{'title': 'テスト', 'rows': ['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||']}],
+              'paint': {}, 'expenses': [], 'totals': {}, 'insurance': dict(ins)}
+        return de.Drafter(rd).build()
+
+    est = build({'accept_no': 'A12345-6789012-03'})
+    assert est['insurance']['policy_no'] == 'A12345-6789012-03', est['insurance']
+    assert est['insurance']['accept_no'] == 'A12345-6789012-03', est['insurance']
+    assert has(est['_draft_notes'], '証券番号の欄にも入れた'), est['_draft_notes']
+    est2 = build({'accept_no': 'A12345-6789012-03', 'policy_no': '1234-5678'})   # 証券番号が読めていれば上書きしない
+    assert est2['insurance']['policy_no'] == '1234-5678', est2['insurance']
+    assert not has(est2['_draft_notes'], '証券番号の欄にも入れた'), est2['_draft_notes']
+    est3 = build({'accept_no': 'A12345-6789012-0123456789'})                     # 20 バイトを超える番号は要確認に出す
+    assert has(est3['_draft_notes'], '切り詰められる'), est3['_draft_notes']
+    assert any(r.get('kind') == '証券番号' and r.get('level') == '要確認' for r in est3['_review']), est3['_review']
+
+
 def est_for(rows, totals, paint=None):
     rd = {'source': 't', 'issuer': '', 'est_date': '20260909', 'format': 'A', 'labor_rate': 8000, 'vehicle': dict(VEH),
           'blocks': [{'title': 'テスト', 'rows': list(rows)}], 'paint': dict(paint or {}), 'expenses': [], 'totals': dict(totals)}
