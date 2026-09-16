@@ -270,6 +270,23 @@ def test_paint_lump_in_rows_and_paint_is_counted_once():
     assert not r2['fail'], r2['fail']
 
 
+def test_material_counts_lines_with_only_material():
+    """材料の列だけに金額のある塗装行も材料計に数える（印字と一致するときだけ）。
+    2026-09-16 アクセラ: 材料計が 2,000 円足りないまま不合格になり NEO を作れなかった"""
+    rd = copy.deepcopy(BASE)
+    rd['paint'] = {'total': 40000, 'material': 22000,
+                   'lines': [{'name': '塗装一式', 'wage': 40000, 'material': 22000},
+                             {'name': 'ｼｮｰﾄﾊﾟｰﾂ', 'material': 1000}, {'name': '写真代', 'material': 1000}]}
+    rd['totals'] = dict(BASE['totals'], material=24000, taxable=197000, tax=19700, total=216700)
+    r = run(rd)
+    assert has(r['note'], '塗装行の材料の合計'), r['note']
+    assert has(r['note'], '合計欄 課税小計: 197,000 一致'), r['note']
+    assert not r['fail'], r['fail']
+    rd['totals'] = dict(BASE['totals'], material=22000)   # 印字の材料計が塗装一式のぶんだけなら触らない
+    r2 = run(rd)
+    assert not has(r2['note'], '塗装行の材料の合計'), r2['note']
+
+
 def test_wage_unknown_row_catches_total_mismatch():
     """未検算でも、合計欄の御見積額が課税小計 + 消費税 + 非課税と合わなければ FAIL にする"""
     rd = copy.deepcopy(BASE)

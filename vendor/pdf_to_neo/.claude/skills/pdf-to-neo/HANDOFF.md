@@ -208,7 +208,7 @@ bash claude_neo_pipeline/tests/verify_all.sh
 |---|---|
 | 実機 NEO との総当たり | **差のある実験 0 / 73**（この PC、2026-09-13） |
 | 全ファイル一致（そのまま保存した実機 NEO） | **25 / 25 本** |
-| 案件回帰 | **不合格 0**（NEO_check の案件対応表にある案件回帰 4 件と、スキル側 `scripts/regress_cases.py` の 8 案件） |
+| 案件回帰 | **不合格 0**（NEO_check の案件対応表にある案件回帰 4 件と、スキル側 `scripts/regress_cases.py` の全案件。2026-09-16 現在 18 案件＝ NEO_check に `reading.json` を置いた案件すべて。不具合を直したら、その案件の `reading.json` を NEO_check に足して `--update` で正解を作る） |
 | 単体テスト（生成器・スキル） | `*** FAILED` の行が 1 つも出ない |
 | 終了コード | 最終行が **`=== verify_all exit 0`** |
 

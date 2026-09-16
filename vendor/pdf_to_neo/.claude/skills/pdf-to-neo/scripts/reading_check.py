@@ -389,6 +389,13 @@ class Checker:
             paint_w += other_w
         other_in = other_w   # paint_w に含めた追加項目の工賃（材料代の割合を出すときは外す。追加項目は材料率の対象外）
         material = _int(p.get('material')) or 0
+        # 材料の列に金額のある塗装行が塗装一式のほかにもある書式（ショートパーツ・写真代 … を材料の列に刷る工場）。
+        # 印字の材料計と塗装行の材料の合計が一致するならそれで数える（下書き draft_estimate.paint と同じ条件。
+        # 2026-09-16 アクセラ: 材料計 39,440 = 塗装一式 37,440 + 1,000 + 1,000 で、2,000 円足りないまま不合格になっていた）
+        _mat_lines = sum(_int(l.get('material')) or 0 for l in lines if isinstance(l, dict))
+        if _mat_lines and _mat_lines != material and _int(t.get('material')) == _mat_lines:
+            self.note(f'材料計 {_mat_lines:,} は塗装行の材料の合計（材料の列だけに金額のある行を含む）。印字と一致するのでそれで数える')
+            material = _mat_lines
         disc = self.rd.get('discount') or {}
         disc_sum = (_int(disc.get('parts')) or 0) + (_int(disc.get('wage')) or 0)
         frame = self.rd.get('frame') or {}

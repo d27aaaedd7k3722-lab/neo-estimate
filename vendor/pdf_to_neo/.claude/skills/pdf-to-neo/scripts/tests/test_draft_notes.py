@@ -506,6 +506,31 @@ def test_wage_round_1_and_material_rounding():
     assert 'material' not in de.Drafter(rd).build()['paint']        # 10 円丸めと一致すれば割合モード
 
 
+def test_material_includes_lines_with_only_material():
+    """材料の列だけに金額のある塗装行（ショートパーツ・写真代 …）も材料代に入れる。
+    印字の材料計と塗装行の材料の合計が一致するときだけ（2026-09-16 アクセラ: 2,000 円足りずに不合格だった）"""
+    paint = {'total': 20000, 'material': 8000,
+             'lines': [{'name': '塗装一式', 'method': '塗装', 'wage': 20000, 'material': 8000},
+                       {'name': 'ｼｮｰﾄﾊﾟｰﾂ', 'material': 1000}, {'name': '写真代', 'material': 1000}]}
+    est = est_for(['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||'], {'paint': 20000, 'material': 10000}, paint)
+    assert est['paint'].get('material') == 10000, est['paint']
+    assert has(est['_draft_notes'], '塗装行の材料の合計'), est['_draft_notes']
+    est2 = est_for(['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||'], {'paint': 20000, 'material': 8000}, paint)
+    assert est2['paint'].get('material') == 8000, est2['paint']      # 印字の材料計と合わなければ触らない
+    assert not has(est2['_draft_notes'], '塗装行の材料の合計'), est2['_draft_notes']
+    # 汎用車種（塗装行を組み立てない経路）でも同じにする。片方だけ直ると「検算は合格・生成で不合格」になる
+    rd_g = {'source': 't', 'issuer': '', 'est_date': '20260909', 'format': 'A', 'labor_rate': 8000,
+            'vehicle': dict(VEH, generic=True),
+            'blocks': [{'title': 'テスト', 'rows': ['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||']}],
+            'paint': dict(paint), 'expenses': [], 'totals': {'paint': 20000, 'material': 10000}}
+    est3 = de.Drafter(rd_g).build()
+    assert est3['paint'].get('material') == 10000, est3['paint']
+    # 材料欄の写し崩れ（'1,0OO' のような値）があっても落ちない（HEAD は落ちなかった）
+    paint_bad = dict(paint, lines=[dict(paint['lines'][0]), {'name': 'ｼｮｰﾄﾊﾟｰﾂ', 'material': '1,0OO'}])
+    est4 = est_for(['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||'], {'paint': 20000, 'material': 10000}, paint_bad)
+    assert est4['paint'].get('material') == 8000, est4['paint']      # 読めない行があるときは触らない（検算で止まる）
+
+
 def test_accept_no_goes_to_the_policy_no_field():
     """速報報告書の事故番号・受付番号は、証券番号の欄が空なら証券番号にも入れる（2026-09-16 亮平さん指示）。
     受付番号の欄（FileInfo.AcceptNo）は消さない"""

@@ -1327,6 +1327,33 @@ class Drafter:
             self.notes.append(f'塗装 {name}: {key} の行が 2 回あるので後の行を採った（前 {out[key]} / 後 {rec}）。別の項目なら reading の name を直す')
         out[key] = rec
 
+    def _material_from_lines(self, out: dict, lines: list) -> None:
+        """材料の列に金額のある塗装行が塗装一式のほかにもある書式（ショートパーツ・写真代 … を材料の列に刷る工場）:
+        印字の材料計と塗装行の材料の合計がぴったり一致するときだけ、材料代をその合計にする
+        （2026-09-16 アクセラ: 材料計 39,440 = 塗装一式 37,440 + 1,000 + 1,000。塗装一式の分しか見ずに 2,000 円足りず不合格だった）。
+        reading_check の同じ判定と条件をそろえる。**汎用車種・一括計上でも通る所**に置くこと（片方だけ直ると報告が嘘になる）。
+        材料欄の写し崩れ（'1,0OO' のような数字にならない値）があるときは何もしない（下書きを落とさない）"""
+        def _m(v) -> int:
+            s = _num(v)
+            return int(float(s)) if s != '' else 0
+
+        try:
+            mat_lines = sum(_m(l.get('material')) for l in lines if isinstance(l, dict))
+            printed = _m((self.rd.get('totals') or {}).get('material'))
+            now = _m(out.get('material'))
+            extra = [l for l in lines if isinstance(l, dict) and _m(l.get('material')) > 0 and not _m(l.get('wage'))]
+        except ValueError:
+            return
+        if not (mat_lines and printed and mat_lines == printed and mat_lines != now):
+            return
+        out['material'] = mat_lines
+        self.notes.append(f'材料代 {mat_lines:,} 円は塗装行の材料の合計（印字の材料計と一致）。'
+                          f'工賃の列が空で材料の列だけに金額のある行（{" / ".join(_hw_kana(l.get("name") or "") for l in extra[:5]) or "（なし）"}）'
+                          'の材料も入れた（この行は工賃が無いので塗装工賃計は変わらない。「追加項目（材料代の対象外）」の注記は材料率の計算の話）')
+        for l in extra:
+            self._rev('判断', '材料代', f'「{_hw_kana(l.get("name") or "")}」{_m(l.get("material")):,} 円は'
+                                    '材料の列に印字されているので材料代に入れた（印字の材料計と一致）')
+
     def paint(self) -> Optional[dict]:
         p = self.rd.get('paint')
         if not p:
@@ -1341,6 +1368,7 @@ class Drafter:
             if 'total' not in out and lines:
                 out['total'] = sum(int(float(_num(l.get('wage')) or 0)) for l in lines)
                 out['_total_from_lines'] = 0   # 塗装行から作った total（印字の塗装工賃計ではない）。数字は total に含めた追加項目の工賃（inspect が二重に数えないため）
+            self._material_from_lines(out, lines)   # 汎用車種・塗装行を組み立てない経路でも材料代は合わせる（検算と同じ条件にする）
             return out
         panels, other = list(out.get('panels') or []), list(out.get('other') or [])
         n_other0 = len(other)   # ここから後ろが塗装行から追加項目にした行（前は転記の paint.other）
@@ -1473,6 +1501,7 @@ class Drafter:
                 t_in = None
             if t_in is not None and t_in != s_lines - line_other_w + s_frame:
                 self.notes.append(f'塗装計: 印字 {t_in:,} と塗装行の工賃合計 {s_lines:,} が違う（差 {t_in - s_lines:+,}）。行の写し漏れか、内板骨格・付加塗装が含まれていないか確かめる')
+        self._material_from_lines(out, lines)
         # 材料代が「塗装工賃計 × 割合」の一括四捨五入と一致するなら割合だけ渡す（コグニは費用割合モード = MaterialTotalbyManual ''。額を渡すと '*' 手入力扱いになる。実機 2026-09-08 exp_paint_B）
         try:
             mat = int(float(_num(out.get('material')) or 0)); rate = float(_num(out.get('material_rate')) or 0); tot = int(float(_num(out.get('total')) or 0))

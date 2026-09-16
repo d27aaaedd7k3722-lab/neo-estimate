@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "2c8b5dabf636a5ee7e16cfa69d6e57a3f3742840",
- "subject": "feat: 事故番号・受付番号を NEO の証券番号の欄にも入れる（証券番号の印字が無い案件）",
- "synced_at": "2026-09-16T16:34:58",
+ "commit": "5ad2bc817f567ef7f61cb9561494cf9ba66950f4",
+ "subject": "fix: 材料の列だけに金額のある塗装行も材料代に入れる（材料計が 2,000 円足りずに NEO を作れなかった）",
+ "synced_at": "2026-09-16T17:04:43",
  "files": 108,
- "tree_sha256": "18d0780c9432a6ef92ca423709f3e351bec9cee62c30c3f6d93a1154dd556662",
+ "tree_sha256": "c77c4b3996346ea92d15b66f52ab85d5a3f06aebd2e12058adf684252e01b454",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }
