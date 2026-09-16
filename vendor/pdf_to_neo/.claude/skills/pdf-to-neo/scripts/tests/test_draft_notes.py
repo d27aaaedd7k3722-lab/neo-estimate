@@ -506,6 +506,57 @@ def test_wage_round_1_and_material_rounding():
     assert 'material' not in de.Drafter(rd).build()['paint']        # 10 円丸めと一致すれば割合モード
 
 
+def est_for(rows, totals, paint=None):
+    rd = {'source': 't', 'issuer': '', 'est_date': '20260909', 'format': 'A', 'labor_rate': 8000, 'vehicle': dict(VEH),
+          'blocks': [{'title': 'テスト', 'rows': list(rows)}], 'paint': dict(paint or {}), 'expenses': [], 'totals': dict(totals)}
+    return de.Drafter(rd).build()
+
+
+def test_blank_wage_is_zero_when_printed_total_matches():
+    """工賃計が印字の工賃の合計と一致する見積: 工賃欄の空欄は 0 円（生成器の標準指数で埋めない）。
+    2026-09-16 シエンタ: 空欄 3 行に標準 6.6h / 6.4h / 0.3h が入り工賃が +106,400 円になって不合格だった"""
+    rows = ['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||', '0400|左ﾍｯﾄﾞﾗｲﾄ|脱着||||||']
+    est = est_for(rows, {'wage': 8000})
+    assert [it.get('wage') for it in est['items']] == [8000, 0], est['items']
+    assert has(est['_draft_notes'], '工賃欄が空欄'), est['_draft_notes']
+
+
+def test_blank_wage_stays_open_when_total_needs_it():
+    """工賃計が行の合計より大きい見積（工賃欄の無い書式など）は、空欄のまま生成器の標準指数に任せる"""
+    est = est_for(['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||', '0400|左ﾍｯﾄﾞﾗｲﾄ|脱着||||||'], {'wage': 12000})
+    assert 'wage' not in est['items'][1], est['items'][1]
+    assert not has(est['_draft_notes'], '工賃欄が空欄'), est['_draft_notes']
+
+
+def test_double_paint_drops_paint_when_wage_total_includes_the_row():
+    """塗装の一式が明細の手入力行と paint の両方にある reading: 印字の工賃計に手入力行が入っているなら paint を書かない"""
+    rows = ['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||', '|塗装費用||||||40000|M|']
+    est = est_for(rows, {'wage': 48000}, {'total': 40000, 'material': 0})
+    assert 'paint' not in est, est.get('paint')
+    assert len(est['items']) == 2 and has(est['_draft_notes'], '両方にある'), est['_draft_notes']
+    est2 = est_for(rows, {'wage': 48000}, {'total': 30000, 'material': 10000})   # 一式（材料込み）で写した手入力行
+    assert 'paint' not in est2, est2.get('paint')
+
+
+def test_double_paint_drops_the_row_when_wage_total_excludes_it():
+    """逆に、印字の工賃計に手入力行が入っていない（塗装計が別に印字されている）なら明細の手入力行を外す"""
+    rows = ['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||', '|塗装費用||||||40000|M|']
+    est = est_for(rows, {'wage': 8000, 'paint': 40000}, {'total': 40000, 'material': 0})
+    assert est.get('paint', {}).get('total') == 40000, est.get('paint')
+    assert len(est['items']) == 1 and has(est['_draft_notes'], '両方にある'), (est['items'], est['_draft_notes'])
+
+
+def test_double_paint_left_alone_when_totals_do_not_decide():
+    """どちらとも決まらない金額なら黙って片方を消さない（reading_check の二重計上の警告と紙上検算に任せる）"""
+    rows = ['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||', '|塗装費用||||||40000|M|']
+    est = est_for(rows, {'wage': 60000}, {'total': 40000, 'material': 0})
+    assert est.get('paint', {}).get('total') == 40000 and len(est['items']) == 2, (est.get('paint'), est['items'])
+    assert not has(est['_draft_notes'], '両方にある'), est['_draft_notes']
+    est2 = est_for(rows, {'wage': 48000, 'paint': 40000}, {'total': 40000, 'material': 0})  # 塗装計も工賃計も手入力行を含む形
+    assert est2.get('paint', {}).get('total') == 40000 and len(est2['items']) == 2, (est2.get('paint'), est2['items'])
+    assert not has(est2['_draft_notes'], '両方にある'), est2['_draft_notes']
+
+
 if __name__ == '__main__':
     fails = 0
     for name, fn in sorted(globals().items()):

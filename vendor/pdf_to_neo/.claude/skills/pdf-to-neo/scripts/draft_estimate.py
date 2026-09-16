@@ -408,6 +408,22 @@ def rate_score(pairs: list[tuple[float, int]], rate: int) -> int:
     return sum(1 for t, w in pairs if w in (_round(round(t * rate, 2), 10), _round(round(t * rate, 2), 100)))
 
 
+def index_from_wage(wage: int, labor: int, wage_round: int = 10) -> float | None:
+    """指数の列が無い書式（コグニ印刷）で `#`（手入力指数）の印が付いた行の指数を、印字の工賃から起こす。
+    指数 = 工賃 ÷ レート が 0.1 刻みで、その指数から工賃を丸め直すと印字の工賃に戻るときだけ返す（戻らなければ None）。
+    コグニは手入力指数の行に `#`、工賃だけ手入力の行に `*` を印字するので、`#` の行はコグニ側に指数がある（2026-09-16 シエンタ）"""
+    if not wage or wage <= 0 or not labor or labor <= 0:
+        return None
+    u = max(1, int(wage_round or 10))
+    x = round(wage / labor, 1)
+    if x <= 0:
+        return None
+    y = round(x * labor, 2)
+    if int(y // u + (1 if (y % u) >= u / 2 else 0)) * u != int(wage):
+        return None
+    return x
+
+
 def infer_labor_rate(rows: list[dict]) -> int:
     """レバーレートの推定: 各行の wage/index を候補にし、候補ごとに「指数×候補を 10 円または 100 円で丸めると印字工賃に一致する行数」を数えて最多の候補を選ぶ
     （100 円丸めの工場では 0.25h → 2,800 なので単純な wage/index = 11,200 が混ざる。全行を説明できる 11,000 を選ぶ）
@@ -826,6 +842,7 @@ class Drafter:
         if self.wage_round != 10:
             self.notes.append(f'工賃の丸め単位 {self.wage_round} 円（印字の工賃が指数×レートの {self.wage_round} 円丸めと一致）→ estimate.wage_round')
         has_wage_col = any(r.get('wage') is not None or r.get('index') is not None for r in rows_flat)  # 工賃列のある書式か
+        has_index_col = any(_num(r.get('index')) != '' for r in rows_flat)  # 指数列のある書式か（コグニ印刷は工賃だけ）。空欄（''・'-'）は行の読み取りと同じく「指数なし」
         ctx_block = ''
         used: set[int] = set()
         cur_title = None
@@ -877,6 +894,20 @@ class Drafter:
             elif has_wage_col and dcode == 0 and price > 0 and index is None:
                 item['wage'] = 0  # 工賃列のある書式で工賃も指数も空の部品行 = 付属部品（工賃なし）
             # それ以外（工賃列の無い書式、脱着/修理/板金で工賃が読めない行）は wage を省略し、生成器の標準指数に任せる
+            if index is None and not has_index_col and '#' in str(row.get('mark') or '') and int(item.get('wage') or 0) > 0:
+                # コグニ印刷で指数の列が無い書式の `#`（手入力指数）行: 指数を工賃から起こす。
+                # 起こさないと生成器は「工賃だけ手入力」（Time -1・印 `*`）になり、コグニの印字（`#`・指数あり）と食い違う。
+                # `*`（工賃だけ手入力）の行は起こさない（3800 ﾗｲｾﾝｽﾌﾟﾚｰﾄ脱着修正 12,000 = 1.5 も `*` のまま）
+                _x = index_from_wage(int(item.get('wage') or 0), labor, self.wage_round) if labor else None
+                if _x is not None:
+                    index = _x
+                    self.notes.append(f'{name_raw}: 印字の印 # （手入力指数）なので、指数 {_x:g} = 工賃 {int(item["wage"]):,} ÷ レート {labor:,} を 0.1 刻みに丸めた値として写した'
+                                      f'（{_x:g} × {labor:,} を {self.wage_round} 円丸めで戻すと印字の工賃に一致。この書式には指数の列が無い）')
+                elif not labor:
+                    item['_index_from_mark'] = True   # レートが技術料から後で決まる書式: レート確定後に起こす（_labor_from_wages の最後）
+                else:
+                    self.notes.append(f'{name_raw}: 印字の印 # （手入力指数）だが、工賃 {int(item.get("wage") or 0):,} はレート {labor:,} × 0.1 刻みの指数'
+                                      f'（{self.wage_round} 円丸め）では作れないので指数を起こさない（工賃だけ手入力の行になる）')
             if index is not None and float(index) > 0:
                 item['index'] = float(index)
             if row.get('comment'):  # 転記メモ（人が確かめる点）。NEO の明細コメントには書かず確認箇所シートへ
@@ -1194,6 +1225,16 @@ class Drafter:
         self.labor = pick
         self.notes.append(f'レバーレート {pick:,} 円: 技術料を 0.1 刻みの指数で説明できるレート{why}')
         self._rev('判断', 'レバーレート', f'{pick:,} 円（技術料だけの書式。技術料 ÷ レートが 0.1 刻みの指数になるレート{why}）')
+        for it in items:  # レートが決まる前に印 `#` だけ分かっていた行の指数を起こす（指数の列が無く技術料だけの書式）
+            if not it.pop('_index_from_mark', False) or it.get('index'):
+                continue
+            x_ = index_from_wage(int(it.get('wage') or 0), pick, self.wage_round)
+            if x_ is not None:
+                it['index'] = x_
+                self.notes.append(f"{it.get('name')}: 印字の印 # （手入力指数）なので、指数 {x_:g} = 工賃 {int(it.get('wage') or 0):,} ÷ レート {pick:,}（レート決定後）")
+            else:
+                self.notes.append(f"{it.get('name')}: 印字の印 # （手入力指数）だが、工賃 {int(it.get('wage') or 0):,} はレート {pick:,} × 0.1 刻みの指数"
+                                  f"（{self.wage_round} 円丸め）では作れないので指数を起こさない（工賃だけ手入力の行になる）")
         for it in items:  # レートが決まる前に面積だけ分かっていた板金行のランクを引き直す（Codex 指摘）
             area = it.pop('_bankin_area', None)
             if not area or it.get('bankin') or not it.get('wage'):
@@ -1760,10 +1801,101 @@ class Drafter:
         t.update(getattr(self, '_paint_split', None) or {})  # auto_panels で決めた塗装の内訳は印字より優先する
         return t
 
+    def _printed_wage(self) -> int:
+        """見積書に印字された工賃計（読めなければ 0）"""
+        try:
+            return int(float(_num((self.rd.get('totals') or {}).get('wage')) or 0))
+        except ValueError:
+            return 0
+
+    def _wage_sums(self, items: list[dict], expenses: list[dict]) -> tuple[int, int]:
+        """（明細の工賃の合計, 費用の工賃分）。印字の工賃計は費用を含む書式と含まない書式があるので両方返す。
+        保留（reserve）行は生成器が工賃を捨てる（estimate_to_neo は WageOutTax -1）ので、reading_check と同じく数えない"""
+        return (sum(int(it.get('wage') or 0) for it in items if not it.get('reserve')),
+                sum(int(e.get('amount') or 0) for e in expenses if e.get('kind') != 'parts'))
+
+    def _drop_double_paint(self, items: list[dict], paint: Optional[dict], expenses: list[dict]) -> Optional[dict]:
+        """塗装の一式が明細（手入力行）と paint の両方にある reading の二重計上を、印字の合計で決着させる。
+        どちらが正しいかは印字の工賃計で分かる（手入力行を足して一致するなら塗装は明細側、
+        引いて一致するなら塗装は paint 側）。判断が付かないときは何もしない（reading_check の
+        二重計上の警告と紙上検算に任せる。黙って片方を消さない）"""
+        if not paint:
+            return paint
+        try:
+            pt = int(float(_num(paint.get('total')) or 0))
+            mat = int(float(_num(paint.get('material')) or 0))
+        except ValueError:
+            return paint
+        kw = re.compile(r'塗装|ﾄｿｳ|塗料|材料')
+        dup = [it for it in items if it.get('manual') and int(it.get('wage') or 0) > 0
+               and int(it.get('price') or 0) <= 0                      # 部品代のある行は外さない（外すと部品計がずれる）
+               and kw.search(_hw_kana(str(it.get('name') or '')))]
+        m_sum = sum(int(it.get('wage') or 0) for it in dup)
+        want = self._printed_wage()
+        # 手入力行の合計が塗装工賃計（材料込みで写した一式なら + 材料代）と同じ = 同じ金額が 2 か所にある
+        if pt <= 0 or not dup or m_sum not in (pt, pt + mat) or want <= 0:
+            return paint
+        got, ex_w = self._wage_sums(items, expenses)
+        try:
+            printed_paint = int(float(_num((self.rd.get('totals') or {}).get('paint')) or 0))
+        except ValueError:
+            return paint
+        names = ' / '.join(str(it.get('name') or '')[:14] for it in dup[:3])
+        # paint を捨ててよいのは「手入力行と同じ額しか入っていない一式」のときだけ（材料代・追加項目・内板骨格塗装・
+        # パネル別の内訳があるのに捨てると、証拠の無い金額まで消える）。塗装計・塗装計(材料込)・材料計の印字が
+        # 1 つでもあるなら寄せない（reading_check の同じ判定と条件をそろえる）
+        lump_only = (m_sum == pt + mat and not (paint.get('other') or paint.get('frame') or paint.get('lines') or paint.get('panels'))
+                     and all((self.rd.get('totals') or {}).get(k) is None for k in ('paint', 'paint_total', 'material')))
+        # 塗装計の印字が無く、手入力行が印字の工賃計に入っている = 塗装は明細側。paint を書くと塗装計が二重に乗る
+        if printed_paint <= 0 and lump_only and want in (got, got + ex_w):
+            self.notes.append(f'塗装 {m_sum:,} 円が明細の手入力行（{names}）と paint の両方にある。'
+                              f'印字の工賃計 {want:,} 円は手入力行を含む金額なので、paint（塗装計）は書かない')
+            self._rev('判断', '塗装の二重計上', f'塗装 {m_sum:,} 円が明細の手入力行と paint の両方にあった。'
+                                          f'印字の工賃計 {want:,} 円は手入力行を含む金額なので、明細の行で計上し塗装計には入れない', item=dup[0])
+            return None
+        if want in (got - m_sum, got - m_sum + ex_w) and printed_paint in (0, pt, pt + mat):   # 工賃計に入っていない = 塗装は paint 側。明細の手入力行が余分
+            for it in dup:
+                items.remove(it)
+                for _e in self.review:   # 消した行に結び付けた確認箇所は明細 No が出ない → どの行の話か分かる文言にする
+                    if _e.get('_item') is it:
+                        _e['_item'] = None
+                        _e['text'] = f"（明細から外した塗装の行「{str(it.get('name') or '')[:14]}」）" + str(_e.get('text') or '')
+            self.notes.append(f'塗装 {m_sum:,} 円が明細の手入力行（{names}）と paint の両方にある。'
+                              f'印字の工賃計 {want:,} 円は手入力行を含まない金額なので、明細の手入力行を外して paint（塗装計）で計上する')
+            self._rev('判断', '塗装の二重計上', f'塗装 {m_sum:,} 円が明細の手入力行（{names}）と paint の両方にあった。'
+                                          f'印字の工賃計 {want:,} 円は手入力行を含まない金額なので、明細から外して塗装計で計上した')
+        return paint
+
+    def _blank_wage_is_zero(self, items: list[dict], expenses: list[dict]) -> None:
+        """工賃計の印字が「印字された工賃の合計」と一致する見積では、工賃欄の空欄は工賃 0 円。
+        生成器は工賃も指数も無い取替/脱着行をコグニの標準指数で埋めるので、そのままだと
+        見積どおりに読めているのに工賃計だけ増えて協定見積にならない
+        （2026-09-16 シエンタ: 空欄 3 行に標準 6.6h / 6.4h / 0.3h が入り +106,400 円）"""
+        want = self._printed_wage()
+        rows_w, ex_w = self._wage_sums(items, expenses)
+        if want <= 0 or want not in (rows_w, rows_w + ex_w):
+            return
+        blanks = [it for it in items
+                  if it.get('wage') is None and it.get('index') is None
+                  and not it.get('manual') and not it.get('reserve')
+                  and str(it.get('method') or '').strip() in ('取替', '脱着')]
+        if not blanks:
+            return
+        for it in blanks:
+            it['wage'] = 0
+            self._rev('判断', '工賃欄が空欄', f'工賃 0 円で作成（印字の工賃計 {want:,} 円が明細の工賃の合計と一致するので、'
+                                        'この見積の空欄は「工賃なし」。コグニの標準指数では埋めない）', item=it)
+        names = ' / '.join(str(it.get('name') or '')[:14] for it in blanks[:6])
+        self.notes.append(f'工賃欄が空欄の {len(blanks)} 行を工賃 0 円として渡す（印字の工賃計 {want:,} 円が明細の工賃の合計と'
+                          'ぴったり一致するので、この見積の空欄は「工賃なし」。コグニの標準指数では埋めない）: '
+                          + names + (f' ほか {len(blanks) - 6} 行' if len(blanks) > 6 else ''))
+
     def build(self) -> dict:
         items = self.items()
         paint = self.paint()
         expenses = self.expenses()
+        paint = self._drop_double_paint(items, paint, expenses)   # 塗装の一式が明細と paint の両方にある reading
+        self._blank_wage_is_zero(items, expenses)                 # 工賃欄の空欄を標準指数で埋めない見積
         est: dict = {
             'source': self.rd.get('source', ''), 'issuer': self.rd.get('issuer', ''), 'est_date': self.rd.get('est_date', ''),
             'vehicle': self.vehicle, 'customer': self._fit_texts(self.rd.get('customer') or {}, ('name', 'owner_name', 'user_name'), '顧客'),

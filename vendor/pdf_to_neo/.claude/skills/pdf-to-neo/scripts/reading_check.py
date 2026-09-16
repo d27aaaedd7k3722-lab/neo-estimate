@@ -393,6 +393,33 @@ class Checker:
         disc_sum = (_int(disc.get('parts')) or 0) + (_int(disc.get('wage')) or 0)
         frame = self.rd.get('frame') or {}
         frame_w = sum(_int(x.get('wage')) or 0 for x in frame.get('items') or []) + (_int(frame.get('basic_wage')) or 0) if frame else 0
+        _ex_nonparts = ex_by['wage'] + ex_by['expense'] + ex_by['taxfree']   # 下書きが「費用の工賃分」として数える範囲（部品計に入る費用以外）
+        # 塗装の一式が明細の手入力行と paint の両方にある reading（読み取りの二重計上）。
+        # 下書き（draft_estimate._drop_double_paint）は印字の工賃計で片方に寄せるので、検算も同じ寄せ方で数える。
+        # ここで寄せないと、下書きが直せる案件を紙上検算で止めてしまう（2026-09-16 シエンタ: 塗装費用 191,360 が二重）
+        _kw_paint = re.compile(r'塗装|ﾄｿｳ|塗料|材料')
+        dup_rows = [r for r in rows if r.get('manual') and (_int(r.get('wage')) or 0) > 0
+                    and (_int(r.get('price')) or 0) <= 0              # 部品代のある行は寄せない（下書きと同じ条件）
+                    and _kw_paint.search(_hw_kana(r.get('name') or ''))]
+        dup_sum = sum(_int(r.get('wage')) or 0 for r in dup_rows)
+        drop_paint = False
+        _gw = _int(t.get('wage')) or 0
+        _printed_paint = _int(t.get('paint')) or 0
+        if dup_rows and paint_w > 0 and _gw > 0 and dup_sum in (paint_w, paint_w + material):
+            # paint を数えないのは「手入力行と同じ額しか入っていない一式」のときだけ（材料代・追加項目・内板骨格塗装・
+            # パネル別の内訳があるのに落とすと、証拠の無い金額まで消える）。draft_estimate._drop_double_paint と同じ条件
+            _lump_only = (dup_sum == paint_w + material and not (p.get('other') or p.get('frame') or p.get('lines') or p.get('panels'))
+                          and all(t.get(k) is None for k in ('paint', 'paint_total', 'material')))
+            if _lump_only and _gw in (wage_sum, wage_sum + _ex_nonparts):
+                drop_paint = True   # 手入力行が印字の工賃計に入っている = 塗装は明細側。paint は数えない
+                self.note(f'塗装 {dup_sum:,} 円が明細の手入力行と paint の両方にある。印字の工賃計 {_gw:,} は手入力行を含む金額なので、'
+                          '塗装計は明細の行で数える（下書きも paint を書かない）')
+            elif _gw in (wage_sum - dup_sum, wage_sum - dup_sum + _ex_nonparts) and _printed_paint in (0, paint_w, paint_w + material):
+                wage_sum -= dup_sum   # 印字の工賃計に入っていない = 塗装は paint 側。明細の手入力行は数えない
+                self.note(f'塗装 {dup_sum:,} 円が明細の手入力行と paint の両方にある。印字の工賃計 {_gw:,} は手入力行を含まない金額なので、'
+                          '塗装計は paint で数える（下書きも明細の手入力行を外す）')
+        paint_w_sub = 0 if drop_paint else paint_w        # 課税小計に足す塗装工賃
+        material_sub = 0 if drop_paint else material      # 同じく材料代
 
         def cmp(label: str, calc: int, given, alts: Optional[dict] = None) -> bool:
             g = _int(given)  # 印字どおり '95,000' や空欄 '' でも落ちない（空欄・非数値は未記入扱い）
@@ -411,9 +438,15 @@ class Checker:
             return False
 
         cmp('部品計', parts_sum, t.get('parts'), {'明細 + 費用（部品計）': parts_sum + ex_by['parts'], '明細 − 値引': parts_sum + (_int(disc.get('parts')) or 0)})
-        if unknown_w:
+        # 工賃も指数も無い行があっても、印字の工賃計が明細の工賃の合計（＋費用の工賃分）とぴったり一致するなら
+        # その空欄は 0 円（下書きが 0 円で渡し、生成器は標準指数で埋めない。draft_estimate._blank_wage_is_zero と同じ条件）
+        blank_zero = bool(unknown_w) and _gw > 0 and _gw in (wage_sum, wage_sum + _ex_nonparts)
+        if unknown_w and not blank_zero:
             self.warn(f'工賃も指数も無い行が {len(unknown_w)} 行（{", ".join(str(r.get("name") or "")[:10] for r in unknown_w[:4])}）。生成器が標準指数で補完するので、工賃計は検算できない。印字に工賃があるなら写す')
         else:
+            if blank_zero:
+                self.note(f'工賃も指数も無い行が {len(unknown_w)} 行あるが、印字の工賃計 {_gw:,} は明細の工賃の合計と一致する。'
+                          'この見積の空欄は 0 円（下書きが 0 円で渡すので標準指数では埋めない）')
             wage_alts = {}
             for n in range(1, 5):
                 for comb in combinations((('塗装工賃', paint_w), ('材料代', material), ('内板骨格', frame_w), ('費用（作業計）', ex_by['wage']), ('費用（諸費用）', ex_by['expense'])), n):
@@ -431,7 +464,7 @@ class Checker:
         if _num(self.rd.get('target_total')) != '':
             self.note(f"target_total {self.rd.get('target_total')}: 課税小計・消費税・合計は draft が材料代で合わせるので検算しない")
             return
-        if unknown_w:  # 工賃の無い行があると明細からの課税小計は出せないが、合計欄どうしの整合（課税小計 + 消費税 + 非課税 = 御見積額、税の丸め）は必ず見る
+        if unknown_w and not blank_zero:  # 工賃の無い行があると明細からの課税小計は出せないが、合計欄どうしの整合（課税小計 + 消費税 + 非課税 = 御見積額、税の丸め）は必ず見る
             self.wage_unchecked = True
             g_sub, g_tax, g_tot = _int(t.get('taxable')), _int(t.get('tax')), _int(t.get('total'))
             if g_sub is not None and g_tax is not None:
@@ -445,7 +478,7 @@ class Checker:
                 self.fail(f'合計欄 御見積額: 印字 {g_tot:,} ≠ 課税小計 {g_sub:,} + 消費税 {g_tax:,} + 非課税 {_tf:,} = {g_sub + g_tax + _tf:,}')
             self.warn('工賃の無い行があるので「明細からの課税小計」は未検算（合計欄どうしの整合だけ確認した）')
             return
-        sub = parts_sum + wage_sum + paint_w + material + frame_w + ex_by['parts'] + ex_by['wage'] + ex_by['expense'] + disc_sum
+        sub = parts_sum + wage_sum + paint_w_sub + material_sub + frame_w + ex_by['parts'] + ex_by['wage'] + ex_by['expense'] + disc_sum
         ok_sub = cmp('課税小計', sub, t.get('taxable'))
         g_sub = _int(t.get('taxable'))
         base = g_sub if (g_sub is not None and not ok_sub) else sub  # 課税小計が印字と違うときは、税の丸めは印字の課税小計で判定する（原因を分けるため）
@@ -486,7 +519,8 @@ class Checker:
             if not rows_:
                 continue
             if explicit:
-                self.warn(f"{label}らしい手入力行が {len(rows_)} 行（{', '.join(str(r.get('name') or '')[:10] for r in rows_[:3])}）あり {where} にも書かれている。二重計上でないか合計欄で確かめる")
+                self.warn(f"{label}らしい手入力行が {len(rows_)} 行（{', '.join(str(r.get('name') or '')[:10] for r in rows_[:3])}）あり {where} にも書かれている。二重計上でないか合計欄で確かめる"
+                          + ('（印字の工賃計でどちらが正か決まる場合は、下書きが片方に寄せて報告書に残す）' if label == '塗装' else ''))
             else:
                 mode = True
         if mode:

@@ -129,6 +129,22 @@ def test_side20():
     assert de._side20(' Rﾊﾞﾝﾊﾟﾌｴｲｽ') == '', '2 文字目の R は前後であって左右ではない'
 
 
+def test_index_from_wage_only_for_clean_steps():
+    """指数の列が無い書式の `#` 行: 指数 = 工賃 ÷ レート（0.1 刻みで、丸め直すと印字工賃に戻るときだけ）"""
+    assert de.index_from_wage(16000, 8000) == 2.0
+    assert de.index_from_wage(12000, 8000) == 1.5
+    assert de.index_from_wage(20000, 8000) == 2.5
+    assert de.index_from_wage(8000, 8000) == 1.0
+    assert de.index_from_wage(12750, 8500) == 1.5
+    assert de.index_from_wage(28600, 11000, 100) == 2.6  # 100 円丸めの工場（工場 J）: 2.60h × 11,000 = 28,600
+    assert de.index_from_wage(2800, 11000, 100) is None  # 0.25h × 11,000 の印字 2,800 は 0.1 刻みに乗らない（0.3 なら 3,300）
+    assert de.index_from_wage(13716, 7620, 1) == 1.8     # 1 円丸めの工場（指数 × レートをそのまま刷る書式）
+    assert de.index_from_wage(2420, 8050) == 0.3        # 端数のレート: 商 0.3006… を 0.1 刻みに丸め、戻すと印字に一致
+    assert de.index_from_wage(300, 8000) is None        # 0.05h 未満（商が 0）は起こさない
+    assert de.index_from_wage(12345, 8000) is None       # 0.1 刻みに乗らない工賃は起こさない
+    assert de.index_from_wage(0, 8000) is None and de.index_from_wage(8000, 0) is None
+
+
 if __name__ == '__main__':
     fails = 0
     for name, fn in sorted(globals().items()):

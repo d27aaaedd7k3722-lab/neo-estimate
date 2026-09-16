@@ -229,11 +229,45 @@ def test_wage_unknown_row_still_checks_totals():
     rd = copy.deepcopy(BASE)
     rd['blocks'][1]['rows'][1] = '|RH ﾌｪﾝﾀﾞ ﾗｲﾅ|脱着|53875-11111||1||||'  # 取替 → 脱着（部品代も工賃も指数も無い）
     rd['pages']['2'] = {'rows': 2, 'parts': 30000, 'wage': 16000}
-    rd['totals'] = {'parts': 92000, 'wage': 28000, 'paint': 40000, 'material': 22000, 'expense': 10000,
-                    'taxable': 192000, 'tax': 19200, 'total': 211200}
+    rd['totals'] = {'parts': 92000, 'wage': 36000, 'paint': 40000, 'material': 22000, 'expense': 10000,
+                    'taxable': 192000, 'tax': 19200, 'total': 211200}  # 工賃計が明細より多い = 空欄の行に工賃がある書式
     r = run(rd)  # ここで NameError で落ちないこと
     assert has(r['warn'], '未検算'), r['warn']
     assert not r['fail'], r['fail']
+
+
+def test_wage_unknown_row_is_zero_when_printed_total_matches():
+    """工賃も指数も無い行があっても、印字の工賃計が明細の工賃の合計と一致するなら空欄は 0 円（下書きと同じ判断）。
+    未検算にせず課税小計まで検算する（2026-09-16 シエンタ: 空欄に標準指数が入って +106,400 円になっていた）"""
+    rd = copy.deepcopy(BASE)
+    rd['blocks'][1]['rows'][1] = '|RH ﾌｪﾝﾀﾞ ﾗｲﾅ|脱着|53875-11111||1||||'
+    rd['pages']['2'] = {'rows': 2, 'parts': 30000, 'wage': 16000}
+    rd['totals'] = {'parts': 92000, 'wage': 28000, 'paint': 40000, 'material': 22000, 'expense': 10000,
+                    'taxable': 192000, 'tax': 19200, 'total': 211200}
+    r = run(rd)
+    assert not has(r['warn'], '未検算') and not r['warn'], r['warn']
+    assert has(r['note'], '空欄は 0 円') and has(r['note'], '合計欄 課税小計: 192,000 一致'), r['note']
+    assert not r['fail'], r['fail']
+
+
+def test_paint_lump_in_rows_and_paint_is_counted_once():
+    """塗装の一式が明細の手入力行と paint の両方にある reading: 下書きと同じ寄せ方（印字の工賃計で決める）で検算する。
+    ここで寄せないと、下書きが直せる案件を紙上検算で止めてしまう（2026-09-16 シエンタ）"""
+    rd = copy.deepcopy(BASE)
+    rd['paint'] = {'total': 40000}                      # 塗装計の印字は無い
+    rd['blocks'][1]['rows'].append('|塗装費用||||||40000|M|')
+    rd['pages']['2'] = {'rows': 3, 'parts': 33000, 'wage': 56000}
+    rd['totals'] = {'parts': 95000, 'wage': 68000, 'expense': 10000,   # 工賃計は手入力行を含む（28,000 + 40,000）
+                    'taxable': 173000, 'tax': 17300, 'total': 190300}
+    r = run(rd)
+    assert has(r['note'], '塗装計は明細の行で数える'), r['note']
+    assert has(r['note'], '合計欄 課税小計: 173,000 一致'), r['note']
+    assert not r['fail'], r['fail']
+    rd['paint'] = {'total': 40000}                      # 逆: 工賃計が手入力行を含まない = 塗装は paint 側
+    rd['totals'].update({'wage': 28000, 'paint': 40000})
+    r2 = run(rd)
+    assert has(r2['note'], '塗装計は paint で数える'), r2['note']
+    assert not r2['fail'], r2['fail']
 
 
 def test_wage_unknown_row_catches_total_mismatch():

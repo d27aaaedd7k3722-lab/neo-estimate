@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "a798f598cfd0178e63170dedaef98992474035f5",
- "subject": "fix: XML の所有者名・使用者名も DB と同じ 20 バイトで切る（XML だけ 50 バイトのまま出ていた）",
- "synced_at": "2026-09-15T22:21:14",
+ "commit": "0b9d6eeb36047fc8556540560fedcf08145ac69e",
+ "subject": "fix: 工賃欄の空欄を印字の工賃計で 0 円と決める・塗装の二重計上を印字の合計で寄せる（実案件で NEO を作れなかった）",
+ "synced_at": "2026-09-16T14:59:45",
  "files": 108,
- "tree_sha256": "f702bf0cfa7c1b5d4302c799ca9360529fee2c72ebb97b9cc7006b8659c146af",
+ "tree_sha256": "0d3f6995bd8d687a7a5e500fac98933a7324a9278a34e25f443bb8074292ead5",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }
