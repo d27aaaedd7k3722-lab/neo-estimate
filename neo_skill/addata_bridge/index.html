@@ -36,6 +36,54 @@
   const sentCars = new Set();
   let lastArgs = {want: '', have: [], com: false};
 
+  // ── このPC・このブラウザの覚え ──────────────────────────────
+  // 画面を読み直すと、選んだフォルダ（File System Access API の handle）も、送り先のフォルダ名も消える。
+  // handle は IndexedDB に、送り先のフォルダ名と設定は localStorage に覚えて、次に開いたときに使う。
+  const LS_BID = 'neo_addata_bridge_id', LS_NAME = 'neo_addata_root_name';
+  const IDB_NAME = 'neo_addata', IDB_STORE = 'handles';
+  let helloSent = false, needPerm = false;
+  let savedBid = '';          // 起動時に読む（親から来る新しい bid で上書きされる前に控える）
+
+  function lsGet(k) { try { return window.localStorage.getItem(k) || ''; } catch (e) { return ''; } }
+  function lsSet(k, v) { try { if (v) window.localStorage.setItem(k, v); else window.localStorage.removeItem(k); } catch (e) {} }
+
+  function idb() {
+    return new Promise(function (res, rej) {
+      let r;
+      try { r = window.indexedDB.open(IDB_NAME, 1); } catch (e) { rej(e); return; }
+      r.onupgradeneeded = function () { const db = r.result; if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE); };
+      r.onsuccess = function () { res(r.result); };
+      r.onerror = function () { rej(r.error); };
+    });
+  }
+  async function idbPut(key, val) {
+    try {
+      const db = await idb();
+      await new Promise(function (res, rej) {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        tx.objectStore(IDB_STORE).put(val, key);
+        tx.oncomplete = res; tx.onerror = function () { rej(tx.error); };
+      });
+    } catch (e) {}
+  }
+  async function idbGet(key) {
+    try {
+      const db = await idb();
+      return await new Promise(function (res, rej) {
+        const tx = db.transaction(IDB_STORE, 'readonly');
+        const q = tx.objectStore(IDB_STORE).get(key);
+        q.onsuccess = function () { res(q.result || null); };
+        q.onerror = function () { rej(q.error); };
+      });
+    } catch (e) { return null; }
+  }
+  async function forgetAll() {
+    lsSet(LS_BID, ''); lsSet(LS_NAME, '');
+    await idbPut('dir', null);
+    dirHandle = null; needPerm = false; sentCom = false; sentCars.clear();
+    btn.textContent = '📂 PC の Addata フォルダを選ぶ（C:\\Addata）';
+  }
+
   function post(type, extra) {
     window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: type}, extra || {}), '*');
   }
@@ -131,17 +179,72 @@
       status('このブラウザはフォルダの選択（File System Access API）に対応していません。Chrome か Edge で開いてください。', 'ng');
       return;
     }
+    if (needPerm) {
+      // 覚えていたフォルダの許可を取り直すだけ（フォルダを選び直さなくてよい）
+      const saved = await idbGet('dir');
+      if (saved && saved.requestPermission) {
+        let st1 = 'denied';
+        try { st1 = await saved.requestPermission({mode: 'read'}); } catch (e) { st1 = 'denied'; }
+        if (st1 === 'granted') {
+          dirHandle = saved; needPerm = false;
+          btn.textContent = '📂 PC の Addata フォルダを選ぶ（C:\\Addata）';
+          sentCom = false; sentCars.clear();
+          await sendCom();
+          return;
+        }
+      }
+      needPerm = false;   // 許可が取れなければ、ふつうに選び直してもらう
+    }
     try {
       dirHandle = await window.showDirectoryPicker({id: 'addata', mode: 'read'});
     } catch (e) { return; }   // キャンセル
+    await idbPut('dir', dirHandle);          // 次に開いたときのために覚える
+    lsSet(LS_NAME, dirHandle.name || '');
     sentCom = false; sentCars.clear();
     await sendCom();
   });
+
+  async function restore() {
+    // 覚えていた handle を出し、許可が残っていればそのまま使う（残っていなければボタン 1 回で復帰）
+    const saved = await idbGet('dir');
+    const name = lsGet(LS_NAME);
+    if (saved && saved.queryPermission) {
+      let st0 = 'prompt';
+      try { st0 = await saved.queryPermission({mode: 'read'}); } catch (e) { st0 = 'prompt'; }
+      if (st0 === 'granted') {
+        dirHandle = saved;
+      } else {
+        needPerm = true;
+        btn.textContent = '🔓 前回の Addata フォルダ（' + (saved.name || name || 'C:\\Addata') + '）を使う';
+      }
+    }
+    // 送り先のフォルダ名と、PC 側のデータ版（COM/AnVer.DB。27 バイト）を Python に渡す。
+    // アプリ側に前の取り込みが残っていて版も同じなら、送り直さずに続きができる。版が違えば引き継がれず、下で送り直す
+    let anver = '';
+    if (dirHandle) {
+      try {
+        const com = await dirHandle.getDirectoryHandle('COM');
+        const fh = await com.getFileHandle('AnVer.DB');
+        const r = await readFile(await fh.getFile());
+        anver = r.b64;
+      } catch (e) { anver = ''; }
+    }
+    status('前回の接続を確かめています…', 'busy');
+    send({phase: 'hello', bridge_id: savedBid || lsGet(LS_BID), root_name: name, files: {}, bytes: 0, anver: anver,
+          keep: {addata_dir: lsGet('neo_addata_dir'), addata_url: lsGet('neo_addata_url')}});
+    helloSent = true;
+  }
 
   window.addEventListener('message', async function (ev) {
     const d = ev.data || {};
     if (d.type !== 'streamlit:render') return;
     lastArgs = d.args || lastArgs;
+    if (lastArgs.forget) { await forgetAll(); status('接続を解除しました。使うときは、もう一度フォルダを選んでください。', ''); setHeight(); return; }
+    if (!helloSent) { savedBid = lsGet(LS_BID); await restore(); }
+    // 覚えるのは COM が届いている接続だけ（空のフォルダの名前を覚えても、次に開いたとき何も引き継げない）
+    if (lastArgs.bid && lastArgs.com) { lsSet(LS_BID, String(lastArgs.bid)); }
+    const keep = lastArgs.keep || {};
+    if (keep && typeof keep === 'object') { for (const k in keep) { lsSet('neo_' + k, String(keep[k] || '')); } }
     const want = (lastArgs.want || '').toString().trim();
     const have = lastArgs.have || [];
     if (!lastArgs.com && sentCom && !sending) {
@@ -152,7 +255,13 @@
     if (!dirHandle && want) {
       // 画面を読み直すとフォルダの選択は消える（ブラウザの決まり）。読み取り結果はアプリ側に取り置かれているので、
       // ここで選び直せば車種フォルダだけ送って続きができる（読み直しは要らない）
-      status(`車種 ${want} のフォルダが必要ですが、PC のフォルダの選択が消えています（画面を読み直したため）。「📂 PC の Addata フォルダを選ぶ」でもう一度選ぶと続きができます。`, 'ng');
+      status(`車種 ${want} のフォルダが必要ですが、PC のフォルダの選択が消えています（画面を読み直したため）。上のボタンを 1 回押すと`
+             + (needPerm ? '、前回のフォルダの許可を取り直して続きができます。' : '選び直せます。'), 'ng');
+    }
+    if (dirHandle && !lastArgs.com && !sentCom && !sending) {
+      // フォルダは使えるのに、アプリ側に車種マスタが無い（掃除で消えた・版が変わって捨てた・初めて）:
+      // 選び直してもらわずにそのまま送る
+      await sendCom();
     }
     if (dirHandle) {
       if (lastArgs.com && !want) {

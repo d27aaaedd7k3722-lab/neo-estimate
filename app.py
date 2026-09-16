@@ -8904,19 +8904,42 @@ def main():
                 _br.sweep()
                 from neo_skill import maker as _nsk_maker_sw
                 _nsk_maker_sw.sweep_case_dirs()   # 車種フォルダ待ちのまま放置された作業フォルダ（reading.json 入り）も消す
+                # 同じ PC・同じブラウザに覚えさせる（読み直しても送り直さずに済む）。解除したら覚えも消させる
+                _forget = bool(st.session_state.pop('_bridge_forget', False))
+                # 覚えさせるのは、部品から hello（覚えていた内容）を受け取ったあとだけ。先に渡すと、まだ空の設定で
+                # ブラウザの覚えを消してしまう（レビュー）
+                _keep = ({'addata_dir': addata_setting(_QS_ADDATA_DIR), 'addata_url': addata_setting(_QS_ADDATA_URL)}
+                         if st.session_state.get('_bridge_hello_done') else {})
                 _bval = _br.render(want=st.session_state.get('_bridge_want', ''), have=_br.cars(_bpath),
-                                   com=_br.has_com(_bpath), key='addata_bridge')
+                                   com=_br.has_com(_bpath), key='addata_bridge',
+                                   bid=st.session_state.get('_bridge_id', ''), forget=_forget, keep=_keep)
                 _bmsg = _br.ingest(st.session_state, _bval)
                 # COM を受け取った直後は、部品はまだ com=false の render しか見ていない（render は ingest より先）。
                 # もう一度 rerun して com=true を届ける: 車種フォルダ待ちがあれば部品はその後それを送る（Codex 50）
-                _bridge_rerun = bool(_bmsg and isinstance(_bval, dict) and _bval.get('phase') == 'com' and _br.has_com(_bpath)
+                # 引き継ぎ（hello）で送り先が変わったら、それを先に読み直してから描き直しの判断をする
+                _bpath = st.session_state.get('_bridge_path') or _bpath
+                _bridge_rerun = bool(_bmsg and isinstance(_bval, dict) and _bval.get('phase') in ('com', 'hello') and _br.has_com(_bpath)
                                      # 同じ run で「生成」ボタンが押されていたら rerun しない（rerun するとその押下が消える。ボタンの run は最後に rerun する）
                                      and not st.session_state.get('pdf2neo_run') and not st.session_state.get('pdf2neo_run_beta'))
                 if _br.has_com(_bpath):
                     st.session_state['_bridge_path'] = _bpath
+                    # いつ送ったものかを出す（覚えていた接続をそのまま使うと、PC で Addata を入れ替えても古い版のままになる）
+                    _sent = _br.sent_at(_bpath)
+                    _sent_txt = ''
+                    if _sent:
+                        # 本番（クラウド）のコンテナは日本時間ではないので JST で出す（そのままだと 9 時間ずれ、
+                        # 「いつの Addata か」の判断を誤らせる。レビュー）
+                        _ago = max(0.0, time.time() - _sent)
+                        _ago_txt = ('{:.0f} 日前'.format(_ago / 86400) if _ago >= 86400 else '{:.0f} 時間前'.format(_ago / 3600))
+                        _sent_txt = (' ／ 送った日時 ' + datetime.datetime.fromtimestamp(_sent, JST).strftime('%m/%d %H:%M')
+                                     + ('（{}。PC の Addata を入れ替えたときは「🔄 送り直す」）'.format(_ago_txt) if _ago >= 3600 else ''))
                     st.success(f"PC の Addata（{st.session_state.get('_bridge_root_name') or 'フォルダ'}）を使用中 ／ "
                                f"データ版 {_br.version(_bpath) or '不明'} ／ 取り込んだ車種: "
-                               f"{', '.join(_br.cars(_bpath)) or 'なし（見積を入れると自動で送ります）'}")
+                               f"{', '.join(_br.cars(_bpath)) or 'なし（見積を入れると自動で送ります）'}" + _sent_txt)
+                    if st.button("🔄 いまの PC の Addata を送り直す", key='bridge_resend',
+                                 help="PC で Addata を入れ替えたときに押します。いま送ってある車種マスタを消し、選んである PC のフォルダから送り直します"):
+                        _br.resend(st.session_state)
+                        _defer_sidebar_rerun()
                     if st.button("🔌 PC の Addata との接続を解除", key='bridge_disconnect',
                                  help="この画面に送った車種マスタ・車種フォルダを消し、他の設定（ZIP・パス・取得URL・自動検出）に戻します"):
                         _br.disconnect(st.session_state)

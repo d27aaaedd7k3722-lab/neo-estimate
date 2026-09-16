@@ -57,16 +57,81 @@ def component():
     return _component
 
 
-def render(want: str, have: list, com: bool, key: str = 'addata_bridge'):
-    """部品を描く。戻り値は部品が最後に送った値（{seq, phase, car, files, bytes, error}）か None"""
-    return component()(want=want or '', have=list(have or []), com=bool(com), key=key, default=None)
+def render(want: str, have: list, com: bool, key: str = 'addata_bridge',
+           bid: str = '', forget: bool = False, keep: Optional[dict] = None):
+    """部品を描く。戻り値は部品が最後に送った値（{seq, phase, car, files, bytes, error}）か None。
+    bid … いまの送り先のフォルダ名（部品がブラウザに覚える）／forget … 覚えを消させる／
+    keep … ブラウザに覚えさせる設定（フォルダのパス・取得URL）"""
+    return component()(want=want or '', have=list(have or []), com=bool(com), key=key, default=None,
+                       bid=str(bid or ''), forget=bool(forget), keep=dict(keep or {}))
+
+
+_BID_RE = re.compile(r'[0-9a-f]{12}|[0-9a-f]{32}')   # 古い 12 桁（48 bit）も受ける。新しく作るのは 32 桁（128 bit）
+
+
+def adopt(session_state, bridge_id, anver: Optional[bytes] = None) -> bool:
+    """ブラウザが覚えていた送り先のフォルダ名を引き継ぐ（画面を読み直しても送り直さなくて済むように）。
+    引き継ぐのは次のすべてを満たすときだけ:
+      ・名前の形が合っている（当てられない長さ）
+      ・そのフォルダに COM が丸ごと届いている
+      ・いまのセッションが使える接続を持っていない（別のタブのフォルダに黙って乗り換えない）
+      ・PC 側の COM/AnVer.DB（データ版）と、置いてあるものが同じ（PC で Addata を入れ替えたら引き継がない。
+        引き継がなければ部品が COM から送り直すので、古い版で照合し続けることがない）"""
+    bid = str(bridge_id or '').strip()
+    if not _BID_RE.fullmatch(bid) or session_state.get('_bridge_id') == bid:
+        return False
+    cur = session_state.get('_bridge_path')
+    if cur and has_com(cur):
+        return False        # いま使えている接続はそのまま
+    p = os.path.join(tempfile.gettempdir(), PREFIX + bid)
+    if not has_com(p):
+        return False
+    if anver is not None:
+        try:
+            with open(os.path.join(p, 'COM', 'AnVer.DB'), 'rb') as fh:
+                same = fh.read() == anver
+        except OSError:
+            same = False
+        if not same:
+            # PC の Addata が入れ替わっている: 置いてあるものは捨て、COM から送り直させる
+            _clear_all(p)
+            return False
+    old = session_state.get('_bridge_id')
+    session_state['_bridge_id'] = bid
+    session_state['_bridge_path'] = p
+    touch(p)
+    if old and old != bid:
+        # この run で作ったばかりの空のフォルダを片づける（読み直すたびに増える）
+        try:
+            os.rmdir(os.path.join(tempfile.gettempdir(), PREFIX + str(old)))
+        except OSError:
+            pass
+    return True
+
+
+def resend(session_state) -> None:
+    """いま送ってある車種マスタ・車種フォルダを消して、部品に送り直させる（PC で Addata を入れ替えたとき）。
+    接続そのものは切らない（フォルダの選択は残るので、部品が自動で COM から送り直す）"""
+    p = session_state.get('_bridge_path') or ''
+    if p and is_bridge(p):
+        _clear_all(p)
+    session_state.pop('_bridge_path', None)
+    session_state['_bridge_msg'] = 'PC の Addata を送り直します（車種マスタから取り直します）'
+
+
+def sent_at(path: Optional[str]) -> float:
+    """その橋渡しフォルダに COM が届いた日時（完了印の更新時刻）。分からなければ 0"""
+    try:
+        return os.path.getmtime(os.path.join(str(path), MARKER_DIR, 'COM.ok'))
+    except (OSError, ValueError, TypeError):
+        return 0.0
 
 
 def root(session_state) -> str:
     """このセッションの橋渡し Addata フォルダ（無ければ作る）"""
     bid = session_state.get('_bridge_id')
     if not bid:
-        bid = secrets.token_hex(6)
+        bid = secrets.token_hex(16)   # 名前が分かれば引き継げる（ブラウザに覚えさせる）ので、当てられない長さにする
         session_state['_bridge_id'] = bid
     p = os.path.join(tempfile.gettempdir(), PREFIX + bid)
     os.makedirs(p, exist_ok=True)
@@ -270,8 +335,30 @@ def ingest(session_state, value) -> Optional[str]:
     seen[nonce] = seq
     seen['_active'] = nonce
     session_state['_bridge_seen'] = seen
-    path = root(session_state)
     phase = value.get('phase')
+    if phase == 'hello':
+        session_state['_bridge_hello_done'] = True
+        # 部品が起動時に送る「前に覚えた送り先」。引き継げたら、送り直さずに続きができる。
+        # 覚えていた設定（フォルダのパス・取得URL）も、いまの画面が空のときだけ引き継ぐ（URL のクエリが優先）
+        keep = value.get('keep')
+        if isinstance(keep, dict):
+            for _k in ('addata_dir', 'addata_url'):
+                _v = str(keep.get(_k) or '').strip()[:500]
+                if _v and not str(session_state.get('_setting_' + _k) or '').strip():
+                    session_state['_setting_' + _k] = _v
+        _anver = None
+        _av = value.get('anver')
+        if isinstance(_av, str) and _av:
+            try:
+                _anver = base64.b64decode(_av, validate=True)[:4096]
+            except Exception:  # noqa: BLE001
+                _anver = None
+        if adopt(session_state, value.get('bridge_id'), _anver):
+            session_state['_bridge_root_name'] = str(value.get('root_name') or session_state.get('_bridge_root_name') or '')[:64]
+            session_state['_bridge_msg'] = 'このブラウザに覚えていた PC の Addata につなぎ直しました'
+            return session_state['_bridge_msg']
+        return None
+    path = root(session_state)
     if value.get('error'):
         if phase == 'com':
             _clear_all(path)   # COM の無いフォルダを選び直した: 前の Addata を消して「未接続」に戻す（古い Addata で黙って作らない）
@@ -333,6 +420,7 @@ def disconnect(session_state) -> None:
     # 見なして黙って再接続してしまう（Codex 47）。選び直せば seq が進み、iframe を読み直せば nonce が変わるので処理される
     for k in ('_bridge_path', '_bridge_id', '_bridge_want', '_bridge_msg', '_bridge_root_name'):
         session_state.pop(k, None)
+    session_state['_bridge_forget'] = True   # 部品にも覚え（localStorage・IndexedDB）を消させる
 
 
 def resolve_car(path: str, reading: dict) -> dict:

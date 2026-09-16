@@ -285,7 +285,9 @@ def main() -> int:
         com_val = {'seq': 1, 'nonce': 'abc', 'phase': 'com', 'root_name': 'Addata', 'files': files_of(os.path.join(ADDATA, 'COM'), 'COM', False)}
         bridge.ingest(ss2, com_val)
         bridge.disconnect(ss2)
-        if os.path.exists(r2) or os.path.exists(cd2) or any(k.startswith('_bridge') and k != '_bridge_seen' for k in ss2):
+        # _bridge_seen は残す（古い値を新しい選択と見なさないため）。_bridge_forget は部品にブラウザの覚えを消させる印
+        _keep_keys = ('_bridge_seen', '_bridge_forget')
+        if os.path.exists(r2) or os.path.exists(cd2) or any(k.startswith('_bridge') and k not in _keep_keys for k in ss2):
             fails.append(f'disconnect が消し残す: dir={os.path.exists(r2)} case={os.path.exists(cd2)} keys={[k for k in ss2 if k.startswith("_bridge")]}')
         # 解除の直後、部品が返す古い値（同じ seq・nonce）は処理しない ＝ 黙って再接続しない。iframe を読み直した新しい値（別の nonce）は処理する
         if bridge.ingest(ss2, com_val) is not None or bridge.has_com(bridge.root(ss2)):
