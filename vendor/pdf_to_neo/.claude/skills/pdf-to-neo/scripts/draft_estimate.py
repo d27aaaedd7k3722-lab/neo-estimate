@@ -220,11 +220,30 @@ def _area_of(name: str, row: dict) -> Optional[int]:
     return _round_half_up(float(m.group(1))) if m else None
 
 
+# 区分表を「NFKC・鈑→板・空白なし」に揃えた写し。部分一致（下）はこちらで引く
+# （m2 を 板 に正規化しているので、'鈑金修正' のまま持つと「鈑金修正 ランクB」が 板金(6) に落ちてしまう）
+_DISPOSAL_N: dict = {}
+for _dk, _dv in DISPOSAL.items():
+    _DISPOSAL_N.setdefault(_nfkc(_dk).replace('鈑', '板').replace(' ', ''), _dv)
+
+
 def _dcode(method: str, price, wage) -> int:
     m = (method or '').strip()
     m2 = _nfkc(m).replace('鈑', '板').replace(' ', '')
     default = 0 if (price or 0) > 0 else (1 if (wage or 0) > 0 else 0)
-    return DISPOSAL.get(m, DISPOSAL.get(m2, default))
+    if m in DISPOSAL:
+        return DISPOSAL[m]
+    if m2 in _DISPOSAL_N:   # 正規化した写しで引く（'鈑金修正' は '板金修正' として入っている）
+        return _DISPOSAL_N[m2]
+    # 「修正 基本内」「修正 ランク B」のように区分の後ろに印字（ランク・基本内）が続くセル
+    # （読み手が備考ごと 1 つの欄に写した形）は、含まれている区分の語のうち長いものを採る。
+    # 既定（部品代あり → 取替 / 工賃あり → 脱着）に落とすと、金額の印字が無い内板骨格の行が「取替」になり、
+    # 生成器が標準価格・標準指数で埋めてしまう（2026-09-16 シエンタ: 部品計 +9,400 円）
+    hit = [k for k in _DISPOSAL_N if len(k) >= 2 and k in m2]
+    if not hit:
+        return default
+    head = [k for k in hit if m2.startswith(k)]   # 印字は「区分 + 但し書き」の順なので、先頭に来ている語を優先する
+    return _DISPOSAL_N[max(head or hit, key=len)]
 
 
 METHOD_NAME = {0: '取替', 1: '脱着', 2: '修理', 3: '脱着修理', 4: '点検調整', 5: '分解調整', 6: '板金'}
@@ -1808,6 +1827,18 @@ class Drafter:
         except ValueError:
             return 0
 
+    def _printed_parts(self) -> int:
+        """見積書に印字された部品計（読めなければ 0）"""
+        try:
+            return int(float(_num((self.rd.get('totals') or {}).get('parts')) or 0))
+        except ValueError:
+            return 0
+
+    def _parts_sums(self, items: list[dict], expenses: list[dict]) -> tuple[int, int]:
+        """（明細の部品代の合計, 費用の部品分）。印字の部品計は費用を含む書式と含まない書式があるので両方返す"""
+        return (sum(int(it.get('price') or 0) for it in items if not it.get('reserve')),
+                sum(int(e.get('amount') or 0) for e in expenses if e.get('kind') == 'parts'))
+
     def _wage_sums(self, items: list[dict], expenses: list[dict]) -> tuple[int, int]:
         """（明細の工賃の合計, 費用の工賃分）。印字の工賃計は費用を含む書式と含まない書式があるので両方返す。
         保留（reserve）行は生成器が工賃を捨てる（estimate_to_neo は WageOutTax -1）ので、reading_check と同じく数えない"""
@@ -1890,12 +1921,40 @@ class Drafter:
                           'ぴったり一致するので、この見積の空欄は「工賃なし」。コグニの標準指数では埋めない）: '
                           + names + (f' ほか {len(blanks) - 6} 行' if len(blanks) > 6 else ''))
 
+    def _blank_price_is_zero(self, items: list[dict], expenses: list[dict]) -> None:
+        """部品計の印字が「印字された部品代の合計」と一致する見積では、部品代の空欄は 0 円。
+        生成器は price を省いた取替行に ADDATA の標準価格を入れる（部品コードを入れたときのコグニと同じ）ので、
+        そのままだと見積どおりに読めているのに部品計だけ増える
+        （2026-09-16 シエンタ: 金額の印字が無い「リヤフロアクロスメンバー 基本内」に標準価格が入り +9,400 円）"""
+        want = self._printed_parts()
+        rows_p, ex_p = self._parts_sums(items, expenses)
+        if want <= 0 or want not in (rows_p, rows_p + ex_p):
+            return
+        blanks = [it for it in items
+                  if it.get('price') is None and not it.get('manual') and not it.get('reserve')
+                  and str(it.get('method') or '').strip() == '取替']   # 生成器が標準価格で埋めるのは取替だけ
+        if not blanks:
+            return
+        for it in blanks:
+            it['price'] = 0
+            _pn = str(it.get('parts_no') or '').strip()
+            # 0 円の取替行はコグニと同じく NEO の品番欄が空になる（生成器は pprice > 0 の行にだけ品番を書く）。
+            # 印字に品番がある行は、そこだけ見積書と見た目が変わるので確認箇所シートに残す
+            self._rev('判断', '部品代が空欄', f'部品代 0 円で作成（印字の部品計 {want:,} 円が明細の部品代の合計と一致するので、'
+                                        'この見積の空欄は「部品代なし」。ADDATA の標準価格では埋めない）'
+                                        + (f'。0 円の取替行は NEO の品番欄が空欄になる（見積書の印字 {_pn}）' if _pn else ''), item=it)
+        names = ' / '.join(str(it.get('name') or '')[:14] for it in blanks[:6])
+        self.notes.append(f'部品代が空欄の {len(blanks)} 行を部品代 0 円として渡す（印字の部品計 {want:,} 円が明細の部品代の合計と'
+                          'ぴったり一致するので、この見積の空欄は「部品代なし」。ADDATA の標準価格では埋めない）: '
+                          + names + (f' ほか {len(blanks) - 6} 行' if len(blanks) > 6 else ''))
+
     def build(self) -> dict:
         items = self.items()
         paint = self.paint()
         expenses = self.expenses()
         paint = self._drop_double_paint(items, paint, expenses)   # 塗装の一式が明細と paint の両方にある reading
         self._blank_wage_is_zero(items, expenses)                 # 工賃欄の空欄を標準指数で埋めない見積
+        self._blank_price_is_zero(items, expenses)                # 部品代の空欄を標準価格で埋めない見積
         est: dict = {
             'source': self.rd.get('source', ''), 'issuer': self.rd.get('issuer', ''), 'est_date': self.rd.get('est_date', ''),
             'vehicle': self.vehicle, 'customer': self._fit_texts(self.rd.get('customer') or {}, ('name', 'owner_name', 'user_name'), '顧客'),

@@ -9572,13 +9572,14 @@ def main():
                 _p2n_beta_ui_shown = True
                 _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_model, _pdf_tax_sel)
             else:
-                # 読み手: 両方のキーがあれば選べる（既定は Claude。移植ガイド §3-4 が「同じ精度を狙うなら Claude が近い」）。
-                # 片方だけならそれを使う。指示文・検算・読み直し・生成は同じなので、違うのは読み取りの精度だけ
+                # 読み手: 両方のキーがあれば選べる。**既定は Gemini**（2026-09-16 亮平さん指示: API は Gemini をメインで使う。
+                # 本番の Secrets も Gemini だけ）。片方だけならそれを使う。指示文・検算・読み直し・生成は同じなので、
+                # 違うのは読み取りの精度だけ（読み取りの揺れは、ページごとの検算・読み直しと下書きの判断で受け止める）
                 _p2n_choices = []
-                if claude_api_key:
-                    _p2n_choices.append(('claude', f"Claude（{os.environ.get('NEO_READER_MODEL') or 'claude-opus-5'}）"))
                 if api_key:
                     _p2n_choices.append(('gemini', f"Gemini（{selected_model}）"))
+                if claude_api_key:
+                    _p2n_choices.append(('claude', f"Claude（{os.environ.get('NEO_READER_MODEL') or 'claude-opus-5'}）"))
                 if len(_p2n_choices) > 1:
                     _p2n_labels = [c[1] for c in _p2n_choices]
                     _p2n_prev = st.session_state.get('_p2n_reader_label')   # 書類添付の rerun でラジオが描かれる前に状態が捨てられても選択を保つ（H6）
@@ -9796,6 +9797,12 @@ def main():
                 st.error("❌ NEO の生成が不合格でした（pdf-to-neo スキル make_neo.py の判定）。NEO は出しません。")
                 for _r in (_p2n_mk.get('reasons') or []):
                     st.markdown(f"- {_md_literal(_r)}")
+                # 読み取り（AI）は同じ見積書でも毎回少しずつ違う（欄の割り当て・費用の置き場所）。
+                # もう一度押すと通ることがあるので、先に案内する（2026-09-16 Gemini 4 回の実測）
+                st.info("もう一度「見積書からNEOを生成」を押すと、読み取りからやり直します。"
+                        "AI の読み取りは同じ見積書でも毎回少し変わるので、これで通ることがあります"
+                        "（金額が印字と合わないときは NEO を出さないので、作り直しても中身が甘くなることはありません）。"
+                        "下の報告文に「差額と同じ額: 行N …」が出ていれば、その行の印字を確かめてください。")
                 if _p2n_mk.get('error'):
                     st.caption(_p2n_mk['error'])
                 if _p2n_mk.get('match_line'):

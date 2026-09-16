@@ -123,6 +123,19 @@ def main() -> int:
             fails.append('header の雛形に customer.postal / customer.address が無い')
         if 'wage_round / tax_round: 書かない' not in _h:
             fails.append('header の指示文に「wage_round / tax_round は書かない」が無い')
+        # 塗装の一式（「塗装費用 ○○円」1 行）を明細と paint の両方に書かせない（2026-09-16: 塗装計が二重に乗って不合格になった）
+        if 'paint には**何も書かない**' not in _h:
+            fails.append('header の指示文に「明細に 1 行の塗装は paint に書かない」が無い')
+    # ページの指示文: 区分の欄には区分語だけ・金額欄の空欄は空のまま（2026-09-16 Gemini: 「修正 基本内」で区分が取替に化け、
+    # 金額の印字が無い行に ADDATA の標準価格が入って部品計が +9,400 円になった）
+    if len(fake.prompts) >= 2:
+        _p = fake.prompts[1]
+        if 'method には**区分の語だけ**' not in _p:
+            fails.append('ページの指示文に「method には区分の語だけ」が無い')
+        if '空のまま' not in _p or '0 や推測値を書かない' not in _p:
+            fails.append('ページの指示文に「金額欄の空欄は空のまま」が無い')
+        if '同じ金額を header の paint.total にも書かない' not in _p:
+            fails.append('ページの指示文に「塗装の一式を paint にも書かない」が無い')
         if '工場（発行元）の住所は issuer' not in _h:
             fails.append('header の指示文に「工場の住所は customer に入れない」が無い')
     if not os.path.isfile(os.path.join(case, 'pages', 'page_1.json')) or not os.path.isfile(os.path.join(case, 'pages', 'header.json')):

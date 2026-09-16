@@ -521,6 +521,33 @@ def test_blank_wage_is_zero_when_printed_total_matches():
     assert has(est['_draft_notes'], '工賃欄が空欄'), est['_draft_notes']
 
 
+def test_blank_price_is_zero_when_printed_total_matches():
+    """部品計が印字の部品代の合計と一致する見積: 部品代の空欄は 0 円（生成器の標準価格で埋めない）。
+    2026-09-16 シエンタ（Gemini）: 金額の印字が無い「リヤフロアクロスメンバー 基本内」に標準価格が入り部品計が +9,400 円"""
+    rows = ['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||', '0400|左ﾍｯﾄﾞﾗｲﾄ|取替|||1||||']
+    est = est_for(rows, {'parts': 30000})
+    assert [it.get('price') for it in est['items']] == [30000, 0], est['items']
+    assert has(est['_draft_notes'], '部品代が空欄'), est['_draft_notes']
+
+
+def test_blank_price_stays_open_when_total_needs_it():
+    """部品計が明細より大きい見積（部品代の欄が無い書式など）は、空欄のまま生成器の標準価格に任せる"""
+    est = est_for(['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||', '0400|左ﾍｯﾄﾞﾗｲﾄ|取替|||1||||'], {'parts': 80000})
+    assert 'price' not in est['items'][1], est['items'][1]
+    assert not has(est['_draft_notes'], '部品代が空欄'), est['_draft_notes']
+
+
+def test_method_cell_with_extra_text_keeps_the_disposal_word():
+    """区分の欄に備考まで入った読み取り（「修正 基本内」「修正 ランク B」）でも区分を取り違えない。
+    既定に落ちると、金額の印字が無い内板骨格の行が「取替」になって標準価格・標準指数が入る"""
+    assert de._dcode('修正 基本内', 0, 0) == 2 and de._dcode('修正 ランク B', 0, 12000) == 2
+    assert de._dcode('取替（部品持込）', 5000, 0) == 0 and de._dcode('脱着 修理', 0, 8000) == 3
+    assert de._dcode('板金 3d㎡', 0, 8000) == 6 and de._dcode('修正', 0, 0) == 2
+    assert de._dcode('鈑金修正 ランクB', 0, 8000) == 2 and de._dcode('板金修正（一部）', 0, 8000) == 2   # 鈑→板 の正規化で取りこぼさない
+    assert de._dcode('脱着鈑金', 0, 8000) == 3 and de._dcode('鈑金 5d㎡', 0, 8000) == 6
+    assert de._dcode('基本内', 0, 0) == 0 and de._dcode('', 0, 8000) == 1   # 区分の語が無ければ今までどおり既定
+
+
 def test_blank_wage_stays_open_when_total_needs_it():
     """工賃計が行の合計より大きい見積（工賃欄の無い書式など）は、空欄のまま生成器の標準指数に任せる"""
     est = est_for(['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||', '0400|左ﾍｯﾄﾞﾗｲﾄ|脱着||||||'], {'wage': 12000})
