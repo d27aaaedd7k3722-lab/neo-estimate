@@ -15,6 +15,16 @@ Iter2 追加要件:
 """
 from __future__ import annotations
 
+# 読み込みを始めたときのコードの指紋（ファイルの最後で読み直し、同じ中身のときだけ __app_src_digest__ に控える。読み込みの途中で
+# push されたら控えず、古い扱いにして読み直させる。レビュー 3 周目）
+try:
+    import hashlib as _stamp_hashlib0
+    with open(__file__, 'rb') as _stamp_f0:
+        _stamp_digest_at_start = _stamp_hashlib0.sha256(_stamp_f0.read()).hexdigest()
+    del _stamp_hashlib0, _stamp_f0
+except Exception:  # noqa: BLE001
+    _stamp_digest_at_start = None
+
 import copy
 import hashlib
 import logging
@@ -110,17 +120,28 @@ def _to_int(val, default: int = 0) -> int:
     if isinstance(val, int):
         return val
     if isinstance(val, float):
-        try:
-            return int(round(val))
-        except (ValueError, OverflowError):
+        if val != val or val in (float('inf'), float('-inf')):
             return default
+        return _half_up(val)
     cleaned = _clean_numeric_token(val)
     if cleaned is None:
         return default
     try:
-        return int(round(float(cleaned)))
+        f = float(cleaned)
     except (ValueError, OverflowError):
         return default
+    if f != f or f in (float('inf'), float('-inf')):
+        return default
+    return _half_up(cleaned)
+
+
+def _half_up(v) -> int:
+    """.5 は四捨五入（Python の round() は偶数丸めで '1234.5' が 1234。生成側の jpy_round と同じ規則。バグハント 3 回目 O12）"""
+    from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+    try:
+        return int(Decimal(str(v)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError, OverflowError):
+        return int(round(float(v)))
 
 
 def _to_float(val, default: float = 0.0) -> float:
@@ -912,8 +933,18 @@ def _normalize_items_for_neo(items: List[Dict[str, Any]]) -> List[Dict[str, Any]
         # v4: app.generate_neo_file は part_no を読むため、parts_no を part_no にもコピー
         if nit.get("parts_no") and not nit.get("part_no"):
             nit["part_no"] = nit["parts_no"]
-        # 数量 (v11.0: _to_int で括弧書き対策)
-        qty_i = max(_to_int(nit.get("quantity"), 1), 1)
+        # 数量 (v11.0: _to_int で括弧書き対策)。整数でない数量（2.5 L など）は 1（金額はその行のまま。コグニの数量欄は整数。
+        # 四捨五入した数量で単価の税×数量の規則を当てると税が原本と変わる。バグハント 3 回目 L7）
+        _qf = None
+        try:
+            _qc = _clean_numeric_token(nit.get("quantity"))
+            _qf = float(_qc) if _qc is not None else None
+        except (TypeError, ValueError):
+            _qf = None
+        if _qf is not None and _qf == _qf and _qf not in (float('inf'), float('-inf')) and _qf != int(_qf):
+            qty_i = 1
+        else:
+            qty_i = max(_to_int(nit.get("quantity"), 1), 1)
         nit["quantity"] = qty_i
         # 単価: unit_price 未設定なら parts_amount/qty で算出
         if not nit.get("unit_price"):
@@ -1324,8 +1355,8 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
     直接くらべるのがいちばん強い検査で、部品計・工賃計が値引き前なのか
     後なのかといった帳票ごとの違いに左右されない。
     grand_is_intax は「印字された総額が明細の 1.1 倍の基準か」。
-    画面から足したレッカー代などの費用がある .neo は総額が増えるので、
-    呼び出し側が pdf_grand_total を渡さないこと。
+    画面から足したレッカー代などの費用がある .neo でも総額を渡してよい（費用を除いた明細ぶんの総額で比べる。
+    消費税の端数処理は、できた .neo の設定 Setting.tx_ArrangeFlag に従う）。
     """
     def _yen2(x):
         """日本円の丸め（四捨五入・.5 は切り上げ）。生成側と同じ規則。"""
@@ -1346,6 +1377,8 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
         "neo_total": 0,
         "pdf_total": 0,
         "mismatches": [],
+        # 印字の総額が税込の基準か（プレビュー取り込みのステップ③が同じ基準で照合する。レビュー 2 周目）
+        "grand_is_intax": bool(grand_is_intax),
     }
     try:
         # PDF total 計算 (v11.0 Phase A-3: parts_amount + wage を直接合計。
@@ -1673,16 +1706,48 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                     try:
                         _nt = conn3.execute(
                             "SELECT Total FROM Total").fetchone()
+                        # 明細ぶんの総額（画面で足したレッカー代・代車・非課税の費用を除く）。見積書に印字された総額は
+                        # 明細だけのものなので、これと比べる。以前は費用がある .neo では総額を比べておらず、値引きの読み落とし
+                        # などが「検証OK」で素通りしていた（バグハント 3 回目 O1）。費用が無ければ Total と同じ値になる
+                        try:
+                            _nt_items = conn3.execute(
+                                "SELECT SubTotal, hy_PartsTaxTotalOutTax, hy_WageTaxTotalOutTax,"
+                                " ms_PartsTotalInTax, ms_WageTotalInTax FROM Total").fetchone()
+                        except sqlite3.Error:
+                            _nt_items = None
                     finally:
                         conn3.close()
+                    # 消費税の端数処理は、できた NEO の設定（テンプレートの tx_ArrangeFlag。生成もこれで計算する）。四捨五入で
+                    # 計算し直すと、切り捨てのテンプレートで 1 円少ない NEO が合格し、正しい NEO が不一致になっていた（レビュー 2 周目）
+                    _round10 = None
+                    _tmode = '四捨五入'
+                    try:
+                        from app import _template_tax_round, _round_tax10 as _round10  # type: ignore
+                        _tmode = _template_tax_round(files.get('AnSvEm0001Ex.db') or b'')[0]
+                    except Exception:  # noqa: BLE001
+                        _round10 = None
+                    res["tax_round"] = _tmode
+
+                    def _tax10(v):
+                        return _round10(v, _tmode) if _round10 else _yen2(v * tax_rate)
                     if _nt is not None:
                         _neo_grand = _to_int(_nt[0])
+                        if _nt_items is not None:
+                            _s_items = (_to_int(_nt_items[0]) - _to_int(_nt_items[1])
+                                        - _to_int(_nt_items[2]))
+                            if is_tax_inclusive:
+                                # 税込表記の明細: 税は「原本の税込 − 逆算した税抜」で書いてあるので、明細の税込の合計そのもの
+                                _items_grand = _to_int(_nt_items[3]) + _to_int(_nt_items[4])
+                            else:
+                                _items_grand = _s_items + _tax10(_s_items)
+                            res["neo_total_with_expenses"] = _neo_grand
+                            _neo_grand = _items_grand
                         # 印字された総額が明細の 1.1 倍の基準なら、それが
-                        # そのまま .neo の税込合計。そうでなければ 1.1 倍する。
-                        # 生成側は四捨五入（.5 切り上げ）。Python の round() は
-                        # 偶数丸めなので、ここで使うと .5 になる見積で誤報が出る。
+                        # そのまま .neo の税込合計。そうでなければ税を足す。
+                        # 税の端数処理は生成と同じく .neo の設定（テンプレートの tx_ArrangeFlag）。
+                        # Python の round() は偶数丸めなので使わない（.5 になる見積で誤報が出る）。
                         _want = (_g if (is_tax_inclusive or grand_is_intax)
-                                 else _yen2(_g * (1 + tax_rate)))
+                                 else _g + _tax10(_g))
                         res["neo_grand_total"] = _neo_grand
                         res["pdf_grand_total"] = _g
                         # 協定見積は1円でも違えば使えない。許容は置かない。
@@ -1951,6 +2016,12 @@ def process_pdf_to_neo(pdf_path,
             # 同じバイト列でも、PDF として送るか画像として送るかで
             # 読み取り結果が変わる。キーに入れないと前の結果が返る。
             str(source_mime or ''),
+            # コードの版（このモジュールと生成の本体 app）と見積日（JST の日付）と顧客情報。入れないと、読み直した新しい
+            # コードでも・日付が変わっても、控えた古い .neo が返っていた（バグハント 3 回目 N5）
+            str(globals().get('__app_src_digest__', '')),
+            str(getattr(__import__('sys').modules.get('app'), '__app_src_digest__', '')),
+            __import__('datetime').datetime.now(__import__('datetime').timezone(__import__('datetime').timedelta(hours=9))).strftime('%Y%m%d'),
+            repr(sorted((customer_info or {}).items())) if isinstance(customer_info, dict) else repr(customer_info),
         ])
         if cache_key in _PIPELINE_CACHE:
             cached = copy.deepcopy(_PIPELINE_CACHE[cache_key])
@@ -2034,6 +2105,11 @@ def process_pdf_to_neo(pdf_path,
                         ocr_meta_first = {}
                     out["ocr_used"] = True
                     out["ocr_meta"] = ocr_meta_first
+                    if isinstance(ocr_meta_first, dict) and ocr_meta_first.get("_incomplete"):
+                        # 明細の返事が途中で切れた読み取りは控えず、画面で知らせる（バグハント 3 回目 P2）
+                        out["ocr_incomplete"] = True
+                        warnings.append(str(ocr_meta_first.get("_incomplete_reason") or "明細の読み取りが途中で終わりました")
+                                        + "。明細が欠けている可能性があります。もう一度読み直すか、原本と突き合わせてください。")
                     # 後処理で金額の列を動かした行（validate_and_correct_items）。画面で警告し、ダウンロード前の確認に使う（Codex hunt E4）
                     out["amount_changes"] = list((ocr_meta_first or {}).get("_amount_changes") or []) if isinstance(ocr_meta_first, dict) else []
                     log.append(f"OCR estimate OK ({len(items)} items)")
@@ -2226,6 +2302,9 @@ def process_pdf_to_neo(pdf_path,
     # 埋める。それを「印字された総額」として検証に渡すと、自分の
     # 読み取り結果と比べることになる（しかも基準が違って誤報も出る）。
     _grand_from_items = False
+    # 解析（analyze_estimate の交差検証）が印字の部品計・工賃計を明細合算で置き換えたか（O2）
+    _subtotals_from_items = bool((out.get("ocr_meta") or {}).get("_subtotals_from_items")) \
+        if isinstance(out.get("ocr_meta"), dict) else False
     # 印字された総額が明細の 1.1 倍の基準か。下の突き合わせで決め直すが、
     # ocr_meta が無い経路でも verify に渡すので、ここで用意しておく。
     _grand_is_intax = not is_tax_inclusive
@@ -2685,16 +2764,19 @@ def process_pdf_to_neo(pdf_path,
         log.append(f"NEO生成成功 size={len(neo) if neo else 0}")
         # verify
         try:
-            # 画面から足したレッカー代などの費用がある .neo は、
-            # 見積書の総額より増えるのが正しい。総額の突き合わせは外す。
+            # 画面から足したレッカー代などの費用がある .neo でも総額を比べる。verify は .neo の総額から費用ぶんを
+            # 除いた「明細ぶんの総額」と比べる（以前は費用があると総額を比べず、値引きの読み落としなどが素通りした。O1）
             _v_grand = None
-            if not expenses and not _grand_from_items:
+            if not _grand_from_items:
                 _v_grand = _to_int((out.get("ocr_meta") or {}).get(
                     "pdf_grand_total")) or None
             v = verify_neo_against_pdf(neo, items,
-                                       pdf_parts_total=hdr_parts_total or None,
+                                       # 解析で印字の小計を明細合算に置き換えた見積は、小計を「印字された値」として渡さない
+                                       # （自分の読み取り結果と比べることになる。バグハント 3 回目 O2）
+                                       pdf_parts_total=(None if _subtotals_from_items
+                                                        else (hdr_parts_total or None)),
                                        pdf_wage_total=(
-                                           None if _wage_from_items
+                                           None if (_wage_from_items or _subtotals_from_items)
                                            else (hdr_wage_total or None)),
                                        is_tax_inclusive=is_tax_inclusive,
                                        pdf_grand_total=_v_grand,
@@ -2860,3 +2942,17 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         r = process_pdf_to_neo(sys.argv[1], skip_ocr=True)
         print({k: v for k, v in r.items() if k != "neo_bytes"})
+
+# 読み込んだときのコードの指紋（app.sync_app_modules が「メモリのコードがディスクと同じか」を見る。読み込みの時点で
+# 控えないと、あとから初めて import したモジュールが「古い」と見なされ、偽の版ずれで変換を断っていた。バグハント 3 回目 N2）。
+# ファイルの最後に置く: 読み直しが途中で例外になったときは古い指紋のまま残り、版ずれとして断れる（先頭に置くと
+# 途中までしか新しくないモジュールを「揃った」と見ていた。レビュー 2026-09-15）
+try:
+    import hashlib as _stamp_hashlib
+    with open(__file__, 'rb') as _stamp_f:
+        _stamp_now = _stamp_hashlib.sha256(_stamp_f.read()).hexdigest()
+    if _stamp_now == globals().get('_stamp_digest_at_start'):
+        __app_src_digest__ = _stamp_now
+    del _stamp_hashlib, _stamp_f, _stamp_now
+except Exception:  # noqa: BLE001
+    pass

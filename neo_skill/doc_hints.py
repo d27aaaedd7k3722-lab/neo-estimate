@@ -13,6 +13,16 @@ Streamlit・Gemini に依存しない（tests/reg_hints.py）。
 """
 from __future__ import annotations
 
+# 読み込みを始めたときのコードの指紋（ファイルの最後で読み直し、同じ中身のときだけ __app_src_digest__ に控える。読み込みの途中で
+# push されたら控えず、古い扱いにして読み直させる。レビュー 3 周目）
+try:
+    import hashlib as _stamp_hashlib0
+    with open(__file__, 'rb') as _stamp_f0:
+        _stamp_digest_at_start = _stamp_hashlib0.sha256(_stamp_f0.read()).hexdigest()
+    del _stamp_hashlib0, _stamp_f0
+except Exception:  # noqa: BLE001
+    _stamp_digest_at_start = None
+
 import datetime as _dt
 import re
 import unicodedata
@@ -120,12 +130,22 @@ def parse_km(s) -> str:
     return str(int(round(float(m.group(1))))) if m else ''
 
 
+def _fold_fullwidth_ascii(s: str) -> str:
+    """全角の英数・記号（U+FF01〜FF5E）を半角に、全角空白を半角空白に。それ以外（漢字・かな・半角カナ）は触らない"""
+    return ''.join(chr(ord(c) - 0xFEE0) if 0xFF01 <= ord(c) <= 0xFF5E else (' ' if c == '\u3000' else c) for c in s)
+
+
 def split_address(pref='', muni='', other='') -> tuple:
     """住所を生成器（vendor estimate_to_neo）と同じ規則で 都道府県 / 市区郡 / 以降 に分ける。
     実機 NEO 51 件の Municipality は '〜市' まで（政令市の区は AddressOther1 側。'市…区' は 0 件。2026-09-15 集計）。
     車検証 OCR は '北九州市小倉北区' を municipality に返すので、書く前にここで揃える（Codex hunt B2）"""
-    pref_s, muni_s, other_s = (re.sub(r'\s+', '', _nfkc(x)) for x in (pref, muni, other))
-    if muni_s and (pref_s or not re.match(r'^.{2,3}?[都道府県]', muni_s)):
+    # 書く値は元の字のまま（空白だけ詰める。実機 307 本の住所欄に空白は 1 件も無い）。以前は NFKC した値を書いていたため、
+    # 半角カナの建物名が全角になってバイト数が倍になり、30 バイトの欄で部屋番号が黙って消えていた（バグハント 3 回目 L6）。
+    # 実機も全角数字の住所がそのまま入っている（68 本中 11 本）。区切りの判定（都道府県・市・区 は漢字）は元の字でも同じ
+    # 全角の英数・記号（Ａ〜Ｚ・０〜９・－ など U+FF01〜FF5E）と全角空白だけは半角に畳む（実機も 68 本中 57 本は半角数字。全角のまま
+    # だと 2 バイトずつ食って 30 バイトの欄で部屋番号が欠ける。レビュー 2026-09-15）。半角カナは畳まない（上の理由）
+    pref_s, muni_s, other_s = (re.sub(r'\s+', '', _fold_fullwidth_ascii('' if x is None else str(x))) for x in (pref, muni, other))
+    if muni_s and (pref_s or not re.match(r'^.{2,3}?[都道府県]', _nfkc(muni_s))):
         # 市区郡が構造化されて来ている（車検証 OCR・Step 4 の vehicle_info）: 名前の中の 市・郡（四日市市・余市郡余市町）で切らず、
         # 政令市の区（'北九州市小倉北区'）だけを以降側へ移す（Codex 75）
         m = re.match(r'^(.+?市)(.+区)$', muni_s)
@@ -231,7 +251,7 @@ _SERIAL_JUNK = re.compile(r'[\s\-‐‑―ー・･.]')
 # 分類番号は 3 桁の数字のほか、下 2 桁にアルファベットが入る形（30A・3AC。2018 年〜の希望番号）も受ける（Codex 65）。
 # ※ 生成器（vendor estimate_to_neo）の登録番号の正規表現は数字 2〜3 桁しか受けないので、スキル経路では
 #    アルファベット入りの分類番号は空欄になる（files 側の残課題。ベタ打ち側は app._reg_no_part がそのまま書く）
-_REG_SPLIT = re.compile(r'^\s*(\S+?)\s*(\d[0-9A-Z]{1,2})\s*([ぁ-んア-ン])\s*([-‐‑―ー・･.\s\d]+?)\s*$')
+_REG_SPLIT = re.compile(r'^\s*(\S+?)\s*(\d[0-9A-Z]{0,2})\s*([ぁ-んア-ン])\s*([-‐‑―ー・･.\s\d]+?)\s*$')   # 分類番号は旧式の 1 桁も（vendor の REG_NO_RE と同じ）
 
 
 def _serial_clean(s) -> str:
@@ -454,3 +474,17 @@ def summary(vd: Optional[dict], doc: Optional[dict]) -> str:
                                                     ('事故日', 'accident_date'), ('契約者', 'contractor'), ('登録番号', 'reg_no'), ('車台番号', 'serial_no'),
                                                     ('カラーNo', 'color_code'), ('走行距離', 'mileage')) if _get(doc, k)))
     return ' ／ '.join(g for g in got if not g.endswith(': '))
+
+# 読み込んだときのコードの指紋（app.sync_app_modules が「メモリのコードがディスクと同じか」を見る。読み込みの時点で
+# 控えないと、あとから初めて import したモジュールが「古い」と見なされ、偽の版ずれで変換を断っていた。バグハント 3 回目 N2）。
+# ファイルの最後に置く: 読み直しが途中で例外になったときは古い指紋のまま残り、版ずれとして断れる（先頭に置くと
+# 途中までしか新しくないモジュールを「揃った」と見ていた。レビュー 2026-09-15）
+try:
+    import hashlib as _stamp_hashlib
+    with open(__file__, 'rb') as _stamp_f:
+        _stamp_now = _stamp_hashlib.sha256(_stamp_f.read()).hexdigest()
+    if _stamp_now == globals().get('_stamp_digest_at_start'):
+        __app_src_digest__ = _stamp_now
+    del _stamp_hashlib, _stamp_f, _stamp_now
+except Exception:  # noqa: BLE001
+    pass

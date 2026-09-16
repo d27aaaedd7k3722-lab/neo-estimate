@@ -186,22 +186,26 @@ for (n, m, p), o in zip(_KEEP, _out):
         % (n, m or '空欄', format(p, ','), format(o['parts_amount'], ',')))
 chk(not _notes, '7b: 何も動かしていないのに「動かした」と記録している')
 
-# 作業区分がはっきり作業の行は、これまでどおり動かす。ただし**黙ってやらない**
+# 作業区分がはっきり作業の行でも**金額は動かさない**（正しく読めた見積が原本と違う .neo になり、差を調整行が
+# 埋めていた。バグハント 3 回目 O6）。読み取りのずれの疑いとして知らせるだけ
 _work = [{'name': 'ﾊﾞﾝﾊﾟ脱着', 'method': '脱着', 'parts_amount': 5000,
           'wage': 9800, 'quantity': 1},
          {'name': 'ﾊﾞﾝﾊﾟ板金', 'method': '板金', 'parts_amount': 12000,
-          'wage': 0, 'quantity': 1}]
+          'wage': 0, 'quantity': 1},
+         {'name': 'ﾊﾞﾝﾊﾟ塗装', 'method': '塗装', 'parts_amount': 8200,
+          'wage': 15000, 'quantity': 1},
+         {'name': 'ﾄﾞｱ脱着修理', 'method': '脱着修理', 'parts_amount': 3000,
+          'wage': 9000, 'quantity': 1}]
 _out2, _notes2 = app.validate_and_correct_items(_work)
-chk(_out2[0]['parts_amount'] == 0, '7c: 脱着の行の部品代が残っている')
-chk(_out2[1]['parts_amount'] == 0 and _out2[1]['wage'] == 12000,
-    '7d: 板金の行の金額が工賃へ移っていない')
-chk(len(_notes2) == 2,
-    '7e: 原本の金額を動かしたのに知らせていない（%d件）' % len(_notes2))
+chk([(o['parts_amount'], o['wage']) for o in _out2] == [(5000, 9800), (12000, 0), (8200, 15000), (3000, 9000)],
+    '7c: 後処理が金額を動かしている: %s' % [(o['parts_amount'], o['wage']) for o in _out2])
+chk(len(_notes2) == 2 and '脱着' in _notes2[0] and '板金' in _notes2[1],
+    '7e: 脱着の部品代・板金の部品欄だけの金額を知らせていない（塗装の材料＋工賃・脱着修理は正当な形）: %s' % _notes2)
 # 画面に出る道があること
 with open(os.path.join(R, 'app.py'), encoding='utf-8') as _f:
     _appsrc = _f.read()
-chk("_amount_changes" in _appsrc and "原本の金額を動かしました" in _appsrc,
-    '7f: 金額を動かしたことが画面に出ない')
+chk("_amount_changes" in _appsrc and "要確認（金額は原本の読み取りどおり）" in _appsrc,
+    '7f: 区分と金額の欄が合わない行が画面に出ない')
 
 # ── 8. 部品代の無い行の数量 ────────────────────────────────
 # 実機 150 件では -1 が 90.3% ／ 1 が 9.7% ／ 2以上は 1 行も無い。

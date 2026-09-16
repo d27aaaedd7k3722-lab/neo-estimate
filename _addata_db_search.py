@@ -58,6 +58,16 @@
 検証済みメーカー: Honda(J), Toyota(T,W), Nissan(P,Q), Suzuki(S), Mazda(M),
                   Mitsubishi(C), Daihatsu(D), Subaru(F), Lexus(L), Hino(H)
 """
+# 読み込みを始めたときのコードの指紋（ファイルの最後で読み直し、同じ中身のときだけ __app_src_digest__ に控える。読み込みの途中で
+# push されたら控えず、古い扱いにして読み直させる。レビュー 3 周目）
+try:
+    import hashlib as _stamp_hashlib0
+    with open(__file__, 'rb') as _stamp_f0:
+        _stamp_digest_at_start = _stamp_hashlib0.sha256(_stamp_f0.read()).hexdigest()
+    del _stamp_hashlib0, _stamp_f0
+except Exception:  # noqa: BLE001
+    _stamp_digest_at_start = None
+
 import sys
 # Streamlit Cloud は標準出力をログ収集用の独自オブジェクトに差し替えるため、
 # reconfigure() が無い。無防備に呼ぶと import 時に AttributeError で落ち、
@@ -1308,3 +1318,17 @@ if __name__ == '__main__':
             count += 1
             if count >= 20:
                 break
+
+# 読み込んだときのコードの指紋（app.sync_app_modules が「メモリのコードがディスクと同じか」を見る。読み込みの時点で
+# 控えないと、あとから初めて import したモジュールが「古い」と見なされ、偽の版ずれで変換を断っていた。バグハント 3 回目 N2）。
+# ファイルの最後に置く: 読み直しが途中で例外になったときは古い指紋のまま残り、版ずれとして断れる（先頭に置くと
+# 途中までしか新しくないモジュールを「揃った」と見ていた。レビュー 2026-09-15）
+try:
+    import hashlib as _stamp_hashlib
+    with open(__file__, 'rb') as _stamp_f:
+        _stamp_now = _stamp_hashlib.sha256(_stamp_f.read()).hexdigest()
+    if _stamp_now == globals().get('_stamp_digest_at_start'):
+        __app_src_digest__ = _stamp_now
+    del _stamp_hashlib, _stamp_f, _stamp_now
+except Exception:  # noqa: BLE001
+    pass

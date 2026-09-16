@@ -486,14 +486,24 @@ chk(_v.get('grand_match') is True,
 chk(_v.get('neo_grand_total') == _GT,
     '17b: .neo の合計 %s（原本 %s）' % (_v.get('neo_grand_total'), _GT))
 chk(_v.get('ok'), '17c: 正しい .neo で検証が通らない')
-# 費用を足した .neo は総額が増えるのが正しいので、突き合わせを外す
+# 費用を足した .neo は総額が増えるのが正しい。見積書の総額とは「明細ぶんの総額」（.neo の総額から費用を除いたもの）で
+# 比べる（以前は突き合わせを外していて、値引きの読み落としなどが「検証OK」で素通りした。バグハント 3 回目 O1）
 _res = run(_I2, {'pdf_parts_total': 38600, 'pdf_wage_total': 9800,
                  'discount_amount': 0, 'pdf_grand_total': _GT}, False,
            expenses={'towing': 12000})
 _v = _res.get('verify') or {}
-chk(_v.get('grand_match') is None,
-    '17d: 費用を足した .neo で総額の突き合わせをして誤報を出している')
+chk(_v.get('grand_match') is True,
+    '17d: 費用を足した .neo で、明細ぶんの総額の突き合わせが通らない（誤報）: %s' % _v.get('mismatches'))
+chk(_v.get('neo_total_with_expenses') == jr((38600 + 9800 + 12000) * 1.10),
+    '17d2: 費用込みの .neo の合計 %s' % _v.get('neo_total_with_expenses'))
 chk(_v.get('ok'), '17e: 費用を足しただけで検証が落ちている')
+# 費用を足した .neo でも、明細の読み落とし（総額が合わない）は捕まえる
+_res = run(_I2, {'pdf_parts_total': 38600, 'pdf_wage_total': 9800,
+                 'discount_amount': 0, 'pdf_grand_total': _GT - 5500}, False,
+           expenses={'towing': 12000})
+_v = _res.get('verify') or {}
+chk(_v.get('grand_match') is False and not _v.get('ok'),
+    '17f: 費用を足した .neo で、見積書の総額と合わないのに検証が通る（O1）')
 
 # ── 18. 税込は税込どうしで比べること ─────────────────────────────
 # 以前は税込表記でも .neo の税抜どうしで比べていた。数量2以上の行は

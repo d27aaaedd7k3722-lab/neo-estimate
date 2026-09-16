@@ -247,6 +247,24 @@ def test_wage_unknown_row_catches_total_mismatch():
 
 
 
+def test_paint_total_transcribed_with_other():
+    """塗装工賃計を追加項目込みで写した形（2026-09-15 N-BOX: パネル・加算基礎・ブース等の内訳 94,210 + アンダーコート 3,680 = 97,890）。
+    内訳 + 追加項目とちょうど一致するときは追加項目を足し直さない（足すと塗装計（材料込）・課税小計が 3,680 多く出て、正しい転記を不合格にしていた）。
+    C-HR の形（塗装工賃計が追加項目を含まない）は従来どおり足す"""
+    rd = copy.deepcopy(BASE)
+    rd['paint'] = {'total': 40000, 'material': 12400, 'panels': [{'code': '2300', 'name': 'x', 'method': '取替', 'wage': 30000}],
+                   'base': {'index': 0.25, 'wage': 2000}, 'other': [{'name': 'アンダーコート', 'index': 1.0, 'wage': 8000}]}   # 30,000 + 2,000 + 8,000 = 40,000
+    rd['totals'] = {'parts': 95000, 'wage': 28000, 'paint': 40000, 'paint_total': 52400, 'material': 12400, 'expense': 10000,
+                    'taxable': 185400, 'tax': 18540, 'total': 203940}
+    r = run(rd)
+    assert not r['fail'], r['fail']
+    assert has(r.get('info') or r.get('notes') or r.get('note') or [], '追加項目は足し直さない'), r.keys()
+    rd2 = copy.deepcopy(rd)   # 塗装工賃計が追加項目を含まない（C-HR の形）: 32,000 と写し、塗装計（材料込）は 32,000 + 8,000 + 12,400
+    rd2['paint']['total'] = 32000
+    rd2['totals'] = dict(rd['totals'], paint=32000)
+    assert not run(rd2)['fail'], run(rd2)['fail']
+
+
 def test_paint_other_outside_paint_total():
     """印字の塗装工賃計は追加項目（プライマー塗装など paint.other。コグニ印刷の「追加塗装費用計」）を含まない。
     塗装計（材料込）・課税小計は 塗装工賃計 + 追加項目 + 材料代で見て、材料代の割合は追加項目を除いて出す（2026-09-14 C-HR）"""

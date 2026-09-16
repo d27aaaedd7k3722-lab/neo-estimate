@@ -71,13 +71,19 @@ exp = {'towing': 20000, 'rental_car': 15000, 'tax_exempt': 11000}
 neo = P._call_generate_neo(TPL, {}, items, is_beta_mode=True, expenses=exp)
 cur, t = totals(neo)
 rows = [r for r in cur.execute('select LineNo, WageOutTax from Expense') if r[1]]
-# レッカー=LineNo5「レッカー代１」/ 非課税=LineNo8「その他控除」は固定費目名。
-# 代車は固定費目に無いので LineNo9 の自由行に費目名ごと入れる（実機と同じ）。
-chk(sorted(rows) == [(5, 20000), (8, 11000), (9, 15000)],
-    f'2: PDF経路の Expense が {rows}（期待 LineNo5=20000/8=11000/9=15000）')
+# レッカー=LineNo5「レッカー代１」は固定費目名。
+# 代車・非課税は固定費目に無いので LineNo9・10 の自由行に費目名ごと入れる（実機と同じ。非課税を LineNo8
+# 「その他控除」に入れると帳票に「その他控除」と印字される。バグハント 3 回目 L10）。
+chk(sorted(rows) == [(5, 20000), (9, 15000), (10, 11000)],
+    f'2: PDF経路の Expense が {rows}（期待 LineNo5=20000/9=15000/10=11000）')
 _nm = dict(cur.execute('select LineNo, Name from Expense').fetchall())
 chk((_nm.get(9) or '').strip() == '代車費用',
     f'2c: 代車の費目名が {_nm.get(9)!r}（期待 代車費用）')
+chk((_nm.get(10) or '').strip() == '非課税費用' and
+    cur.execute('select OutTaxFlag from Expense where LineNo=10').fetchone()[0] == 1,
+    f'2d: 非課税の費目名・非課税の旗（LineNo 10）: {_nm.get(10)!r}')
+chk(not cur.execute('select WageEnabled from Expense where LineNo=8').fetchone()[0],
+    '2e: 固定費目「その他控除」（LineNo 8）に金額を入れている')
 chk(t[9] == 112200, f'2b: PDF経路の Total={t[9]:,}（期待 112,200）')
 
 print('REG_EXPENSE:', 'ALL PASS' if not FAIL else f'FAIL {len(FAIL)}件')

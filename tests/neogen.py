@@ -17,9 +17,28 @@ def unpack(neo_bytes):
     mgmt, entries = app.parse_entries(neo_bytes, real_ck[0])
     return app.extract_files(full_raw, entries)
 
+_TMP_DBS = []
+
+
+def _cleanup_tmp_dbs():
+    # 試験のたびに %TEMP% に tmp*.db が溜まっていた（バグハント 3 回目の作業記録）。終わりに消す
+    import gc
+    gc.collect()
+    for p in _TMP_DBS:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+import atexit
+atexit.register(_cleanup_tmp_dbs)
+
+
 def opendb(blob):
     tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
     tf.write(blob); tf.close()
+    _TMP_DBS.append(tf.name)
     return sqlite3.connect(tf.name)
 
 def rows(conn, sql):

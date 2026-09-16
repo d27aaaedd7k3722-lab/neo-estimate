@@ -43,5 +43,9 @@ anthropic==1.5.0; python_version >= "3.10"
 anthropic==0.125.0; python_version < "3.10"
 # 確認箇所シート（xlsx）。無い環境では vendor 側が CSV に落とす
 openpyxl==3.1.5
-# iPhone の HEIC/HEIF 写真を pdf-to-neo 経路で使うときだけ（任意。Cloud ではこの経路自体が動かないので固定しない）
-# pillow-heif==1.7.0
+# iPhone の HEIC/HEIF 写真を pdf-to-neo 経路で開く（画面は HEIC を受け付けるので必須。無いと必ず失敗していた。P5）。
+# 本番（Linux）の manylinux wheel は cp311〜cp313 にある（2026-09-15 確認）
+pillow-heif==1.7.0; python_version >= "3.10"
+# 権限パスワードだけで暗号化した PDF（AES）を pypdf で復号するのに要る。無いと「パスワード付きの PDF は読めません」と
+# 誤って断っていた（レビュー 2026-09-15）
+cryptography==50.0.1; python_version >= "3.10"

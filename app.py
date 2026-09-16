@@ -30,6 +30,16 @@ AI-OCR連携 NEOファイル自動生成Webアプリ v3.2
 """
 
 
+# 読み込みを始めたときのコードの指紋（ファイルの最後で読み直し、同じ中身のときだけ __app_src_digest__ に控える。読み込みの途中で
+# push されたら控えず、古い扱いにして読み直させる。レビュー 3 周目）
+try:
+    import hashlib as _stamp_hashlib0
+    with open(__file__, 'rb') as _stamp_f0:
+        _stamp_digest_at_start = _stamp_hashlib0.sha256(_stamp_f0.read()).hexdigest()
+    del _stamp_hashlib0, _stamp_f0
+except Exception:  # noqa: BLE001
+    _stamp_digest_at_start = None
+
 from dotenv import load_dotenv
 load_dotenv()
 from neo_skill import doc_hints as _doc_hints  # noqa: E402  車検証・事故/保険の書類の OCR 結果を hint に写す（2026-09-14）
@@ -186,7 +196,17 @@ _FALLBACK_STORE: dict = {}
 
 
 def _persist_store() -> dict:
-    """再実行をまたいで保持されるストアを返す（session_state が使えない場合はモジュール変数）"""
+    """再実行をまたいで保持されるストアを返す（session_state が使えない場合はモジュール変数）。
+
+    画面の外（ベタ打ちの明細解析の worker スレッド）では session_state を使わない。Streamlit 1.63 はそこで
+    プロセスに 1 つの代用品を返すので、書いた記録が本人のセッションには届かず、別のセッションの worker から
+    読めていた（バグハント 3 回目 N6/P18）。worker の記録はモジュール変数に置き、画面側は読むときに合わせる"""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx as _grc
+        if _grc(suppress_warning=True) is None:
+            return _FALLBACK_STORE
+    except Exception:
+        pass
     try:
         store = st.session_state.setdefault('_gemini_model_store', {})
         if isinstance(store, dict):
@@ -197,7 +217,7 @@ def _persist_store() -> dict:
 
 
 def _quota_exhausted_set() -> set:
-    """クォータ超過で利用不可になったモデルの集合"""
+    """クォータ超過で利用不可になったモデルの集合（worker スレッドで記録したぶんも合わせる。N6）"""
     store = _persist_store()
     val = store.get('quota_exhausted')
     if not isinstance(val, set):
@@ -535,14 +555,38 @@ def safe_int(val, default=0):
         # 例外になり、画面が操作不能になるため既定値に倒す。
         if val != val or val in (float('inf'), float('-inf')):
             return default
-        return int(round(val))
+        return jpy_round(val)   # .5 は四捨五入（round() の偶数丸めだと '1234.5' が 1234。バグハント 3 回目 O12）
     s = _normalize_number_text(str(val))
     if s is None:
         return default
     try:
-        return int(round(float(s)))
+        f = float(s)
     except (ValueError, OverflowError):
         return default
+    if f != f or f in (float('inf'), float('-inf')):
+        return default
+    return jpy_round(s)
+
+
+def qty_int(v, default: int = 1) -> int:
+    """明細の数量を整数に。整数でない数量（2.5 L など）は 1（金額はその行のまま。コグニの数量欄は整数。L7）"""
+    return 1 if is_fractional_qty(v) else safe_int(v, default)
+
+
+def is_fractional_qty(v) -> bool:
+    """数量が整数でない（'2.5'・1.5・'0.5L'）か。'1.00'・'3個'・空は整数扱い（バグハント 3 回目 L7）"""
+    if v is None or isinstance(v, (bool, int)):
+        return False
+    if isinstance(v, float):
+        return v == v and v not in (float('inf'), float('-inf')) and v != int(v)
+    s = _normalize_number_text(str(v))
+    if s is None:
+        return False
+    try:
+        f = float(s)
+    except (ValueError, OverflowError):
+        return False
+    return math.isfinite(f) and f != int(f)
 
 
 def _xml_escape(value) -> str:
@@ -613,6 +657,51 @@ def cp932_trim(value, max_bytes: int) -> str:
         except UnicodeDecodeError:
             b = b[:-1]
     return ''
+
+
+def _round_tax10(sub: int, mode: str = '四捨五入') -> int:
+    """請求書単位の消費税（10%）。mode は '四捨五入'（既定）/ '切り捨て' / '切り上げ'（vendor と同じ整数の計算）"""
+    sub = int(sub)
+    if mode == '切り捨て':
+        return (sub * 10) // 100
+    if mode == '切り上げ':
+        return -((-sub * 10) // 100)
+    return jpy_round(sub * TAX_RATE)
+
+
+_TAX_ARRANGE = {1: '四捨五入', 2: '切り捨て', 3: '切り上げ'}
+
+
+def _template_tax_round(em_db_bytes) -> tuple:
+    """テンプレートの顧客・設定 DB（このアプリのキーでは 'AnSvEm0001Ex.db'）の Setting.tx_ArrangeFlag → (端数処理, 旗)。
+    読めなければ ('四捨五入', 1)"""
+    try:
+        c = sqlite3.connect(':memory:')
+        try:
+            c.deserialize(em_db_bytes)
+            r = c.execute('SELECT tx_ArrangeFlag FROM Setting').fetchone()
+        finally:
+            c.close()
+        f = safe_int(r[0], 1) if r else 1
+        return (_TAX_ARRANGE.get(f, '四捨五入'), f if f in _TAX_ARRANGE else 1)
+    except Exception:
+        return ('四捨五入', 1)
+
+
+import functools as _functools
+
+
+@_functools.lru_cache(maxsize=8)
+def _neo_tax_round(neo_bytes: bytes) -> tuple:
+    """NEO（テンプレート）の消費税の端数処理 → (端数処理, 旗)。ステップ③の合計・照合を、生成（generate_neo_file）と同じ
+    端数処理で出すため（生成だけテンプレートに従い、画面と照合は四捨五入のままだった。レビュー 2 周目）。読めなければ ('四捨五入', 1)"""
+    try:
+        ck = find_real_cks(neo_bytes)
+        full = decompress_neo(neo_bytes, ck)
+        _m, ent = parse_entries(neo_bytes, ck[0])
+        return _template_tax_round(extract_files(full, ent).get('AnSvEm0001Ex.db') or b'')
+    except Exception:  # noqa: BLE001
+        return ('四捨五入', 1)
 
 
 def jpy_round(value) -> int:
@@ -784,7 +873,14 @@ MAX_NEO_UPLOAD_BYTES = 8 * 1024 * 1024
 
 
 def find_real_cks(data, start=424, max_marks=MAX_CK_MARKS):
-    """comp_len連鎖法でCK位置を特定（偽CK除外）"""
+    """comp_len連鎖法でCK位置を特定（偽CK除外）
+
+    連鎖の始まりは「最後の塊がファイルの終わりでちょうど閉じる」ものを選ぶ（実機 307 本と雛形すべてで
+    最後の CK 位置 + comp_len = ファイル長）。ファイル表の中に DOS 時刻 0x4B43 などの偽の 'CK' があると、
+    以前はそこから連鎖を始めて展開に失敗し、その秒に保存された .neo がテンプレートとして弾かれ、
+    ベタ打ちの検算も「検証できませんでした」になっていた（バグハント 3 回目 L9）。
+    閉じる連鎖が無いときは従来どおり最初の候補からの連鎖を返す。
+    """
     all_ck = []
     for i in range(start, len(data) - 1):
         if data[i] == 0x43 and data[i + 1] == 0x4B:
@@ -795,22 +891,31 @@ def find_real_cks(data, start=424, max_marks=MAX_CK_MARKS):
                     "壊れているか、コグニセブンのNEOファイルではありません。")
     if not all_ck:
         return []
-    real_ck = []
-    idx = 0
-    while idx < len(all_ck):
-        ck = all_ck[idx]
-        real_ck.append(ck)
-        cl = struct.unpack('<H', data[ck - 4:ck - 2])[0]
-        exp = ck + cl + 8
-        found = False
-        for j in range(idx + 1, len(all_ck)):
-            if all_ck[j] == exp:
-                idx = j
-                found = True
-                break
-        if not found:
+    pos = set(all_ck)
+
+    def _chain(first):
+        chain = [first]
+        ck = first
+        while True:
+            cl = struct.unpack('<H', data[ck - 4:ck - 2])[0]
+            exp = ck + cl + 8
+            if exp in pos:
+                chain.append(exp)
+                ck = exp
+            else:
+                return chain, (ck + cl == len(data))
+
+    first_chain = None
+    # 始まりの候補は先頭付近だけ試す（ファイル表は数百バイト。細工したファイルで試行が膨らまないように）
+    for n, cand in enumerate(all_ck):
+        if n >= 64 or cand > all_ck[0] + 65536:
             break
-    return real_ck
+        chain, closed = _chain(cand)
+        if closed:
+            return chain
+        if first_chain is None:
+            first_chain = chain
+    return first_chain or []
 
 
 # 展開後サイズの上限。実データは1500明細でも約620KBなので、64MBは十分に余裕がある。
@@ -913,12 +1018,14 @@ def extract_files(full_raw, entries):
 # 内部ファイル更新: AnSMB.txt（見積本体SQLite）
 # ============================================================
 
-def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclusive=False, is_beta_mode=False):
+def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclusive=False, is_beta_mode=False,
+                 tax_round='四捨五入'):
     """ERParts/Expense/Total を更新（値引き行の負工賃も対応）
     expenses: {
         'towing': レッカー費用,              # LineNo=5「レッカー代１」（固定費目名）
-        'rental_car': 代車費用,              # LineNo=9（自由行。費目名も書く）
-        'tax_exempt': 非課税費用,            # LineNo=8「その他控除」（OutTaxFlag=1）
+        'rental_car': 代車費用,              # 自由行（LineNo=9 から。費目名も書く）
+        'tax_exempt': 非課税費用,            # 自由行（代車の次）に「非課税費用」（OutTaxFlag=1）
+    tax_round: 消費税（請求書単位）の端数処理。テンプレートの Setting.tx_ArrangeFlag（1 四捨五入 / 2 切り捨て / 3 切り上げ）
     ショートパーツは expenses ではなく引数 short_parts_wage で受け取り、
     LineNo=4 の部品欄に入れる（実機も部品列に出す）。
     }
@@ -936,7 +1043,7 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
     # 途中で例外が出ても一時ファイル（顧客情報を含む）を残さない
     try:
         return _update_ansmb_impl(tf.name, items, short_parts_wage, expenses,
-                                  is_tax_inclusive, is_beta_mode)
+                                  is_tax_inclusive, is_beta_mode, tax_round=tax_round)
     finally:
         try:
             os.unlink(tf.name)
@@ -945,14 +1052,14 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
 
 
 def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
-                       is_tax_inclusive, is_beta_mode):
+                       is_tax_inclusive, is_beta_mode, tax_round='四捨五入'):
     # 途中で落ちても必ず閉じる。閉じないまま抜けると、Windows では
     # SQLite がファイルを掴んだままで呼び出し元の unlink が失敗し、
     # **顧客情報の入った一時DBが消えずに残る**。
     conn = sqlite3.connect(_tmp_db_path)
     try:
         return _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage,
-                                  expenses, is_tax_inclusive, is_beta_mode)
+                                  expenses, is_tax_inclusive, is_beta_mode, tax_round=tax_round)
     finally:
         try:
             conn.close()
@@ -961,7 +1068,9 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
 
 
 def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
-                       is_tax_inclusive, is_beta_mode):
+                       is_tax_inclusive, is_beta_mode, tax_round='四捨五入'):
+    # 消した明細（前の案件の品名・品番・金額）がファイルの空き領域に残らないよう 0 で消す（レビュー: 顧客 DB だけだった）
+    conn.execute('PRAGMA secure_delete=ON')
     cur  = conn.cursor()
     cur.execute('DELETE FROM ERParts')
     # ── 塗装セクション・その他テーブルをリセット ──
@@ -1162,6 +1271,7 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
     _adj_wage_line  = None
     _adj_parts_amount = 0
     _adj_wage_amount  = 0
+    _minus_one_rows = []   # ちょうど −1 円になる金額の行（L2）
     total_wages = 0
     for i, item in enumerate(items):
         name   = item.get('name', '')
@@ -1241,7 +1351,11 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
             name = '※' + cp932_trim(name, _avail)
         
         # 区分: work_code（Markdownパーサー保存先）または method から取得
-        method = item.get('method', '') or item.get('work_code', '')
+        method = _ctrl_to_space(item.get('method', '') or item.get('work_code', ''))
+        # 改行・タブなどの制御文字は空白にしてから書く。ERParts にそのまま入り、AnSMB（注記）側だけ消していたため、
+        # 同じ行の品名・品番が 2 通りになっていた（バグハント 3 回目 L5）。AnSMB には ERParts に書いた値をそのまま置く
+        name     = _ctrl_to_space(name)
+        parts_no = _ctrl_to_space(parts_no)
         # 明細もコグニセブンの宣言列幅（CP932バイト）に収める。
         # 顧客欄と同じ理由で、ここで守らないと桁あふれした値が入る。
         # 「フロントバンパーカバーASSY」程度の普通の部品名で超える。
@@ -1304,6 +1418,10 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
                         break
 
         qty    = safe_int(item.get('quantity', 1), 1)
+        # 整数でない数量（'2.5' L など）はコグニの数量欄（整数）に書けない。丸めた数量で「単価の税×数量」の規則を当てると
+        # 行の税が原本と変わる（2.5 L ¥2,750 → 数量 2・税 276）。数量 1・金額そのままで書く（バグハント 3 回目 L7）
+        if is_fractional_qty(item.get('quantity')):
+            qty = 1
         if qty < 1:
             qty = 1
         if 'parts_amount' in item:
@@ -1364,6 +1482,21 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
             wage_tax_abs = jpy_round(abs(wage_total) * TAX_RATE) if wage_total != 0 else 0
             wage_tax     = wage_tax_abs if wage_total >= 0 else -wage_tax_abs
             wage_intax   = wage_total + wage_tax if wage_total != 0 else 0
+        # 行の税がちょうど −1（−5〜−14 円程度の値引き行）だと、税の欄が「空欄」に見える。行の税は 0 にする。
+        # 税抜表記は請求書単位の消費税で総額が決まるので総額は変わらない。税込表記は税抜を税込と同じにし、差は下の
+        # 配分で他の行が吸収する（レビュー 2026-09-15）
+        if parts_total != 0 and parts_tax == -1:
+            if is_tax_inclusive:
+                parts_outtax = parts_intax
+            else:
+                parts_intax = parts_total
+            parts_tax = 0
+        if wage_total != 0 and wage_tax == -1:
+            if is_tax_inclusive:
+                wage_outtax = wage_intax
+            else:
+                wage_intax = wage_total
+            wage_tax = 0
         total_parts += parts_outtax
         total_wages += wage_outtax
         # 部品計・工賃計の税額欄は「行ごとの税の合計」。仕様書 §6・§4 が
@@ -1384,6 +1517,10 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
         if wage_total != 0 and abs(wage_outtax) >= abs(_adj_wage_amount):
             _adj_wage_amount = wage_outtax
             _adj_wage_line   = line_no
+        # −1 はコグニの「空欄」の印。ちょうど −1 円の金額（端数値引 −1 など）は書けない（下で止める。L2）
+        if ((parts_total != 0 and -1 in (parts_outtax, parts_intax))
+                or (wage_total != 0 and -1 in (wage_outtax, wage_intax))):
+            _minus_one_rows.append((line_no, name, '部品' if parts_total != 0 and -1 in (parts_outtax, parts_intax) else '工賃'))
         # コグニセブンは -1 を空白として表示する（0やNULLは「0」と表示される）
         db_parts_total = parts_outtax if parts_total != 0 else -1
         db_parts_intax = parts_intax  if parts_total != 0 else -1
@@ -1452,6 +1589,20 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
         # '1AA' のような英字混じりが INTEGER 列に入らず、それを理由に
         # 部品コードごと捨てていた（主要部品のコードが常に空欄だった）。
         parts_code_sub = -1
+        # 手入力の印と数量行の単価欄（バグハント 3 回目 L11。vendor・実機と同じ）。
+        # 実機 307 本の手入力行（部品コード無し）: 部品代の無い行の PartsPriceByManual は 165 行すべて ''、
+        # 工賃も指数も無い行の WageByManual は 386 行すべて ''。以前はどちらも '*' 固定だった。
+        # 部品コードのある行（照合した行）は従来どおり '*'（'' にするとコグニが標準価格・標準工賃で埋め直しうる）。
+        _manual_row = not parts_code
+        db_parts_manual = '*' if (parts_total != 0 or not _manual_row) else ''
+        db_wage_manual = '*' if (wage_total != 0 or db_time > 0 or not _manual_row) else ''
+        # 数量 2 以上の行は単価欄にも書く（実機 64/64 行。単価の税は切り捨て: 155 → 15。vendor と同じ）
+        db_unit_out = db_unit_in = db_unit_tax = -1
+        if (not is_tax_inclusive and isinstance(qty, int) and qty > 1 and parts_total != 0
+                and db_parts_total > 0 and db_parts_total % qty == 0):
+            db_unit_out = db_parts_total // qty
+            db_unit_tax = (db_unit_out * 10) // 100
+            db_unit_in = db_unit_out + db_unit_tax
         cur.execute("""INSERT INTO ERParts (
             RecordNo, LineNo, PartsCode, PartsCodeSub, DisposalCode,
             DisposalName, DisposalNameStandard, PartsName, PartsNameStandard,
@@ -1483,11 +1634,11 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
             ?, '', ?, '',
             ?, '',
             ?, ?, ?,
-            -1, -1, -1,
+            ?, ?, ?,
             -- 空欄は -1。NULL や 0 にすると帳票に「0」と表示され、
             -- 標準部品価格ゼロ・標準指数ゼロの見積として読まれてしまう。
             -1, -1, -1,
-            '*',
+            ?,
             -- 指数は入力値、標準指数は 0。実機の自由入力行 536行すべてが
             -- TimeStandard=0 で、-1（空欄）を持つ行は1行も無かった。
             ?, 0,
@@ -1495,7 +1646,7 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
             -- 標準工賃も 0。実機の自由入力行 527行（98.3%）が 0 で、
             -- 標準部品価格だけが -1 のまま、という非対称な形をしている。
             0, 0, 0,
-            '*', ?,
+            ?, ?,
             -1, -1, -1,
             '', '', '',
             ?, '', 0, 0,
@@ -1515,8 +1666,11 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
             method, name,
             parts_no,
             db_parts_total, db_parts_intax, db_parts_tax,
+            db_unit_out, db_unit_in, db_unit_tax,
+            db_parts_manual,
             db_time,
             db_wage_total, db_wage_intax, db_wage_tax,
+            db_wage_manual,
             # 部品代の無い行（工賃だけの行）の数量。実機 150 件では
             # **-1 が 90.3% ／ 1 が 9.7% ／ 2以上は 1 行も無い**（AnSMB の
             # 数量欄は全部 '01'）。数量1のときに 1 を書くと「部品が無いのに
@@ -1589,18 +1743,30 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
     # 実機も代車・室内清掃・エーミング等は LineNo=9 以降に名前を付けて使う。
     rental_car = safe_int(expenses.get('rental_car', 0))
     rent_out, rent_intax, rent_tax = _calc_tax(rental_car, False)
-    cur.execute("""UPDATE Expense SET
-        Name=?, WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?
-        WHERE LineNo=9""", (cp932_trim('代車費用', 30) if rental_car > 0 else '',
-                            1 if rental_car > 0 else 0, rent_out, rent_intax, rent_tax))
+    _free_lines = [r[0] for r in cur.execute(
+        'SELECT LineNo FROM Expense WHERE NameFix=0 AND LineNo>=9 ORDER BY LineNo').fetchall()]
 
-    # LineNo=8: その他控除（非課税）。OutTaxFlag で非課税であることを示す。
+    def _take_free_line(_what):
+        if _free_lines:
+            return _free_lines.pop(0)
+        raise ValueError(f"テンプレートの費用欄に空いた行が無いので「{_what}」を書けません（自由入力の費用行が要ります）。"
+                         "別のテンプレートを使うか、費用を 0 にしてください。")
+    if rental_car > 0:
+        cur.execute("""UPDATE Expense SET
+            Name=?, WageEnabled=1, WageOutTax=?, WageInTax=?, WageTax=?
+            WHERE LineNo=?""", (cp932_trim('代車費用', 30), rent_out, rent_intax, rent_tax, _take_free_line('代車費用')))
+
+    # LineNo=10: 自由入力の費用行に「非課税費用」という費目名で入れる。OutTaxFlag=1 で非課税であることを示す。
+    # 以前は LineNo=8（固定費目「その他控除」）に入れていたため、帳票に「その他控除 3,000」と印字されていた。
+    # 実機 307 本で LineNo 8 に金額の入った .neo は 1 本も無く、非課税の行は自由行にも置かれている。vendor も
+    # 名前付きの自由行に置く（バグハント 3 回目 L10）
     tax_exempt = safe_int(expenses.get('tax_exempt', 0))
-    cur.execute("""UPDATE Expense SET
-        OutTaxFlag=?, WageEnabled=?, WageOutTax=?, WageInTax=?, WageTax=?, Comment=?
-        WHERE LineNo=8""", (1 if tax_exempt > 0 else 0, 1 if tax_exempt > 0 else 0,
-                            tax_exempt, tax_exempt, 0,
-                            cp932_trim('非課税費用', 30) if tax_exempt > 0 else ''))
+    if tax_exempt > 0:
+        if rental_car <= 0 and _free_lines and _free_lines[0] == 9 and len(_free_lines) > 1:
+            _free_lines.pop(0)   # 9 行目は代車の置き場として空けておく（いつも同じ行に同じ費目）
+        cur.execute("""UPDATE Expense SET
+            Name=?, OutTaxFlag=1, WageEnabled=1, WageOutTax=?, WageInTax=?, WageTax=0
+            WHERE LineNo=?""", (cp932_trim('非課税費用', 30), tax_exempt, tax_exempt, _take_free_line('非課税費用')))
 
     # ── 税込モードの丸め調整 ──
     # 行ごとの逆算をそのまま足すと、見積書の税込総額と生成NEOの合計が
@@ -1621,7 +1787,7 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
         _best, _best_err = _base, None
         for _off in (0, -1, 1, -2, 2):
             _cand = _base + _off
-            _err = abs(_cand + jpy_round(_cand * TAX_RATE) - _items_intax)
+            _err = abs(_cand + _round_tax10(_cand, tax_round) - _items_intax)   # 端数処理はテンプレートの設定（レビュー 2 周目）
             if _best_err is None or _err < _best_err:
                 _best, _best_err = _cand, _err
             if _err == 0:
@@ -1666,21 +1832,58 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
             if not _rows:
                 continue
             _step = 1 if _delta > 0 else -1
-            _i = 0
-            while _delta != 0 and _i < abs(_target - _cur) + len(_rows):
-                _ln, _out, _in = _rows[_i % len(_rows)]
-                _new_out = _out + _step
-                cur.execute(
-                    f'UPDATE ERParts SET {_col_out}=?, {_col_tax}=? WHERE LineNo=?',
-                    (_new_out, _in - _new_out, _ln))
-                _rows[_i % len(_rows)] = (_ln, _new_out, _in)
-                _delta -= _step
-                _i += 1
+            # 税込額の大きい行から 1 円ずつ何周も配る（従来どおり。ふつうはどの行も自然な逆算値から ±1 円に収まり、
+            # 消費税 = 課税額計の 10% が保たれる）。ただし 1 行に寄せるのは税込額の 1%（最低 1 円）まで、税の符号が
+            # 反転する（税抜が税込を超える）・−1（空欄の印）・0 になる動きはしない。以前は上限が無く、数量 2 以上の行の
+            # 丸め差が数量 1 の少数の行に寄って、ステッカー 110 円の行が 税抜 145／税額 −35 になっていた（O4）。
+            # 配りきれない端数は、下で税額（税込 − 税抜）が吸収するので総額は変わらない
+            _moved = [0] * len(_rows)
+            _cur_out = [r[1] for r in _rows]
+
+            def _can(_k2, _nv):
+                _in2 = _rows[_k2][2]
+                if _nv in (0, -1) or _in2 == 0 or (_nv > 0) != (_in2 > 0):
+                    return False
+                _tx2 = _in2 - _nv
+                if _in2 > 0 and _tx2 < 0:
+                    return False
+                if _in2 < 0 and (_tx2 > 0 or _tx2 == -1):
+                    return False
+                return abs(_moved[_k2] + _step) <= max(1, abs(_in2) // 100)
+
+            while _delta != 0:
+                _progress = False
+                for _k in range(len(_rows)):
+                    if _delta == 0:
+                        break
+                    _nv = _cur_out[_k] + _step
+                    if not _can(_k, _nv):
+                        continue
+                    _cur_out[_k] = _nv
+                    _moved[_k] += _step
+                    _delta -= _step
+                    _progress = True
+                if not _progress:
+                    break
+            for _k, (_ln, _out, _in) in enumerate(_rows):
+                if _cur_out[_k] != _out:
+                    cur.execute(
+                        f'UPDATE ERParts SET {_col_out}=?, {_col_tax}=? WHERE LineNo=?',
+                        (_cur_out[_k], _in - _cur_out[_k], _ln))
             _applied = _target - _cur - _delta
             if _col_out == 'PartsPriceOutTax':
                 total_parts += _applied
             else:
                 total_wages += _applied
+
+    if _minus_one_rows:
+        _ln0, _nm0, _kind0 = _minus_one_rows[0]
+        raise ValueError(
+            f"明細「{_nm0 or f'{_ln0 // 10}行目'}」の{_kind0}がちょうど −1 円です"
+            + (f"（ほか {len(_minus_one_rows) - 1} 行）" if len(_minus_one_rows) > 1 else "")
+            + "。コグニセブンでは −1 は「空欄」の印なので、この金額は .neo に書けません"
+            "（書くと行は空欄に見えるのに、合計だけ 1 円ずれます）。見積書どおりか確かめ、"
+            "端数の値引きはコグニセブンで開いてから値引き欄に入れてください。")
 
     # ── Total計算 ──
     # total_parts / total_wages は既に税抜値（is_tax_inclusive時は逆算済み）
@@ -1690,8 +1893,8 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
     # 1回丸めていたため、実機と 18% の見積で部品計の税額欄が食い違った。
     parts_tax_total   = total_parts_rowtax
     wages_tax_total   = total_wages_rowtax
-    sp_tax_total      = jpy_round(sp_out * TAX_RATE)
-    expenses_tax_total = jpy_round(taxable_expenses * TAX_RATE)
+    sp_tax_total      = _round_tax10(sp_out, tax_round)
+    expenses_tax_total = _round_tax10(taxable_expenses, tax_round)   # 税込表記の総額の税もテンプレートの端数処理（レビュー 2 周目）
     # 消費税は請求書単位で1回だけ丸める。これが見積書に印字された税込総額の
     # 作り方であり、画面もこの刻みで出している。
     # バケットごとに丸めて足すと、約4件に1件で原本の税込総額から1円離れる。
@@ -1718,7 +1921,7 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
         wages_tax_total = total_wages_intax - total_wages
         tax_total = parts_tax_total + wages_tax_total + expenses_tax_total
     else:
-        tax_total = jpy_round(sub_total * TAX_RATE)
+        tax_total = _round_tax10(sub_total, tax_round)
     # 内訳の税額欄（部品計・工賃計・諸経費計）の合計は tx_Total と
     # 一致させる。同じ .neo の中で「内訳の和 ≠ 合計」になっていると、
     # コグニの画面でも紙でも説明がつかない（この不一致は過去に
@@ -1840,7 +2043,8 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
 # 内部ファイル更新: AnSvEm0001Ex.db（顧客・車両・保険）
 # ============================================================
 
-def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusive=False, merge_mode=False):
+def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusive=False, merge_mode=False,
+                 tax_arrange_flag=1):
     """Customer/FileInfo/Insurance/Setting テーブルを更新
     merge_mode=True の場合、OCRで取得した非空の値のみでテンプレートの既存値を上書きする。
     空値のフィールドはテンプレートNEOの値を保持する。
@@ -1851,8 +2055,18 @@ def update_em_db(db_bytes, cust, insurance_info, estimated_date, is_tax_inclusiv
     finally:
         tf.close()
     try:
-        return _update_em_db_impl(tf.name, cust, insurance_info, estimated_date,
-                                  is_tax_inclusive, merge_mode)
+        # 途中で落ちても接続を閉じる。閉じないまま抜けると、Windows では一時 DB（顧客情報入り）が消せずに残る（バグハント 3 回目 L19）
+        conn = sqlite3.connect(tf.name)
+        try:
+            _update_em_db_impl(conn, cust, insurance_info, estimated_date, is_tax_inclusive, merge_mode,
+                               tax_arrange_flag=tax_arrange_flag)
+        finally:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        with open(tf.name, 'rb') as f:
+            return f.read()
     finally:
         try:
             os.unlink(tf.name)
@@ -1926,9 +2140,12 @@ def _trimmed_cust_values(cust: dict) -> dict:
     }
 
 
-def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
-                       is_tax_inclusive, merge_mode):
-    conn = sqlite3.connect(_tmp_db_path)
+def _update_em_db_impl(conn, cust, insurance_info, estimated_date,
+                       is_tax_inclusive, merge_mode, tax_arrange_flag=1):
+    """顧客・車両・保険・案件の欄を書く（接続の開け閉めは update_em_db）"""
+    # 書き換えで空いた領域を 0 で消す。過去の案件の .neo をテンプレートにすると、上書きした氏名・車台番号の古い値が
+    # ページの空き領域に残り、提出する .neo の中から読めてしまう（バグハント 3 回目 L1）
+    conn.execute('PRAGMA secure_delete=ON')
     cur  = conn.cursor()
     # コグニセブンの列幅（CP932バイト数）に合わせて切り詰める。
     # SQLite は TEXT(n) を強制しないため、ここで守らないと桁あふれした値が
@@ -1988,9 +2205,15 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
         if car_reg_date != '00000000':
             _cust_updates += ['CarRegDate=?', 'CarRegEra=?', 'CarRegEraYear=?']
             _cust_values  += [car_reg_date, reg_era, reg_era_year]
-        if kilometer >= 0:
+        # 走行距離は 0 より大きいときだけ書く。画面の数値欄は未入力でも 0 なので、0 で上書きするとテンプレートの距離が消える（L13）
+        if kilometer > 0:
             _cust_updates.append('Kilometer=?')
             _cust_values.append(kilometer)
+        # 住所を書き換えたら住所コードは前の住所のもの。残さない（L1）
+        if any((postal_no, prefecture, municipality, address_other)) and 'AddressCode' in {
+                r[1] for r in cur.execute('PRAGMA table_info(Customer)').fetchall()}:
+            _cust_updates.append('AddressCode=?')
+            _cust_values.append('')
         if _cust_updates:
             cur.execute(f"UPDATE Customer SET {', '.join(_cust_updates)}", _cust_values)
     else:
@@ -2013,6 +2236,12 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
             car_reg_date, reg_era, reg_era_year,
             kilometer
         ))
+        # 画面に入力欄の無い顧客欄（氏名 2・3、住所 2、電話、FAX、住所コード）も前の案件の値を残さない
+        # （バグハント 3 回目 L1。vendor と同じ。実機 307 本: Name2・住所コードは全件空）
+        _cu_cols = {r[1] for r in cur.execute('PRAGMA table_info(Customer)').fetchall()}
+        _cu_blank = [c for c in ('Name2', 'Name3', 'AddressOther2', 'Phone', 'Fax', 'AddressCode') if c in _cu_cols]
+        if _cu_blank:
+            cur.execute('UPDATE Customer SET ' + ', '.join(f"{c}=''" for c in _cu_blank))
 
     # Car テーブル更新（車名・カラーコード・トリムコード） — 非空の値のみ更新（通常・マージ共通）
     car_cols = {row[1] for row in cur.execute("PRAGMA table_info(Car)").fetchall()}
@@ -2020,6 +2249,9 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
         ('CarName', car_name), ('CarNameByUser', car_name),
         ('ColorCode', color_code), ('ColorName', body_color),
         ('TrimCode', trim_code),
+        # カラーコードを書いたら旗も 1（実機 307 本: コードあり 293 本が 1、コード無し 12 本が 0。vendor と同じ。バグハント 3 回目 L18）
+        ('ColorCodeFlag', 1 if color_code else 0),
+        ('TrimCodeFlag', 1 if trim_code else 0),
     ]
     # 非マージモードでは空欄でも書いてテンプレートの値を消す。
     # ここだけ「非空のみ」だったため、前案件の車の色・カラーコードが
@@ -2031,6 +2263,8 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
         set_clause = ', '.join(f'{col}=?' for col, _ in valid_car)
         values = [val for _, val in valid_car]
         cur.execute(f'UPDATE Car SET {set_clause}', values)
+    _update_car_search(cur, merge_mode, car_name, color_code, body_color, trim_code,
+                       car_serial_no, model_desig, category_num, car_reg_date, reg_era, reg_era_year)
     est_era, est_era_year = get_era_info(estimated_date)
     cur.execute('''UPDATE FileInfo SET
         EstimatedDate=?, EstimatedEra=?, EstimatedEraYear=?
@@ -2041,7 +2275,7 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
     contractor    = cp932_trim(insurance_info.get('contractor_name', ''), 20)
     agency_name   = cp932_trim(insurance_info.get('agency_name', ''), 20)
     adjuster_name = cp932_trim(insurance_info.get('adjuster_name', ''), 20)
-    adjuster_post = cp932_trim(insurance_info.get('adjuster_post', ''), 20)   # 支店・所属（Insurance.AdjusterPost）
+    adjuster_post = cp932_trim(insurance_info.get('adjuster_post', ''), 40)   # 支店・所属（Insurance.AdjusterPost は TEXT(40)。L20）
     factory_name  = cp932_trim(insurance_info.get('factory_name', ''), 30)   # 立会工場（Insurance.ConsultantFactory。vendor と同じ 30 バイト）
     accept_no     = cp932_trim(insurance_info.get('accept_no', ''), 37)
     accident_date = _normalize_date8(insurance_info.get('accident_date', ''))
@@ -2071,9 +2305,16 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
         for _col, _val in (('PresenceDate', '00000000'), ('PresenceEraYear', '0000'), ('AgreedDate', '00000000'), ('AgreedEraYear', '0000'), ('ConsultantName', '')):
             _ins_updates.append(f'{_col}=?')
             _ins_values.append(_val)
-    if repair_days > 0:
+        # 時価額も前の案件の値を残さない（-1 = 空欄。実機 307 本すべて -1。vendor と同じ。バグハント 3 回目 L1）
+        _ins_cols = {r[1] for r in cur.execute('PRAGMA table_info(Insurance)').fetchall()}
+        for _col in ('TimelyPriceOutTax', 'TimelyPriceInTax', 'TimelyPriceTax'):
+            if _col in _ins_cols:
+                _ins_updates.append(f'{_col}=?')
+                _ins_values.append(-1)
+    if repair_days > 0 or (not merge_mode and 'RepairDays' in {
+            r[1] for r in cur.execute('PRAGMA table_info(Insurance)').fetchall()}):   # 非マージで入力が無ければ -1（空欄）。前の案件の日数を残さない（L1）
         _ins_updates.append('RepairDays=?')
-        _ins_values.append(repair_days)
+        _ins_values.append(repair_days if repair_days > 0 else -1)
     if accident_date:
         _acc_era, _acc_era_year = get_era_info(accident_date)
         _ins_updates += ['AccidentDate=?', 'AccidentEra=?', 'AccidentEraYear=?']
@@ -2099,6 +2340,16 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
             _era, _era_year = get_era_info(_date)
             _fi_updates += [f'{_prefix}Date=?', f'{_prefix}Era=?', f'{_prefix}EraYear=?']
             _fi_values  += [_date, _era, _era_year]
+        elif not merge_mode and f'{_prefix}Date' in {r[1] for r in cur.execute('PRAGMA table_info(FileInfo)').fetchall()}:
+            # 前の案件の入出庫日を残さない（バグハント 3 回目 L1）。列の無いテンプレートでは書かない（UPDATE ごと落ちる）
+            _fi_updates += [f'{_prefix}Date=?', f'{_prefix}Era=?', f'{_prefix}EraYear=?']
+            _fi_values  += ['00000000', '令和', '0000']
+    if not merge_mode:   # 入力欄の無い 備考 2・3 とグループキーも前の案件の値を残さない（L1。実機 307 本すべて空）
+        _fi_cols = {r[1] for r in cur.execute('PRAGMA table_info(FileInfo)').fetchall()}
+        for _col in ('Note2', 'Note3', 'GroupKey'):
+            if _col in _fi_cols:
+                _fi_updates.append(f'{_col}=?')
+                _fi_values.append('')
     if _fi_updates:
         cur.execute(f"UPDATE FileInfo SET {', '.join(_fi_updates)}", _fi_values)
     conn.commit()
@@ -2114,26 +2365,68 @@ def _update_em_db_impl(_tmp_db_path, cust, insurance_info, estimated_date,
     if True:
         try:
             cur.execute("""UPDATE Statistics SET
-                EstimationId='', ProjectNo='', ProjectCompletedFlag='',
+                EstimationId='', ProjectNo='', ProjectCompletedFlag='0',
                 DefiniteOutTax=-1, DefiniteInTax=-1, DefiniteTax=-1,
                 AccidentLargeCategoryCode='', AccidentSmallCategoryCode='',
-                DisasterFlag='', DisasterIdentificationCode=''""")
+                DisasterFlag='0', DisasterIdentificationCode=''""")
             conn.commit()
         except Exception as e:
             print("Statistics reset failed:", e)
 
-    # TaxKindFlag 更新 (1=内税, 0=外税)
+    # TaxKindFlag 更新 (1=内税, 0=外税)。消費税の率・計算単位は、この経路の計算（10%・請求書単位）にそろえる。端数処理は
+    # テンプレートの設定（tax_arrange_flag。明細 DB の税もこの端数処理で計算している）。1 つの .neo の中で設定と税額が食い違わないように
+    # （バグハント 3 回目 O3。実機 307 本: (TaxRate, tx_CalculateFlag, tx_Unit, tx_ArrangeFlag) = (10,1,1,1) が 300 本、切り捨て (10,1,1,2) が 7 本）
     try:
         tax_flag = 1 if is_tax_inclusive else 0
-        cur.execute('UPDATE Setting SET TaxKindFlag=?', (tax_flag,))
+        _set_cols = {r[1] for r in cur.execute('PRAGMA table_info(Setting)').fetchall()}
+        _set_upd = [(c, v) for c, v in (('TaxKindFlag', tax_flag), ('TaxRate', 10), ('tx_CalculateFlag', 1),
+                                         ('tx_Unit', 1), ('tx_ArrangeFlag', int(tax_arrange_flag or 1)))
+                    if c in _set_cols]
+        if _set_upd:
+            cur.execute('UPDATE Setting SET ' + ', '.join(f'{c}=?' for c, _ in _set_upd), [v for _, v in _set_upd])
         conn.commit()
     except Exception as e:
         print("TaxKindFlag update failed:", e)
 
-    conn.close()
-    with open(_tmp_db_path, 'rb') as f:
-        result = f.read()
-    return result
+
+def _update_car_search(cur, merge_mode, car_name, color_code, body_color, trim_code,
+                       car_serial_no, model_desig, category_num, car_reg_date, reg_era, reg_era_year):
+    """CarSearch（車種の検索条件）を Car・Customer と同じ値にそろえる（バグハント 3 回目 L1）。
+
+    実機 307 本: nm_CarNameByUser = Car.CarNameByUser が全件、ev_CarName = Car.CarName が 299 本。
+    車検証から検索した .neo（SearchMethod=3）は ps_CarSerialNo = Customer.CarSerialNo = Head + '-' + Tail、
+    ps_CarMouldNo・ps_CarRegDate も Customer と同じ（243/243 本）。メーカーから検索した汎用車種
+    （SearchMethod=1）は ps_* が空（9/9 本）、ms_CarSerialNoHead/Tail は全件空。
+    過去の案件の .neo をテンプレートにすると、ここに前の車の車台番号が残っていた。
+    マージでは空の値は書かない（テンプレートの値を残す。Car と同じ規則）。
+    """
+    try:
+        _cols = {r[1] for r in cur.execute('PRAGMA table_info(CarSearch)').fetchall()}
+        _row = cur.execute('SELECT SearchMethod FROM CarSearch').fetchone() if 'SearchMethod' in _cols else None
+    except sqlite3.Error:
+        return
+    if not _cols:
+        return
+    _sm = safe_int(_row[0], 0) if _row else 0
+    _want = [('nm_CarNameByUser', car_name), ('ev_CarName', car_name),
+             ('ev_ColorCode', color_code), ('ev_ColorName', body_color), ('ev_TrimCode', trim_code)]
+    _ps = ('ps_CarSerialNo', 'ps_CarSerialNoHead', 'ps_CarSerialNoTail', 'ps_CarMouldNo', 'ps_CarKindNo',
+           'ps_CarRegDate', 'ps_CarRegEra', 'ps_CarRegEraYear')
+    if _sm == 3:
+        _head, _sep, _tail = car_serial_no.partition('-')
+        _want += [('ps_CarSerialNo', car_serial_no), ('ps_CarSerialNoHead', _head if _sep else car_serial_no),
+                  ('ps_CarSerialNoTail', _tail if _sep else ''), ('ps_CarMouldNo', model_desig),
+                  ('ps_CarKindNo', category_num)]
+        if car_reg_date != '00000000':
+            _want += [('ps_CarRegDate', car_reg_date), ('ps_CarRegEra', reg_era), ('ps_CarRegEraYear', reg_era_year)]
+        else:
+            _want += [('ps_CarRegDate', ''), ('ps_CarRegEra', ''), ('ps_CarRegEraYear', '')]
+    else:
+        _want += [(c, '') for c in _ps + ('ps_YearName',)]
+    _want += [('ms_CarSerialNoHead', ''), ('ms_CarSerialNoTail', '')]
+    _upd = [(c, v) for c, v in _want if c in _cols and (v or not merge_mode)]
+    if _upd:
+        cur.execute('UPDATE CarSearch SET ' + ', '.join(f'{c}=?' for c, _ in _upd), [v for _, v in _upd])
 
 
 # ============================================================
@@ -2176,18 +2469,20 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
         'CarNoClass':    car_div,
         'CarNoKana':     car_biz,
         'CarNoSeries':   car_serial,
-        'Total':         grand_total,
+        'Total':         str(safe_int(grand_total)),
         # 作成日を更新しないと、どの見積にもテンプレート作成時の日付が残る
         'CreatedDate':   now_jst().strftime('%Y/%m/%d'),
         # 事故・保険情報。DBに書くのと同じ値をヘッダXMLにも書かないと、
         # 過去のNEOをテンプレートに使ったとき前の案件の値が残ってしまう。
         'AcceptNo':      cp932_trim(ins.get('accept_no', ''), 37),
-        'AccidentDate':  _normalize_date8(ins.get('accident_date', '')),
+        # 事故日は 'YYYY/MM/DD'（実機 307 本: 日付あり 67 本すべてこの形、無ければ空。vendor と同じ。バグハント 3 回目 L14）
+        'AccidentDate':  _slash_date(_normalize_date8(ins.get('accident_date', ''))),
         'AdjusterName':  cp932_trim(ins.get('adjuster_name', ''), 20),
         'Note1':         cp932_trim(
             re.sub(r'\s+', ' ', safe_str(ins.get('note1', ''))).strip(), 40),
-        'GarageInDate':  _normalize_date8(ins.get('garage_in_date', '')),
-        'GarageOutDate': _normalize_date8(ins.get('garage_out_date', '')),
+        # 入出庫日はヘッダ XML には書かない（実機 307 本すべて空。DB の FileInfo には書く。vendor と同じ。L14）
+        'GarageInDate':  '',
+        'GarageOutDate': '',
         'CarMouldNo':    _t['model_desig'],
         'CarKindNo':     _t['category_num'],
         'ColorCode':     _t['color_code'],
@@ -2258,7 +2553,8 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
         tag_values['CarNo'] = ''.join(_eff)
 
     for tag_name, value in tag_values.items():
-        if merge_mode and not value:
+        # 総額と入出庫日はマージでも必ず書く（総額 0 のときにテンプレートの総額が残っていた。バグハント 3 回目 L15）
+        if merge_mode and not value and tag_name not in ('Total', 'GarageInDate', 'GarageOutDate'):
             continue  # マージモード: 空値はスキップ（テンプレートの既存値を保持）
         # 値に & や < が入るとXMLが壊れるためエスケープする（法人名の「＆」等）
         text = replace_xml_tag(text, tag_name, _xml_escape(value))
@@ -2269,36 +2565,165 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
 # 内部ファイル更新: AnSvImge.ini（INI）
 # ============================================================
 
-def update_imge_ini(orig_bytes, cust, insurance_info=None, merge_mode=False):
-    """INIファイルの顧客・車両情報を更新
-    merge_mode=True の場合、非空の値のみ上書きする。
+def update_imge_ini(orig_bytes, em_db_bytes):
+    """実体の AnSvMail.ini（NEOMAIL2。このアプリのキーでは 'AnSvImge.ini'）を、書き終わった顧客・保険 DB の値から作り直す。
+
+    仕様（NEO_FILE_SPEC_COMPLETE.md §2「全キー書換」）と実機 307 本: CustomerName = Insurance.ContractorName（契約者。
+    顧客名ではない）、TicketNo = PolicyNo（証券番号）、AgreedName = ConsultantFactory（相手工場）、CarName = Car.CarNameByUser、
+    AccidentDate = Insurance.AccidentDate（無ければ 00000000）。以前は顧客名を書き、証券番号・相手工場は書いておらず、
+    テンプレートの前の案件の値が残っていた（バグハント 3 回目 L1/L4）。DB から読むので、マージ（テンプレートの値を
+    残す）でも DB と食い違わない。DB が読めなければ全部空で作る（前の案件の値を残さない）。
     """
-    text      = orig_bytes.decode('cp932', errors='replace')
-    # DB・ヘッダXML と同じ切り詰め済みの値を使う
-    _t = _trimmed_cust_values(cust)
-    ini_values = {
-        'CustomerName':    _t['customer_name'],
-        'CarNoDepartment': _t['car_dept'],
-        'CarNoDivision':   _t['car_div'],
-        'CarNoBusiness':   _t['car_biz'],
-        'CarNoSerial':     _t['car_serial'],
-        'CarName':         _t['car_name'],
-        # 事故情報。書かないとテンプレート再利用時に前の案件の値が残る。
-        'AcceptNo':        cp932_trim((insurance_info or {}).get('accept_no', ''), 37),
-        # 8桁固定の欄。未入力は純正テンプレートと同じ 00000000 にする
-        # （空文字だと DB の Insurance.AccidentDate='00000000' と食い違う）
-        # 未入力を '00000000' に既定化するのは非マージモードのときだけ。
-        # マージモードでも真の値になってしまうと下の空値スキップに
-        # 引っかからず、DB・ヘッダXMLには前案件の事故日が残るのに
-        # ここだけ 00000000 に潰れ、同じ .neo で事故日が2通りになる。
-        'AccidentDate':    (_normalize_date8((insurance_info or {}).get('accident_date', ''))
-                            or ('' if merge_mode else '00000000')),
-    }
-    for key, value in ini_values.items():
-        if merge_mode and not value:
-            continue  # マージモード: 空値はスキップ（テンプレートの既存値を保持）
-        text = replace_ini_value(text, key, value)
-    return neo_header.encode_cp932w(text)
+    vals = {'CustomerName': '', 'CarNoDepartment': '', 'CarNoDivision': '', 'CarNoBusiness': '', 'CarNoSerial': '',
+            'TicketNo': '', 'AcceptNo': '', 'AccidentDate': '00000000', 'AgreedName': '', 'CarName': ''}
+    tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    try:
+        tf.write(em_db_bytes or b'')
+        tf.close()
+        conn = sqlite3.connect(tf.name)
+        try:
+            def _one(sql):
+                try:
+                    return conn.execute(sql).fetchone()
+                except sqlite3.Error:
+                    return None
+            c = _one('SELECT CarRegNoDepartment, CarRegNoDivision, CarRegNoBusiness, CarRegNoSerial FROM Customer')
+            i = _one('SELECT ContractorName, PolicyNo, AccidentDate, ConsultantFactory FROM Insurance')
+            f = _one('SELECT AcceptNo FROM FileInfo')
+            k = _one('SELECT CarNameByUser FROM Car')
+        finally:
+            conn.close()
+        if c:
+            vals['CarNoDepartment'], vals['CarNoDivision'], vals['CarNoBusiness'], vals['CarNoSerial'] = (safe_str(x) for x in c)
+        if i:
+            vals['CustomerName'], vals['TicketNo'] = safe_str(i[0]), safe_str(i[1])
+            _acc = safe_str(i[2])
+            vals['AccidentDate'] = _acc if re.fullmatch(r'\d{8}', _acc) else '00000000'
+            vals['AgreedName'] = safe_str(i[3])
+        if f:
+            vals['AcceptNo'] = safe_str(f[0])
+        if k:
+            vals['CarName'] = safe_str(k[0])
+    except Exception:
+        pass
+    finally:
+        try:
+            os.unlink(tf.name)
+        except OSError:
+            pass
+    lines = ['[General]', 'Signature=NEOMAIL2', '[Audaneo2]']
+    lines += [f'{key}={_ctrl_to_space(v)}' for key, v in vals.items()]
+    return neo_header.encode_cp932w('\r\n'.join(lines) + '\r\n')
+
+
+def _slash_date(d8) -> str:
+    """'YYYYMMDD' → 'YYYY/MM/DD'。空・'00000000' は ''"""
+    d8 = str(d8 or '')
+    return f'{d8[:4]}/{d8[4:6]}/{d8[6:8]}' if re.fullmatch(r'\d{8}', d8) and d8 != '00000000' else ''
+
+
+def _ctrl_to_space(value) -> str:
+    """制御文字（改行・タブ・NUL など）だけを空白に置き換える。空白を詰めたり前後を落としたりはしない
+    （明細の ERParts と AnSMB で同じ値を書くため。_strip_control_chars は空白も詰める）"""
+    return re.sub(r'[\x00-\x1f\x7f]', ' ', str(value if value is not None else ''))
+
+
+def _reset_note_flags(note_bytes, details_db_bytes, merge_mode=False):
+    """実体の AnNote.ini（このアプリのキーでは 'AnFlInfo'）の [Reserve] / [Comment] Flag を、書き終わった明細から数える
+    （vendor と同じ）。過去の案件の .neo をテンプレートにすると Flag=1 が残り、保留・コメントの無い見積に印が付いていた。
+    非マージでは備考（Note=）も空にする（バグハント 3 回目 L1）"""
+    if not note_bytes:
+        return note_bytes
+    has_res = has_com = False
+    tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    try:
+        tf.write(details_db_bytes or b'')
+        tf.close()
+        conn = sqlite3.connect(tf.name)
+        try:
+            has_res = conn.execute('SELECT COUNT(*) FROM ERParts WHERE ReserveFlag=1').fetchone()[0] > 0
+            has_com = conn.execute('SELECT COUNT(*) FROM ERParts WHERE CommentFlag=1').fetchone()[0] > 0
+        except sqlite3.Error:
+            pass
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    finally:
+        try:
+            os.unlink(tf.name)
+        except OSError:
+            pass
+    t = note_bytes.decode('cp932', errors='replace')
+    t = re.sub(r'(\[Reserve\]\s*\r?\n(?:[^\[]*?\r?\n)??Flag\s*=)[^\r\n]*',
+               lambda m: m.group(1) + ('1' if has_res else '0'), t, count=1)
+    t = re.sub(r'(\[Comment\]\s*\r?\n(?:[^\[]*?\r?\n)??Flag\s*=)[^\r\n]*',
+               lambda m: m.group(1) + ('1' if has_com else '0'), t, count=1)
+    if not merge_mode:
+        t = replace_ini_value(t, 'Note', '')
+    return neo_header.encode_cp932w(t)
+
+
+_ADAS_WORK_BLANK = '[ADASWork]\r\nIdx1.PartsCode=``\r\nIdx1.ItemName=``\r\nIdx1.Comment=``\r\n'
+
+
+def _reset_adas_work(ini_bytes):
+    """実体の AnSvEm0001Ex.db（INI。このアプリのキーでは 'AnSvEm0001.sld'）の [ADASWork] を雛形の空の 1 件に戻す。
+    ADAS の作業は予備明細（ReserveERParts）と対で、予備明細はどちらのモードでも空に戻している（バグハント 3 回目 L1）"""
+    if not ini_bytes:
+        return ini_bytes
+    t = ini_bytes.decode('cp932', errors='replace')
+    m = re.search(r'(?m)^\[ADASWork\][^\r\n]*(?:\r?\n|$)(?:(?!\[)[^\r\n]*\r?\n)*(?:(?!\[)[^\r\n]+$)?', t)
+    if not m or m.group(0).replace('\r\n', '\n') == _ADAS_WORK_BLANK.replace('\r\n', '\n'):
+        return ini_bytes
+    return neo_header.encode_cp932w(t[:m.start()] + _ADAS_WORK_BLANK + t[m.end():])
+
+
+def _clear_image_db(db_bytes):
+    """画像 DB（このアプリのキーでは 'AnSvIf0001.sld'）の画像を消す。非マージ（ベタ打ち）で過去の案件の .neo を
+    テンプレートにすると、前の案件の写真が新しい見積に入ったまま出ていた（バグハント 3 回目 L1）。
+    消した画像がファイルの空き領域に残らないよう secure_delete で消す"""
+    if not db_bytes or db_bytes[:15] != b'SQLite format 3':
+        return db_bytes
+    tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+    try:
+        tf.write(db_bytes)
+        tf.close()
+        conn = sqlite3.connect(tf.name)
+        try:
+            conn.execute('PRAGMA secure_delete=ON')
+            _tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            _n = 0
+            for _t in ('Image', 'ImageAnnotation'):
+                if _t in _tables:
+                    _n += conn.execute(f'SELECT COUNT(*) FROM {_t}').fetchone()[0]
+            if not _n:
+                return db_bytes
+            for _t in ('Image', 'ImageAnnotation'):
+                if _t in _tables:
+                    conn.execute(f'DELETE FROM {_t}')
+            conn.commit()
+        finally:
+            conn.close()
+        with open(tf.name, 'rb') as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(tf.name)
+        except OSError:
+            pass
+
+
+def _reset_image_ini(ini_bytes):
+    """実体の AnSvImge.ini（画像の目録。このアプリのキーでは 'AnSvIg0001.sld'）を、画像の無い雛形と同じ形に戻す（L1）"""
+    if not ini_bytes:
+        return ini_bytes
+    t = ini_bytes.decode('cp932', errors='replace')
+    i = t.find('[ImageSections]')
+    blank = '[ImageSections]\r\n\r\n[Image1]\r\n'
+    if i < 0 or t[i:].replace('\r\n', '\n') == blank.replace('\r\n', '\n'):
+        return ini_bytes
+    return neo_header.encode_cp932w(t[:i] + blank)
 
 
 # ============================================================
@@ -2358,12 +2783,12 @@ def generate_annote(rows):
         # 品名欄は [14:38] の24バイト。ERParts.PartsName と同じ幅で切る。
         # ここを広く取ると、隣の標準品名欄（[38:62]）へはみ出す。
         name_bytes = neo_header.encode_cp932w(
-            cp932_trim(_strip_control_chars(name), _ERPARTS_WIDTH['PartsName']))
+            cp932_trim(_ctrl_to_space(name), _ERPARTS_WIDTH['PartsName']))
         for j, b in enumerate(name_bytes):
             line[14 + j] = b
         # 品番欄は [62:80] の18バイト。
         _pno = neo_header.encode_cp932w(
-            cp932_trim(_strip_control_chars(str(row.get('parts_no', '') or '')),
+            cp932_trim(_ctrl_to_space(str(row.get('parts_no', '') or '')),
                        _ERPARTS_WIDTH['PartsNo']))
         for j, b in enumerate(_pno):
             line[62 + j] = b
@@ -2511,19 +2936,34 @@ def generate_neo_file(template_data, customer_info, items, short_parts_wage, ins
     files        = extract_files(full_raw, entries)
     estimated_date = now_jst().strftime('%Y%m%d')
     normalized_items = items or []
+    # 消費税の端数処理はテンプレート（工場のコグニ設定）に従う。切り捨ての工場の .neo をテンプレートにしたら切り捨てで計算し、
+    # 設定もそのまま残す（以前は四捨五入で計算して設定だけ残す／設定も四捨五入に上書きしていた。O3・レビュー）
+    _tax_round, _tax_flag = _template_tax_round(files.get('AnSvEm0001Ex.db') or b'')
     files['AnSMB.txt'], total_parts, total_wages, grand_total, _annote_rows = update_ansmb(
         files['AnSMB.txt'], normalized_items, short_parts_wage,
-        expenses=expenses, is_tax_inclusive=is_tax_inclusive, is_beta_mode=is_beta_mode
+        expenses=expenses, is_tax_inclusive=is_tax_inclusive, is_beta_mode=is_beta_mode,
+        tax_round=_tax_round,
     )
     files['AnNote.ini']       = generate_annote(_annote_rows)
     files['AnSvEm0001Ex.db']  = update_em_db(
         files['AnSvEm0001Ex.db'], customer_info, insurance_info, estimated_date,
-        is_tax_inclusive=is_tax_inclusive, merge_mode=merge_mode
+        is_tax_inclusive=is_tax_inclusive, merge_mode=merge_mode, tax_arrange_flag=_tax_flag,
     )
     files['AnSvMail.ini'] = update_mail_ini(files['AnSvMail.ini'], customer_info, grand_total,
                                             insurance_info=insurance_info, merge_mode=merge_mode)
-    files['AnSvImge.ini'] = update_imge_ini(files['AnSvImge.ini'], customer_info,
-                                            insurance_info=insurance_info, merge_mode=merge_mode)
+    # 実体の AnSvMail.ini（NEOMAIL2）は書き終わった DB から作り直す（DB と同じ値。バグハント 3 回目 L1/L4）
+    files['AnSvImge.ini'] = update_imge_ini(files['AnSvImge.ini'], files['AnSvEm0001Ex.db'])
+    # 実体の AnNote.ini の Flag は明細から数え、[ADASWork] は予備明細と一緒に空へ戻す（L1）
+    if 'AnFlInfo' in files:
+        files['AnFlInfo'] = _reset_note_flags(files['AnFlInfo'], files['AnSMB.txt'], merge_mode=merge_mode)
+    if 'AnSvEm0001.sld' in files:
+        files['AnSvEm0001.sld'] = _reset_adas_work(files['AnSvEm0001.sld'])
+    if not merge_mode:
+        # ベタ打ちは「テンプレートの工場名・車種の設定だけ引き継ぐ」。前の案件の写真は持ち込まない（L1）
+        if 'AnSvIf0001.sld' in files:
+            files['AnSvIf0001.sld'] = _clear_image_db(files['AnSvIf0001.sld'])
+        if 'AnSvIg0001.sld' in files:
+            files['AnSvIg0001.sld'] = _reset_image_ini(files['AnSvIg0001.sld'])
     files['AnDBVersion.ini'] = update_file_info(files.get('AnDBVersion.ini', b''))
     neo_data = repack_neo(template_data, files, mgmt, entries)
     # コグニセブンの「既存見積」一覧は、内包ファイルではなく
@@ -2898,11 +3338,50 @@ def detect_and_reorder_pages(pages):
     return pages
 
 
-@st.cache_resource
+# Gemini に 1 回で送れる大きさ。公式（ai.google.dev の Files API の説明、2026-09 に確認）は「要求全体が 100MB を超えるとき・
+# PDF は 50MB を超えるときは Files API を使う」。PDF の 50MB から余裕を見て 45MB。これを超えるファイルは送っても失敗するうえ、
+# 送信の組み立てでメモリがファイルの何倍にも膨れ、共有プロセスごと落ちうる（P1-1/P8）
+GEMINI_MAX_INLINE_BYTES = 45 * 1024 * 1024
+# 応答を待つ上限（ミリ秒）。無いと、応答しない宛先で画面が止まったままになる（P7）。長い明細の返事（出力 65,536 トークン）が
+# 3 分を超えて毎回切れないよう 10 分（読み手 GeminiReader と同じ）。締め切りで切れたら送り直さない（また 10 分待たせない）
+GEMINI_TIMEOUT_MS = 600_000
+
+
+@st.cache_resource(max_entries=16)
 def _get_genai_client(api_key):
     """google.genai クライアントを取得（セッション間で再利用）"""
     from google import genai
-    return genai.Client(api_key=api_key)
+    from google.genai import types
+    return genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS))
+
+
+def _gemini_ready_bytes(file_bytes, mime_type):
+    """Gemini に送れる形にする。TIFF・BMP・GIF は Gemini の対応外なので PDF にする（多ページの FAX TIFF は全ページ。
+    P11）。大きすぎるファイルは送る前に日本語で断る（P1-1）"""
+    mt = str(mime_type or '').lower()
+    if mt in ('image/tiff', 'image/tif', 'image/bmp', 'image/x-ms-bmp', 'image/gif'):
+        try:
+            from neo_skill import llm as _nllm
+            file_bytes, mt = _nllm.image_to_pdf(file_bytes), 'application/pdf'
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"画像を開けません（{mt}）: {str(e)[:120]}")
+    if len(file_bytes or b'') > GEMINI_MAX_INLINE_BYTES:
+        raise ValueError(
+            f"ファイルが大きすぎます（{len(file_bytes) / 1024 / 1024:.1f}MB。AI に送れるのは "
+            f"{GEMINI_MAX_INLINE_BYTES // 1024 // 1024}MB まで）。PDF ならページを減らす、写真なら解像度を下げてから入れ直してください。")
+    return file_bytes, mt
+
+
+def _is_gemini_timeout(e, msg: str = '') -> bool:
+    """締め切り切れ（クライアント側の httpx.TimeoutException、サーバー側の 504 DEADLINE_EXCEEDED）か。接続の失敗
+    （ConnectError「Connection timed out」）は含めない（送り直せば通ることがある。文言では見分けない。レビュー 3 周目）"""
+    try:
+        import httpx
+        if isinstance(e, httpx.TimeoutException):
+            return True
+    except ImportError:  # pragma: no cover
+        pass
+    return getattr(e, 'code', None) == 504 or 'DEADLINE_EXCEEDED' in (msg or str(e)).upper()
 
 
 def call_gemini(api_key, file_bytes, mime_type, prompt_text, model_name=None, use_json_mode=False):
@@ -2910,13 +3389,16 @@ def call_gemini(api_key, file_bytes, mime_type, prompt_text, model_name=None, us
     use_json_mode=True の場合、構造化JSON出力モードを使用（解析精度向上）
     """
     from google.genai import types
+    file_bytes, mime_type = _gemini_ready_bytes(file_bytes, mime_type)
     client = _get_genai_client(api_key)
     model = model_name or GEMINI_MODEL
     file_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
     config = {"temperature": 0.0, "max_output_tokens": 65536}
     if use_json_mode:
         config["response_mime_type"] = "application/json"
-    last_error = None
+    # 例外そのものは持ち越さない（送信内容を抱えたまま残り、メモリが解放されない。P1-1）。文言だけ持つ
+    last_msg = ''
+    fatal_msg = None
     for attempt in range(3):
         try:
             response = client.models.generate_content(
@@ -2933,18 +3415,26 @@ def call_gemini(api_key, file_bytes, mime_type, prompt_text, model_name=None, us
         except ValueError:
             raise
         except Exception as e:
-            last_error = e
+            last_msg = str(e)
+            _code = getattr(e, 'code', None)
             # モデルが無い（404）・クォータ切れ（429）は、1秒待って同じモデルに
             # 投げ直しても絶対に通らない。とくに 429 はリトライ自体がクォータを
             # さらに食う。ここで即座に諦めて、呼び出し側のモデル切り替えに任せる。
-            if _is_model_unavailable_error(str(e)) or _is_quota_error(str(e)):
-                raise ValueError(f"Gemini API呼び出しに失敗しました: {str(e)}")
-            if attempt < 2:
-                # 一時的な障害（500 など）は待って再送する。
-                # 固定1秒だと復旧前に打ち切ることがあるので、少しずつ延ばす。
-                import time; time.sleep(1 + attempt)
-                continue
-            raise ValueError(f"Gemini API呼び出しに失敗しました（{attempt+1}回試行）: {str(last_error)}")
+            # 400（不正な要求・対応外の形式・大きすぎる）・401/403（キー）など 4xx も同じく送り直さない（P11）
+            if (_is_model_unavailable_error(last_msg) or _is_quota_error(last_msg)
+                    or (isinstance(_code, int) and 400 <= _code < 500 and _code != 408)):
+                fatal_msg = f"Gemini API呼び出しに失敗しました: {last_msg[:500]}"
+            elif _is_gemini_timeout(e, last_msg):
+                fatal_msg = ('Gemini の応答が時間内（10 分）に返りませんでした。ページ数を減らすか、'
+                             'しばらくしてからもう一度お試しください。')
+        if fatal_msg:
+            raise ValueError(fatal_msg)
+        if attempt < 2:
+            # 一時的な障害（500 など）は待って再送する。
+            # 固定1秒だと復旧前に打ち切ることがあるので、少しずつ延ばす。
+            import time; time.sleep(1 + attempt)
+            continue
+    raise ValueError(f"Gemini API呼び出しに失敗しました（3回試行）: {last_msg[:500]}")
 
 
 def classify_first_page_as_fax(api_key, pdf_bytes, model_name):
@@ -3230,6 +3720,41 @@ def extract_addata_zip(zip_src, dest_dir: str, max_total=None) -> tuple:
 _ADDATA_TMP_TTL_SEC = 6 * 3600
 
 
+def _forget_vendor_cache_under(path):
+    """Addata の置き場（とその中の Addata の root）用に vendor が作った COM.CAB の展開キャッシュを消す。ZIP・取得URL の
+    展開先は毎回 root が変わるので、置き場を消すときに一緒に消さないと 1 件約 5.6MB ずつ溜まり続ける（バグハント 3 回目 N8）"""
+    try:
+        from neo_skill import bridge as _nbr
+    except Exception:       # noqa: BLE001
+        return
+    cands = [path]
+    try:
+        cands.append(os.path.realpath(path))
+        for n1 in os.listdir(path)[:200]:
+            p1 = os.path.join(path, n1)
+            if os.path.isdir(p1):
+                cands.append(p1)
+                if not os.path.isdir(os.path.join(p1, 'COM')):
+                    for n2 in os.listdir(p1)[:200]:
+                        p2 = os.path.join(p1, n2)
+                        if os.path.isdir(os.path.join(p2, 'COM')):
+                            cands.append(p2)
+    except OSError:
+        pass
+    for c in dict.fromkeys(cands):
+        try:
+            _nbr.forget_vendor_cache(c)
+        except Exception:   # noqa: BLE001
+            pass
+
+
+def _rmtree_addata(path):
+    """Addata の置き場を消す（vendor の展開キャッシュも一緒に。N8）"""
+    import shutil as _sh
+    _forget_vendor_cache_under(path)
+    _sh.rmtree(path, ignore_errors=True)
+
+
 def _sweep_stale_addata_dirs():
     """古い Addata 展開先を回収する。
 
@@ -3252,7 +3777,7 @@ def _sweep_stale_addata_dirs():
                     and os.path.basename(rd).startswith('addata_')
                     and os.path.isdir(rd) and rd != keep
                     and now - os.path.getmtime(rd) > _ADDATA_TMP_TTL_SEC):
-                _sh.rmtree(rd, ignore_errors=True)
+                _rmtree_addata(rd)
         # 取得の途中で落ちた（プロセスごと止められた等）ぶんの ZIP も拾う。
         # ふだんは download_zip / _addata_from_url が自分で消している。
         for f in _glob.glob(os.path.join(base, 'addata_dl_*.zip')):
@@ -3390,7 +3915,7 @@ def _evict_addata_url_cache(keep=None):
         if total <= _ADDATA_URL_CACHE_MAX_BYTES:
             return
         for _mt, rd, size in sorted(free) + sorted(busy):
-            _sh.rmtree(rd, ignore_errors=True)
+            _rmtree_addata(rd)
             total -= size
             if total <= _ADDATA_URL_CACHE_MAX_BYTES:
                 break
@@ -3409,8 +3934,7 @@ def _discard_uploaded_addata():
     st.session_state.pop('_addata_upload_label', None)
     st.session_state.pop('_addata_zip_id', None)
     if base and os.path.isdir(base) and os.path.basename(base).startswith('addata_'):
-        import shutil as _sh
-        _sh.rmtree(base, ignore_errors=True)
+        _rmtree_addata(base)
 
 
 def addata_setting(key):
@@ -3549,7 +4073,7 @@ def _addata_from_url(url):
             except OSError:
                 pass
         if not root:
-            _sh.rmtree(dest, ignore_errors=True)
+            _rmtree_addata(dest)
             _addata_url_remember_failure(real, why)
             return ''
         # 展開したぶんも数に入れてもう一度均す。展開の前だけだと、
@@ -3651,6 +4175,11 @@ def _stale_modules():
         mod = sys.modules.get(name)
         if mod is None:
             continue        # まだ読まれていない → 次の import で新しいものが載る
+        if getattr(getattr(mod, '__spec__', None), '_initializing', False):
+            continue        # 初めて import している途中（指紋はファイルの最後で控えるので、まだ無い。別の利用者の変換を偽の版ずれで断っていた。レビュー 2 周目）
+        if name in _reload_failures():
+            out.append(name)    # 読み直しが途中で失敗したまま（ファイルを元の版に戻して指紋が合っても、中身は新旧が混ざっている。レビュー 2 周目）
+            continue
         loaded, on_disk = _module_src_state(mod)
         if on_disk is None:
             continue        # 調べられないものには口を出さない
@@ -3677,14 +4206,50 @@ def sync_app_modules():
             mod = sys.modules.get(name)
             if mod is None:
                 continue
+            if getattr(getattr(mod, '__spec__', None), '_initializing', False):
+                continue
             loaded, on_disk = _module_src_state(mod)
-            if on_disk is None or loaded == on_disk:
+            if on_disk is None or (loaded == on_disk and name not in _reload_failures()):
                 continue
             try:
+                # 前の版のバイトコード（.pyc）を消してから読み直す。Python は .pyc を「更新時刻（秒）と大きさ」で確かめるので、
+                # 同じ秒に同じ大きさで書き換わった版だと古いコードのまま動き、指紋（ファイルから読む）だけ新しくなる（レビュー 2 周目）
+                import importlib.util as _ilu
+                _pyc = _ilu.cache_from_source(mod.__file__)
+                if os.path.exists(_pyc):
+                    os.remove(_pyc)
+            except Exception:       # noqa: BLE001  消せなくても読み直しは続ける
+                pass
+            # 読み直しの前に、ディスクの指紋を読み、前の版の指紋と「最初の指紋」を消す（前の版の値が残ると、読み直しの途中で
+            # push されたときに古い版の指紋のまま「揃った」と見ていた。レビュー 4 周目）
+            _pre = None
+            try:
+                _pre = _file_digest(mod.__file__)
+            except Exception:       # noqa: BLE001
+                pass
+            vars(mod).pop('__app_src_digest__', None)
+            vars(mod).pop('_stamp_digest_at_start', None)
+            try:
                 importlib.reload(mod)
-            except Exception:       # noqa: BLE001  下の再判定で拾う
+            except Exception:       # noqa: BLE001  下の再判定で拾う（指紋はファイルの最後で控えるので、途中で落ちれば古いまま）
+                _reload_failures().add(name)
                 continue
-            _stamp_module(mod)
+            _reload_failures().discard(name)
+            # 指紋はモジュール自身が読み込みの最初と最後で同じ中身のときだけ控える。ここでディスクの指紋で上書きすると、読み直しの
+            # 途中で push された版を「揃った」と見てしまう（レビュー 3 周目）。自分で控えないモジュールだけ、ここで控える
+            if '_stamp_digest_at_start' not in vars(mod):
+                _stamp_module(mod)
+            elif vars(mod).get('_stamp_digest_at_start') != _pre:
+                # 読み直しの前に読んだ版と、モジュールが読み込みの最初に読んだ版が違う（コンパイル中に push された）。
+                # Python が読んだのがどちらか分からないので、古い扱いにして次の sync で読み直す
+                vars(mod).pop('__app_src_digest__', None)
+        # 読み直したら、古いコードで作った .neo の控えを捨てる（N5）
+        try:
+            _pp = sys.modules.get('pdf_to_neo_pipeline')
+            if _pp is not None and hasattr(_pp, 'clear_pipeline_cache'):
+                _pp.clear_pipeline_cache()
+        except Exception:       # noqa: BLE001
+            pass
         return _stale_modules()
 
 
@@ -3724,10 +4289,59 @@ def _pipeline_accepts(fn, names):
     return tuple(n for n in names if n not in params)
 
 
+def _reload_failures() -> set:
+    """読み直しが例外で失敗したモジュールの名前（プロセスで 1 つ。待っても揃わないので案内を変える）"""
+    s = getattr(_pstate, 'reload_failures', None)
+    if s is None:
+        s = set()
+        _pstate.reload_failures = s
+    return s
+
+
 def _version_skew_message(names):
+    if any(n in _reload_failures() for n in names):
+        return ('アプリの内部で新しいコードの読み込みに失敗しました（%s）。'
+                'お手数ですが、アプリを再起動してからもう一度お試しください。' % '・'.join(names))
     return ('アプリの内部で新旧のコードが混ざっています（%s）。'
-            'お手数ですが、アプリを再起動してからもう一度お試しください。'
+            '更新の直後で、ほかの人の変換が終わると自動で新しいコードに揃います。少し待ってからもう一度お試しください'
+            '（続くときはアプリを再起動してください）。'
             % '・'.join(names))
+
+
+@contextlib.contextmanager
+def _synced_conversion():
+    """版を揃えてから「変換中」の印を立てる（揃えることと印を立てることを錠の中で一度に行う。間に別のセッションが
+    モジュールを差し替えないように）。スキル経路も、ベタ打ち（_call_pipeline）と同じくこの中で動かす（バグハント 3 回目 N1）"""
+    with _module_lock:
+        stale = sync_app_modules()
+        if not stale:
+            _pstate.enter()
+    if stale:
+        raise RuntimeError(_version_skew_message(stale))
+    try:
+        yield
+    finally:
+        _pstate.leave()
+
+
+def _guarded_call(fn, *args, **kwargs):
+    """_synced_conversion の中で fn を呼ぶ。版が揃わなければ失敗の dict を返す（p2n_read / p2n_make / run_pdf_to_neo_skill 用）"""
+    try:
+        cm = _synced_conversion()
+        cm.__enter__()
+    except RuntimeError as e:
+        # 断ったら取り置きの作業フォルダ（顧客情報入りの reading.json）を残さない（p2n_make の state。レビュー）
+        if args and isinstance(args[0], dict) and args[0].get('case_dir'):
+            try:
+                from neo_skill import maker as _nsk_maker_g
+                _nsk_maker_g.remove_case_dir(args[0].get('case_dir'))
+            except Exception:  # noqa: BLE001
+                pass
+        return {'ok': False, 'stage': 'error', 'error': str(e)}
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        cm.__exit__(None, None, None)
 
 
 def _defer_sidebar_rerun():
@@ -4205,10 +4819,13 @@ def generate_discrepancy_report_pdf(discrepancies, total_diff, vehicle_info):
     buf.close()
     return pdf_bytes
 
-def generate_beta_discrepancy_report_pdf(estimate_data, calc_parts, calc_wages, pdf_parts, pdf_wages, vehicle_info):
+def generate_beta_discrepancy_report_pdf(estimate_data, calc_parts, calc_wages, pdf_parts, pdf_wages, vehicle_info, verdict=None):
     """
-    ReportLabを使用してベタ打ちモード用の金額ズレ検証レポート(PDF)を生成する
+    ReportLabを使用してベタ打ちモード用の金額ズレ検証レポート(PDF)を生成する。
+    verdict はステップ③の照合の結果（parts_ok / wage_ok / grand_ok と総額）。③で一致とした小計（値引き前の小計など）は赤にせず、
+    総額の差は総額の行で示す（小計を完全一致で比べ直して別の差を赤で示し、総額の差を載せていなかった。レビュー 4 周目）
     """
+    verdict = verdict or {}
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib import colors
@@ -4255,21 +4872,50 @@ def generate_beta_discrepancy_report_pdf(estimate_data, calc_parts, calc_wages, 
     parts_diff = calc_parts - pdf_parts
     wage_diff = calc_wages - pdf_wages
 
+    def _judge(pdf_v, diff_v, ok, gross, sp_=False):
+        # 判定は差額と別の列に書く（差額の欄に続けて書くと隣の欄にはみ出していた。レビュー 5 周目）
+        if not pdf_v:
+            return '未照合'          # 見積書から読めなかった小計は「一致」と書かない
+        if ok is False:
+            return '相違'            # ③で相違としたものを「一致」と書かない（判定が無いときは書かない。レビュー 6・7 周目）
+        if diff_v == 0:
+            return '一致'
+        if gross:
+            return '一致（値引き前）'
+        if sp_:
+            return '一致(ｼｮｰﾄﾊﾟｰﾂ)'    # 半角で入れる（全角だと判定の欄からはみ出す。レビュー 7 周目に実測）
+        if verdict.get('rev'):
+            return '一致（逆算）'
+        return '一致（③で確認）' if ok else '未照合'
+    _pj = _judge(pdf_parts, parts_diff, verdict.get('parts_ok'), verdict.get('parts_gross'), verdict.get('parts_sp'))
+    _wj = _judge(pdf_wages, wage_diff, verdict.get('wage_ok'), verdict.get('wage_gross'), verdict.get('wage_sp'))
+
+    def _cell_or_dash(pdf_v, text):
+        # 照合していない（印字が読めなかった）欄には印字も差額も出さない（レビュー 6・7 周目）
+        return text if pdf_v else '—'
     sum_data = [
-        ['項目', 'PDF原本 記載値', 'AI抽出 明細合算値', '差額'],
-        ['部品合計', f"¥{pdf_parts:,}", f"¥{calc_parts:,}", f"{'+' if parts_diff>0 else ''}{parts_diff:,}円"],
-        ['工賃合計', f"¥{pdf_wages:,}", f"¥{calc_wages:,}", f"{'+' if wage_diff>0 else ''}{wage_diff:,}円"]
+        ['項目', '見積書の印字', '明細の合算', '差額', '判定'],
+        ['部品合計', _cell_or_dash(pdf_parts, f"¥{pdf_parts:,}"), f"¥{calc_parts:,}",
+         _cell_or_dash(pdf_parts, f"{'+' if parts_diff > 0 else ''}{parts_diff:,}円"), _pj],
+        ['工賃合計', _cell_or_dash(pdf_wages, f"¥{pdf_wages:,}"), f"¥{calc_wages:,}",
+         _cell_or_dash(pdf_wages, f"{'+' if wage_diff > 0 else ''}{wage_diff:,}円"), _wj],
     ]
-    t_sum = Table(sum_data, colWidths=[30*2.83, 40*2.83, 40*2.83, 30*2.83])
+    _g_bad = verdict.get('grand_ok') is False
+    if _g_bad:
+        _gd = safe_int(verdict.get('grand_diff'))
+        sum_data.append(['総額（明細・税込）', f"¥{safe_int(verdict.get('grand_want')):,}", f"¥{safe_int(verdict.get('grand_neo')):,}",
+                         f"{'+' if _gd > 0 else ''}{_gd:,}円", '相違'])
+    _red = [('TEXTCOLOR', (3, r_), (4, r_), colors.red) for r_, j_ in ((1, _pj), (2, _wj), (3, '相違' if _g_bad else '')) if j_ == '相違']
+    # 差額の欄は 9 桁（打ち間違いで 0 を 1 つ多く入れた額）でも隣と重ならない幅にする（レビュー 6 周目）
+    t_sum = Table(sum_data, colWidths=[36*2.83, 30*2.83, 30*2.83, 32*2.83, 32*2.83])
     t_sum.setStyle(TableStyle([
         ('FONT', (0,0), (-1,-1), font_name, 10),
         ('ALIGN', (0,0), (-1,0), 'CENTER'),
-        ('ALIGN', (1,1), (-1,-1), 'RIGHT'),
+        ('ALIGN', (1,1), (3,-1), 'RIGHT'),
+        ('ALIGN', (4,1), (4,-1), 'CENTER'),
         ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
         ('GRID', (0,0), (-1,-1), 0.5, colors.black),
-        ('TEXTCOLOR', (3,1), (3,1), colors.red if parts_diff != 0 else colors.black),
-        ('TEXTCOLOR', (3,2), (3,2), colors.red if wage_diff != 0 else colors.black),
-    ]))
+    ] + _red))
     elements.append(t_sum)
     elements.append(Spacer(1, 10 * 2.83))
 
@@ -4330,7 +4976,7 @@ CORE_PROMPT = """<system_instruction>
 1. 【完全転写】入力画像に記載されているテキスト・数値をそのまま抽出すること。存在しない値の推測、補完、勝手な計算は絶対に行わない。
 2. 【欠落防止】ページ跨ぎ、折り返し行、セクション区切り、ページ最下部の行などを絶対に漏らさないこと。
 3. 【ノイズ排除】挨拶、説明文、Markdownの装飾（```json など）は一切出力しない。純粋なJSON文字列のみを返すこと。
-4. 【数値の正規化】金額や数量は、カンマ(,)を除去した半角整数の数値型(Number)で出力すること。読み取れない数値は 0 とし、読み取れない文字は "不明" とする。
+4. 【数値の正規化】金額は、カンマ(,)を除去した半角整数の数値型(Number)で出力すること。数量は印字どおりの数値で出力すること（2.5 L のような小数は 2.5 のまま。整数に丸めない）。読み取れない数値は 0 とし、読み取れない文字は "不明" とする。
 </golden_rules>
 
 <extraction_logic>
@@ -4589,6 +5235,11 @@ def analyze_insurance_document(api_key, file_bytes, mime_type, model_name=None):
     返り値は neo_skill.doc_hints.INSURANCE_DOC_KEYS の dict（値は文字列）。失敗は {'_error': 理由}（黙って空を返さない）"""
     if not api_key:
         return {'_error': 'Gemini APIキーが設定されていません'}
+    try:
+        # 送る前に大きさ・形式を確かめる（大きな添付で送り直しを重ねてメモリが膨れていた。P1-1/P11）
+        file_bytes, mime_type = _gemini_ready_bytes(file_bytes, mime_type)
+    except ValueError as _ge:
+        return {'_error': str(_ge)}
     if not model_name:
         try:
             model_name = st.session_state.get('selected_model')
@@ -4691,6 +5342,11 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
     if not api_key:
         # キーが無ければ呼ぶ前に失敗を返す（黙って空の車両情報を返さない）
         return {'_error': 'Gemini APIキーが設定されていません'}
+    try:
+        # 送る前に大きさ・形式を確かめる（P1-1/P11）
+        file_bytes, mime_type = _gemini_ready_bytes(file_bytes, mime_type)
+    except ValueError as _ge:
+        return {'_error': str(_ge)}
     try:
         from google.genai import types
         client = _get_genai_client(api_key)
@@ -4863,30 +5519,63 @@ _TOTAL_PREFIXES_FOR_KEI = (
 # 見出し名 → 内部キー。曖昧な短い別名は最後に置き、具体的な名前を優先する。
 # 「部品」だけの列は品番のことも金額のこともあるため候補に入れない。
 _COLUMN_ALIASES = {
-    'name':         ('品名', '部品名', '品目', '名称', '摘要', '作業内容'),
+    'name':         ('品名', '部品名', '品目', '名称', '摘要', '作業内容', '項目', '作業項目', '作業名', '内容'),
     'work_code':    ('区分', '作業区分'),
-    'quantity':     ('数量', '個数'),
-    'parts_amount': ('部品金額', '部品代', '部品価格', '部品単価', '部品油脂'),
-    'wage':         ('工賃', '技術料', '作業工賃'),
-    'part_no':      ('部品コード', '部品番号', '品番'),
+    'quantity':     ('数量', '個数', '数', '個', '員数', '点数', '使用数'),
+    # 「部品単価」「単価」は行の金額ではない（数量 10・単価 150 を 150 円にしていた。O5/M6）。unit_price に分け、
+    # 金額の列が無い・空の行だけ 単価×数量 にする。「金額」「合計」などは別名にしない（部品だけの金額のことも、行の合計の
+    # こともある。_resolve_columns_by_data が明細の値で決め、決まらなければ止める）
+    'parts_amount': ('部品金額', '部品代', '部品価格', '部品油脂', '部品費', '部品代金', '部品料金', '部品額'),
+    'unit_price':   ('部品単価', '単価'),
+    'wage':         ('工賃', '技術料', '作業工賃', '工賃金額', '技術料金額', '作業料金', '工賃額', '技術料額', '作業金額',
+                     '技術金額', '作業料', '作業代', '作業費', '技術費', '技術料金', '工賃代'),
+    'part_no':      ('部品コード', '部品番号', '品番', '部品NO', '品番NO', 'パーツNO', 'パーツ番号', '部品NO.', '品番NO.', 'パーツNO.'),
     'index_value':  ('工数', '指数'),
 }
+# 見出しの名前だけでは「部品だけの金額」か「行の合計（部品＋工賃）」か決まらない列（明細の値で決める。決まらなければ止める）。
+# 「値引金額」「塗装金額」「外注金額」など、ここに無い「〜金額」は何の金額か分からない列として止める（「〜金額」をまとめて
+# 部品か行の合計とみなし、作業金額を消したり値引きの額を部品にしたりしていた。レビュー 4 周目）。「値引後金額」「掛率後金額」は
+# 部品だけにも行の合計にも値引きがかかり、明細の値では決められないので入れない（止める。レビュー 5 周目）
+_COLUMN_AMBIGUOUS_AMOUNT = ('金額', '合計', '計', '小計', '合計金額', '金額計', '総額', '税込', '税込金額', '税込合計', '税抜金額',
+                            '行合計', '明細金額', '税抜合計', '税抜合計金額', '合計額', '金額合計', '小計金額', '請求金額',
+                            '見積金額')
+# 品名の列らしい見出しの一部（「品名・作業内容」「品名/作業」など別名表に無い形）
+_COLUMN_NAME_HINTS = ('品名', '作業内容', '項目', '内容', '名称', '品目', '摘要', '部品名')
+_COLUMN_ROWNO_RE = re.compile(r'(?i)(明細|行)?(no\.?|#)')
+
+
+def _norm_col_header(c) -> str:
+    """見出しのセルを比べる形に: 全角英数・括弧を半角に（英字は大文字）、空白・区切りを詰め、丸括弧の注記（（税抜）・(円)）を落とし、
+    全体が【】・[] で囲まれていれば中身、【税込】などの角括弧の注記は落とす（「【部品金額】(円)」を読めなかった。レビュー 4 周目）"""
+    c = unicodedata.normalize('NFKC', str(c or '')).upper()
+    c = re.sub(r'[\s\u3000・、，,/／]', '', c)
+    # 全体が括弧で囲まれた見出し（「（品名）」「【品名】」）は中身（丸括弧の注記として消すと空になり、見出しを見失って位置で
+    # 金額を読んでいた。レビュー 4 周目）
+    m = re.fullmatch(r'\(([^()]+)\)|【([^【】]+)】|\[([^\[\]]+)\]', c)
+    if m:
+        return m.group(1) or m.group(2) or m.group(3)
+    c1 = re.sub(r'\([^()]*\)', '', c)
+    c1 = re.sub(r'\(.*$', '', c1)
+    m = re.fullmatch(r'【([^【】]+)】|\[([^\[\]]+)\]', c1)
+    if m:
+        return m.group(1) or m.group(2)
+    c2 = re.sub(r'【[^【】]*】|\[[^\[\]]*\]', '', c1)
+    return c2 or c1 or c
 
 
 def _build_column_map(header_row) -> dict:
     """見出し行から「内部キー → 列位置」を作る。判別できない場合は空dict。"""
     if not header_row:
         return {}
-    # 空白で切り捨てると「部品 コード」が「部品」になり、品番列を見失う。
-    # 空白は詰めるだけにし、括弧書きの注記だけを落とす。
-    cells = []
-    for c in header_row:
-        c = re.sub(r'[\s\u3000・、，]', '', str(c or ''))
-        # 括弧書きの注記だけを落とす。閉じ括弧が無い場合は以降を捨てる。
-        c = re.sub(r'[（(\[【][^）)\]】]*[）)\]】]', '', c)
-        c = re.sub(r'[（(\[【].*$', '', c)
-        cells.append(c)
+    cells = [_norm_col_header(c) for c in header_row]
     colmap = {}
+    # 「金額（部品）」「金額（工賃）」は括弧を落とす前に見分ける（落とすと両方「金額」になる）
+    for i, c in enumerate(header_row):
+        rc = re.sub(r'[\s\u3000・、，]', '', unicodedata.normalize('NFKC', str(c or '')))
+        if 'parts_amount' not in colmap and re.fullmatch(r'金額\((部品|部品代|部品油脂)\)', rc):
+            colmap['parts_amount'] = i
+        elif 'wage' not in colmap and re.fullmatch(r'金額\((工賃|技術料)\)', rc):
+            colmap['wage'] = i
     # 別名を外側で回し、具体的な名前から順に列を確保する。
     # 列を外側で回すと「部品 コード」→「部品」のような弱い一致が
     # 先に金額列を奪い、部品代が全部0になる。
@@ -4898,10 +5587,309 @@ def _build_column_map(header_row) -> dict:
                     break
             if key in colmap:
                 break
+    # 品名の見出しが別名に無い（「品名・作業内容」「品名/作業」など）: 品名らしい語を含む列。それも無ければ、金額の列が
+    # 分かっているときに限り、残った左端の列を品名にする（見出しを無視して位置で金額まで読んでいた。レビュー 3 周目）
+    if 'name' not in colmap:
+        for i, c in enumerate(cells):
+            if i not in colmap.values() and any(h in c for h in _COLUMN_NAME_HINTS):
+                colmap['name'] = i
+                break
+    if 'name' not in colmap and any(k in colmap for k in ('parts_amount', 'wage', 'unit_price')):
+        for i, c in enumerate(cells):
+            if (i not in colmap.values() and c and not _COLUMN_ROWNO_RE.fullmatch(c)
+                    and c not in _COLUMN_AMBIGUOUS_AMOUNT and not c.endswith('金額')):
+                colmap['name'] = i
+                break
     # 品名の列が見つからないなら、この見出しは当てにならないので位置決め打ちに戻す
     if 'name' not in colmap:
         return {}
+    # 見出しだけでは中身が決まらない列は、明細の値を見て _resolve_columns_by_data が決める（決まらなければ止める）。
+    #  「金額」「合計」「税込金額」など: 部品だけの金額か行の合計（部品＋工賃）か／「部品」: 部品の金額か品番か／「番号」: 品番か行の
+    #  番号か。決まるまでは位置の補いにも使わせない
+    for i, c in enumerate(cells):
+        if i in colmap.values():
+            continue
+        if c in _COLUMN_AMBIGUOUS_AMOUNT:
+            colmap[f'_kingaku_{i}'] = i
+        elif c == '部品':
+            colmap[f'_buhin_{i}'] = i
+        elif c == '番号':
+            colmap[f'_bango_{i}'] = i
+    # 金額でない見出し（備考・メモ・単位・行の番号・率・税額など）は位置の補いに使わせない（「備考」を工賃として読んで止まっていた）
+    for i, c in enumerate(cells):
+        if i in colmap.values():
+            continue
+        if (c in ('備考', 'メモ', 'コメント', '単位', '項番', '行', '行番号', '連番', 'ページ', '頁', '消費税', '税額', '税')
+                or _COLUMN_ROWNO_RE.fullmatch(c) or c.endswith('率') or '%' in c):
+            colmap[f'_other_{i}'] = i
     return colmap
+
+
+def _looks_like_part_no(v) -> bool:
+    """品番らしい値か: 英字か「数字-数字」を含み数字もある 5 字以上（52119-12345・90467A1234 など）、または 8 桁以上の数字だけ
+    （ハイフン無しの品番。明細 1 行の金額としてはあり得ない大きさ）。全角・空白入りも見る。「-」「OEM」「45000」は品番とみなさない"""
+    s = re.sub(r'\s', '', unicodedata.normalize('NFKC', str(v or '')))
+    if not re.search(r'\d', s):
+        return False
+    if re.fullmatch(r'\d{8,}', s):
+        return True
+    return (len(s) >= 5 and bool(re.fullmatch(r'[0-9A-Za-z][0-9A-Za-z\-‐－]*[0-9A-Za-z]', s))
+            and bool(re.search(r'[A-Za-z]|\d[\-‐－]\d', s)))
+
+
+def _csv_row_parts(pa_raw, up_raw, qty_raw, wage_amt, unit_generic: bool, has_pa_col: bool, index_raw='',
+                   unit_is_parts: bool = False):
+    """CSV の 1 行の部品の金額: 部品金額の欄の値。空で単価があれば 単価×数量。取り込みと「金額」の列の確かめで同じ値を使う
+    （確かめは部品 0、取り込みは 単価×数量 とみて食い違い、確かめを通った行に部品を足していた。レビュー 5 周目）。
+    見出しが「単価」で 単価×数量（または 単価×工数）がちょうど工賃と同じ行は、単価がレバーレート（工賃の時間単価）かもしれない:
+    部品金額の列があれば、その欄が空なのは「部品が無い」という意味なので 0。部品金額の列が無ければ部品の単価と区別できないので
+    None を返す（呼び出し側は部品 0 円にして、そう読んだことを警告に出す。単価をそのまま部品にして水増ししていた。レビュー 6 周目）。
+    行の合計の列で 単価×数量＋工賃 と裏が取れているときは、単価は部品の単価と分かる（unit_is_parts）"""
+    pa_raw = str(pa_raw or '').strip()
+    up_raw = str(up_raw or '').strip()
+    if pa_raw or not up_raw:
+        return safe_int(pa_raw)
+    try:
+        qf = float(_normalize_number_text(qty_raw) or 1)
+    except (TypeError, ValueError):
+        qf = 1.0
+    try:
+        xf = float(_normalize_number_text(index_raw) or 0)
+    except (TypeError, ValueError):
+        xf = 0.0
+    if (unit_generic and wage_amt > 0 and not unit_is_parts
+            and (abs(safe_int(up_raw) * qf - wage_amt) <= 1 or (xf and abs(safe_int(up_raw) * xf - wage_amt) <= 1))):
+        # 単価の欄にレバーレート 8,000・数量 1.5 で工賃 12,000 の行（部品 12,000 を足していた。レビュー 3 周目）。
+        # 時間が「工数」の列にある形も同じ（単価×工数 ＝ 工賃。部品 8,000 を作っていた。レビュー 5 周目）。
+        # 単価×数量 も 単価×工数 も工賃と合わなければ、単価はレバーレートでは説明が付かないので部品の単価として足す
+        return 0 if has_pa_col else None
+    from decimal import Decimal as _Dec, InvalidOperation as _DecErr
+    try:
+        # 数量が小数でも元の数量で掛け、単価は丸めずに掛ける（155.5 × 10 を 1,560 にしていた。レビュー 2 周目）。
+        # 負の数量（返品 −1 × 単価）は符号を残す（+5,000 にしていた。レビュー 3 周目）
+        _qd = _Dec(_normalize_number_text(qty_raw) or '1') if qf != 0 else _Dec(1)
+        return jpy_round(_Dec(_normalize_number_text(up_raw) or '0') * _qd)
+    except (_DecErr, ValueError, TypeError):
+        return jpy_round(safe_int(up_raw) * (qf if qf > 0 else 1))
+
+
+def _resolve_columns_by_data(colmap: dict, data_rows: list, header_row) -> list:
+    """見出しだけでは決まらない列（_kingaku_ / _buhin_ / _bango_・位置 2 の見出しの無い列）を明細の値で決め、何の金額か
+    分からない列を探す。colmap をその場で直し、取り込みを止める誤り（'❌ ' で始まる文言）を返す。
+    data_rows は集計行・見出しの繰り返しを除いた明細。推し量れる形は狭くし、合わなければ止める（CSV は取り込んだあと原本と
+    照合しないので、黙って誤った金額にするより止めるほうがよい）"""
+    errs = []
+    hdr = [str(c or '').strip() for c in (header_row or [])]
+    name_i = colmap.get('name', 0)
+
+    def vals(i):
+        return [str(r[i] or '').strip() for r in data_rows if i < len(r) and str(r[i] or '').strip()]
+
+    def num(r, i):
+        if i is None or i >= len(r):
+            return None
+        raw = str(r[i] or '').strip()
+        t = _normalize_number_text(raw) if raw else None
+        try:
+            return float(t) if t is not None else None
+        except ValueError:
+            return None
+
+    def _amount_like(v):
+        core = re.sub(r'[\s¥￥\\円]', '', v)
+        if not core or re.fullmatch(r'[-‐‑‒–—―−ー－ｰ*＊・…]+', core):
+            return True
+        return _normalize_number_text(v) is not None and not _looks_like_part_no(v)
+
+    def _drop(key, i):
+        colmap.pop(key, None)
+        colmap[f'_other_{i}'] = i
+
+    def _nm(r):
+        return str(r[name_i] if name_i < len(r) else '').strip()[:16] or '（品名なし）'
+
+    def _few(names):
+        return '・'.join(names[:3]) + (' など' if len(names) > 3 else '')
+
+    # 「番号」: 品番らしい値があれば品番、無ければ行の番号（金額には使わない）
+    for key, i in [(k, v) for k, v in colmap.items() if k.startswith('_bango_')]:
+        if 'part_no' not in colmap and any(_looks_like_part_no(v) for v in vals(i)):
+            colmap.pop(key)
+            colmap['part_no'] = i
+        else:
+            _drop(key, i)
+    # 「部品」: 値がどれも金額なら部品金額、品番らしい値があれば品番
+    for key, i in [(k, v) for k, v in colmap.items() if k.startswith('_buhin_')]:
+        vs = vals(i)
+        if vs and 'parts_amount' not in colmap and all(_amount_like(v) for v in vs):
+            colmap.pop(key)
+            colmap['parts_amount'] = i
+        elif vs and 'part_no' not in colmap and any(_looks_like_part_no(v) for v in vs):
+            colmap.pop(key)
+            colmap['part_no'] = i
+        else:
+            _drop(key, i)
+    # 位置 2 の列（数量の既定の位置）で見出しが別名に無いもの: 見出しが空か数量らしい語（〜数・QTY・個）で、値がどれも数量らしい
+    # ときだけ数量にする。それ以外は取らない（金額なら下の「何の金額か分からない列」で止まり、文字の列はそのまま読み飛ばす）。
+    # 数量らしくない値の列を「金額でない列」として外し、見出しが「作業代」「値引」の列の金額を黙って捨てていた（レビュー 5 周目）。
+    # 注意書きの行（⚠・❌・※）の値は見ない（注意書きが 1 行混ざるだけで数量の列を外し、部品を 単価×1 にしていた）
+    if 'quantity' not in colmap and 2 < len(hdr) and 2 not in colmap.values():
+        vs2 = [str(r[2] or '').strip() for r in data_rows
+               if 2 < len(r) and str(r[2] or '').strip() and not _nm(r).startswith(('⚠', '❌', '※'))]
+        _h2 = _norm_col_header(hdr[2])
+        # 見出しが空の列は 2 桁までの数だけ数量とみる（3 桁の金額を数量として取り込み、その列の金額を黙って捨てていた。
+        # レビュー 6 周目）。見出しが数量らしい語のときは 3 桁（100 個のクリップ）まで
+        _qmax = 1000 if _h2 else 100
+        _qlike = [v for v in vs2 if re.fullmatch(r'(一式|式|ｾｯﾄ|セット|(?i:set)|[-‐－ーｰ―*＊])', v)
+                  or (_normalize_number_text(v) is not None and abs(float(_normalize_number_text(v))) < _qmax)]
+        if vs2 and len(_qlike) == len(vs2) and (not _h2 or re.search(r"数|Q'?TY|PCS|個", _h2)):
+            colmap['quantity'] = 2
+
+    up_i, wg_i, q_i = colmap.get('unit_price'), colmap.get('wage'), colmap.get('quantity')
+
+    def _c(r, i):
+        return str(r[i] or '').strip() if i is not None and i < len(r) else ''
+
+    def _wb(r):
+        w = (num(r, wg_i) or 0.0) if wg_i is not None else 0.0
+        u = num(r, up_i) if up_i is not None else None
+        q = num(r, q_i) if q_i is not None else None
+        base = (u * (q if q else 1.0)) if u else None      # 返品（数量 −1）は符号も
+        return w, base
+
+    kg_cols = sorted(v for k, v in colmap.items() if k.startswith('_kingaku_'))
+    parts_src = 'col' if 'parts_amount' in colmap else None     # 部品の出どころ: 部品金額の列 / 単価×数量
+    if kg_cols and parts_src is None:
+        kg = kg_cols[0]
+        label = hdr[kg] if kg < len(hdr) else '金額'
+        rows_k = []
+        for r in data_rows:
+            k = num(r, kg)
+            if k is not None:
+                w, base = _wb(r)
+                rows_k.append((k, w, base, _nm(r)))
+        # 行ごとの証拠: 部品だけの金額（par）・行の合計（tot）・どちらとも言えない（amb）。部品だけの証拠は
+        #  ・工賃のある行の 0 円（行の合計なら工賃より小さくならない）
+        #  ・単価×数量 そのもの（単価×数量 が工賃と違う行。工賃は別の列）
+        # に絞る。値引き後の行の合計は工賃や 単価×数量 より小さくなり得るので、工賃のある行の 金額 ＜ 工賃・金額 ＜ 単価×数量 や、
+        # 単価×数量 ＝ 工賃（単価がレバーレートかもしれない）の行は、どちらとも言えないとして止める（部品の証拠にして工賃を二重に
+        # 数えていた。レビュー 5 周目）
+        par, tot, amb, par_strong = [], [], [], []
+        for k, w, base, nm_ in rows_k:
+            if w > 0:
+                if abs(k - ((base or 0.0) + w)) <= 1.0:
+                    tot.append(nm_)     # 単価×数量＋工賃（単価が無ければ工賃だけ）＝ 行の合計
+                elif abs(k) <= 0.5:
+                    par.append(nm_)     # 工賃のある行の 0 円（行の合計の列に 1 行だけ混ざることがあるので、下で 2 行以上を求める）
+                elif base is not None and abs(base - w) > 1.0 and abs(k - base) <= 1.0:
+                    par.append(nm_)
+                    par_strong.append(nm_)   # 単価×数量 そのもの（行の合計なら 単価×数量＋工賃 になるはずで、見間違えない）
+                elif base is None and k > w + 1.0:
+                    pass                # 工賃より大きい金額は、部品だけの金額とも行の合計とも読める（証拠にしない）
+                else:
+                    amb.append(nm_)
+            elif base is not None:
+                if k < base - 1.0:
+                    par.append(nm_)     # 工賃の無い行の値引き後の部品（行の合計でも同じ額）
+                elif k > base + 1.0:
+                    amb.append(nm_)     # 単価×数量より大きいのに工賃が無い（工賃込みか税込か読めない）
+            # 工賃も単価も無い行は、どちらで読んでも同じ
+        # 工賃の列が無い・工賃が 1 つも無い CSV は、工賃の行の金額もこの列にあるはずで、部品と工賃を分けられない（工賃の列が無いと
+        # 「金額のある行に工賃が無い」がいつも成り立ち、工賃の行を部品にしていた。レビュー 5 周目）
+        _wage_used = wg_i is not None and any((num(r, wg_i) or 0.0) > 0 for r in data_rows)
+        role = None
+        if not rows_k:
+            role = 'parts'              # 列が全部空: 部品金額の列として扱い、単価×数量で埋める
+        elif not _wage_used:
+            role = None
+        elif amb or (par and tot):
+            role = None
+        elif tot:
+            # 単価の列が無いときの「行の合計」の証拠は 金額 ＝ 工賃 の行だけ。1 行では部品がたまたま工賃と同じ額かもしれないので、
+            # 2 行以上そろったときだけ決める（1 行の「8000,8000」を部品 0 円にしていた。レビュー 4 周目）
+            if (all(abs(k - ((base or 0.0) + w)) <= 1.0 for k, w, base, _n in rows_k)
+                    and (up_i is not None or len(tot) >= 2)):
+                role = 'total'          # どの行も 単価×数量＋工賃（部品は 単価×数量）
+        elif par_strong or len(par) >= 2 or not any(w > 0 for _k, w, _b, _n in rows_k):
+            # 部品だけの証拠がある（単価で裏が取れない「工賃のある行の 0 円」だけのときは 2 行以上。行の合計の列に 0 円の行が
+            # 1 行混ざるだけで全部を部品と読み、工賃を二重に数えていた。レビュー 6 周目）／金額のある行に工賃が無い
+            role = 'parts'
+        # それ以外（工賃のある行が、どちらとも読める形だけ）は決められない
+        if role == 'parts':
+            colmap.pop(f'_kingaku_{kg}', None)
+            colmap['parts_amount'] = kg
+            parts_src = 'col'
+        elif role == 'total':
+            parts_src = 'unit'
+            # 行の合計（単価×数量＋工賃）で確かめた ＝ その行の単価は部品の単価（レバーレートではない）。金額の欄が空の行は
+            # 確かめていないので、行ごとに見る（CSV 全体の旗にしていたため、金額の欄が空の行があると裏の取れている行まで
+            # レバーレート扱いになり、関係ない行を名指しして止まっていた。レビュー 7・8 周目）
+            colmap['_unit_parts_col'] = kg
+        elif not _wage_used:
+            errs.append(('❌ 工賃の列が無いので' if wg_i is None else '❌ 工賃の列に金額が 1 つも無いので')
+                        + f'、見出しの「{label}」を部品と工賃に分けられません（工賃の行の金額も部品になります）。'
+                        '部品の金額は「部品金額」、工賃は「工賃」の列に分けてください。（例: 品名,区分,数量,部品金額,工賃,部品コード）')
+        else:
+            errs.append(f'❌ 見出しの「{label}」が、部品だけの金額か、部品と工賃を足した行の合計か決められません'
+                        '（値引きの行・金額だけの行・単価×数量と合わない行があるときも止めます）。部品だけの金額なら見出しを'
+                        '「部品金額」に、行の合計なら部品と工賃を「部品金額」「工賃」の列に分けてください。'
+                        '（例: 品名,区分,数量,部品金額,工賃,部品コード）')
+    # 残りの「金額」「合計」などの列: 行ごとに 部品＋工賃（税抜・税込）か部品と合うときだけ読み飛ばす。合わない行があれば止める
+    # （部品金額の列があると行の合計の列を確かめずに捨て、外注・値引きの行が消えていた。レビュー 4 周目）
+    pa_i = colmap.get('parts_amount')
+    _upc = colmap.get('_unit_parts_col')    # 行の合計の列（この欄に金額のある行は 単価×数量＋工賃 で裏が取れている）
+    _ug = up_i is not None and up_i < len(hdr) and _norm_col_header(hdr[up_i]) == '単価'
+    for key in [k for k in list(colmap) if k.startswith('_kingaku_')]:
+        kg = colmap[key]
+        label = hdr[kg] if kg < len(hdr) else '金額'
+        if not errs and parts_src is not None:
+            bad = []
+            for r in data_rows:
+                k = num(r, kg)
+                if k is None:
+                    continue
+                w = safe_int(_c(r, wg_i))
+                # 部品は取り込みと同じ決め方で（部品金額の欄が空なら 単価×数量。確かめだけ部品 0 とみて通していた。レビュー 5 周目）
+                pv0 = _csv_row_parts(_c(r, pa_i), _c(r, up_i), _c(r, q_i), w, _ug, pa_i is not None,
+                                     _c(r, colmap.get('index_value')),
+                                     bool(_upc is not None and num(r, _upc) is not None))
+                pv = float(pv0 or 0)    # 取り込み側もレバーレートの行は部品 0 円にする
+                if not any(abs(k - c) <= 1.0 for c in (pv + w, pv, float(jpy_round((pv + w) * 1.1)))):
+                    bad.append(_nm(r))
+            if bad:
+                errs.append(f'❌ 見出し「{label}」の列が、部品金額＋工賃（または部品金額）と合わない行があります（{_few(bad)}）。'
+                            '何の金額か分からないので止めました。その行の金額を「部品金額」「工賃」の列に入れてください'
+                            '（金額でなければ見出しを「備考」に）。')
+        _drop(key, kg)
+    # 見出しはあるのに何の金額か分からない列（「値引金額」「外注金額」「部品価格(円)」など）: 位置で補うと別の列を読むことがあり、
+    # 補わないと金額が黙って消える。どちらも協定見積では困るので止める（レビュー 2 周目）
+    taken = set(colmap.values())
+    unknown = []
+    for i, h in enumerate(hdr):
+        # 見出しが空の列も、金額があれば止める（位置で品番として読むか、黙って捨てていた。レビュー 5 周目）。
+        # 品名より左の見出し無しの列は、行番号（1・2・3…）なら読み飛ばす（レビュー 6 周目）
+        if i in taken:
+            continue
+        amounts = [v for v in vals(i) if _normalize_number_text(v) is not None and not _looks_like_part_no(v)
+                   and re.search(r'[1-9]', v)]
+        if not h and i <= name_i:
+            # 行番号の列は 1（か 2）から 1 ずつ増える形だけ。「100・300」のような小さな金額を行番号とみて黙って捨てていた
+            # （レビュー 7 周目）
+            _vs = vals(i)
+            _nums = [float(_normalize_number_text(v)) for v in _vs if _normalize_number_text(v) is not None]
+            if (len(_nums) == len(_vs) and _nums and all(n == int(n) for n in _nums)
+                    and _nums[0] in (1.0, 2.0) and _nums == sorted(set(_nums))
+                    and _nums[-1] <= len(data_rows) + 3):   # 読み落として番号が飛ぶこともある（レビュー 8 周目）
+                continue        # 見出しの無い行番号の列
+        if amounts:
+            unknown.append(h or f'（見出しなし・{i + 1} 列目）')
+    if unknown:
+        # 「合計」に直すと、単価の列が無いときは決められないまま（案内が堂々巡りになる）。部品金額の書き方を案内する（レビュー 6 周目）
+        errs.append('❌ 見出し「' + '」「'.join(unknown[:3]) + '」の列は金額（数字）に見えますが、何の金額か分かりません。'
+                    '部品だけの金額なら見出しを「部品金額」、工賃なら「工賃」にしてください'
+                    '（部品と工賃を足した行の合計なら、部品金額＝合計−工賃 を「部品金額」の列に。品番なら「部品コード」、'
+                    '行番号なら「No」、金額でなければ「備考」に）。')
+    return errs
 
 
 def _is_total_row_name(name: str) -> bool:
@@ -4913,7 +5901,7 @@ def _is_total_row_name(name: str) -> bool:
     「合計表示灯」「総額メーター」「温度計」のような部品名は末尾が
     集計語ではないので残る。
     """
-    nm = re.sub(r'[\s\u3000【】\[\]「」『』¥￥:：･・]', '', str(name or ''))
+    nm = re.sub(r'[\s\u3000【】\[\]「」『』¥￥:：･・*＊_~]', '', str(name or ''))   # Markdown の太字（**合計**）も（レビュー 3 周目）
     nm = re.sub(r'[（(].*?[）)]', '', nm)          # 括弧書きを除去
     nm = re.sub(r'[0-9０-９①-⑳%％]+$', '', nm)     # 末尾の番号・率を除去
     nm = nm.replace('御', 'ご')                     # 御請求額 → ご請求額
@@ -4946,6 +5934,7 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
 
     # BOM除去・改行正規化
     text = csv_text.strip().lstrip('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
+    _errors: list = []      # 取り込みを止める誤り（'❌ ' で始まる注記として返す。M2）
     # AIの回答をそのまま貼り付けたときの前後のコードフェンスだけを外す。
     # 全行から除去すると、引用符で囲まれた複数行フィールドを壊してしまう。
     text = re.sub(r'^[^\n]*```[a-zA-Z]*\n', '', text)
@@ -4956,8 +5945,36 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
     text = '\n'.join(l for l in text.split('\n')
                      if not re.fullmatch(r'\s*```[a-zA-Z]*\s*', l))
     items = []
+    # 表計算ソフトから貼るとタブ区切り、AI の回答をそのまま貼ると Markdown の表になる（M6）。区切りを見分ける
+    _lines = [l for l in text.split('\n') if l.strip()]
+    _md = [l for l in _lines if l.strip().startswith('|')]
+    _delim = ','
+    _is_md = False      # Markdown の表（品名の「|」で欄が割れることがある）
+    if len(_md) >= 2 and len(_md) >= len(_lines) // 2:
+        _is_md = True
+        _conv = []
+        for l in text.split('\n'):
+            ls = l.strip()
+            if not ls.startswith('|'):
+                _conv.append(l)
+                continue
+            _ls2 = ls[1:] if ls.startswith('|') else ls
+            _ls2 = _ls2[:-1] if _ls2.endswith('|') else _ls2
+            # 太字の記号は外し（レビュー 3 周目）、取り消し線は中身ごと消す（消した値を足していた。レビュー 4 周目）
+            _cells = [re.sub(r'(\*\*|__)', '', re.sub(r'~~.*?~~', '', c)).strip() for c in _ls2.split('|')]
+            if all(re.fullmatch(r':?-{2,}:?', c) for c in _cells if c) and any(_cells):
+                continue   # 区切り線 |---|---|
+            _conv.append('\t'.join(c.replace('\t', ' ') for c in _cells))
+        text = '\n'.join(_conv)
+        _delim = '\t'
+    elif _lines:
+        _head = _lines[:5]
+        _cnt = {d: sum(l.count(d) for l in _head) for d in (',', '\t', ';')}
+        _best = max(_cnt, key=lambda d: _cnt[d])
+        if _best != ',' and _cnt[_best] > _cnt[',']:
+            _delim = _best
     try:
-        reader = _csv.reader(_io.StringIO(text))
+        reader = _csv.reader(_io.StringIO(text), delimiter=_delim)
         rows = list(reader)
     except Exception:
         return (items, _trailer_notes) if return_notes else items
@@ -4968,15 +5985,14 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
     # ヘッダ行を特定する。「品名」が無くてもヘッダらしい行なら読み飛ばす。
     # 以前は先頭セルに「品名」が無いとヘッダ行をそのまま明細として
     # 取り込み、「品目」のような別表記で先頭行がゴミ明細になっていた。
-    _HEADER_WORDS = ('品名', '品目', '部品名', '名称', '摘要', '区分', '作業内容',
-                     '数量', '個数', '数', '単価', '金額', '部品金額', '工賃',
-                     '部品コード', '部品番号', '工数', '番号', '備考', '単位')
+    # 見出しの判定語は列の別名から作る（別名にだけ足した「部品代」「技術料」「項目」などの見出しを見出しと認識せず、
+    # 明細として読んでいた。レビュー 4 周目）
+    _HEADER_WORDS = set(sum((list(v) for v in _COLUMN_ALIASES.values()), [])) | set(_COLUMN_AMBIGUOUS_AMOUNT) \
+        | {'番号', '備考', '単位', '部品', 'NO', 'NO.'}
 
     def _norm_header_cell(c):
-        # 「部品金額（税抜）」「数 量」のような装飾を外して見出し語と比べる
-        c = re.sub(r'[\s\u3000・]', '', c)
-        c = re.sub(r'[（(\[【][^）)\]】]*[）)\]】]', '', c)
-        return c
+        # 「部品金額（税抜）」「数 量」「【品名】」のような装飾を外して見出し語と比べる（列の対応付けと同じ形）
+        return _norm_col_header(c)
 
     def _looks_like_header(r):
         if not r:
@@ -5043,8 +6059,33 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
     # 見出し行があれば列名で対応付ける。位置決め打ちだと、先頭に「No」列が
     # 付いただけで全列が1つずれ、部品代が工賃に化けてしまう。
     _colmap = _build_column_map(rows[header_idx - 1]) if header_idx > 0 else {}
+    if _colmap:
+        _name_i = _colmap.get('name', 0)
+        _data_rows = [r for r in rows[header_idx:]
+                      if r and any(str(c or '').strip() for c in r) and not _looks_like_header(r)
+                      and str(r[0] if r else '').strip() != '品名'
+                      and not _is_total_row_name(str(r[_name_i] if _name_i < len(r) else ''))]
+        _errors.extend(_resolve_columns_by_data(_colmap, _data_rows, rows[header_idx - 1]))
 
     _claimed = set(_colmap.values())
+    # 単価の見出しが「単価」（部品単価でない）か。工賃のレバーレートを入れる書式がある（レビュー 4 周目）
+    _unit_generic = bool(header_idx > 0 and 'unit_price' in _colmap
+                         and _norm_col_header(rows[header_idx - 1][_colmap['unit_price']]) == '単価')
+    # 見出しの列数（右端の空の見出しは数えない）。これより右に値のある行は列がずれている（M2）
+    _hdr_cells = rows[header_idx - 1] if header_idx > 0 else []
+    _hdr_len = len(_hdr_cells)
+    while _hdr_len and not str(_hdr_cells[_hdr_len - 1] or '').strip():
+        _hdr_len -= 1
+    if not _hdr_len:
+        _hdr_len = 6   # 見出しが無いときは既定の 6 列（品名,区分,数量,部品金額,工賃,部品コード）
+    def _amount_ok(raw):
+        """金額の欄として読める（空・ダッシュ・数字）か。「4万5千」「45,000円也」などは読めない（P19）。
+        表計算ソフトの会計表示のゼロ（「¥ -」「¥-」）・「***」・ダッシュの類は 0 円として受ける（レビュー）"""
+        raw = str(raw or '').strip()
+        core = re.sub(r'[\s¥￥\\円]', '', raw)
+        if not core or re.fullmatch(r'[-‐‑‒–—―−ー－ｰ*＊・…]+', core):
+            return True
+        return _normalize_number_text(raw) is not None
 
     def _cell(row, key, pos):
         # 見出しに無い項目は位置で補う。「部品、油脂」「金額（部品）」の
@@ -5052,13 +6093,102 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
         # ただし他のキーが既に確保した列（品名・区分など）は横取りしない。
         idx = _colmap.get(key)
         if idx is None:
-            idx = pos if (pos is not None and pos not in _claimed) else None
+            # 見出しがあるときは金額（部品金額・工賃）を位置で補わない。見出しの別の列を金額として読んでいた
+            # （「金額」だけの列の部品金額が 0 円、「部品」の列が区分に入る。レビュー 2 周目）。何の金額か分からない列は
+            # _resolve_columns_by_data が止める
+            if _colmap and key in ('parts_amount', 'wage', 'quantity'):
+                idx = None
+            else:
+                idx = pos if (pos is not None and pos not in _claimed) else None
         return row[idx].strip() if idx is not None and 0 <= idx < len(row) else ''
 
     row_idx = 0
+    # 明細の行のセル数。どの行も見出しより同じだけ多い（全行の末尾に余分なカンマがある書き出し）ときは、部品 1〜3 桁・工賃 3 桁の
+    # 行を「割れた金額」とみなさない（クリップ 300 円・工賃 500 円の正しい行を止めていた。レビュー 3 周目）
+    # 1 行だけのときは、正しい行と割れた金額の行の形が同じで見分けられないので止める側に倒す
+    _data_lens = [len(r) for r in rows[header_idx:] if r and any(str(c or '').strip() for c in r)
+                  and not _looks_like_header(r) and str(r[0] if r else '').strip() != '品名']
+    _amt_pos = [q for q in ((_colmap.get('parts_amount'), _colmap.get('wage')) if _colmap else (3, 4)) if q is not None]
+    _name_i0 = _colmap.get('name', 0) if _colmap else 0
+
+    def _is_detail_row(r):
+        # 集計行・注意書き・見出しの繰り返しは「明細」ではない（合計行の 4 桁の金額で「桁区切りを使っていない CSV」と
+        # 判断し、割れた金額を通していた。レビュー 7 周目）
+        if not r or not any(str(c or '').strip() for c in r) or _looks_like_header(r):
+            return False
+        nm0 = str(r[_name_i0] if _name_i0 < len(r) else '').strip()
+        return not nm0.startswith(('⚠', '❌', '※')) and not _is_total_row_name(nm0)
+    # 桁区切りの無い 4 桁以上の金額が明細に 2 つ以上あれば、この CSV は桁区切りを使っていない
+    _no_sep = sum(1 for r in rows[header_idx:] if _is_detail_row(r)
+                  for q in _amt_pos if q < len(r) and re.fullmatch(r'-?\d{4,}', str(r[q] or '').strip())) >= 2
+    _hdr_n = len(_hdr_cells) if header_idx > 0 else 6   # 見出しの無い CSV は既定の 6 列（品名,区分,数量,部品金額,工賃,部品コード）
+    _uniform_extra = (len(_data_lens) >= 2 and len(set(_data_lens)) == 1
+                      and _data_lens[0] > _hdr_n and _no_sep)   # 全行が同じだけ割れた CSV と見分ける（レビュー 4 周目）
+    _name_col = _colmap.get('name', 0) if _colmap else 0
+    _has_qty_col = (not _colmap) or ('quantity' in _colmap)
+    _split_like: list = []      # 割れた行と同じ形だが、桁区切りを使っていない CSV なので通した行（知らせる）
+    _lever_rows: list = []      # 単価をレバーレートとみて部品 0 円にした行
+    _short_rows: list = []      # 列が見出しより少ない行
+    _frac_rows: list = []       # 数量が整数でない行
+
+    def _few_rows(names):
+        # 知らせは 1 件にまとめる（行ごとに出すと行数ぶん並び、読み飛ばされる。レビュー 9 周目）
+        return '・'.join(names[:3]) + (f' ほか {len(names) - 3} 行' if len(names) > 3 else '')
+    # その CSV のほかの行に数量が書いてあるか（数量が空欄なのが例外のときだけ、空欄を列ずれの印にする。数量を落とした CSV を
+    # まるごと止めていた。レビュー 6 周目）
+    _qty_used = any(_cell(r, 'quantity', 2).strip() for r in rows[header_idx:] if _is_detail_row(r))
+
+    def _shift_reason(row, name, qty_raw, pa_raw, wg_raw, up_raw, part_no, qty_ok, nums_ok, extra_cells):
+        '''1 列ずれた行の形か（品名のカンマ・桁区切りのカンマで割れた行）。ずれて見えるわけを返す（無ければ ''）。
+        見出しより 1 セル多い行（部品コードが空の行の末尾のカンマ。アプリの指示文どおりの形）と同じセル数の行に同じ確かめを
+        かける（多い行には品名のカンマの確かめがかからず、工賃が品番の欄に入って消えていた。レビュー 5 周目）'''
+        q, pa, wg, up, pn = (str(v or '').strip() for v in (qty_raw, pa_raw, wg_raw, up_raw, part_no))
+        if not qty_ok or (extra_cells and not nums_ok):
+            return '数量か金額の欄が数字として読めません'
+        if _delim != ',' and not _is_md:
+            return ''       # タブ区切り（表計算ソフト）の欄は割れない
+        nxt = str(row[_name_col + 1] if _name_col + 1 < len(row) else '')
+        if ((name.count('(') + name.count('（')) > (name.count(')') + name.count('）'))
+                and (nxt.count(')') + nxt.count('）')) > (nxt.count('(') + nxt.count('（'))):
+            # 品名の括弧が次の欄で閉じる（「写真代(事故,修理後)」が割れた形）。括弧が閉じないだけなら、元の見積で品名が途中で
+            # 切れたこともあるので止めない（レビュー 5 周目）
+            return '品名の括弧が次の欄で閉じています（品名のカンマで割れた形）'
+        if re.fullmatch(r'0\d{1,2}', pn):
+            # 「12,000」が割れた後半（012・000）。工場の社内コードには 3 桁もあるので、0 で始まらない数字だけでは止めない
+            # （正しい行をまるごと止めていた。レビュー 6 周目）
+            return f'品番の欄が 0 で始まる数字（{pn}）です（桁区切りのカンマで割れた形）'
+        # 区分が空欄の行（指示文では 写真代・研磨・ショートパーツ）の品名のカンマ: 数量の欄に空の区分、部品金額の欄に数量、品番の欄に
+        # 工賃が来る。指示文は数量を必ず書かせる（不明は 1）ので、ほかの行に数量があるのにこの行だけ空欄なら止める
+        _q_blank = (not (q if _has_qty_col else pa)) and (_qty_used or not _has_qty_col)
+        if _has_qty_col and _q_blank and (re.fullmatch(r'-?[1-9]\d?', pa) or re.fullmatch(r'-?[1-9]\d?', up)):
+            return '数量が空欄で、部品金額が 1〜99 です（区分が空欄の行の品名のカンマで割れた形）'
+        if _q_blank and re.fullmatch(r'\d{1,7}', pn):
+            return (('数量' if _has_qty_col else '部品金額')
+                    + f'が空欄で、品番の欄が数字だけ（{pn}）です（区分が空欄の行の品名のカンマで割れた形）')
+        if (not (q if _has_qty_col else pa)) and re.fullmatch(r'\d{1,7}', pn) and safe_int(pa) == 0 and safe_int(wg) == 0:
+            # 部品も工賃も 0 なのに品番の欄にだけ数字がある: 正しい明細ではあり得ない（本当の工賃が品番の欄に来た形）。
+            # どの行にも数量が無い CSV でも止める（レビュー 7 周目）
+            return f'部品金額も工賃も 0 で、品番の欄にだけ数字（{pn}）があります（品名のカンマで割れた形）'
+        if _delim != ',':
+            return ''
+        # 桁区切りのカンマで割れた金額（「45,500」→ 45 と 500、「12,000」→ 12 と 000）
+        if any(re.fullmatch(r'0\d{2}', v) for v in (pa, wg)):
+            return '金額が 0 で始まる 3 桁です（桁区切りのカンマで割れた形）'
+        if re.fullmatch(r'-?[1-9]\d{0,2}', pa) and re.fullmatch(r'\d{3}', wg):
+            # 「45,500」が割れた形（部品 45・工賃 500）。止めるのは、割れた行の品番の欄に本当の工賃が来ている（品番が数字）か、
+            # 見出しより多いセルのある行（全行に同じ余分なカンマがある書き出しを除く）。
+            # 桁区切りの無い 4 桁以上の金額がその CSV にあれば、桁区切りを使っていない CSV なので止めない（部品 300 円・
+            # 工賃 500 円・社内品番の正しい行を止め、直しようが無かった。レビュー 6 周目）。
+            # 止めなかった行は必ず読んだ値を知らせる（品番の欄が空の行が ❌ にも ⚠️ にもかからず黙って通っていた。レビュー 10 周目）
+            if ((extra_cells and not _uniform_extra)
+                    or (not extra_cells and not _no_sep and re.fullmatch(r'0|[1-9]\d*', pn))):
+                return '部品金額が 1〜3 桁で、工賃がちょうど 3 桁です（桁区切りのカンマで割れた形）'
+            _split_like.append(f'「{name}」（部品金額 {pa}・工賃 {wg}・品番 {pn or "（空）"}）')
+        return ''
     for row in rows[header_idx:]:
         if not row or not any(c.strip() for c in row):
             continue
+        _row_len_orig = len(row)
         # 列数が足りない場合は右側を空文字で補完
         while len(row) < 6:
             row.append('')
@@ -5070,9 +6200,34 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
 
         name      = _cell(row, 'name', 0)
         category  = _cell(row, 'work_code', 1)
-        qty       = safe_int(_cell(row, 'quantity', 2), 1)
-        parts_amt = safe_int(_cell(row, 'parts_amount', 3))
-        wage_amt  = safe_int(_cell(row, 'wage', 4))
+        _qty_raw  = _cell(row, 'quantity', 2)
+        _frac_row = False
+        _pa_raw   = _cell(row, 'parts_amount', 3)
+        _wg_raw   = _cell(row, 'wage', 4)
+        _up_raw   = _cell(row, 'unit_price', None)
+        qty       = safe_int(_qty_raw, 1)
+        if is_fractional_qty(_qty_raw):
+            # コグニの数量は整数。数量 1・金額そのままで取り込む（丸めた数量で単価の税×数量を当てると税が変わる。L7）。
+            # 知らせるのは取り込む行だけ（集計行・品名の無い行・注意書きの行にも出していた。レビュー 10 周目）
+            qty = 1
+            _frac_row = True
+        wage_amt  = safe_int(_wg_raw)
+        # 行の合計の列で 単価×数量＋工賃 と裏が取れた行か（その欄に金額が書いてある行だけ。レビュー 8 周目）。
+        # 数として読めるときだけ（「-」「***」「¥ -」のような会計表示のゼロでも旗が立ち、レバーレートの単価を無警告で
+        # 部品に足していた。レビュー 9 周目）
+        _upc_i = _colmap.get('_unit_parts_col')
+        _upc_raw = str(row[_upc_i] or '').strip() if (_upc_i is not None and _upc_i < len(row)) else ''
+        _row_total_ok = bool(_upc_raw) and _normalize_number_text(_upc_raw) is not None
+        # 金額の列が無い・空の行で単価だけある: 行の金額は 単価×数量（M6。「金額」の列が空の行も 0 円にしていた。レビュー 2 周目）。
+        # 数量が小数でも元の数量で掛ける（数量 1 にする前に）。「金額」の列の確かめと同じ関数で決める（レビュー 5 周目）
+        parts_amt = _csv_row_parts(_pa_raw, _up_raw, _qty_raw, wage_amt, _unit_generic, 'parts_amount' in _colmap,
+                                   _cell(row, 'index_value', None), _row_total_ok)
+        _lever_row = parts_amt is None
+        if _lever_row:
+            # 単価×数量（または単価×工数）がちょうど工賃と同じで、部品金額の列が無い行（レビュー 6 周目）。
+            # 単価はレバーレート（工賃の時間単価）とみて部品 0 円にする。知らせるのは取り込む行だけ（集計行・注意書きの行にも
+            # 出して、消えた金額があるように見せていた。レビュー 7 周目）
+            parts_amt = 0
         part_no   = _cell(row, 'part_no', 5)
         # 見出しに「工数」「指数」列があれば取り込む（従来は常に空だった）
         index_val = _cell(row, 'index_value', None)
@@ -5087,12 +6242,29 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
             continue
         # 表の後ろにAIが書き足す説明文（「上記のとおりです。」など）は明細ではない。
         # 金額も数量も品番も無く、1セルだけの文章行に限って落とす。
-        if (parts_amt == 0 and wage_amt == 0 and not part_no
-                and sum(1 for c in row if str(c or '').strip()) == 1
-                and (re.search(r'[。．!！?？]', name)
-                     or re.search(r'(です|ます|ください|とおり|下さい)', name)
-                     or len(name) > 24)):
-            _trailer_notes.append(name.strip())
+        _mark = name.strip().startswith(('⚠', '❌', '※'))
+        _strict_amt = [v for v in (_pa_raw, _wg_raw)
+                       if re.fullmatch(r'[-+−△▲]?[¥￥]?\d[\d,，]*(\.\d+)?円?', str(v or '').strip())]
+        # 「⚠」「❌」で始まるのに金額の欄に数字がある行は、注意書きなのか明細なのか分からない（AI が注意書きの中に明細を写した形で、
+        # 明細として数えると二重になる。レビュー 4 周目）
+        if name.strip().startswith(('⚠', '❌')) and _strict_amt:
+            _errors.append(f'❌ 「{name.strip()[:24]}」の行は、注意書きなのか明細なのか分かりません（金額の欄に数字が入っています）。'
+                           '明細なら品名の先頭の記号を消し、注意書きなら金額を消してください。')
+            continue
+        # 「※」で始まり金額の欄が数字だけでない（「5行目」など）行も注意書き（部品 7・工賃 9 の明細にしていた。レビュー 4 周目）
+        _marker_note = _mark and not _strict_amt
+        if ((_marker_note or (parts_amt == 0 and wage_amt == 0 and not part_no))
+                and (_marker_note
+                     or (sum(1 for c in row if str(c or '').strip()) == 1
+                         and (re.search(r'[。．!！?？]', name)
+                              or re.search(r'(です|ます|ください|とおり|下さい)', name)
+                              or len(name) > 24)))):
+            # 注意書きの中のカンマでセルが割れていてもつなげる（列ずれで取り込みが止まる・0 円の明細になっていた。レビュー 3 周目）
+            _tn = ','.join(str(c).strip() for c in row if str(c or '').strip()) if _marker_note else name.strip()
+            # AI が CSV の後ろに書いた「❌」「⚠️」の注意（「3 行読み取れませんでした」など）は、閉じた欄に隠さず警告として出す。
+            # 取り込みは止めない（先頭が「⚠️ CSV の中の注意」なので、取り込みを止める ❌ とは区別される。レビュー 2 周目）
+            _trailer_notes.append(('⚠️ CSV の中の注意: ' + _tn.lstrip('❌⚠\ufe0f ').strip())
+                                  if _tn.startswith(('❌', '⚠', '※')) else _tn)
             continue
         # アプリ自身のプロンプトが末尾に付ける差異メモは明細ではない
         _nm_s = name.strip()
@@ -5113,8 +6285,72 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
         if _nm in ('値引', '値引き') and parts_amt == 0 and wage_amt == 0:
             continue
         if qty < 1:
+            if str(_qty_raw or '').strip():
+                _trailer_notes.append(f'⚠️ 「{name}」の数量 {_qty_raw} は 1 未満なので 1 にしました（値引きは金額のマイナスで書きます）。')
             qty = 1
+        # 列のずれ: 見出しより右に値がある行（引用符の無いカンマ付き金額「45,000」や品名のカンマ）。
+        # 黙って取り込むと金額が千分の一になったり工賃に移ったりする（バグハント 3 回目 M2）
+        # 見出しがあるときは見出しより「セルの数」が多い行（空のセルでも）。「クリップ,取替,10,1,550,0,」のように
+        # 末尾の部品コードが空だと、ずれたセルは空になるので値の有無では見分けられない
+        _extra = ([c for c in row[len(_hdr_cells):] if str(c or '').strip()] if header_idx > 0
+                  else [c for c in row[_hdr_len:] if str(c or '').strip()])
+        # 数量・金額の欄が数字として読めるか（品名・区分のカンマで 1 列ずれると、数量の欄に「取替」などが来る）
+        _qty_ok = ((not str(_qty_raw or '').strip()) or _normalize_number_text(_qty_raw) is not None
+                   or bool(re.fullmatch(r'(一式|式|ｾｯﾄ|セット|(?i:set)|[-‐－ーｰ―*＊])', str(_qty_raw).strip())))
+        _nums_ok = _qty_ok and _amount_ok(_pa_raw) and _amount_ok(_wg_raw) and _amount_ok(_up_raw)
+        _why = ''
+        if _extra:
+            if (len(_extra) == 1 and 'part_no' not in _colmap and header_idx > 0 and _nums_ok
+                    and _looks_like_part_no(_extra[0]) and str(part_no or '').strip() in ('', str(_extra[0]).strip())
+                    and not _shift_reason(row, name, _qty_raw, _pa_raw, _wg_raw, _up_raw, part_no, _qty_ok, _nums_ok, False)):
+                # 見出しの無い品番の列（見出しより 1 つ右。英字・ハイフン入り）: 品番として受ける。数量・金額が数字として読める行
+                # だけ（品名のカンマで 1 列ずれた行の「-」「OEM」を品番として受け、部品 1・工賃 45,000 で入っていた。レビュー 2 周目）
+                part_no = str(_extra[0]).strip()
+                _extra = []
+            else:
+                _why = '見出しより右の欄に値があります'
+        else:
+            # 見出しより多いセルが全部空の行（末尾のカンマ）も、見出しと同じセル数の行も、同じ確かめで 1 列ずれた形を探す
+            # （「45,500」が 2 つのセルに割れて部品 45・工賃 500、品名のカンマで数量の欄に「取替」。レビュー 2・3・5 周目）
+            _why = _shift_reason(row, name, _qty_raw, _pa_raw, _wg_raw, _up_raw, part_no, _qty_ok, _nums_ok,
+                                 _row_len_orig > _hdr_n)
+            if _why:
+                _extra = ['']
+        if _extra:
+            _errors.append(f'❌ 「{name}」の行は列がずれています（{",".join(str(c).strip() for c in row if str(c).strip())[:60]}。'
+                           f'数量 {_qty_raw or "（空）"}・部品金額 {_pa_raw or "（空）"}・工賃 {_wg_raw or "（空）"}・品番 {part_no or "（空）"} と'
+                           f'して読めました。{_why}）。金額の桁区切りのカンマ（45,000）・品名のカンマ・見出しの無い列が考えられます。'
+                           '金額はカンマ無し（45000）にし、カンマを含む欄は「"」で囲み、列には見出しを付けてください。'
+                           + ('（品名のカンマでなければ、数量の欄に数量を入れてください）'
+                              if _why.startswith(('数量が空欄', '部品金額も工賃も 0')) else '')
+                           + ('（金額がこのとおりで正しいなら、品番の欄を「P-12345」のように数字だけでない形にするか、'
+                              'タブ区切り〔表計算ソフトからの貼り付け〕で貼り直してください）'
+                              if _why.startswith(('部品金額が 1〜3 桁', '部品金額も工賃も 0')) else '')
+                           + ('（金額がこのとおりで正しいなら、行の終わりの余分なカンマを消してください）'
+                              if _row_len_orig > _hdr_n and not any(str(c or '').strip() for c in row[_hdr_n:]) else ''))
+            continue
+        if header_idx > 0 and _row_len_orig < len(_hdr_cells) and any(
+                k in _colmap and _colmap[k] >= _row_len_orig for k in ('parts_amount', 'wage', 'unit_price')):
+            _short_rows.append(f'「{name}」')
+        # 桁区切りを「.」で書いた金額（「45.000」）は 1/1000 になる。単価は「155.5」が正しいことがあるので部品金額・工賃だけ
+        # （レビュー 10 周目）
+        _dot_amt = [f'{lbl}「{raw}」' for lbl, raw in (('部品金額', _pa_raw), ('工賃', _wg_raw))
+                    if re.fullmatch(r'[-+]?\d+\.\d{3}', str(raw or '').strip())]
+        if _dot_amt:
+            _errors.append(f'❌ 「{name}」の{"・".join(_dot_amt)}は小数点付きです（桁区切りのカンマを「.」と書くと 1/1000 に'
+                           'なります）。金額は「45000」のように、区切りを入れずに書いてください。')
+            continue
+        _bad_amt = [lbl for lbl, raw in (('部品金額', _pa_raw), ('工賃', _wg_raw), ('単価', _up_raw)) if not _amount_ok(raw)]
+        if _bad_amt:
+            _errors.append(f'❌ 「{name}」の{"・".join(_bad_amt)}が数字として読めません'
+                           f'（{" / ".join(str(r) for r in (_pa_raw, _wg_raw, _up_raw) if str(r or "").strip())[:40]}）。'
+                           '半角の数字（例 45000）で書いてください。')
+            continue
 
+        if _lever_row:
+            _lever_rows.append(f'「{name}」（工賃 {wage_amt:,}円）')
+        if _frac_row:
+            _frac_rows.append(f'「{name}」（数量 {_qty_raw}）')
         row_idx += 1
         items.append({
             'page':         1,
@@ -5133,11 +6369,33 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
             'row_id':       f'p1_r{row_idx:03d}',
             'row_bbox':     {'x1': 0, 'y1': 0, 'x2': 1000, 'y2': 50},
         })
+    if _short_rows:
+        _trailer_notes.append('⚠️ ' + _few_rows(_short_rows) + 'の行は列が見出しより少なく、金額の欄がありません'
+                              '（0 円として取り込みました）。')
+    if _frac_rows:
+        _trailer_notes.append('⚠️ ' + _few_rows(_frac_rows) + 'の数量は整数でないので、数量 1・金額そのままで取り込みました。')
+    if _lever_rows:
+        _trailer_notes.append('⚠️ ' + _few_rows(_lever_rows) + 'は「単価」×数量（または工数）が工賃と同じなので、'
+                              '単価を工賃のレバーレート（時間単価）とみて部品 0 円で取り込みました。'
+                              '部品の金額なら「部品金額」の列に書いてください。')
+    if _split_like:
+        _trailer_notes.append('⚠️ 次の行は、桁区切りのカンマで割れた行と同じ形です（この CSV はほかの行で桁区切りを使っていないので'
+                             'そのまま読みました）: ' + _few_rows(_split_like)
+                             + '。金額が違っていたら、金額をカンマ無しで書き直してください。')
     if _dropped_amount:
-        _trailer_notes.append(
+        # 金額のある行を落とした知らせは先頭に置く（注記が多いと隠れていた。M7）
+        _trailer_notes.insert(0,
             f'⚠️ 品名が空欄の行を{len(_dropped_amount)}行読み飛ばしました'
             f'（金額の合計 {sum(_dropped_amount):,}円）。'
             'CSVの品名欄をご確認ください。')
+    if header_idx > 0 and _colmap and not any(k in _colmap for k in ('parts_amount', 'wage', 'unit_price')):
+        # 見出しはあるのに金額の列が分からない（「値段」など）。位置で推し量ると別の列を金額として読む（M6）
+        _errors.insert(0, '❌ 見出しに金額の列（部品金額・工賃・技術料・単価）が見つかりません。'
+                          '1行目を「品名,区分,数量,部品金額,工賃,部品コード」にしてください。'
+                          '（AI の返事に説明文が多いときは、表の部分だけを貼ってください）')
+    if _errors:
+        # 誤りのある CSV は取り込まない（1 行でも列がずれていると、ほかの行も同じずれ方をしている疑いがある）
+        return ([], _errors + _trailer_notes) if return_notes else []
     return (items, _trailer_notes) if return_notes else items
 
 
@@ -5177,7 +6435,7 @@ def parse_detail_json_to_items(json_text: str, page_num: int = 1) -> list:
         parts_raw   = detail.get('part_price', 0)
         part_no     = str(detail.get('part_number', '') or '').strip()
         wage  = safe_int(wage_raw)
-        qty   = safe_int(qty_raw, 1)
+        qty   = qty_int(qty_raw, 1)
         parts = safe_int(parts_raw)
         if wage == 0 and parts == 0:
             continue
@@ -5289,7 +6547,7 @@ def parse_markdown_to_items(md_text: str, page_num: int = 1) -> list:
         method      = _md_cell('work_code', 1)
         index_value = _md_cell('index_value', 2).strip()
         wage        = to_int(_md_cell('wage', 3))
-        qty         = to_int(_md_cell('quantity', 4))
+        qty         = qty_int(_md_cell('quantity', 4), 1)   # 小数の数量（2.5 L）は数量 1・金額そのまま（切り捨てて 2 にしていた。レビュー 2 周目）
         parts       = to_int(_md_cell('parts_amount', 5))
         part_no     = _md_cell('part_no', 6).strip()
 
@@ -5346,11 +6604,22 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
                 # JSONパースが空ならMarkdownフォールバック
                 if not items:
                     items = parse_markdown_to_items(response.text, page_num)
-                return {
+                # 返事が途中で切れた（max_tokens）・安全性で止まった返事は、補って使っても明細が欠けている。
+                # 「不完全」の印を付けて控えない・知らせる（以前は 6 行中 3 行だけ採用して成功として控えていた。P2）
+                try:
+                    _fr = response.candidates[0].finish_reason if response.candidates else None
+                    _fin = str(getattr(_fr, 'name', _fr) or '')
+                except Exception:  # noqa: BLE001
+                    _fin = ''
+                _res = {
                     'items':           items,
                     'discount_amount': 0,
                     'confidence':      0.9,
                 }
+                if _fin and _fin != 'STOP':
+                    _res['_incomplete'] = True
+                    _res['_incomplete_reason'] = f'明細の読み取りの返事が途中で終わりました（finish_reason={_fin}）'
+                return _res
             if attempt < 2:
                 import time; time.sleep(1)
                 continue
@@ -5376,8 +6645,13 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
                     del _availability_cache()[cache_key]
                 raise ValueError(
                     f"モデル '{model_name}' のクォータが上限に達しました。"
-                    "自動的に代替モデルに切り替えます。"
+                    "しばらく待つか、サイドバーで別のモデルを選んでからやり直してください。"
                 ) from e
+            # 決まって失敗する 4xx（408 以外）と締め切り切れは送り直さない（call_gemini と同じ。締め切り 10 分を 3 回待たせない）
+            _code = getattr(e, 'code', None)
+            if ((isinstance(_code, int) and 400 <= _code < 500 and _code != 408)
+                    or _is_gemini_timeout(e, err_msg)):
+                raise ValueError(f"Gemini API呼び出しに失敗しました: {err_msg[:500]}") from e
             if attempt < 2:
                 import time; time.sleep(1)
                 continue
@@ -5386,91 +6660,49 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
 
 def validate_and_correct_items(items):
     """
-    辞書ベースバリデーション: AIの誤分類を後処理で修正する。
+    辞書ベースの点検: 作業区分と金額の欄が合わない行を「要確認」として知らせる。**金額は動かさない。**
 
-    【部品価格計上の必須ルール】
-    基本ルール: 部品価格を計上するのは、作業内容（method）が「取替」の場合のみ。
-    例外ルール: 作業内容が空白でも、部品価格欄に金額がある場合は「取替」とみなし計上。
-    それ以外（脱着・修理・板金等）の場合、parts_amount は強制的に 0 とする。
-    これにより「脱着」行の空欄によって次行の金額がズレて取り込まれる連鎖エラーを防ぐ。
+    以前は「脱着」の行の部品代を 0 にし、「修理・板金・塗装」の行の部品代を 0 にするか工賃へ移していた
+    （読み取りが 1 行ずれたときの救済）。しかし正しく読めた見積でも、塗装の行の材料代（部品欄）・
+    脱着修理の行の部品代・板金の行の金額が毎回原本と違う .neo になり、その差を「※金額調整」の行が
+    埋めていた（行も金額も原本と違う協定見積になる。バグハント 3 回目 O6）。読み取りのずれは総額・
+    小計の照合と調整行の確認で捕まるので、ここでは印を付けて知らせるだけにする。
 
-    【作業区分ごとの挙動】
-    - 取替/交換系:    parts_amount 有効（工賃も同行にある場合はそのまま）
-    - 脱着/取外系:    parts_amount = 0 強制（部品代なし）。工賃はそのまま保持。
-    - 修理/板金等:    parts_amount = 0 強制。wage==0 のとき parts_amt を wage へ移動
-                      （AIが工賃を parts 列に誤分類したケースを救済）
-    - 空白method:     parts_amount > 0 ならそのまま（取替とみなす）
+    **品名では判断しない**（「Rﾊﾞﾝﾊﾟ(塗装済)」「ｸﾛｽﾒﾝﾊﾞ(修理)」のような正式な部品名に作業の語が入るのは普通）。
 
-    **品名では判断しない。** 以前は品名に「取付」「組付」「板金」「塗装」
-    「修理」「研磨」があると部品代を消していたが、ADDATA の正式な部品名
-    49,432 語のうち 182 語がこれらの語を含む:
-        Rﾊﾞﾝﾊﾟ(塗装済) / Fﾊﾞﾝﾊﾟ(未塗装) / ｸﾛｽﾒﾝﾊﾞ(修理) / ｻｰﾄﾞｼｰﾄ（脱着・修理）
-    「Rﾊﾞﾝﾊﾟ(塗装済)」は取替の定番部品で数万円。区分の欄に「取替」以外の語
-    （日産系の「部品」など）が入っていると、この部品代が黙って消えていた。
-    品名は「その部品が何か」であって「作業か部品か」ではない。
-
-    戻り値: (直した明細, 何をしたかの記録) の組。原本の金額を変えたことは
-    黙って済ませず、画面で知らせる。
+    戻り値: (明細, 要確認の記録) の組。明細は写しを返す（中身は元のまま）。
     """
-    # 部品代計上が有効な作業区分
+    # 部品代計上が普通の作業区分
     PARTS_OK_METHODS = {'取替', '交換', '脱着組替', '取外組付'}
-
-    # 脱着系: parts_amount を 0 に強制。工賃は保持。wage への移動も行わない。
+    # 脱着系: 部品代が付いているのは読み取りのずれの疑い
     REMOVAL_METHODS  = {'脱着', '取外', '取付', '組付', '脱外'}
-
-    # 修理・塗装系: parts_amount = 0 強制。wage==0 なら parts_amt を wage へ移動
+    # 修理・塗装系: 部品欄だけに金額があるのは工賃の読み違いの疑い（部品欄と工賃欄の両方に金額がある塗装行は
+    # 「材料＋工賃」の正当な形なので知らせない）
     REPAIR_METHODS   = {'修理', '調整', '板金', '塗装', 'ペイント', '研磨',
                         '清掃', '点検', '作業', '修正', '施工', '補修'}
 
-    corrected = []
+    out = []
     notes = []
     for item in items:
         item      = dict(item)
-        method    = str(item.get('method', '')).strip()
+        method    = str(item.get('method', '') or item.get('work_code', '') or '').strip()
         name      = str(item.get('name', ''))
         parts_amt = safe_int(item.get('parts_amount', 0))
         wage      = safe_int(item.get('wage', 0))
-
-        # ケース1: 取替/交換系 → 部品代・工賃ともに有効（変更なし）
-        if any(kw in method for kw in PARTS_OK_METHODS):
-            corrected.append(item)
+        out.append(item)
+        if not parts_amt or not method or any(kw in method for kw in PARTS_OK_METHODS):
             continue
-
-        # ケース2: 作業内容空白 + 部品価格あり → 「取替」とみなしそのまま計上
-        if not method and parts_amt > 0:
-            corrected.append(item)
-            continue
-
-        # ケース3: 脱着/取外系 → parts_amount を強制ゼロ（wage は触らない）
-        #   判断は**見積書に印字された作業区分だけ**で行う。品名で判断すると
-        #   「Rﾊﾞﾝﾊﾟ(塗装済)」のような正式な部品名の数万円が消える。
         if any(kw in method for kw in REMOVAL_METHODS):
-            if parts_amt:
+            if wage == 0 or not any(kw in method for kw in REPAIR_METHODS):
                 notes.append(
-                    f"「{name}」（{method}）の部品代 {parts_amt:,}円 を 0 に"
-                    "しました。脱着の行に部品代が付いているのは、"
-                    "読み取りが1行ずれた可能性があります。原本をご確認ください。")
-                item['parts_amount'] = 0
-            corrected.append(item)
+                    f"「{name}」（{method}）に部品代 {parts_amt:,}円 が付いています（金額は原本の読み取りどおり）。"
+                    "脱着の行の部品代は、読み取りが1行ずれた可能性があります。原本をご確認ください。")
             continue
-
-        # ケース4: 修理・塗装等 → parts_amount = 0 強制。wage==0 なら wage へ救済移動
-        if any(kw in method for kw in REPAIR_METHODS) and parts_amt > 0:
-            if wage == 0:
-                # AIが工賃を parts 列に誤分類したとみなして wage へ移動
-                item['wage']  = parts_amt
-                notes.append(
-                    f"「{name}」（{method}）の {parts_amt:,}円 を部品代から"
-                    "工賃へ移しました。原本で部品・工賃のどちらの欄か"
-                    "ご確認ください。")
-            else:
-                notes.append(
-                    f"「{name}」（{method}）の部品代 {parts_amt:,}円 を 0 に"
-                    "しました。原本をご確認ください。")
-            item['parts_amount'] = 0
-
-        corrected.append(item)
-    return corrected, notes
+        if any(kw in method for kw in REPAIR_METHODS) and wage == 0:
+            notes.append(
+                f"「{name}」（{method}）の {parts_amt:,}円 が部品代の欄に入っています（金額は原本の読み取りどおり）。"
+                "原本で部品・工賃のどちらの欄かご確認ください。")
+    return out, notes
 
 
 def check_parts_labor_classification(items):
@@ -5895,6 +7127,34 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     used_model = model_name or GEMINI_MODEL
     _log: list = []  # 解析ログ収集リスト
 
+    # 送る前に形と大きさを確かめる（バグハント 3 回目 P8/P10/P13）。スキル経路と同じくページ数の上限を置き、権限
+    # パスワードだけの暗号化 PDF は暗号を外し、ページ木の申告が巨大な PDF は展開せずに断る。大きすぎるファイルは
+    # 送っても必ず失敗するうえ、メモリをファイルの十数倍使うので送らない
+    if str(mime_type or '').lower() == 'application/pdf':
+        from neo_skill import llm as _nllm
+        from neo_skill import reader as _nreader
+        try:
+            file_bytes = _nllm.pdf_prepare(file_bytes)
+            _np_in = _nllm.pdf_page_count(file_bytes)
+        except _nllm.LLMError as _pe:
+            if 'パスワード' in str(_pe):
+                raise ValueError(str(_pe))
+            _np_in = None
+        except Exception:  # noqa: BLE001  pypdf が読めない（xref・trailer が欠けた等）
+            _np_in = None
+        if _np_in is None:
+            # pypdf で開けない PDF でも PyMuPDF で開けることがある（以前は続けていた。レビュー）。ページ数はそちらで数える
+            try:
+                import fitz as _fitz_in
+                with _PDFIUM_LOCK:
+                    with _fitz_in.open(stream=file_bytes, filetype='pdf') as _doc_in:
+                        _np_in = int(_doc_in.page_count)
+            except Exception:  # noqa: BLE001
+                raise ValueError('見積書の PDF を開けません（壊れているか PDF ではありません）。印刷し直した PDF か写真で入れてください。')
+        if _np_in > _nreader.MAX_PAGES:
+            raise ValueError(f"見積書の PDF が {_np_in} ページあります（上限 {_nreader.MAX_PAGES}）。見積書だけの PDF にして入れてください。")
+    file_bytes, mime_type = _gemini_ready_bytes(file_bytes, mime_type)
+
     def _logw(msg: str):
         """ログをリストと stderr 両方に出力する"""
         _log.append(msg)
@@ -5905,7 +7165,9 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     # 読み取り結果が変わるため、入れないと前の mime での結果がそのまま返る。
     _cache_key = (hashlib.md5(file_bytes).hexdigest()
                   + f"_{used_model}_{use_rasterize}_{use_fax_filter}_{use_enhance}_{enable_self_correction}"
-                  + f"_{mime_type}_tax{int(bool(tax_inclusive))}")   # 税区分でプロンプトが変わる（Codex hunt E2）
+                  + f"_{mime_type}_tax{int(bool(tax_inclusive))}"   # 税区分でプロンプトが変わる（Codex hunt E2）
+                  # キーの持ち主ごとに分ける（別の利用者・別のキーの読み取りを返さない。N3/P2）
+                  + '_k' + hashlib.sha256(str(api_key or '').encode('utf-8')).hexdigest()[:16])
     def _cb(pct, text):
         """進捗コールバック呼び出し（Noneなら何もしない）"""
         if progress_cb:
@@ -6179,7 +7441,7 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     # ⑥-b 辞書ベースバリデーション
     result['items'], _vc_notes = validate_and_correct_items(result['items'])
     if _vc_notes:
-        # 原本の金額を動かしたことは黙って済ませない
+        # 区分と金額の欄が合わない行は黙って済ませない（金額は動かさない。O6）
         result.setdefault('_amount_changes', []).extend(_vc_notes)
 
     # ⑥-c 品名空白フォールバック（AIが名称を読み取れなかった行を保護）
@@ -6243,6 +7505,11 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
             print(f"[INFO] cross-validation: Gemini stated totals誤り検出 → 明細合算値で上書き", file=_sys_cv.stderr)
             print(f"  Gemini: 部品={_cv_p_stated:,}, 工賃={_cv_w_stated:,}", file=_sys_cv.stderr)
             print(f"  明細合算: 部品={_cv_calc_p:,}, 工賃={_cv_calc_w+_cv_sp:,} (sp={_cv_sp:,}), 合計={_cv_item_total:,}≈{_cv_grand:,}", file=_sys_cv.stderr)
+            # 置き換えたことを印で残す。印字の値も別のキーに残す。印が無いと、下流（ベタ打ちの検算）が明細合算を
+            # 「見積書に印字された小計」として自分の読み取り結果と比べ、明細の誤りを見逃す（バグハント 3 回目 O2）
+            result['pdf_parts_total_printed'] = _cv_p_stated
+            result['pdf_wage_total_printed']  = _cv_w_stated
+            result['_subtotals_from_items']   = True
             result['pdf_parts_total'] = _cv_calc_p
             result['pdf_wage_total']  = _cv_calc_w + _cv_sp
 
@@ -6410,7 +7677,12 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     # 保存側もコピーする。参照のまま入れると、この呼び出しの後段（生成側）が
     # result を書き換えたときにキャッシュに残り、2回目の入力になる。
     # 取り出し側だけ守っても、1回目の書き換えは防げない。
-    _analyze_result_cache[_cache_key] = copy.deepcopy(result)
+    # 控えるのは「明細があり、印字の合計が読めて、返事が途中で切れていない」読み取りだけ。以前は失敗や欠けた読み取り
+    # （明細 0 行・合計欄の呼び出しだけ 429・max_tokens で途中切れ）も控え、押し直しても同じ欠けた結果を返し続けた（P2）
+    _cache_ok = (bool(result.get('items')) and not result.get('_incomplete')
+                 and any(safe_int(result.get(_k, 0)) > 0 for _k in ('pdf_grand_total', 'pdf_parts_total', 'pdf_wage_total')))
+    if _cache_ok:
+        _analyze_result_cache[_cache_key] = copy.deepcopy(result)
     # キャッシュが大きくなりすぎないよう古いエントリを削除（最大20件）
     while len(_analyze_result_cache) > 20:
         oldest_key = next(iter(_analyze_result_cache))
@@ -6425,11 +7697,14 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
 # ============================================================
 
 def generate_filename(cust, calc_parts, calc_wages, pdf_parts, pdf_wages,
-                      has_estimate, reverse_match=False, short_parts_wage=0):
+                      has_estimate, reverse_match=False, short_parts_wage=0,
+                      parts_ok=False, wage_ok=False, grand_ok=True):
     """
     登録番号から出力ファイル名を生成。
     reverse_match=True の場合は部品・工賃相違を抑制する。
     ショートパーツがPDF側の部品合計に含まれているケースも考慮して比較する。
+    parts_ok / wage_ok はステップ③の照合で一致とした（値引き前の小計・総額の一致を含む）もの。grand_ok=False は
+    見積書の総額と合わないまま確認して生成したもの（「総額相違」を付ける。レビュー 3 周目）
     """
     dept   = safe_str(cust.get('car_reg_department', ''))
     div    = safe_str(cust.get('car_reg_division', ''))
@@ -6444,15 +7719,21 @@ def generate_filename(cust, calc_parts, calc_wages, pdf_parts, pdf_wages,
         _cname = re.sub(r'[\\/:*?"<>|\s\x00-\x1f]', '', safe_str(cust.get('car_name', '')))[:20]
         _stamp = now_jst().strftime('%m%d_%H%M%S')
         base = f'{_cname}_{_stamp}' if _cname else f'新規見積_{_stamp}'
-    sp = safe_int(short_parts_wage)
+    # short_parts_wage（ショートパーツ）は呼び出し側との約束で残すが、判定には使わない（③の parts_ok / wage_ok に入っている）
     discrepancies = []
     if not reverse_match and has_estimate:
-        # ショートパーツがPDF部品合計に含まれている場合も一致とみなす
-        parts_match = (calc_parts == pdf_parts) or (calc_parts + sp == pdf_parts)
+        # ショートパーツ（印字の部品計・工賃計に入っている見積がある）の逃げ道は③の判定に入っている。ここで独立に当てると、
+        # ③が「相違」としたもの（部品計と工賃計の両方がショートパーツで合う＝印字どうしが矛盾）に印が付かない（レビュー 8 周目）
+        parts_match = (calc_parts == pdf_parts) or parts_ok
         if pdf_parts is not None and pdf_parts > 0 and not parts_match:
             discrepancies.append('部品相違')
-        if pdf_wages is not None and pdf_wages > 0 and calc_wages != pdf_wages:
+        wage_match = (calc_wages == pdf_wages) or wage_ok
+        if pdf_wages is not None and pdf_wages > 0 and not wage_match:
             discrepancies.append('工賃相違')
+    # 総額の 1 円違いは、逆算一致（印字の小計から総額を逆算できたという話）とは別の事実。③が確認を求めた相違が、
+    # 逆算一致の見積ではファイル名に出ていなかった（レビュー 6 周目）
+    if not grand_ok:
+        discrepancies.append('総額相違')
     if discrepancies:
         suffix = '（' + '・'.join(discrepancies) + '）'
     else:
@@ -6542,6 +7823,14 @@ def p2n_read(pdf_bytes, file_name, api_key, mime_type='application/pdf',
         out['error'] = ('Addata（コグニの車種データ）が決まっていないので生成しません。'
                         'サイドバーの「Addata の場所を設定する」で確かめてください'
                         '（別の版の Addata で作らないよう、自動検出には落としません）')
+        return out
+    _com_dir = os.path.join(str(addata_root), 'COM')
+    if not (os.path.isfile(os.path.join(_com_dir, 'KA06_ALL.DB'))
+            and (os.path.isfile(os.path.join(_com_dir, 'AnVer.DB')) or os.path.isfile(os.path.join(_com_dir, 'COM.CAB')))):
+        # vendor が部分 Addata と認める条件（skill_env.is_addata_partial・bridge.has_com と同じ）。欠けたまま渡すと vendor は何も使えず、
+        # 画面は「Addata あり」のまま生成に失敗する（2026-09-15 バグハント 3 回目 Q1）
+        out['error'] = ('Addata に COM（車種マスタ KA06_ALL.DB と、データ版 AnVer.DB か COM.CAB）がありません。'
+                        'Addata の ZIP・フォルダには COM フォルダを含めてください')
         return out
     case_dir = None
     try:
@@ -6744,7 +8033,7 @@ def _render_beta_result(_p2n_res, selected_model):
                    + "。「プレビューに取り込む」で内容を確認・修正してください。")
     _p2n_ac = _p2n_res.get('amount_changes') or []
     if _p2n_ac:
-        st.warning(f"⚠️ 読み取りの後処理で金額の列を {len(_p2n_ac)} 行で動かしました（部品↔工賃など）: "
+        st.warning(f"⚠️ 作業区分と金額の欄が合わない行が {len(_p2n_ac)} 行あります（金額は読み取りどおり。読み取りのずれの疑い）: "
                    + ' / '.join(str(x)[:60] for x in _p2n_ac[:4]) + ('…' if len(_p2n_ac) > 4 else '') + "。原本と突き合わせてください")
     _p2n_neo = _p2n_res.get('neo_bytes')
     # 原本と差がある可能性のある結果（金額調整の行・検証の差・金額列の補正）は、確認のチェックを入れないと落とせない
@@ -6776,6 +8065,25 @@ def _render_beta_result(_p2n_res, selected_model):
         st.session_state['tax_override'] = _carry
         st.session_state['_tax_carry_pending'] = _carry
         st.session_state['pdf2neo_vehicle_info'] = _p2n_res.get('vehicle_info') or {}
+        # 取り込んだ明細の指紋と、見積書に印字された合計・確認の要否・費用の扱いを一緒に持つ。車両情報と印字の合計は
+        # この明細のときだけ使う（別の CSV を入れた案件に前の案件の氏名・登録番号が入っていた。バグハント 3 回目 M3/M8/O9）
+        _pm_exp_any = any(safe_int(st.session_state.get(k, 0)) for k in ('exp_towing', 'exp_rental', 'exp_exempt'))
+        st.session_state['pdf2neo_preview_meta'] = {
+            'sig': _items_sig(_p2n_items),
+            'pdf_parts_total': safe_int(_p2n_v.get('pdf_parts_total')) if _p2n_v.get('total_source') == 'pdf_header' else 0,
+            'pdf_wage_total': safe_int(_p2n_v.get('pdf_wage_total')) if _p2n_v.get('wage_source') == 'pdf_header' else 0,
+            'pdf_grand_total': safe_int(_p2n_v.get('pdf_grand_total')) if _p2n_v.get('grand_match') is not None else 0,
+            'grand_is_intax': bool(_p2n_v.get('grand_is_intax', True)),
+            'needs_ack': bool(_p2n_needs_ack),
+            # 「費用を入れない」を選んでいた（費用があったのにチェックを入れなかった）ときだけ、ステップ④でも入れない
+            'exp_declined': bool(_pm_exp_any) and not bool(st.session_state.get('pdf2neo_beta_use_exp',
+                                                                                   st.session_state.get('_beta_use_exp_val'))),
+        }
+        # 前に貼った CSV は消す（ステップ①に戻ったとき、前の CSV を読み直してこの明細を置き換えないように）
+        st.session_state.pop('_csv_paste_saved', None)
+        _cseq = st.session_state.get('csv_area_seq', 0)
+        st.session_state.pop(f'csv_paste_area_{_cseq}', None)
+        st.session_state['csv_area_seq'] = _cseq + 1
         st.session_state['vehicle_file_bytes'] = None
         st.session_state['vehicle_file_name'] = None
         st.session_state['estimate_file_bytes'] = None
@@ -6815,6 +8123,29 @@ def run_pdf_to_neo_skill(pdf_bytes, file_name, api_key, mime_type='application/p
     if not state.get('ok'):
         return state
     return p2n_make(state, addata_root=addata_root, record_profile=record_profile, progress=progress)
+
+
+def _md_literal(text) -> str:
+    """vendor の報告文・検算の理由・読み取りの注意を Markdown として描くときの逃がし（バグハント 3 回目 Q8）。
+    「45,000(*)」が 2 つある行で間が斜体になり手入力の印が消える、「印字 $ / 生成 #*」の $ … $ が数式になる、
+    PDF 由来の「![](//…)」が外の画像を読み込む、を防ぐ。見出し・箇条書き・表の形（# - |）はそのまま"""
+    s = str(text if text is not None else '')
+    s = s.replace('\\', '\\\\')
+    for ch in ('*', '_', '$', '~', '`', '[', ']', '<', '>'):
+        s = s.replace(ch, '\\' + ch)
+    return s
+
+
+# 入力そのものが読めない（ベタ打ちでも同じ理由で読めない）ときの文言。検算の不合格とは分けて出す（P13）
+_P2N_INPUT_ERRORS = ('パスワード', 'ページあります', 'ページが多すぎ', '開けません')
+
+
+def _items_sig(items) -> str:
+    """明細の並びの指紋（プレビュー取り込みの明細と、あとで入れた別の CSV を見分ける。M3/M8）"""
+    try:
+        return hashlib.sha256(json.dumps(items, ensure_ascii=False, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+    except Exception:  # noqa: BLE001
+        return ''
 
 
 def _sidebar_insurance_hint():
@@ -7489,8 +8820,9 @@ def main():
     """, unsafe_allow_html=True)
 
     # テンプレートチェック（キャッシュ付き — 毎リランで再読込しない）
-    @st.cache_data(show_spinner=False)
-    def _load_template(path: str) -> bytes:
+    @st.cache_data(show_spinner=False, max_entries=4)
+    def _load_template(path: str, mtime: float = 0.0, size: int = 0) -> bytes:
+        # 更新時刻と大きさも鍵に入れる（push で雛形が変わっても、再起動まで古い雛形のままだった。N10）
         with open(path, 'rb') as f:
             return f.read()
 
@@ -7500,7 +8832,8 @@ def main():
             f"app.py と同じフォルダに「{TEMPLATE_FILENAME}」を配置してください。"
         )
         st.stop()
-    template_data = _load_template(TEMPLATE_PATH)
+    _tpl_st = os.stat(TEMPLATE_PATH)
+    template_data = _load_template(TEMPLATE_PATH, _tpl_st.st_mtime, _tpl_st.st_size)
 
     # ─── サイドバー ───────────────────────────────────
     with st.sidebar:
@@ -7857,8 +9190,7 @@ def main():
                     st.session_state['_addata_zip_id'] = _zip_id
                     _defer_sidebar_rerun()
                 else:
-                    import shutil as _sh
-                    _sh.rmtree(_dest, ignore_errors=True)
+                    _rmtree_addata(_dest)
                     st.session_state['_addata_zip_id'] = _zip_id
                     st.error(f"❌ {_why}")
         st.markdown("---")
@@ -8271,8 +9603,17 @@ def main():
                         with st.status("車種フォルダが届いたので NEO を作っています…", expanded=True) as _p2n_status:
                             def _p2n_progress(msg):
                                 _p2n_status.write(msg)
-                            _p2n_out = p2n_make(_p2n_pending, addata_root=_p2n_addata, record_profile=_p2n_profile,
-                                                progress=_p2n_progress)
+                            from neo_skill import vendor as _p2n_vendor_now
+                            if _p2n_pending.get('vendor_commit') and _p2n_pending.get('vendor_commit') != _p2n_vendor_now.commit_short():
+                                # 読み取りの後（車種フォルダ待ちの間）にアプリが更新された: 前の版で読んだ結果を新しい版で NEO に
+                                # しない（N1）
+                                from neo_skill import maker as _nsk_maker
+                                _nsk_maker.remove_case_dir(_p2n_pending.get('case_dir'))
+                                _p2n_out = dict(_p2n_pending, ok=False, stage='error',
+                                                error='読み取りの後でアプリ（生成器）が更新されました。お手数ですが、もう一度「見積書からNEOを生成」を押してください')
+                            else:
+                                _p2n_out = _guarded_call(p2n_make, _p2n_pending, addata_root=_p2n_addata, record_profile=_p2n_profile,
+                                                         progress=_p2n_progress)
                             _p2n_status.update(
                                 label=("✅ 合格" if _p2n_out.get('ok') else "❌ 不合格（下の理由をご確認ください）"),
                                 state=('complete' if _p2n_out.get('ok') else 'error'), expanded=False)
@@ -8320,7 +9661,7 @@ def main():
                         )
                         if _p2n_bridge:
                             # PC の Addata: 読む → 車種を決める（COM だけで足りる）→ 車種フォルダが無ければ部品に頼んで待つ
-                            _p2n_state = p2n_read(_p2n_bytes, _p2n_file.name, _p2n_key, **_p2n_kw)
+                            _p2n_state = _guarded_call(p2n_read, _p2n_bytes, _p2n_file.name, _p2n_key, **_p2n_kw)
                             if not _p2n_state.get('ok'):
                                 _p2n_out = _p2n_state
                             else:
@@ -8341,10 +9682,10 @@ def main():
                                 if not _p2n_car:
                                     _p2n_progress('車種マスタで車種を決められませんでした（' + str(_p2n_res.get('error') or _p2n_res.get('evidence') or '')[:120]
                                                   + '）。そのまま生成に進みます')
-                                _p2n_out = p2n_make(_p2n_state, addata_root=_p2n_addata, record_profile=_p2n_profile,
-                                                    progress=_p2n_progress)
+                                _p2n_out = _guarded_call(p2n_make, _p2n_state, addata_root=_p2n_addata, record_profile=_p2n_profile,
+                                                         progress=_p2n_progress)
                         else:
-                            _p2n_out = run_pdf_to_neo_skill(_p2n_bytes, _p2n_file.name, _p2n_key, **_p2n_kw)
+                            _p2n_out = _guarded_call(run_pdf_to_neo_skill, _p2n_bytes, _p2n_file.name, _p2n_key, **_p2n_kw)
                         _p2n_status.update(
                             label=("✅ 合格" if _p2n_out.get('ok') else "❌ 不合格（下の理由をご確認ください）"),
                             state=('complete' if _p2n_out.get('ok') else 'error'), expanded=False)
@@ -8365,7 +9706,9 @@ def main():
         # 同じ run で 2 回描くとウィジェットのキーが重複して落ちるので、描いた印を見る（レビュー 2026-09-15）
         _p2n_offer_beta = (isinstance(_p2n_res, dict) and _p2n_file is not None and bool(api_key) and not _p2n_beta_ui_shown
                            and ((not _p2n_res.get('legacy_beta') and not _p2n_res.get('ok'))
-                                or bool(_p2n_res.get('fallback_from_skill'))))   # 逃げ道で作った後も、入力を直したら作り直せる（H2/K4）
+                                or bool(_p2n_res.get('fallback_from_skill')))   # 逃げ道で作った後も、入力を直したら作り直せる（H2/K4）
+                           # 入力そのものが読めない（パスワード・ページ数・大きさ・キー）ときは、ベタ打ちでも同じ理由で読めないので出さない（P13）
+                           and not any(k in str(_p2n_res.get('error') or '') for k in _P2N_INPUT_ERRORS))
         if isinstance(_p2n_res, dict) and _p2n_res.get('inputs_sig'):
             # 生成したあとに入力（見積書・添付・事故/保険欄・費用・税区分・テンプレート）が変わっていたら、前の入力の結果 ＝ 落とさせない
             _p2n_is_beta = bool(_p2n_res.get('legacy_beta'))
@@ -8396,15 +9739,18 @@ def main():
             if _p2n_res.get('cleanup_warning'):
                 st.warning("⚠️ " + _p2n_res['cleanup_warning'])
             if _p2n_res.get('error') and _p2n_res.get('stage') in ('error',):
-                st.error(f"❌ {_p2n_res['error']}")
+                st.error(f"❌ {_md_literal(_p2n_res['error'])}")
             elif _p2n_res.get('stage') == 'read' and not _p2n_rd.get('ok'):
                 if _p2n_res.get('error'):
-                    st.error(f"❌ 読み取りを続けられませんでした: {_p2n_res['error']}")
-                st.error("❌ 見積書の写しが機械検算に通りませんでした。NEO は作っていません"
-                         "（合計を合わせるために行を消したり金額を動かしたりはしません）。"
-                         "下の項目を見積書と突き合わせてください。")
+                    st.error(f"❌ 読み取りを続けられませんでした: {_md_literal(_p2n_res['error'])}")
+                if not (_p2n_res.get('error') and not (_p2n_rd.get('fails') or _p2n_rd.get('traces'))):
+                    # 読み取れた写しが検算に通らなかったときだけ（PDF が開けない・ページ数の上限・キーの誤りなど、
+                    # 写す前に止まったときは「検算に通らない」とは言わない。P13）
+                    st.error("❌ 見積書の写しが機械検算に通りませんでした。NEO は作っていません"
+                             "（合計を合わせるために行を消したり金額を動かしたりはしません）。"
+                             "下の項目を見積書と突き合わせてください。")
                 for _f in (_p2n_rd.get('fails') or []):
-                    st.markdown(f"- {_f}")
+                    st.markdown(f"- {_md_literal(_f)}")
                 _p2n_tr = _p2n_rd.get('traces') or []
                 if _p2n_tr:
                     st.dataframe(pd.DataFrame([{
@@ -8422,7 +9768,7 @@ def main():
             elif _p2n_mk and not _p2n_mk.get('ok'):
                 st.error("❌ NEO の生成が不合格でした（pdf-to-neo スキル make_neo.py の判定）。NEO は出しません。")
                 for _r in (_p2n_mk.get('reasons') or []):
-                    st.markdown(f"- {_r}")
+                    st.markdown(f"- {_md_literal(_r)}")
                 if _p2n_mk.get('error'):
                     st.caption(_p2n_mk['error'])
                 if _p2n_mk.get('match_line'):
@@ -8441,13 +9787,13 @@ def main():
                                " `make_neo.py <案件フォルダ>` を回すと続きができます。")
                 if _p2n_res.get('report_md'):
                     with st.expander("📝 報告文（report.md）", expanded=True):
-                        st.markdown(_p2n_res['report_md'])
+                        st.markdown(_md_literal(_p2n_res['report_md']))
                 with st.expander("生成ログ（make_neo）", expanded=False):
                     st.code(_p2n_mk.get('tail') or '', language='text')
             elif _p2n_res.get('ok'):
                 st.success(f"✅ 合格 — {_p2n_mk.get('match_line') or '見積書合計との一致: OK'}")
                 for _w in (_p2n_rd.get('warn') or []):
-                    st.warning(f"⚠️ 読み取りの注意: {_w}")
+                    st.warning(f"⚠️ 読み取りの注意: {_md_literal(_w)}")
                 _p2n_name = _p2n_res.get('download_name') or '見積_claude'
                 _p2n_c1, _p2n_c2 = st.columns(2)
                 with _p2n_c1:
@@ -8474,7 +9820,7 @@ def main():
                            "（人が確かめる点は NEO の明細コメントではなくシートにあります）。")
                 if _p2n_res.get('report_md'):
                     with st.expander("📝 報告文（report.md）", expanded=True):
-                        st.markdown(_p2n_res['report_md'])
+                        st.markdown(_md_literal(_p2n_res['report_md']))
             else:
                 st.error(f"❌ {_p2n_res.get('error') or '変換できませんでした'}")
             if _p2n_offer_beta:
@@ -8593,18 +9939,19 @@ def main():
 【各列の抽出・加工ルール】
 * 品名：元の記載から「取替」「脱着」「修理」「鈑金」「塗装」などの作業を示す文言（後述の区分ルールに該当する語）を削除した、純粋な部品名・対象名。
 * 区分：元の記載から下記のいずれか1語を割り当てる。上に書いたものほど優先する。 【最優先・空欄】「研磨」「磨き」「写真代」「ショートパーツ」を含む行は空欄にする。**部品金額だけの行でも空欄のまま**（「取替」にしない）。ただし「磨き調整」は区分なので次の行を採る。 【重要】次の語群は**見積書に書かれていた語をそのまま**出すこと（言い換えない）: 「脱着修理」「脱着鈑金」「脱着板金」／「点検調整」「点検清掃」／「分解調整」「分解清掃」／「鈑金」「板金」。この文字列は帳票の「修理方法」欄にそのまま印字されるため。 ・磨き調整：「磨き調整」 ・取替：「取替」「交換」「取換」（※部品金額のみで工賃0の行も「取替」とする。ただし上の空欄ルールに当たる行を除く） ・脱着：「脱着」「取外」「取付」「組付」 ・塗装：「塗装」「ペイント」「ワックス」「加算」「ブース」 ・分解調整：単に「分解」とだけ書かれている場合 ・点検：「点検」「診断」 ・調整：「調整」「光軸」「フィッティング」「コーディング」「設定」「消去」 ・修理：「修理」「補修」「修正」「穴あけ」「シーリング」 ・該当なし：空欄
-* 数量：半角整数（空欄や不明な場合は 1 を補完）
+* 数量：見積書の数量（半角。整数でなければ 2.5 のようにそのまま。空欄や不明な場合は 1 を補完）
 * 部品金額：「部品、油脂」列の金額。半角整数・カンマなし（記載なしは 0）
 * 工賃：「技術料」列の金額。半角整数・カンマなし（記載なしは 0）
 * 部品コード：品番・部品番号（記載なしは空欄）
 【データ処理の重要ルール（高速化・精度向上）】
-1. 行の分割：1つの項目に対し「部品、油脂」「技術料」両方に金額がある場合、必ず2行に分割する。 ・1行目：部品金額のみ記載（工賃は0） ・2行目：工賃のみ記載（部品金額は0）
-2. 列の厳密照合：金額が部品列か技術料列か、PDFの表ヘッダーを厳密に確認する（例：「ショートパーツ」等、技術料列のみの数値を部品列に入れない）。
-3. 対象外：合計行、小計行、消費税行は出力しない。全ページ・全明細行を漏れなく処理する。
+1. 1行1明細：1つの項目に「部品、油脂」「技術料」両方の金額がある場合も、見積書と同じ1行のまま部品金額と工賃の両方を書く（2行に分けない。行数を見積書と同じにする）。
+2. 品名などにカンマ（,）が入るときは、その欄を「"」で囲む。金額にはカンマを入れない。
+3. 列の厳密照合：金額が部品列か技術料列か、PDFの表ヘッダーを厳密に確認する（例：「ショートパーツ」等、技術料列のみの数値を部品列に入れない）。
+4. 対象外：合計行、小計行、消費税行は出力しない。全ページ・全明細行を漏れなく処理する。
 【合計額の自動検算と出力】 明細抽出後、内部で以下の検算を実施すること。
 1. 抽出した全明細の「部品金額」の合計と「工賃」の合計を算出。
 2. 見積書原本の最終的な「部品代合計」「技術料（工賃）合計」と照合。
-3. 不一致の場合のみ、CSVの末尾に改行して以下を出力（一致時は出力しない）。※金額には必ずカンマ（,）を含めること。 部品相違〇,〇〇〇円 工賃相違●,●●●円
+3. 不一致の場合のみ、CSVの末尾に改行して以下を出力（一致時は出力しない）。行全体を「"」で囲むこと。 "部品相違〇,〇〇〇円 工賃相違●,●●●円"
 出力はCSVデータおよび相違確認結果のみ。説明文・コメントは一切不要。"""
 
         # ── ボタン行: プロンプトコピー ＋ Geminiを開く ──
@@ -8651,10 +9998,13 @@ def main():
             _csv_file = st.file_uploader(
                 "CSVファイル",
                 type=['csv', 'txt'],
-                key='csv_file_upload',
+                # 連番で作り直せるようにする（「取り込みをクリア」でファイルも外す。以前はファイルが残り、クリアが効かなかった。M12）
+                key=f"csv_file_upload_{st.session_state.get('csv_area_seq', 0)}",
                 label_visibility='collapsed',
             )
         _csv_text = ''
+        if _csv_file and _csv_paste and _csv_paste.strip():
+            st.info("ℹ️ CSV ファイルと貼り付けの両方があります。ファイルの内容を取り込んでいます（貼り付けは使っていません）。")
         if _csv_file:
             try:
                 _raw = _csv_file.read()
@@ -8687,9 +10037,25 @@ def main():
 
         if _csv_text:
             _preview_items, _csv_notes = parse_csv_to_items(_csv_text, return_notes=True)
-            for _note in _csv_notes[:3]:
+            _csv_errs  = [n for n in _csv_notes if str(n).startswith('❌')]
+            _csv_warns = [n for n in _csv_notes if str(n).startswith('⚠️')]
+            _csv_diffs = [n for n in _csv_notes if re.match(r'^(部品|工賃)相違', str(n))]
+            _csv_other = [n for n in _csv_notes if n not in _csv_errs and n not in _csv_warns and n not in _csv_diffs]
+            for _note in _csv_errs:
+                st.error(_note)
+            for _note in _csv_warns:
+                # 金額のある行を読み飛ばした知らせは赤で（注記が多いと 4 件目以降が出ず、行が黙って消えていた。M7）
+                (st.error if '読み飛ばしました' in _note else st.warning)(_note)
+            for _note in _csv_diffs:
                 st.warning(f"⚠️ 見積書との差異が記録されています: {_note}")
-            if _preview_items:
+            if _csv_other:
+                with st.expander(f"CSV の後ろの説明文 {len(_csv_other)} 行（明細には取り込んでいません）", expanded=False):
+                    for _note in _csv_other:
+                        st.text(str(_note))
+            if _csv_errs:
+                st.session_state.pop('csv_items', None)
+                st.session_state.pop('csv_mode', None)
+            elif _preview_items:
                 st.success(f"✅ {len(_preview_items)}行 読み込み完了 — 部品: ¥{sum(safe_int(it.get('parts_amount',0)) for it in _preview_items):,} / 工賃: ¥{sum(safe_int(it.get('wage',0)) for it in _preview_items):,}")
                 st.session_state['csv_items'] = _preview_items
                 st.session_state['csv_mode']  = True
@@ -8732,7 +10098,8 @@ def main():
         _csv_mode_active = st.session_state.get('csv_mode') and st.session_state.get('csv_items')
         _has_input = vehicle_file or _csv_mode_active
         if _has_input:
-            _btn_label = "🚀 NEO生成を開始 →"
+            _btn_label = ("🚀 NEO生成を開始 →" if _csv_mode_active
+                          else "🚗 車検証だけで NEO を作る（明細なし） →")
             if st.button(_btn_label, type="primary", width='stretch'):
                 if vehicle_file:
                     st.session_state['vehicle_file_bytes'] = vehicle_file.read()
@@ -8781,7 +10148,9 @@ def main():
             vehicle_data = {}
             # PDF→NEO変換で読み取った車両情報があれば引き継ぐ（車検証未添付時）
             _p2n_vi = st.session_state.get('pdf2neo_vehicle_info')
-            if _p2n_vi and not vehicle_bytes:
+            _pmeta_s2 = st.session_state.get('pdf2neo_preview_meta') or {}
+            _is_preview_s2 = bool(_pmeta_s2) and bool(_pmeta_s2.get('sig')) and _pmeta_s2.get('sig') == _items_sig(_csv_items_s2)
+            if _p2n_vi and not vehicle_bytes and _is_preview_s2:
                 vehicle_data = {k: v for k, v in dict(_p2n_vi).items() if k != '_error'}
             if vehicle_bytes:
                 with st.spinner("🔍 車検証を解析中..."):
@@ -8812,7 +10181,7 @@ def main():
             _tax_s2 = st.session_state.get('tax_override', '税抜き（外税）')
             _is_tax_incl_csv = '内税' in str(_tax_s2) or '税込' in str(_tax_s2)
             estimate_data = {
-                'items':            _csv_items_s2,
+                'items':            copy.deepcopy(_csv_items_s2),
                 'discount_amount':  0,
                 'short_parts_wage': 0,
                 'confidence':       1.0,
@@ -8827,8 +10196,27 @@ def main():
                 '_csv_import':      True,
                 # CSVは貼り付けた内容がそのまま正なので、PDFとの照合や
                 # 逆算チェックは対象外。以前は必ず不一致の警告が出ていた。
+                # 画面は「逆算一致」ではなく「照合なし」と出す（M8）。
                 '_reverse_match':   True,
             }
+            if _is_preview_s2:
+                # プレビュー取り込み（ベタ打ちの結果）: 見積書に印字された部品計・工賃計と照合する。以前は照合も警告も
+                # 確認のチェックも消えて「逆算一致」になっていた（M8/O9）。費用はベタ打ちで入れる選択のときだけ
+                # 印字の小計が読めていなければ 0（未照合）。明細の合算を「印字」として比べると必ず一致し、偽の「合格」になる（レビュー）
+                estimate_data['pdf_parts_total'] = safe_int(_pmeta_s2.get('pdf_parts_total'))
+                estimate_data['pdf_wage_total'] = safe_int(_pmeta_s2.get('pdf_wage_total'))
+                estimate_data['pdf_grand_total'] = safe_int(_pmeta_s2.get('pdf_grand_total'))
+                estimate_data['_csv_import'] = False
+                estimate_data['_preview_import'] = True
+                estimate_data['_preview_needs_ack'] = bool(_pmeta_s2.get('needs_ack'))
+                estimate_data['_reverse_match'] = False
+                estimate_data['_expenses_off'] = bool(_pmeta_s2.get('exp_declined'))
+                # 印字の総額が税込の基準か（税抜の印字を税込と比べて偽の不一致を出していた）・取り込んだときの値引きの合計
+                # （値引き前の小計との一致は、値引きの行を直していないときだけ認める。レビュー 2 周目）
+                estimate_data['_grand_is_intax'] = bool(_pmeta_s2.get('grand_is_intax', True))
+                estimate_data['_neg_at_import'] = [
+                    sum(min(0, safe_int(_it.get('parts_amount', 0))) for _it in _csv_items_s2),
+                    sum(min(0, safe_int(_it.get('wage', 0))) for _it in _csv_items_s2)]
             if _is_tax_incl_csv:
                 st.info("💴 税込モード: CSVの金額は税込みとして処理されます")
             else:
@@ -8994,12 +10382,10 @@ def main():
 
                 # 精度処理の結果を表示
                 info_msgs = []
-                # 原本の金額を動かしたことは必ず伝える。作業区分が
-                # 「脱着」「板金」等の行に部品代が付いていると、読み取りが
-                # 1行ずれている疑いがあるので消す／工賃へ移す作りだが、
-                # 黙ってやると原本と違う見積が気づかれずに出る。
+                # 作業区分と金額の欄が合わない行（「脱着」「板金」等の行に部品代）は読み取りのずれの疑い。
+                # 金額は動かさずに知らせる（以前は消す／工賃へ移していた。O6）
                 for _ac in (estimate_data.get('_amount_changes') or []):
-                    info_msgs.append("⚠️ 原本の金額を動かしました: " + _ac)
+                    info_msgs.append("⚠️ 要確認（金額は原本の読み取りどおり）: " + _ac)
                 if not vehicle_bytes:
                     info_msgs.append("📋 車検証なしモード: 見積書から読み取れた車両情報のみでNEOを作成します。ステップ③で車両情報を確認・補完してください。")
                 if not estimate_data.get('_addata_matched'):
@@ -9248,7 +10634,9 @@ def main():
                 cogni_tax_border = '#22c55e'
                 cogni_tax_icon = '🟢'
                 basis_label = '税抜明細（ユーザー設定）'
-            rev_icon = '✅ 逆算一致' if rev_match else '⚠️ 逆算不一致（金額を確認してください）'
+            rev_icon = ('— 照合なし（CSV の金額をそのまま使います）' if estimate_data.get('_csv_import')
+                        else ('— ベタ打ちの結果の取り込み（見積書の小計と下で照合）' if estimate_data.get('_preview_import')
+                              else ('✅ 逆算一致' if rev_match else '⚠️ 逆算不一致（金額を確認してください）')))
             shop_html   = f'<div style="font-size:13px;color:#374151;margin-bottom:10px">🏭 修理工場: <b>{esc_html(shop_name)}</b></div>' if shop_name else ''
             st.markdown(f'''
 <div style="border:2px solid {cogni_tax_border};border-radius:8px;background:{cogni_tax_bg};padding:14px 18px;margin-bottom:12px">
@@ -9363,13 +10751,19 @@ def main():
             # メーカー純正色名だとほぼ必ず切れる欄が対象外だった。
             # 塗色名が途中で切れると塗装の色種別の根拠が読めなくなる。
             # 切り詰められる欄はすべて挙げる。
+            # 住所は書く前に 都道府県 / 市区郡 / 以降 に分け直す（政令市の区は以降側へ）。警告も分け直した後の値で見る
+            # （以前は入力のままで見ていて、以降側で切れる部屋番号を知らせなかった。バグハント 3 回目 L6）
+            _w_pref, _w_muni, _w_addr = v_pref, v_muni, v_addr
+            if any(str(x or '').strip() for x in (v_pref, v_muni, v_addr)):
+                _w_pref, _w_muni, _w_addr = _doc_hints.split_address(
+                    _strip_control_chars(v_pref), _strip_control_chars(v_muni), _strip_control_chars(v_addr))
             for _lbl, _val, _w in (
                 ('使用者名',       v_customer,   _CUST_WIDTH['UserName']),
                 ('所有者名',       v_owner,      _CUST_WIDTH['OwnerName']),
                 ('郵便番号',       v_postal,     _CUST_WIDTH['PostalNo']),
-                ('都道府県',       v_pref,       _CUST_WIDTH['Prefecture']),
-                ('市区町村',       v_muni,       _CUST_WIDTH['Municipality']),
-                ('その他住所',     v_addr,       _CUST_WIDTH['AddressOther1']),
+                ('都道府県',       _w_pref,      _CUST_WIDTH['Prefecture']),
+                ('市区町村',       _w_muni,      _CUST_WIDTH['Municipality']),
+                ('その他住所',     _w_addr,      _CUST_WIDTH['AddressOther1']),
                 ('登録番号 地名',   v_dept,       _CUST_WIDTH['CarRegNoDepartment']),
                 ('登録番号 分類番号', v_div,      _CUST_WIDTH['CarRegNoDivision']),
                 ('登録番号 かな',   v_biz,        _CUST_WIDTH['CarRegNoBusiness']),
@@ -9383,11 +10777,19 @@ def main():
                 ('トリムコード',    v_trimcode,   _CAR_WIDTH['TrimCode']),
             ):
                 _cut = cp932_trim(_val, _w)
-                if _val and _cut != safe_str(_val):
+                # 列幅の比較は「cp932 に直した全文」と。「〜」→「～」のように字が置き換わるだけで長さが同じものを
+                # 「超えています」と誤って出していた（バグハント 3 回目 L12）
+                _full = cp932_trim(_val, 10 ** 6)
+                if _val and _cut != _full:
                     st.warning(
                         f"⚠️ {_lbl}はコグニセブンの列幅（{_w}バイト＝全角{_w // 2}文字）を"
                         f"超えています。NEOには「{_cut}」までしか入りません。"
                         "短い表記に直してください。")
+                _bad_ch = neo_header.unencodable_chars(safe_str(_val))
+                if _bad_ch:
+                    st.warning(
+                        f"⚠️ {_lbl}の「{'」「'.join(_bad_ch[:5])}」はコグニセブンの文字（Shift_JIS）に無いため、"
+                        "NEO では「?」になります。近い字に直してください。")
 
         # 入力途中の内容を毎回保存しておく。ステップ①に戻ると
         # vehicle_data が捨てられるため、保存しないと入力が全て消える。
@@ -9429,6 +10831,7 @@ def main():
         pdf_wages     = 0
         sp            = 0
         wage_match_sp = False  # Step4でも参照するため初期化
+        _s3_verdict_now = None  # ③の照合の結果（④の不一致の表示とファイル名が同じ判定を使う）
         # tab_totals 内の条件分岐に依存する変数を安全のため事前初期化
         _step3_mode       = st.session_state.get('selected_mode', 'db')
         discrepancies     = []
@@ -9436,45 +10839,47 @@ def main():
         edited_items      = []
 
         with tab_totals:
-          if estimate_data and estimate_data.get('items'):
+          if estimate_data and (estimate_data.get('items') or estimate_data.get('_csv_import') or estimate_data.get('_preview_import')):   # 全部消しても表は出す（行を足し直せる。M12）
 
             # ── 明細行一覧 (編集可) ──────────────────────────────
             st.markdown('<div class="section-title">📋 明細行一覧（全項目・編集可）</div>', unsafe_allow_html=True)
 
             _items_src = estimate_data['items']
+            # ── 明細表の元の表（バグハント 3 回目 M1）──
+            # Streamlit の data_editor は num_rows="dynamic" のとき、表の識別子を「渡した元の表の中身」から作る。
+            # 以前は毎回、直した明細から元の表を作り直していたため、直すたびに識別子が変わって表が作り直され、
+            # 続けて入れた修正が 1 つおきに捨てられていた（行の削除・追加直後の入力も同じ）。元の表はセッションに
+            # 固定し、明細が表の外で変わったとき（行挿入・コピー・読み直し）だけ作り直してキーを進める
+            _ed_base = st.session_state.get('_items_editor_base')
+            if not (isinstance(_ed_base, dict) and _ed_base.get('out') == _items_src):
+                _ed_ver_new = int(st.session_state.get('items_editor_ver', 0)) + 1
+                st.session_state['items_editor_ver'] = _ed_ver_new
+                _ed_base = {'items': copy.deepcopy(_items_src), 'out': None}
+                st.session_state['_items_editor_base'] = _ed_base
+            _base_items = _ed_base['items']
             # ── 行操作ボタン（挿入・コピー・削除） ──────────────────────
             _op_col1, _op_col2, _op_col3, _op_col4 = st.columns([1, 1, 1, 5])
+            # 行挿入・コピーは押した印だけ残し、表の出力（その run の入力を含む）の後で当てる。ボタンの処理が表より先に
+            # 走ると、表に入れた直後の入力が同じ run で捨てられていた（レビュー 2026-09-15）
+            def _queue_row_op(_kind):
+                st.session_state['_pending_row_op'] = (_kind, int(st.session_state.get('row_copy_no') or 1))
             with _op_col1:
-                if st.button("➕ 行挿入", key="row_insert_btn", help="最終行に空白行を追加"):
-                    _new_row = {
-                        'name': '', 'method': '', 'work_code': '', 'index_value': '',
-                        'quantity': 1, 'parts_amount': 0, 'wage': 0, 'part_no': '',
-                        '_master_name': '', '_master_price': 0, '_master_part_no': '',
-                        '_master_repair_code': '', '_master_branch_code': '',
-                        '_master_part_code_r': '', '_master_part_code_l': '',
-                        '_master_ref_no': '',
-                        '_master_section_code': '', 'match_level': '',
-                        '_match_level': 0, '_original_name': '', '_original_parts_amount': 0,
-                    }
-                    estimate_data['items'].append(_new_row)
-                    st.session_state['estimate_data'] = estimate_data
-                    st.rerun()
+                st.button("➕ 行挿入", key="row_insert_btn", help="最終行に空白行を追加",
+                          on_click=_queue_row_op, args=('insert',))
             with _op_col2:
-                _copy_no = st.number_input("コピーNo", min_value=1, max_value=max(len(_items_src), 1),
+                # 上限は固定（行数で上限を変えると入力欄が 1 に戻り、別の行が複製されていた。M5）
+                _copy_no = st.number_input("コピーNo", min_value=1, max_value=9999,
                                            value=1, step=1, key="row_copy_no", label_visibility="collapsed")
             with _op_col3:
-                if st.button("📋 コピー", key="row_copy_btn", help="指定No行を複製して最終行に追加"):
-                    _cidx = int(_copy_no) - 1
-                    if 0 <= _cidx < len(_items_src):
-                        import copy as _copy
-                        _copied = _copy.deepcopy(_items_src[_cidx])
-                        estimate_data['items'].append(_copied)
-                        st.session_state['estimate_data'] = estimate_data
-                        st.rerun()
+                st.button("📋 コピー", key="row_copy_btn", help="指定No行を複製して最終行に追加",
+                          on_click=_queue_row_op, args=('copy',))
+            _row_op_msg = st.session_state.pop('_row_op_msg', None)
+            if _row_op_msg:
+                st.warning(_row_op_msg)
 
-            # 表示用DataFrame（7列）: No / 部品番号 / 品名 / 数量 / 部品金額 / 工数 / 工賃
+            # 表示用DataFrame（8列）: No / 部品番号 / 品名 / 区分 / 数量 / 部品金額 / 工数 / 工賃（元の表 _base_items から作る）
             _edit_rows = []
-            for _i, _item in enumerate(_items_src):
+            for _i, _item in enumerate(_base_items):
                 # この列は編集できて、編集後の値がそのまま part_no（見積書の品番）として
                 # 保存される。ここに Addata 由来の品番を出すと、それが「見積書に
                 # 書いてあった品番」に化けてしまい、L1/L2・金額ありの条件を迂回して
@@ -9487,13 +10892,15 @@ def main():
                     'No':     _i + 1,
                     '部品番号': _part_code,
                     '品名':   str(_item.get('name', '')),
-                    '数量':   safe_int(_item.get('quantity', 1), 1),
+                    # 区分（修理方法）も見せて直せるようにする。帳票の「修理方法」にそのまま出る（M11）
+                    '区分':   str(_item.get('work_code', '') or _item.get('method', '') or ''),
+                    '数量':   qty_int(_item.get('quantity', 1), 1),
                     '部品金額': safe_int(_item.get('parts_amount', 0)),
                     '工数':   _index_value,
                     '工賃':   safe_int(_item.get('wage', 0)),
                 })
             _df_edit = pd.DataFrame(_edit_rows) if _edit_rows else pd.DataFrame(
-                columns=['No', '部品番号', '品名', '数量', '部品金額', '工数', '工賃'])
+                columns=['No', '部品番号', '品名', '区分', '数量', '部品金額', '工数', '工賃'])
             # キーを行数と連動させることで行挿入後に data_editor を強制再初期化する
             # 完全な固定キーにすると、行を削除したときのフロント側の
             # 編集状態が残り、振り直した No が画面に反映されない。
@@ -9506,14 +10913,11 @@ def main():
             if any(not str(_r.get('部品番号', '') or '') for _r in _edit_rows):
                 st.caption("※ 部品番号が空欄の行は、Addata で価格まで一致した部品が"
                            "見つかればその品番を NEO に書きます（画面には出ません）。")
+            # キーは元の表を作り直したときだけ進める（上。行数では進めない: 行を消した・足した直後の入力が消えていた。M1）
             _ed_ver = st.session_state.get('items_editor_ver', 0)
-            if st.session_state.get('items_editor_rows') != len(_items_src):
-                st.session_state['items_editor_rows'] = len(_items_src)
-                _ed_ver += 1
-                st.session_state['items_editor_ver'] = _ed_ver
             _editor_key = f'items_editor_{_ed_ver}'
             # height を固定して描画行数を制限（全行フル展開すると100行超で重くなるため）
-            _editor_height = min(600, max(200, len(_items_src) * 35 + 60))
+            _editor_height = min(600, max(200, len(_base_items) * 35 + 60))
             _edited_df = st.data_editor(
                 _df_edit,
                 width='stretch',
@@ -9524,6 +10928,8 @@ def main():
                     'No':     st.column_config.NumberColumn('No', disabled=True, width='small'),
                     '部品番号': st.column_config.TextColumn('部品番号'),
                     '品名':   st.column_config.TextColumn('品名', width='large'),
+                    '区分':   st.column_config.TextColumn('区分', width='small',
+                                                         help='修理方法（取替・脱着・修理・板金・塗装 など）。帳票の「修理方法」欄にそのまま出ます'),
                     '数量':   st.column_config.NumberColumn('数量', min_value=1, step=1, width='small'),
                     '部品金額': st.column_config.NumberColumn('部品金額', step=1, format="¥%d"),
                     '工数':   st.column_config.TextColumn('工数', width='small'),
@@ -9543,6 +10949,7 @@ def main():
                 _nv = _row.get('品名', '');     _nv = '' if pd.isna(_nv) else str(_nv)
                 _pc = _row.get('部品番号', ''); _pc = '' if pd.isna(_pc) else str(_pc)
                 _iv = _row.get('工数', '');     _iv = '' if pd.isna(_iv) else str(_iv)
+                _kv = _row.get('区分', '');     _kv = '' if pd.isna(_kv) else str(_kv).strip()
                 # 既存行のメタデータを引き継ぐ（新規追加行はデフォルト）
                 _src_idx = None
                 if _i < len(_orig_no_list):
@@ -9552,11 +10959,13 @@ def main():
                             _src_idx = int(_no_val) - 1
                         except (TypeError, ValueError):
                             _src_idx = None
-                _orig = (_items_src[_src_idx]
-                         if _src_idx is not None and 0 <= _src_idx < len(_items_src)
+                # No は元の表（_base_items）の位置。元の表は直しても作り直さないので、No で引けば必ず同じ行
+                _orig = (_base_items[_src_idx]
+                         if _src_idx is not None and 0 <= _src_idx < len(_base_items)
                          else {})
-                _wk   = _orig.get('work_code', '') or _orig.get('method', '')
+                _wk   = _kv
                 edited_items.append({
+                    '_ed_no': (_src_idx + 1) if _orig else None,   # 画面の No（コピー・空行の知らせに使う）
                     'name': _nv, 'method': _wk, 'work_code': _wk,
                     'index_value': _iv,
                     'quantity': safe_int(_row.get('数量', 1), 1),
@@ -9584,6 +10993,36 @@ def main():
                     '_original_parts_amount': _orig.get('parts_amount', safe_int(_row.get('部品金額', 0))),
                 })
             estimate_data['items'] = edited_items
+            # 表から出た明細の写し。次の run で明細がこれと同じなら元の表は作り直さない（M1）。写しで持つのは、行挿入・
+            # コピーが明細のリストに追記するため（同じリストを指していると表の外の変化に気づけない）
+            _ed_base['out'] = copy.deepcopy(edited_items)
+            _pending_op = st.session_state.pop('_pending_row_op', None)
+            if _pending_op:
+                _op_kind, _op_no = _pending_op
+                if _op_kind == 'insert':
+                    edited_items.append({
+                        'name': '', 'method': '', 'work_code': '', 'index_value': '',
+                        'quantity': 1, 'parts_amount': 0, 'wage': 0, 'part_no': '',
+                        '_master_name': '', '_master_price': 0, '_master_part_no': '',
+                        '_master_repair_code': '', '_master_branch_code': '',
+                        '_master_part_code_r': '', '_master_part_code_l': '',
+                        '_master_ref_no': '',
+                        '_master_section_code': '', 'match_level': '',
+                        '_match_level': 0, '_original_name': '', '_original_parts_amount': 0,
+                    })
+                else:
+                    # No は画面の表の No（行を消しても振り直さない）で引く。位置で引くと、行を消した直後に別の行が
+                    # 複製されていた（バグハント 3 回目 M5）
+                    _hit = [it for it in edited_items if it.get('_ed_no') == int(_op_no)]
+                    if _hit:
+                        _copied = copy.deepcopy(_hit[0])
+                        _copied.pop('_ed_no', None)
+                        edited_items.append(_copied)
+                    else:
+                        st.session_state['_row_op_msg'] = f"No {int(_op_no)} の行が表にありません（消した行かもしれません）。"
+                estimate_data['items'] = edited_items
+                st.session_state['estimate_data'] = estimate_data
+                st.rerun()
             # 明細も列幅で無言に切られる。車両情報と同じように画面で知らせる。
             # 切られたことに気づけるのが、コグニセブンに取り込んだ後ではなく
             # ここでなければ、部品番号が切れて発注に使えないまま出荷される。
@@ -9603,7 +11042,9 @@ def main():
             for _it in edited_items:
                 calc_parts += safe_int(_it.get('parts_amount', 0))
                 calc_wages += safe_int(_it.get('wage', 0))
-            sp = 0
+            # ショートパーツは印字の部品計・工賃計に含まれている見積がある。ここで先に読む（0 のままだと③の判定だけ
+            # ショートパーツを見ず、④・ファイル名・差異レポートと食い違っていた。レビュー 6 周目）
+            sp = safe_int((estimate_data or {}).get('short_parts_wage', 0))
             pdf_parts = safe_int(estimate_data.get('pdf_parts_total', 0))
             pdf_wages = safe_int(estimate_data.get('pdf_wage_total', 0))
 
@@ -9627,18 +11068,58 @@ def main():
             parts_diff = calc_parts - pdf_parts if pdf_parts > 0 else 0
             # SP込みでも一致チェック（部品）
             parts_match_sp = (calc_parts + sp == pdf_parts) if pdf_parts > 0 else False
-            # 税込モードでは明細合算とPDF記載値の小差（明細行数×1円以内）も一致とみなす
-            _parts_tol = len(edited_items) if is_tax_incl_s3 else 0
+            # 税込モードでは明細合算とPDF記載値の小差（明細行数×1円以内）も一致とみなす（旧 PDF 解析経路の名残）。プレビュー取り込みは
+            # 印字と明細が同じ基準なので許容しない（1 行を 9 円打ち間違えても一致になっていた。レビュー 3 周目）
+            _tol_on = bool(is_tax_incl_s3) and not estimate_data.get('_preview_import')
+            _parts_tol = len(edited_items) if _tol_on else 0
             parts_match_tol = (abs(calc_parts - pdf_parts) <= _parts_tol) if pdf_parts > 0 else False
             parts_match_tol_sp = (abs(calc_parts + sp - pdf_parts) <= _parts_tol) if pdf_parts > 0 else False
-            parts_match = (calc_parts == pdf_parts) or parts_match_sp or parts_match_tol or parts_match_tol_sp
+            # NEO と同じ消費税の端数処理（テンプレートの設定）。生成だけ従い、画面の合計が 1 円ずれていた（レビュー 2 周目）
+            _s3_round, _s3_flag = _neo_tax_round(st.session_state.get('custom_neo_bytes') or template_data)
+            # 見積書の総額と NEO の総額（明細ぶん。サイドバーの費用は除く）の照合は、小計の判定より先に出す（小計の判定と
+            # 「合格」の帯もこれを見る。レビュー 3 周目）。税抜で印字された総額は税込にしてから比べる
+            pdf_grand = 0 if _csv_mode_s3 else safe_int(estimate_data.get('pdf_grand_total', 0))
+            _sp_s3 = safe_int((estimate_data or {}).get('short_parts_wage', 0)) or sp
+            _gi_s3 = bool(estimate_data.get('_grand_is_intax', True))
+            _grand_mismatch_s3 = None   # 見積書の総額と合わないときの (印字, NEO の明細ぶん)
+            _grand_ok_s3 = None
+            if pdf_grand > 0:
+                if is_tax_incl_s3:
+                    _items_grand_s3 = calc_parts + calc_wages + _sp_s3 + _round_tax10(_sp_s3, _s3_round)
+                else:
+                    _items_grand_s3 = (calc_parts + calc_wages + _sp_s3) + _round_tax10(calc_parts + calc_wages + _sp_s3, _s3_round)
+                _want_grand_s3 = pdf_grand if (is_tax_incl_s3 or _gi_s3) else pdf_grand + _round_tax10(pdf_grand, _s3_round)
+                _grand_ok_s3 = (_items_grand_s3 == _want_grand_s3)
+                if not _grand_ok_s3:
+                    _grand_mismatch_s3 = (_want_grand_s3, _items_grand_s3)
+            # 印字の部品計が値引き前（明細のマイナスの行を含まない）の書式もある（ベタ打ちの検証と同じく両方の基準で見る）
+            _calc_parts_plus = sum(max(0, safe_int(_it.get('parts_amount', 0))) for _it in edited_items)
+            # 値引き前の一致は、値引き（マイナスの行）の合計が取り込んだときのままのとき、または見積書の総額と 1 円単位で合う
+            # ときだけ（値引き −5,000 を −500 に打ち間違えても「一致」になっていた。レビュー 2 周目。読み違えた値引きを原本どおりに
+            # 直すと、総額は合うのに「部品相違」になっていた。レビュー 3 周目）
+            _neg_imp = estimate_data.get('_neg_at_import')
+            _neg_same_p = (_neg_imp is None or bool(_grand_ok_s3)
+                           or sum(min(0, safe_int(_it.get('parts_amount', 0))) for _it in edited_items) == safe_int(_neg_imp[0]))
+            _neg_same_w = (_neg_imp is None or bool(_grand_ok_s3)
+                           or sum(min(0, safe_int(_it.get('wage', 0))) for _it in edited_items) == safe_int(_neg_imp[1]))
             wage_diff = calc_wages - pdf_wages if pdf_wages > 0 else 0
             # SP込みでも一致チェック（工賃）: Honda Cars等でSPが工賃列に含まれる場合
             wage_match_sp = (calc_wages + sp == pdf_wages) if pdf_wages > 0 else False
-            _wages_tol = len(edited_items) if is_tax_incl_s3 else 0
+            _wages_tol = len(edited_items) if _tol_on else 0
             wage_match_tol = (abs(calc_wages - pdf_wages) <= _wages_tol) if pdf_wages > 0 else False
             wage_match_tol_sp = (abs(calc_wages + sp - pdf_wages) <= _wages_tol) if pdf_wages > 0 else False
-            wage_match = (calc_wages == pdf_wages) or wage_match_sp or wage_match_tol or wage_match_tol_sp
+            # ショートパーツを足して初めて一致した側（片方にしか入らない。両方で一致するのは読み違いなので、どちらも一致としない。
+            # レビュー 7 周目）
+            _parts_by_sp = bool(sp) and pdf_parts > 0 and calc_parts != pdf_parts and (parts_match_sp or parts_match_tol_sp)
+            _wage_by_sp = bool(sp) and pdf_wages > 0 and calc_wages != pdf_wages and (wage_match_sp or wage_match_tol_sp)
+            if _parts_by_sp and _wage_by_sp:
+                parts_match_sp = parts_match_tol_sp = wage_match_sp = wage_match_tol_sp = False
+                _parts_by_sp = _wage_by_sp = False
+            parts_match = ((calc_parts == pdf_parts) or parts_match_sp or parts_match_tol or parts_match_tol_sp
+                           or (pdf_parts > 0 and _neg_same_p and _calc_parts_plus != calc_parts and _calc_parts_plus == pdf_parts))
+            _calc_wages_plus = sum(max(0, safe_int(_it.get('wage', 0))) for _it in edited_items)
+            wage_match = ((calc_wages == pdf_wages) or wage_match_sp or wage_match_tol or wage_match_tol_sp
+                          or (pdf_wages > 0 and _neg_same_w and _calc_wages_plus != calc_wages and _calc_wages_plus == pdf_wages))
             has_discrepancy = False
 
             with scol1:
@@ -9650,7 +11131,8 @@ def main():
                         unsafe_allow_html=True
                     )
                 elif pdf_parts > 0:
-                    st.markdown('<div class="success-box">✅ PDF金額と一致</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="success-box">✅ PDF金額と一致'
+                                + ('（ショートパーツ込み）' if _parts_by_sp else '') + '</div>', unsafe_allow_html=True)
             with scol2:
                 st.metric(f"工賃合計（{tax_label_sfx}）", f"¥{calc_wages:,}")
                 if pdf_wages > 0 and not wage_match and not rev_match:
@@ -9660,11 +11142,17 @@ def main():
                         unsafe_allow_html=True
                     )
                 elif pdf_wages > 0:
-                    st.markdown('<div class="success-box">✅ PDF金額と一致</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="success-box">✅ PDF金額と一致'
+                                + ('（ショートパーツ込み）' if _wage_by_sp else '') + '</div>', unsafe_allow_html=True)
             with scol3:
                 exp_tow = st.session_state.get('exp_towing', 0)
                 exp_ren = st.session_state.get('exp_rental', 0)
                 exp_exm = st.session_state.get('exp_exempt', 0)
+                if estimate_data.get('_expenses_off'):
+                    # ベタ打ちで「費用を入れない」を選んでいた見積（見積書に同じ費用が載っている等）は、ここでも足さない（O9）
+                    if any(safe_int(x) for x in (exp_tow, exp_ren, exp_exm)):
+                        st.caption('サイドバーの費用はベタ打ちで入れない選択だったので、NEO に入れません')
+                    exp_tow = exp_ren = exp_exm = 0
                 # ショートパーツを合計に含める（0のままだと画面だけ少なくなる）
                 sp = safe_int((estimate_data or {}).get('short_parts_wage', 0)) or sp
                 sub = calc_parts + calc_wages + sp + exp_tow + exp_ren
@@ -9672,12 +11160,14 @@ def main():
                     # 税込モード: 明細金額は既に税込。ただし費用欄は「税抜」で
                     # 入力させているため、費用ぶんの消費税は別に足す。
                     # これを忘れると画面の合計とNEOの合計が食い違う。
-                    tax   = jpy_round((sp + exp_tow + exp_ren) * TAX_RATE)
+                    tax   = _round_tax10(sp + exp_tow + exp_ren, _s3_round)
                     total = sub + tax + exp_exm
                 else:
-                    tax   = jpy_round(sub * TAX_RATE)
+                    tax   = _round_tax10(sub, _s3_round)
                     total = sub + tax + exp_exm
                 st.metric("合計（税込）", f"¥{total:,}")
+                if _s3_flag != 1:
+                    st.caption(f'消費税の端数はテンプレートの設定（{_s3_round}）で計算します')
                 # ここには以前、「この税込額は .neo では作れないので合計が
                 # 1円変わります」という断りを出していた。
                 # **その前提が実機データで否定されたので消した。**
@@ -9686,7 +11176,9 @@ def main():
                 # いまは税込表記のとき税額を「原本の税込 − 逆算した税抜」で
                 # 書いており、**.neo の総額は原本とぴったり一致する**。
                 # 断りを残すと、ずれないものを「ずれる」と伝えることになる。
-                if rev_match:
+                if estimate_data.get('_csv_import'):
+                    st.caption('照合なし: CSV の金額をそのまま使います（見積書との照合はしていません）')
+                elif rev_match:
                     st.markdown('<div class="success-box">✅ 逆算一致</div>', unsafe_allow_html=True)
 
             # ── STEP 3 バリデーション結果パネル ──
@@ -9696,7 +11188,29 @@ def main():
             if _tv_has_data:
                 _tv_p_mismatch = pdf_parts > 0 and not parts_match and not rev_match
                 _tv_w_mismatch = pdf_wages > 0 and not wage_match and not rev_match
-                if not _tv_p_mismatch and not _tv_w_mismatch:
+                _tv_unv = [_n for _n, _v in (('部品計', pdf_parts), ('工賃計', pdf_wages)) if _v <= 0]
+                if not _tv_p_mismatch and not _tv_w_mismatch and _grand_mismatch_s3:
+                    # 小計は合うが総額が合わない（値引きの行など）。「合格」とは言わない（レビュー 3 周目）
+                    st.markdown(
+                        '<div class="warning-box" style="padding:10px 16px;margin-bottom:12px">'
+                        '⚠️ <b>【STEP 3】</b> 小計は見積書の印字と一致していますが、見積書の総額と NEO の総額が合いません'
+                        '（下の検証表と注意を確かめてください）。</div>', unsafe_allow_html=True)
+                elif not _tv_p_mismatch and not _tv_w_mismatch and (_parts_by_sp or _wage_by_sp):
+                    # ショートパーツを足して一致した（明細の合算そのものは違う。レビュー 7 周目）。片方が未照合でもこちらを先に
+                    # 出す（未照合の文だけになり、ショートパーツに触れなかった。レビュー 8 周目）
+                    st.markdown(
+                        '<div class="success-box" style="padding:10px 16px;margin-bottom:12px">'
+                        f'✅ <b>【STEP 3】</b> 見積書の{"部品計" if _parts_by_sp else "工賃計"}は、明細の合算に'
+                        f'ショートパーツ ¥{sp:,} を足すと一致します（明細の合算そのものは ¥{sp:,} 少ない額です）'
+                        + (f'。{"・".join(_tv_unv)}は見積書から読めず、照合していません' if _tv_unv else '')
+                        + '。</div>', unsafe_allow_html=True)
+                elif not _tv_p_mismatch and not _tv_w_mismatch and _tv_unv:
+                    # 片方しか読めていない: 読めた側だけの一致（工賃が未照合でも「合格」と出ていた。レビュー 2 周目）
+                    st.markdown(
+                        '<div class="success-box" style="padding:10px 16px;margin-bottom:12px">'
+                        f'✅ <b>【STEP 3】</b> 読めた小計は見積書の印字と一致しています（{"・".join(_tv_unv)}は見積書から読めず、照合していません）。'
+                        '</div>', unsafe_allow_html=True)
+                elif not _tv_p_mismatch and not _tv_w_mismatch:
                     st.markdown(
                         '<div class="success-box" style="padding:10px 16px;margin-bottom:12px">'
                         '✅ <b>【STEP 3 バリデーション: 合格】</b> 見積書記載の合計値と1円の誤差もなく一致しています。'
@@ -9718,7 +11232,6 @@ def main():
             _step3_mode = st.session_state.get('selected_mode', 'db')
             if _step3_mode == 'beta':
                 st.markdown('<div class="section-title">📋 ベタ打ちモード — 金額一致検証レポート</div>', unsafe_allow_html=True)
-                pdf_grand = safe_int(estimate_data.get('pdf_grand_total', 0))
                 tax_basis_s3 = estimate_data.get('_tax_basis', 'unknown')
                 _beta_verification_rows = []
                 _beta_all_ok = True
@@ -9743,81 +11256,44 @@ def main():
                         columns=['No', '品名', '部品価格', '工賃'],
                     ).set_index('No'))
 
-                # 合算値の一致確認
+                # 合算値の一致確認。見積書から読めなかった項目（印字が 0）は「未照合」と出し、合否にも一致率にも数えない
+                # （部品計が読めないのに合格扱い・総額だけの照合で「全項目一致（一致率 33%）…完全一致」と出ていた。レビュー 2 周目）
                 _verify_items = []
-                # ① 部品合計
                 parts_ok = parts_match or rev_match
-                _verify_items.append(('部品合計', pdf_parts, calc_parts, parts_ok))
-                if not parts_ok and pdf_parts > 0:
-                    _beta_all_ok = False
-                # ② 工賃合計
+                _verify_items.append(('部品合計', pdf_parts, calc_parts, parts_ok if pdf_parts > 0 else None))
                 wage_ok = wage_match or rev_match
-                _verify_items.append(('工賃合計', pdf_wages, calc_wages, wage_ok))
-                if not wage_ok and pdf_wages > 0:
-                    _beta_all_ok = False
-                # ③ 見積合計（税込or税抜）
-                if pdf_grand > 0:
-                    grand_label = '見積合計（税込）' if tax_basis_s3 == 'tax_inclusive' else '見積合計（税抜→税込算出）'
-                    # 丸め誤差の許容: 明細行数 × 1円 + 基本許容10円（最大50円）
-                    _n_items = len(edited_items)
-                    _grand_tolerance = min(_n_items + 10, 50)
-                    grand_ok = abs(total - pdf_grand) <= _grand_tolerance
-                    _verify_items.append((grand_label, pdf_grand, total, grand_ok))
-                    if not grand_ok:
+                _verify_items.append(('工賃合計', pdf_wages, calc_wages, wage_ok if pdf_wages > 0 else None))
+                if pdf_grand > 0 and _grand_ok_s3 is not None:
+                    # 見積書の総額は、NEO と同じ計算（明細ぶん。サイドバーの費用は除く・消費税の端数はテンプレートの設定）で
+                    # 1 円単位で比べる。以前は最大 50 円の許容で表示するだけで、値引きの打ち間違いも確認なしで生成できた
+                    # （計算は小計の判定の前。レビュー 2・3 周目）
+                    _verify_items.append(('見積合計（税込）' if (is_tax_incl_s3 or _gi_s3) else '見積合計（税抜の印字を税込に）',
+                                          _want_grand_s3, _items_grand_s3, _grand_ok_s3))
+                for _vi in _verify_items:
+                    if _vi[3] is False:
                         _beta_all_ok = False
 
                 verify_html = '<table style="width:100%;border-collapse:collapse;font-size:13px;margin:8px 0">'
                 verify_html += '<tr style="background:#f1f5f9;font-weight:600"><td style="padding:6px 10px">検証項目</td><td style="padding:6px 10px;text-align:right">PDF記載</td><td style="padding:6px 10px;text-align:right">計算値</td><td style="padding:6px 10px;text-align:center">結果</td></tr>'
                 for v_label, v_pdf, v_calc, v_ok in _verify_items:
-                    v_icon = '✅' if v_ok else '❌'
-                    v_color = '#16a34a' if v_ok else '#dc2626'
-                    v_diff = v_calc - v_pdf
-                    v_diff_text = f' ({v_diff:+,}円)' if not v_ok and v_pdf > 0 else ''
-                    verify_html += f'<tr style="border-bottom:1px solid #e2e8f0"><td style="padding:6px 10px">{v_label}</td><td style="padding:6px 10px;text-align:right">¥{v_pdf:,}</td><td style="padding:6px 10px;text-align:right">¥{v_calc:,}{v_diff_text}</td><td style="padding:6px 10px;text-align:center;color:{v_color};font-weight:600">{v_icon}</td></tr>'
-
-                # ④ 逆算チェック: 合計から逆算して個別金額との不整合チェック
-                reverse_ok = False  # ブロック外からの参照に備えて初期化
-                if pdf_grand > 0 and (pdf_parts > 0 or pdf_wages > 0):
-                    reverse_sub = calc_parts + calc_wages + sp
-                    if is_tax_incl_s3:
-                        # 税込モード: 金額は既に税込 → 消費税を加算しない
-                        reverse_grand = reverse_sub + st.session_state.get('exp_exempt', 0)
+                    if v_ok is None:
+                        v_icon, v_color, v_pdf_txt, v_diff_text = '—', '#64748b', '読めず（未照合）', ''
                     else:
-                        reverse_tax = jpy_round(reverse_sub * TAX_RATE)
-                        reverse_grand = reverse_sub + reverse_tax + st.session_state.get('exp_exempt', 0)
-                    _rev_tolerance = min(_n_items + 10, 50)
-                    reverse_ok = abs(reverse_grand - pdf_grand) <= _rev_tolerance
-                    reverse_icon = '✅' if reverse_ok else '⚠️'
-                    reverse_color = '#16a34a' if reverse_ok else '#d97706'
-                    if not reverse_ok:
-                        _beta_all_ok = False
-                    verify_html += f'<tr style="border-bottom:1px solid #e2e8f0;background:#fefce8"><td style="padding:6px 10px">逆算検証（税込総額）</td><td style="padding:6px 10px;text-align:right">¥{pdf_grand:,}</td><td style="padding:6px 10px;text-align:right">¥{reverse_grand:,}</td><td style="padding:6px 10px;text-align:center;color:{reverse_color};font-weight:600">{reverse_icon}</td></tr>'
-
+                        v_icon = '✅' if v_ok else '❌'
+                        v_color = '#16a34a' if v_ok else '#dc2626'
+                        v_pdf_txt = f'¥{v_pdf:,}'
+                        v_diff_text = f' ({v_calc - v_pdf:+,}円)' if not v_ok else ''
+                    verify_html += f'<tr style="border-bottom:1px solid #e2e8f0"><td style="padding:6px 10px">{v_label}</td><td style="padding:6px 10px;text-align:right">{v_pdf_txt}</td><td style="padding:6px 10px;text-align:right">¥{v_calc:,}{v_diff_text}</td><td style="padding:6px 10px;text-align:center;color:{v_color};font-weight:600">{v_icon}</td></tr>'
                 verify_html += '</table>'
                 st.markdown(verify_html, unsafe_allow_html=True)
 
-                # 一致率の算出・表示
-                total_checks = len(_verify_items) + (1 if pdf_grand > 0 and (pdf_parts > 0 or pdf_wages > 0) else 0)
-                passed_checks = sum(1 for _, _, _, ok in _verify_items if ok)
-                if pdf_grand > 0 and (pdf_parts > 0 or pdf_wages > 0) and reverse_ok:
-                    passed_checks += 1
-                match_rate = (passed_checks / total_checks * 100) if total_checks > 0 else 0
-                # 比較相手（見積書に印字された部品計・工賃計・総合計）が
-                # 1つも取れていないときは、何も突き合わせていない。
-                # CSV取り込みは常にこれに当たるのに「PDF原本と完全一致」と
-                # 断言していたため、利用者が原本との突き合わせをここで
-                # 打ち切る根拠になっていた。
-                # 基準が「全く無い」ときだけ止めるのでは足りない。片側だけ
-                # 読めなかった場合、読めなかった側は「検証していない」のに
-                # 合格として扱われ、一致率50%と「全項目一致・完全一致」が
-                # 同じ一文に並んでいた。全項目に基準があるときだけ断言する。
-                _missing = [_n for _n, _v in (('部品計', pdf_parts), ('工賃計', pdf_wages))
-                            if _v <= 0]
-                _ref_ok = (not _missing) or pdf_grand > 0
-                if not _ref_ok:
-                    _what = ('・'.join(_missing) if _missing else '照合の基準')
-                    _note = ('（CSV取り込みでは常にこの状態です）'
-                             if len(_missing) >= 2 else '')
+                _checked = [_v for _v in _verify_items if _v[3] is not None]
+                _unverified = [_v[0] for _v in _verify_items if _v[3] is None]
+                # 比較相手（見積書に印字された部品計・工賃計・総合計）が 1 つも取れていないときは、何も突き合わせていない。
+                # CSV取り込みは常にこれに当たる。「一致」と断言すると、利用者が原本との突き合わせを打ち切る根拠になる
+                if not _checked:
+                    _what = '・'.join(_unverified[:2]) if _unverified else '照合の基準'
+                    _note = '（CSV取り込みでは常にこの状態です）' if estimate_data.get('_csv_import') else ''
                     st.markdown(
                         '<div class="warning-box" style="padding:10px 16px;margin:8px 0">'
                         f'ℹ️ <b>{_what}を見積書から読み取れていないため、'
@@ -9826,9 +11302,11 @@ def main():
                         '下の明細と金額を、原本とご自身で突き合わせてください。</div>',
                         unsafe_allow_html=True)
                 elif _beta_all_ok:
-                    st.markdown(f'<div class="success-box" style="padding:10px 16px;margin:8px 0">✅ <b>ベタ打ち検証: 全項目一致（一致率 {match_rate:.0f}%）</b> — PDF原本とNEO転記内容が完全一致しています。</div>', unsafe_allow_html=True)
+                    _uv_txt = f'（{"・".join(_unverified)}は見積書から読めず、照合していません）' if _unverified else ''
+                    st.markdown(f'<div class="success-box" style="padding:10px 16px;margin:8px 0">✅ <b>ベタ打ち検証: 照合した {len(_checked)} 項目はすべて一致</b>{_uv_txt} — 見積書の印字と 1 円の差もありません。</div>', unsafe_allow_html=True)
                 else:
-                    st.markdown(f'<div class="error-box" style="padding:10px 16px;margin:8px 0">⚠️ <b>ベタ打ち検証: 不一致あり（一致率 {match_rate:.0f}%）</b> — PDF原本との差異を確認してください。基準: 99%以上</div>', unsafe_allow_html=True)
+                    _n_ok = sum(1 for _v in _checked if _v[3])
+                    st.markdown(f'<div class="error-box" style="padding:10px 16px;margin:8px 0">⚠️ <b>ベタ打ち検証: 不一致あり（照合した {len(_checked)} 項目のうち {_n_ok} 項目が一致）</b> — 見積書との差を確かめてください。協定見積は 1 円でも違うと使えません。</div>', unsafe_allow_html=True)
 
             # ── ベタ打ちモード専用: 部品・工賃区分確認パネル ──────────────────────────
             _classification_alerts = []
@@ -9836,7 +11314,8 @@ def main():
             _error_alerts = []
             if _step3_mode == 'beta':
                 # アイテムが変わった時だけ再計算（session_stateでキャッシュ）
-                _items_hash = hash(str([(it.get('name',''), it.get('parts_amount',0), it.get('wage',0)) for it in edited_items]))
+                _items_hash = hash(str([(it.get('name',''), it.get('parts_amount',0), it.get('wage',0),
+                                         it.get('work_code', '') or it.get('method', '')) for it in edited_items]))
                 if st.session_state.get('_cls_hash') != _items_hash:
                     st.session_state['_cls_cache'] = check_parts_labor_classification(edited_items)
                     st.session_state['_cls_hash']  = _items_hash
@@ -9972,16 +11451,72 @@ def main():
                 else:
                     st.markdown(f'<div style="font-weight: bold;">マスタ適用による総額変動: なし (0円)</div>', unsafe_allow_html=True)
 
+            # ③の照合の結果。④の不一致の表示とファイル名の「（部品相違）」などは、これと同じ判定を使う（④は完全一致だけを見て、
+            # 値引き前の小計の見積で正しい NEO に「（工賃相違）」の名前と不一致の警告を付けていた。レビュー 3 周目）
+            _s3_verdict_now = {
+                'parts_ok': not (pdf_parts > 0 and not parts_match and not rev_match),
+                'wage_ok': not (pdf_wages > 0 and not wage_match and not rev_match),
+                'grand_ok': _grand_mismatch_s3 is None,
+                'grand_diff': (_grand_mismatch_s3[1] - _grand_mismatch_s3[0]) if _grand_mismatch_s3 else 0,
+                'grand_want': _grand_mismatch_s3[0] if _grand_mismatch_s3 else 0,
+                'grand_neo': _grand_mismatch_s3[1] if _grand_mismatch_s3 else 0,
+                # 値引き前の小計（マイナスの行を含まない合算）で一致としたか（差異レポートの判定の書き分け。レビュー 5 周目）
+                'parts_gross': bool(pdf_parts > 0 and calc_parts != pdf_parts and _calc_parts_plus == pdf_parts and parts_match),
+                'wage_gross': bool(pdf_wages > 0 and calc_wages != pdf_wages and _calc_wages_plus == pdf_wages and wage_match),
+                # ショートパーツを足して初めて一致した／逆算一致で小計の相違を出していない（レポートの判定の書き分け。レビュー 7 周目）
+                'parts_sp': bool(_parts_by_sp), 'wage_sp': bool(_wage_by_sp),
+                'rev': bool(rev_match),
+            }
+            # 確認のチェックは、確かめた差（小計の差・総額の差）が変わったら外す（小計の差で入れたチェックが、あとで総額の差に
+            # 変わっても残り、確認なしで生成できた。レビュー 3 周目）。ウィジェットを作る前に消す
+            # 差の値が同じまま、どの小計が合っているか（③の判定）だけ変わったときも外す（レビュー 5 周目）
+            _disc_sig = (parts_diff if has_discrepancy else 0, wage_diff if has_discrepancy else 0,
+                         (_grand_mismatch_s3[1] - _grand_mismatch_s3[0]) if _grand_mismatch_s3 else 0,
+                         _s3_verdict_now['parts_ok'], _s3_verdict_now['wage_ok'], _s3_verdict_now['grand_ok'],
+                         _s3_verdict_now['parts_sp'], _s3_verdict_now['wage_sp'])
+            if st.session_state.get('_amount_confirmed_sig') != _disc_sig:
+                st.session_state['_amount_confirmed_sig'] = _disc_sig
+                # 代入して外す（pop はサーバーの値だけを消し、ブラウザのチェックは入ったまま、次の再描画で True が送り直されて
+                # いた。レビュー 4 周目）。value=False のチェックなので既定値の二重指定の警告は出ない
+                st.session_state['amount_confirmed'] = False
+            # 見積書の総額が読めない見積では、ショートパーツを足して一致とした小計を裏づけるものが無い（工賃の行を 1 行落として
+            # いても同じ数字になる）。確認のチェックを出す（6 周目まで「相違」として止めていた形が無警告で通っていた。レビュー 7 周目）
+            _sp_unverified = (_grand_ok_s3 is None) and (_parts_by_sp or _wage_by_sp)
             DISCREPANCY_THRESHOLD = 1000
-            if has_discrepancy and (abs(parts_diff) >= DISCREPANCY_THRESHOLD or abs(wage_diff) >= DISCREPANCY_THRESHOLD):
-                st.markdown(
-                    '<div class="mismatch-banner">'
-                    '<div class="mismatch-title">🚨 金額不一致警告</div>'
-                    '<div class="mismatch-body">AI読み取り金額とPDF記載金額に大きな差があります。<br>'
-                    '明細行の内容を確認・修正してから生成してください。</div>'
-                    '</div>',
-                    unsafe_allow_html=True
+            if _sp_unverified and not has_discrepancy and not _grand_mismatch_s3:
+                st.warning(f"⚠️ 見積書の{'部品計' if _parts_by_sp else '工賃計'}（¥{(pdf_parts if _parts_by_sp else pdf_wages):,}）は、"
+                           f"明細の合算にショートパーツ ¥{sp:,} を足すと一致します。見積書の総額が読めていないので、"
+                           "ショートパーツがその計に含まれているのか、明細の行が落ちているのかを確かめてください。")
+                amount_confirmed = st.checkbox(
+                    "見積書と突き合わせました。このまま生成を続行します。",
+                    value=False,
+                    key='amount_confirmed'
                 )
+            elif _grand_mismatch_s3 and not has_discrepancy:
+                # 小計は合う（または読めていない）が、見積書の総額と NEO の総額（明細ぶん）が合わない（レビュー 2 周目）
+                _gw, _gn = _grand_mismatch_s3
+                st.warning(f"⚠️ 見積書の総額 ¥{_gw:,} と、NEO の総額（明細ぶん） ¥{_gn:,} が合いません（差 {_gn - _gw:+,} 円）。"
+                           "協定見積は 1 円でも違うと使えません。明細（値引きの行を含む）を確かめてください。")
+                amount_confirmed = st.checkbox(
+                    "金額の差異を確認しました。このまま生成を続行します。",
+                    value=False,
+                    key='amount_confirmed'
+                )
+            elif has_discrepancy:
+                if abs(parts_diff) >= DISCREPANCY_THRESHOLD or abs(wage_diff) >= DISCREPANCY_THRESHOLD:
+                    st.markdown(
+                        '<div class="mismatch-banner">'
+                        '<div class="mismatch-title">🚨 金額不一致警告</div>'
+                        '<div class="mismatch-body">AI読み取り金額とPDF記載金額に大きな差があります。<br>'
+                        '明細行の内容を確認・修正してから生成してください。</div>'
+                        '</div>',
+                        unsafe_allow_html=True
+                    )
+                else:
+                    # 差が小さくても確認を求める（協定見積は 1 円でも違うと使えない。以前は 1,000 円未満なら確認なしで進めた。O8）
+                    st.warning("⚠️ 見積書の小計と明細の合計が合いません（協定見積は 1 円でも違うと使えません）。"
+                               + (f"見積書の総額とも {_grand_mismatch_s3[1] - _grand_mismatch_s3[0]:+,} 円違います。" if _grand_mismatch_s3 else '')
+                               + "明細を確かめてください。")
                 amount_confirmed = st.checkbox(
                     "金額の差異を確認しました。このまま生成を続行します。",
                     value=False,
@@ -9989,29 +11524,45 @@ def main():
                 )
             else:
                 amount_confirmed = True
+            if estimate_data.get('_preview_needs_ack'):
+                # ベタ打ちの結果で確認が必要だった（金額調整の行・検証の差・金額列の補正・未照合・ページ境界の統合）もの。
+                # 取り込んでも確認は外さない（以前は取り込むと確認のチェックが消えていた。レビュー）
+                st.warning("⚠️ 取り込んだベタ打ちの結果には、原本と差がある可能性がありました（金額調整の行／検証の差／金額列の補正／"
+                           "見積書の合計が読めず未照合 など）。明細を原本と突き合わせてください。")
+                _pv_ok = st.checkbox("原本と突き合わせました（このまま NEO に進む）", value=False, key='preview_ack_confirmed')
+                amount_confirmed = bool(amount_confirmed) and bool(_pv_ok)
+            # 「※金額調整」の行（読み取った明細と見積書の合計の差を埋めた行）は原本に無い。確かめてから（O9）
+            _adj_nos = [str(_it.get('_ed_no') or _ai) for _ai, _it in enumerate(edited_items, 1)
+                        if str(_it.get('name', '') or '').startswith('※金額調整')]
+            if _adj_nos:
+                st.warning(f"⚠️ No {', '.join(_adj_nos)} は、読み取った明細と見積書の合計の差を埋めた「※金額調整」の行で、"
+                           "原本にはありません。原本の明細を確かめて直すか、行を削除してください。")
+                _adj_ok = st.checkbox("「※金額調整」の行を確認しました（このまま NEO に入れる）", value=False, key='adj_rows_confirmed')
+                amount_confirmed = bool(amount_confirmed) and bool(_adj_ok)
 
             # ── Total strip ──
-            # sp は初期化のまま0で使われていたため、画面の合計だけ
+            # sp はここでも同じ値を読み直すだけ（③の頭で読んでいる）
             # ショートパーツぶん少なく表示されていた（short_parts_wage の
             # 定義はこの後なので estimate_data から直接読む）
             sp = safe_int((estimate_data or {}).get('short_parts_wage', 0)) or sp
-            _exp_tow_s4 = st.session_state.get('exp_towing', 0)
-            _exp_ren_s4 = st.session_state.get('exp_rental', 0)
+            _exp_off_strip = bool((estimate_data or {}).get('_expenses_off'))   # 費用を入れない選択（ステップ④と同じ）
+            _exp_tow_s4 = 0 if _exp_off_strip else st.session_state.get('exp_towing', 0)
+            _exp_ren_s4 = 0 if _exp_off_strip else st.session_state.get('exp_rental', 0)
             sub   = calc_parts + calc_wages + sp + _exp_tow_s4 + _exp_ren_s4
             _is_tax_incl_strip = (estimate_data.get('_is_tax_inclusive', False) if estimate_data else False)
             if _is_tax_incl_strip:
                 # 費用欄は「税抜」入力なので、税込モードでも費用ぶんの税は加算する
-                tax   = jpy_round((sp + _exp_tow_s4 + _exp_ren_s4) * TAX_RATE)
-                total = sub + tax + st.session_state.get('exp_exempt', 0)
+                tax   = _round_tax10(sp + _exp_tow_s4 + _exp_ren_s4, _s3_round)
+                total = sub + tax + (0 if _exp_off_strip else st.session_state.get('exp_exempt', 0))
             else:
-                tax   = jpy_round(sub * TAX_RATE)
-                total = sub + tax + st.session_state.get('exp_exempt', 0)
+                tax   = _round_tax10(sub, _s3_round)   # NEO と同じ端数処理（テンプレートの設定。レビュー 2 周目）
+                total = sub + tax + (0 if _exp_off_strip else st.session_state.get('exp_exempt', 0))
             # 費用（レッカー・代車・非課税）は合計に加算されるのに画面に
             # 出ていなかったため、部品代＋工賃＋消費税と合計が一致せず
             # 「計算が合っていない」ように見えていた。金額がある時だけ表示する。
-            _exp_sum_strip = (st.session_state.get('exp_towing', 0)
-                              + st.session_state.get('exp_rental', 0)
-                              + st.session_state.get('exp_exempt', 0))
+            _exp_sum_strip = 0 if _exp_off_strip else (st.session_state.get('exp_towing', 0)
+                                                        + st.session_state.get('exp_rental', 0)
+                                                        + st.session_state.get('exp_exempt', 0))
             _exp_cell = (
                 '<div class="total-sep">+</div>'
                 '<div class="total-item">'
@@ -10091,20 +11642,34 @@ def main():
                 st.session_state['step'] = 1
                 st.session_state['vehicle_data']  = None
                 st.session_state['estimate_data'] = None
+                st.session_state.pop('_s3_verdict', None)   # ③の判定も消す（次の案件に持ち越さない。レビュー 9 周目）
                 st.rerun()
+            # 戻ると明細表と車両情報の修正は消える（CSV を読み直す）。黙って消さない（M9）
+            st.caption("※ ステップ①に戻ると、ここで直した明細と車両情報は消えます（CSV から読み直します）")
         with bcol2:
             # 金額差異未確認時のみボタンを無効化（分類エラーではブロックしない）
             gen_disabled = not amount_confirmed
+            _blank_nos = [str(_it.get('_ed_no') or _bi) for _bi, _it in enumerate(edited_items or [], 1)
+                          if not str(_it.get('name', '') or '').strip()]
+            _all_deleted = bool(estimate_data) and (estimate_data.get('_csv_import') or estimate_data.get('_preview_import')) \
+                and not (estimate_data.get('items') or [])
             if st.button("📦 NEOファイルを生成する →", type="primary", width='stretch', disabled=gen_disabled):
-                st.session_state['updated_vehicle'] = updated_vehicle
-                st.session_state['calc_parts']      = calc_parts
-                st.session_state['calc_wages']      = calc_wages
-                st.session_state['pdf_parts']       = pdf_parts if estimate_data else None
-                st.session_state['pdf_wages']       = pdf_wages if estimate_data else None
-                st.session_state['discrepancies']   = discrepancies
-                st.session_state['total_diff']      = total_diff
-                st.session_state['step'] = 4
-                st.rerun()
+                if _all_deleted:
+                    st.error("❌ 明細が 0 行です（表の行を全部消しています）。ステップ①に戻って取り込み直してください。")
+                elif _blank_nos:
+                    # 品名の無い行は協定見積に出せない（行挿入の直後の空行など。以前はそのまま NEO に入った。M10）
+                    st.error(f"❌ 品名が空の行があります（No {', '.join(_blank_nos)}）。品名を入れるか、行を削除してから生成してください。")
+                else:
+                    st.session_state['updated_vehicle'] = updated_vehicle
+                    st.session_state['calc_parts']      = calc_parts
+                    st.session_state['calc_wages']      = calc_wages
+                    st.session_state['pdf_parts']       = pdf_parts if estimate_data else None
+                    st.session_state['pdf_wages']       = pdf_wages if estimate_data else None
+                    st.session_state['discrepancies']   = discrepancies
+                    st.session_state['total_diff']      = total_diff
+                    st.session_state['_s3_verdict']     = _s3_verdict_now
+                    st.session_state['step'] = 4
+                    st.rerun()
             if not amount_confirmed:
                 st.caption("⬆️ 金額差異を確認してチェックを入れてください")
 
@@ -10137,6 +11702,9 @@ def main():
             'rental_car':  st.session_state.get('exp_rental', 0),
             'tax_exempt':  st.session_state.get('exp_exempt', 0),
         }
+        if (estimate_data or {}).get('_expenses_off'):
+            # ベタ打ちで「費用を入れない」を選んでいたプレビュー取り込みは、ここでも入れない（ステップ③の合計と同じ。O9）
+            expense_info = {'towing': 0, 'rental_car': 0, 'tax_exempt': 0}
         items            = []
         short_parts_wage = 0
         has_estimate     = False
@@ -10182,9 +11750,12 @@ def main():
                 merge_mode=_use_custom_neo
             )
             progress.progress(85, text="📝 ファイル名を生成中...")
+            _s3v = st.session_state.get('_s3_verdict') or {}
             filename = generate_filename(
                 updated_vehicle, calc_parts, calc_wages, pdf_parts, pdf_wages,
-                has_estimate, reverse_match, short_parts_wage
+                has_estimate, reverse_match, short_parts_wage,
+                parts_ok=bool(_s3v.get('parts_ok')), wage_ok=bool(_s3v.get('wage_ok')),
+                grand_ok=_s3v.get('grand_ok', True) is not False,
             )
             # step4 は再描画のたびにこのブロックを通る。登録番号が無い案件は
             # ファイル名に日時が入るため、そのままだと同じ見積なのに秒が変わって
@@ -10198,9 +11769,12 @@ def main():
                 safe_str(updated_vehicle.get('car_name', '')),
                 len(items), calc_parts, calc_wages,
             )
-            if (st.session_state.get('neo_filename')
+            if (st.session_state.get('neo_filename') and st.session_state.get('_neo_name_base')
                     and st.session_state.get('_neo_name_key') == _name_key):
-                filename = st.session_state['neo_filename']
+                # 使い回すのは日時の入った前半だけ。末尾の「（部品相違）」などは③の判定で毎回つけ直す（名前ごと使い回して、
+                # 取り込み直した正しい NEO に前の「（総額相違）」が残り、直して作った誤った NEO に印が付かなかった。レビュー 4 周目）
+                filename = st.session_state['_neo_name_base'] + '_見積' + filename.rsplit('_見積', 1)[1]
+            st.session_state['_neo_name_base'] = filename.rsplit('_見積', 1)[0]
             st.session_state['_neo_name_key'] = _name_key
             st.session_state['neo_bytes']    = neo_data
             st.session_state['neo_filename'] = filename
@@ -10211,14 +11785,20 @@ def main():
             _discrepancies_step4 = []
             _total_diff_step4 = 0
             if has_estimate and not reverse_match:
-                sp_val = safe_int(short_parts_wage)
-                parts_match_s4 = (calc_parts == pdf_parts) or (calc_parts + sp_val == pdf_parts)
+                # ③と同じ判定（値引き前の小計・ショートパーツ込み・総額の一致を含む。レビュー 3・8 周目）
+                parts_match_s4 = (calc_parts == pdf_parts) or bool(_s3v.get('parts_ok'))
                 if pdf_parts is not None and pdf_parts > 0 and not parts_match_s4:
                     _discrepancies_step4.append(f"部品相違（PDF: ¥{pdf_parts:,} / 計算: ¥{calc_parts:,}）")
                     _total_diff_step4 += calc_parts - pdf_parts
-                if pdf_wages is not None and pdf_wages > 0 and calc_wages != pdf_wages:
+                wage_match_s4 = (calc_wages == pdf_wages) or bool(_s3v.get('wage_ok'))
+                if pdf_wages is not None and pdf_wages > 0 and not wage_match_s4:
                     _discrepancies_step4.append(f"工賃相違（PDF: ¥{pdf_wages:,} / 計算: ¥{calc_wages:,}）")
                     _total_diff_step4 += calc_wages - pdf_wages
+            # 総額相違は逆算一致の外で見る（③が確認を求めた相違が④に出ていなかった。レビュー 6 周目）
+            if _s3v.get('grand_ok') is False:
+                _discrepancies_step4.append(f"総額相違（見積書の総額と NEO の総額が {safe_int(_s3v.get('grand_diff')):+,} 円違うまま、確認して生成）")
+                if not _total_diff_step4:
+                    _total_diff_step4 = safe_int(_s3v.get('grand_diff'))
 
             if _discrepancies_step4:
                 diff_abs = abs(_total_diff_step4)
@@ -10265,13 +11845,10 @@ def main():
             if _step4_beta and _discrepancies_step4:
                 st.markdown('<div class="section-title">📋 ベタ打ちモード — 差異特定レポート</div>', unsafe_allow_html=True)
                 st.markdown('金額の不一致箇所を特定するための詳細レポートをPDF形式でダウンロードできます。')
-                # Step4はStep3とは別ブランチのため、wage_match_sp/spをStep4内で再計算する
-                _sp_s4 = safe_int(short_parts_wage)
-                _pdf_wages_s4 = safe_int(pdf_wages or 0)
-                _wage_match_sp_s4 = (_pdf_wages_s4 > 0 and calc_wages + _sp_s4 == _pdf_wages_s4)
-                # ショートパーツはHonda Cars等で工賃列に含まれるため、差異レポートの計算値に加算
-                _calc_wages_report = calc_wages + _sp_s4 if _wage_match_sp_s4 else calc_wages
-                beta_pdf_bytes = generate_beta_discrepancy_report_pdf(estimate_data, calc_parts, _calc_wages_report, pdf_parts or 0, pdf_wages or 0, updated_vehicle)
+                # 「明細の合算」の欄には明細の合算をそのまま出す（ショートパーツを足した値を入れていたため、④とファイル名が
+                # 「工賃相違」と言っている行にレポートだけ「一致」と書いていた。一致の理由は判定の欄に出る。レビュー 6 周目）
+                beta_pdf_bytes = generate_beta_discrepancy_report_pdf(estimate_data, calc_parts, calc_wages, pdf_parts or 0, pdf_wages or 0, updated_vehicle,
+                                                                      verdict=_s3v)
                 st.download_button(
                     label="📄 差異レポートをダウンロード(PDF)",
                     data=beta_pdf_bytes,
@@ -10294,7 +11871,9 @@ def main():
                     ("明細行数", f"{len(items)} 行"),
                     ("合計金額", f"¥{grand_total:,}（税込）"),
                 ]
-                if reverse_match:
+                if (estimate_data or {}).get('_csv_import'):
+                    summary_items.append(("金額検証", "照合なし（CSV の金額のまま）"))
+                elif reverse_match:
                     summary_items.append(("金額検証", "✅ 逆算一致"))
             else:
                 summary_items.append(("内容", "車両情報のみ（明細なし）"))
@@ -10329,6 +11908,10 @@ def main():
                     st.button("📄 差額なし (PDF生成不要)", disabled=True, width='stretch')
             
             st.markdown("")
+            # 生成した後で直したいとき（以前は「新しい見積を作成する」＝全消去しか無かった。M12）
+            if st.button("← ステップ③に戻って直す", width='stretch', key='back_to_step3_after_gen'):
+                st.session_state['step'] = 3
+                st.rerun()
             if st.button("🔄 新しい見積を作成する", width='stretch'):
                 for key in [
                     'step', 'vehicle_data', 'estimate_data', 'neo_bytes', 'neo_filename',
@@ -10354,13 +11937,14 @@ def main():
                     '_tax_carry_pending', 'pdf_tax_override',
                     'pdf2neo_tax_inclusive', 'csv_tax_radio', 'pdf_tax_radio',
                     'classification_confirmed', 'classification_alerts',
-                    'discrepancies', 'total_diff',
+                    'discrepancies', 'total_diff', '_s3_verdict', '_amount_confirmed_sig',
                     'amount_confirmed',
                     # CSV取り込み関連
                     'csv_mode', 'csv_items', '_csv_paste_saved',
                     # PDF→NEO変換関連
                     'pdf2neo_result', 'pdf2neo_vehicle_info', '_pdf2neo_filename',
-                    '_neo_name_key',
+                    'pdf2neo_preview_meta', '_items_editor_base', 'adj_rows_confirmed',
+                    '_neo_name_key', '_neo_name_base',
                     # その他の残留データ
                     'use_fax_filter', 'use_rasterize', 'use_enhance', 'selected_model',
                     'short_parts_wage',
@@ -10389,3 +11973,17 @@ def main():
 if __name__ == '__main__':
     main()
     _consume_sidebar_rerun()   # サイドバーで頼まれた描き直し（本文の uploader を描き終えてから）
+
+# 読み込んだときのコードの指紋（app.sync_app_modules が「メモリのコードがディスクと同じか」を見る。読み込みの時点で
+# 控えないと、あとから初めて import したモジュールが「古い」と見なされ、偽の版ずれで変換を断っていた。バグハント 3 回目 N2）。
+# ファイルの最後に置く: 読み直しが途中で例外になったときは古い指紋のまま残り、版ずれとして断れる（先頭に置くと
+# 途中までしか新しくないモジュールを「揃った」と見ていた。レビュー 2026-09-15）
+try:
+    import hashlib as _stamp_hashlib
+    with open(__file__, 'rb') as _stamp_f:
+        _stamp_now = _stamp_hashlib.sha256(_stamp_f.read()).hexdigest()
+    if _stamp_now == globals().get('_stamp_digest_at_start'):
+        __app_src_digest__ = _stamp_now
+    del _stamp_hashlib, _stamp_f, _stamp_now
+except Exception:  # noqa: BLE001
+    pass

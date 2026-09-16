@@ -15,6 +15,16 @@ merge して作る（アプリが reading.json を組み立てない = 同じコ
 """
 from __future__ import annotations
 
+# 読み込みを始めたときのコードの指紋（ファイルの最後で読み直し、同じ中身のときだけ __app_src_digest__ に控える。読み込みの途中で
+# push されたら控えず、古い扱いにして読み直させる。レビュー 3 周目）
+try:
+    import hashlib as _stamp_hashlib0
+    with open(__file__, 'rb') as _stamp_f0:
+        _stamp_digest_at_start = _stamp_hashlib0.sha256(_stamp_f0.read()).hexdigest()
+    del _stamp_hashlib0, _stamp_f0
+except Exception:  # noqa: BLE001
+    _stamp_digest_at_start = None
+
 import copy
 import dataclasses
 import json
@@ -120,16 +130,41 @@ class _Usage:
                 'cache_read_tokens': self.cache_read, 'cache_write_tokens': self.cache_write}
 
 
-def _ask_json(reader, system: str, blocks: list, usage: _Usage, what: str) -> dict:
-    """JSON を返させる。壊れた JSON は 1 回だけ言い直させる"""
-    r = reader.ask(system, blocks)
-    usage.add(r)
+def _ask_once(reader, system: str, blocks: list, usage: _Usage):
+    """1 回尋ねる。使えない返事（途中で切れた等）でも、課金された呼び出しは数えてから投げ直す（P15）"""
     try:
+        r = reader.ask(system, blocks)
+    except llm_mod.LLMReplyError as e:
+        if getattr(e, 'reply', None) is not None:
+            usage.add(e.reply)
+        raise
+    usage.add(r)
+    return r
+
+
+def _ask_json(reader, system: str, blocks: list, usage: _Usage, what: str) -> dict:
+    """JSON を返させる。壊れた JSON・途中で切れた返事は 1 回だけ言い直させる。断られた（refusal・安全性で止まった）返事は
+    言い直しても同じなので、そのまま上げる（header が断られても 2 回呼んでいた。レビュー 2 周目）"""
+    try:
+        r = _ask_once(reader, system, blocks, usage)
         return llm_mod.parse_json_reply(r.text)
-    except llm_mod.LLMError as e:
-        r2 = reader.ask(system, blocks + [{'type': 'text', 'text': f'前回の返事は JSON として読めませんでした（{e}）。{what}を JSON だけで返してください。'}])
-        usage.add(r2)
+    except llm_mod.LLMReplyError as e:
+        if not getattr(e, 'retryable', True):
+            raise
+        r2 = _ask_once(reader, system, blocks + [{'type': 'text', 'text': f'前回の返事は JSON として読めませんでした（{e}）。{what}を JSON だけで返してください。'}], usage)
         return llm_mod.parse_json_reply(r2.text)
+
+
+def _ask_page_json(reader, system: str, blocks: list, usage: _Usage, what: str):
+    """ページの写しを JSON で返させる。使えない返事なら (None, 理由, やり直せるか) を返し、そのページの読み直し（上限あり）に回す。
+    以前は 1 ページの返事が max_tokens で切れたり 2 回続けて JSON でなかったりすると、読み直しの上限を使わずに
+    読み取り全体が止まっていた（バグハント 3 回目 P15）。1 回の呼び出しを読み直しの 1 回と数える（内側で言い直させると
+    1 ページ最大 8 回・出力 128k トークンを課金していた。レビュー）"""
+    try:
+        r = _ask_once(reader, system, blocks, usage)
+        return llm_mod.parse_json_reply(r.text), None, True
+    except llm_mod.LLMReplyError as e:
+        return None, f'返事が使えなかった（{str(e)[:120]}）。{what} を JSON だけで、省略せずに返す', bool(getattr(e, 'retryable', True))
 
 
 EMPTY_BLOCKS = [{'title': '', 'rows': []}]
@@ -203,6 +238,21 @@ def _normalise_page(page: dict, page_no: int) -> dict:
         elif b.get('rows') and not all(isinstance(r, (str, dict)) for r in b['rows']):  # 行は "code|name|method|…" の文字列か dict 行（reading_schema.md）
             bad.append('blocks[].rows の各要素は "code|name|method|parts_no|index|qty|price|wage|flags|comment" の文字列（または {"name": …} のオブジェクト）。配列や数値で書かない')
             b['rows'] = [r for r in b['rows'] if isinstance(r, (str, dict))]
+    for b in p['blocks']:   # ブロックの小計（blocks[].subtotal）も数値に（Q14）
+        if isinstance(b.get('subtotal'), dict):
+            _bs = {}
+            for kk, vv in b['subtotal'].items():
+                if vv in (None, '') or _is_blank_print(vv):
+                    continue
+                n_ = _as_int(str(vv).replace('¥', '').replace('￥', '').replace(' ', '')) if not isinstance(vv, (int, float)) else _as_int(vv)
+                if n_ is None:
+                    bad.append(f'blocks[].subtotal.{kk} は数値')
+                    continue
+                _bs[str(kk)] = n_
+            b['subtotal'] = _bs
+        elif b.get('subtotal') not in (None, '', {}):
+            bad.append('blocks[].subtotal は {"parts": …} のオブジェクト')
+            b.pop('subtotal', None)
     p['blocks'] = p['blocks'] or [{'title': '', 'rows': []}]   # 毎回作る（module 定数のリストを共有しない。バグハント G10）
     for k, shape in (('subtotal', '{"parts": …, "wage": …} のオブジェクト'), ('marks', '{"$": n, "#": n} のオブジェクト')):
         v = p.get(k)
@@ -235,6 +285,8 @@ def _normalise_page(page: dict, page_no: int) -> dict:
     for k in ('subtotal', 'marks'):
         fixed = {}
         for kk, vv in (p.get(k) or {}).items():
+            if k == 'marks':
+                kk = unicodedata.normalize('NFKC', str(kk)).strip()   # 全角の ＄ ＃ ＊ ＠ を半角に（vendor の flags と同じ。Q7）
             if vv in (None, '') or (k == 'subtotal' and _is_blank_print(vv)):   # 小計の '-'・'－' は「印字なし」（vendor の _num と同じ）
                 continue
             if k == 'subtotal' and isinstance(vv, str):
@@ -243,15 +295,17 @@ def _normalise_page(page: dict, page_no: int) -> dict:
             if n_ is None:
                 bad.append(f'{k}.{kk} は数値（文字列や配列で書かない）')
                 continue
-            fixed[str(kk)] = n_
+            fixed[str(kk)] = fixed.get(str(kk), 0) + n_ if k == 'marks' else n_
         p[k] = fixed
     if bad:
         raise PageShapeError('page_' + str(page_no) + '.json の形が違う: ' + ' / '.join(bad))
     return p
 
 
-def _apply_hint(header: dict, key: str, hint: Optional[dict]) -> None:
-    """車検証・サイドバーで分かっている値を、見積書に印字が無い項目にだけ補う（印字があればそちらを残す）"""
+def _apply_hint(header: dict, key: str, hint: Optional[dict], override: bool = False) -> None:
+    """車検証・サイドバーで分かっている値を、見積書に印字が無い項目にだけ補う（印字があればそちらを残す）。
+    override=True（サイドバーの事故・保険欄 = 利用者が画面で確かめた値）は印字より優先する（立会工場「写真鑑定」などを読み手の値で
+    潰さない。Q13）"""
     if not hint:
         return
     v = dict(header.get(key) or {})
@@ -266,7 +320,7 @@ def _apply_hint(header: dict, key: str, hint: Optional[dict]) -> None:
             cur = ''
         if key == 'customer' and k in ('prefecture', 'municipality', 'address_other') and printed_addr:
             continue   # 見積書に住所の印字がある: 車検証の構造化住所（都道府県/市区郡/以降）で上書きしない（印字が正。バグハント I2）
-        if val not in (None, '') and not cur:
+        if val not in (None, '') and (override or not cur):
             v[k] = val
     if v:
         header[key] = v
@@ -278,6 +332,101 @@ HEADER_LISTS = ((('expenses',), 'object'), (('adas',), 'object'), (('paint', 'li
 # 生成器が .get() で読むので、文字列や配列で来たら読み直し（Codex 26）
 HEADER_OBJECTS = tuple(('paint', k) for k in ('base', 'booth', 'bumper_front', 'bumper_rear', 'wax', 'sealing', 'door_sash', 'stripe',
                                                'low_cover', 'two_coat_solid', 'two_tone', 'frame'))
+
+
+def _strip_weekday(v):
+    """日付の後ろの曜日（'2026年09月01日(火)'・'2026/9/1（火）'）を落とす"""
+    return re.sub(r'\s*[（(][日月火水木金土祝][）)]\s*$', '', str(v)) if isinstance(v, str) else v
+
+
+def _normalise_values(out: dict, notes: Optional[list]) -> None:
+    """読み手が印字どおりに写した値を、生成器（vendor）が期待する形に揃える（2026-09-15 バグハント 3 回目 Q2/Q3/Q4/Q10）。
+    揃えられない値は落とし（車検証・サイドバーの値で補われる）、注意に出す。形そのものが違う値（dict・配列）は形の FAIL で読み直し"""
+    def note(msg):
+        if notes is not None and msg not in notes:
+            notes.append(msg)
+    bad = []
+    for sec in ('customer', 'insurance', 'vehicle'):
+        d = out.get(sec)
+        if not isinstance(d, dict):
+            continue
+        for k in list(d):
+            v = d[k]
+            if isinstance(v, (dict, list, tuple, set)):
+                bad.append(f'{sec}.{k} は文字列か数値（オブジェクトや配列で書かない）')
+                continue
+            if isinstance(v, str):
+                d[k] = _dh._clean(v)   # 改行・制御文字は空白に（AnSvMail.ini の行が増えない）・長さの上限
+    if bad:
+        raise PageShapeError('header.json の形が違う: ' + ' / '.join(bad))
+    cu = out.get('customer') if isinstance(out.get('customer'), dict) else None
+    if cu is not None:
+        rn = cu.get('reg_no')
+        if rn not in (None, ''):   # 登録番号は「地名 分類 かな 一連」（一連はハイフン・「・」を外す。生成器は区切り付きを受けず 4 欄が空になっていた。Q2）
+            parts = _dh._split_reg(str(rn))
+            if all(parts):
+                cu['reg_no'] = ' '.join(parts)
+            else:
+                cu.pop('reg_no', None)
+                note(f'見積書の登録番号「{str(rn)[:20]}」を地名・分類番号・かな・一連番号に分けられないので、車検証の値（あれば）を使う')
+        if cu.get('kilometer') not in (None, ''):
+            km = _dh.parse_km(cu['kilometer'])
+            if km.strip('0'):
+                cu['kilometer'] = km.lstrip('0')
+            else:
+                cu.pop('kilometer', None)   # 0・読めない走行距離は車検証の値（あれば）で補う（以前は 0 を空とみなしていた）
+        if cu.get('term_date') not in (None, ''):
+            d8 = _dh.date8_full(_strip_weekday(cu['term_date']))
+            if d8:
+                cu['term_date'] = d8
+            else:
+                cu.pop('term_date', None)
+        if cu.get('postal') not in (None, ''):
+            pc = _dh.postal_text(cu['postal'])
+            if pc:
+                cu['postal'] = pc
+            else:
+                cu.pop('postal', None)
+    ins = out.get('insurance') if isinstance(out.get('insurance'), dict) else None
+    if ins is not None:   # 日付は 8 桁（'2026/09/01' のまま渡すと XML の事故日が '2026//0/9/' になっていた。Q3）
+        for k, yy in (('accident_date', True), ('presence_date', False), ('garage_in', False), ('garage_out', False)):
+            if ins.get(k) not in (None, ''):
+                _raw_d = ins[k]
+                d8 = _dh.date8_full(_strip_weekday(_raw_d), allow_yy=yy)
+                if d8:
+                    ins[k] = d8
+                else:
+                    ins.pop(k, None)
+                    note(f'insurance.{k}「{str(_raw_d)[:16]}」を日付として読めないので使わない')
+        if ins.get('repair_days') not in (None, ''):
+            # 日数だけ受ける（'7'・'7日'・'約7日間'）。'2週間'・'1ヶ月' を 2・1 日にしない（レビュー）
+            _m = re.fullmatch(r'\s*(?:約)?\s*(\d+)\s*(?:日|日間)?\s*', unicodedata.normalize('NFKC', str(ins['repair_days'])))
+            rd_ = int(_m.group(1)) if _m else None
+            if rd_ is None or rd_ < 0:
+                note(f'insurance.repair_days「{str(ins.get("repair_days"))[:16]}」を日数として読めないので使わない')
+                ins.pop('repair_days', None)
+            else:
+                ins['repair_days'] = rd_
+    pt = out.get('paint') if isinstance(out.get('paint'), dict) else None
+    if pt is not None:   # 塗装の金額・割合は数値（'55%'・'61,245円' のまま渡すと生成器が float() で落ちていた。Q4）
+        for k in ('total', 'material'):
+            if pt.get(k) not in (None, ''):
+                n_ = _as_int(str(pt[k]).replace('¥', '').replace('￥', '').replace(' ', '')) if not isinstance(pt[k], bool) else None
+                if n_ is None:
+                    raise PageShapeError(f'header.json の形が違う: paint.{k} は数値（「{str(pt[k])[:16]}」は読めない）')
+                pt[k] = n_
+        if pt.get('material_rate') not in (None, ''):
+            m_ = re.search(r'\d+(?:\.\d+)?', unicodedata.normalize('NFKC', str(pt['material_rate'])))
+            if m_:
+                pt['material_rate'] = float(m_.group(0))
+            else:
+                pt.pop('material_rate', None)
+    tt = out.get('totals') if isinstance(out.get('totals'), dict) else None
+    if tt is not None:   # 工場書式の円未満計上などの許容（neo_total / tolerance）は人が決めるもの。読み手からは受けない（O10）
+        for k in ('neo_total', 'tolerance', 'tolerance_reason'):
+            if k in tt:
+                tt.pop(k, None)
+                note(f'読み手が書いた totals.{k} は使わない（合計の許容は人が reading に書くもの）')
 
 
 def _normalise_header(h: dict, vehicle_hint: Optional[dict], insurance_hint: Optional[dict],
@@ -364,8 +513,12 @@ def _normalise_header(h: dict, vehicle_hint: Optional[dict], insurance_hint: Opt
     for k in list(out):
         if out[k] in (None, '', [], {}):
             out.pop(k)
+    _normalise_values(out, notes)
+    for k in list(out):
+        if out[k] in (None, '', [], {}):
+            out.pop(k)
     _apply_hint(out, 'vehicle', vehicle_hint)
-    _apply_hint(out, 'insurance', insurance_hint)
+    _apply_hint(out, 'insurance', insurance_hint, override=True)   # サイドバーの値（利用者が確かめた値）を優先
     _apply_hint(out, 'customer', customer_hint)   # 車検証（使用者・登録番号・住所・有効期限・走行距離）。印字が無い項目にだけ
     return out
 
@@ -402,6 +555,7 @@ def _pages_for_merge(header: dict, pages: list) -> tuple:
     検算・読み直し・画面表示は PDF の実ページ番号のまま行い、ここでは書き出す形だけを変える"""
     hdr = copy.deepcopy(header)
     out = []
+    pending_lists: dict = {}   # 明細の無いページの塗装行・費用（最初の明細ページより前にあったもの）
     pending_notes: list = []   # 明細の無いページの注記行（装備注記）: 直前の明細ページの末尾に繋ぐ（無ければ次の明細ページの先頭）
     for p in pages:
         if _has_rows(p):
@@ -417,12 +571,22 @@ def _pages_for_merge(header: dict, pages: list) -> tuple:
                 out[-1]['blocks'][-1].setdefault('rows', []).extend(notes_)
             else:
                 pending_notes.extend(notes_)
-        if p.get('paint_lines'):
+        for _lk in ('paint_lines', 'expenses'):   # 直前の明細ページの後ろへ（無ければ次の明細ページの前へ）。header に移すと紙と逆順になっていた（Q6）
+            if p.get(_lk):
+                if out:
+                    out[-1].setdefault(_lk, []).extend(copy.deepcopy(p[_lk]))
+                else:
+                    pending_lists.setdefault(_lk, []).extend(copy.deepcopy(p[_lk]))
+    if pending_lists and out:
+        for _lk, _vals in pending_lists.items():
+            out[0][_lk] = _vals + list(out[0].get(_lk) or [])
+    elif pending_lists:   # 明細のページが 1 つも無い（塗装・費用だけの見積）: 従来どおり header へ
+        if pending_lists.get('paint_lines'):
             paint = hdr.get('paint') if isinstance(hdr.get('paint'), dict) else {}
-            paint.setdefault('lines', []).extend(copy.deepcopy(p['paint_lines']))
+            paint.setdefault('lines', []).extend(pending_lists['paint_lines'])
             hdr['paint'] = paint
-        if p.get('expenses'):
-            hdr.setdefault('expenses', []).extend(copy.deepcopy(p['expenses']))
+        if pending_lists.get('expenses'):
+            hdr.setdefault('expenses', []).extend(pending_lists['expenses'])
     for i, p in enumerate(out, 1):
         p['page'] = i
     return hdr, out
@@ -463,6 +627,8 @@ def _index_policy_guard(header: dict, pages: list) -> Optional[str]:
     取付・修正 など）が 1 つでもあれば読み手の判断を残す。区分が全行空欄（作業区分の列が無い書式 F など）は「語彙が違う」証拠ではないので外す"""
     if str(header.get('index_policy') or '').strip().lower() != 'manual':
         return None
+    if str(header.get('format') or '').strip().upper()[:1] == 'C':   # 書式 C（日産系 FAX）は manual が正（format_catalog）。「部品」行が無くても外さない（Q12）
+        return None
     methods = _row_methods(pages)
     if not methods <= _COGNI_METHODS:
         return None
@@ -487,9 +653,18 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
     res = ReadResult(False, case_dir)
     t0 = time.time()
     try:
+        pdf_bytes = llm_mod.pdf_prepare(pdf_bytes)   # 権限パスワードだけの暗号化 PDF は暗号を外す（P6）
         n = llm_mod.pdf_page_count(pdf_bytes)
+    except llm_mod.LLMError as e:
+        res.error = str(e)
+        return res
     except Exception as e:  # noqa: BLE001
-        res.error = f'PDF を開けない: {e}'
+        res.error = f'PDF を開けない: {type(e).__name__}'
+        return res
+    _lim = int(getattr(reader, 'max_pdf_bytes', 0) or 0)
+    if _lim and len(pdf_bytes) > _lim:   # 上限を超える PDF は必ず失敗するのに、全ページ分をメモリに展開して送っていた（P8）
+        res.error = (f'PDF が大きすぎます（{len(pdf_bytes) / 1048576:.1f}MB。この読み手の上限は {_lim / 1048576:.0f}MB）。'
+                     'スキャンの解像度を下げるか、見積書のページだけの PDF にして入れてください')
         return res
     res.n_pages = n
     if n <= 0:
@@ -535,25 +710,30 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
         res.header = header
         # 2) ページごとに写して検算
         pages: list = []
+        _refused = False   # 読み直せない理由（断られた等）で不合格のページがある
         page_pdfs = [llm_mod.pdf_single_page(pdf_bytes, i) for i in range(n)]
         for i in range(n):
             pg = i + 1
             tr = PageTrace(page=pg)
             blocks = [llm_mod.document_block(page_pdfs[i]), {'type': 'text', 'text': prompts.page_task(pg, n, header)}]
             _progress(progress, f'{pg}/{n} ページ目を写しています')
-            raw = _ask_json(reader, system, blocks, usage, f'page_{pg}.json')
-            page, shape_err = normalise_or_fail(raw, pg)
+            raw, reply_err, can_retry = _ask_page_json(reader, system, blocks, usage, f'page_{pg}.json')
+            page, shape_err = normalise_or_fail(raw, pg) if raw is not None else (None, reply_err)
+            raw = raw if raw is not None else {}
             tr.attempts = 1
             v = run('validate', header=header, page=page) if page else {'ok': False, 'fail': [shape_err], 'warn': [], 'rows': 0}
             tr.first_try_ok = bool(v.get('ok'))
-            while not v.get('ok') and tr.attempts <= max_retries:
+            while not v.get('ok') and tr.attempts <= max_retries and can_retry:
                 _progress(progress, f'{pg}/{n} ページ目の検算に落ちたので読み直しています（{tr.attempts} 回目）: {(v.get("fail") or [""])[0][:60]}')
                 blocks = [llm_mod.document_block(page_pdfs[i]),
                           {'type': 'text', 'text': prompts.retry_task(pg, v.get('fail') or [], v.get('warn') or [], page if page else raw)}]
-                raw = _ask_json(reader, system, blocks, usage, f'page_{pg}.json')
-                page, shape_err = normalise_or_fail(raw, pg)
+                raw, reply_err, can_retry = _ask_page_json(reader, system, blocks, usage, f'page_{pg}.json')
+                page, shape_err = normalise_or_fail(raw, pg) if raw is not None else (None, reply_err)
+                raw = raw if raw is not None else {}
                 tr.attempts += 1
                 v = run('validate', header=header, page=page) if page else {'ok': False, 'fail': [shape_err], 'warn': [], 'rows': 0}
+            if not v.get('ok') and not can_retry:
+                _refused = True
             if not page:  # 上限まで形が直らなかった。空ページとして持ち、不合格の理由に残す
                 page = _normalise_page({'page': pg, 'rows_printed': _as_int(raw.get('rows_printed')) if isinstance(raw, dict) else None, 'blocks': []}, pg)
             tr.ok, tr.rows, tr.fail, tr.warn = bool(v.get('ok')), int(v.get('rows') or 0), list(v.get('fail') or []), list(v.get('warn') or [])
@@ -571,7 +751,9 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
         rd, check = m.get('reading'), (m.get('check') or {})
         res.merge_messages = list(m.get('messages') or [])
         rounds = 0
-        while rd and check.get('fail') and rounds < 2:
+        # 断られたページがあると読み取りは必ず不合格なので、合計欄の読み直し（API の呼び出し）はしない（header・全ページを
+        # もう一度呼び、最後も断られていた。レビュー 2 周目）
+        while rd and check.get('fail') and rounds < 2 and not _refused:
             rounds += 1
             if rounds == 1:
                 _progress(progress, '合計欄と合わないので、合計欄・費用・塗装の写しを読み直しています')
@@ -622,3 +804,17 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
         'calls': usage.calls, 'seconds': round(time.time() - t0, 1),
     }
     return res
+
+# 読み込んだときのコードの指紋（app.sync_app_modules が「メモリのコードがディスクと同じか」を見る。読み込みの時点で
+# 控えないと、あとから初めて import したモジュールが「古い」と見なされ、偽の版ずれで変換を断っていた。バグハント 3 回目 N2）。
+# ファイルの最後に置く: 読み直しが途中で例外になったときは古い指紋のまま残り、版ずれとして断れる（先頭に置くと
+# 途中までしか新しくないモジュールを「揃った」と見ていた。レビュー 2026-09-15）
+try:
+    import hashlib as _stamp_hashlib
+    with open(__file__, 'rb') as _stamp_f:
+        _stamp_now = _stamp_hashlib.sha256(_stamp_f.read()).hexdigest()
+    if _stamp_now == globals().get('_stamp_digest_at_start'):
+        __app_src_digest__ = _stamp_now
+    del _stamp_hashlib, _stamp_f, _stamp_now
+except Exception:  # noqa: BLE001
+    pass

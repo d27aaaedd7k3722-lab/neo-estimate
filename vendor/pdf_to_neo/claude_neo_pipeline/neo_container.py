@@ -385,11 +385,19 @@ def safe_str(val, default=''):
     return str(val)
 
 
+def _xml_text(value) -> str:
+    """XML の要素の中身として安全な文字列（& < > をエスケープ。改行・制御文字は空白に）"""
+    s = '' if value is None else str(value)
+    s = re.sub(r'[\x00-\x1f\x7f]', ' ', s)
+    return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+
 def replace_xml_tag(text, tag_name, value):
-    """XMLタグの中身を現在値に関係なく置換"""
+    """XMLタグの中身を現在値に関係なく置換。値はエスケープし、置換は関数で行う（値の \\1・\\x を正規表現の後方参照として
+    解釈させない。受付番号 '\\12345' が 'S45' に化け、'C:\\x' で落ちていた。2026-09-15 アプリのバグハント）"""
     pattern = rf'<{re.escape(tag_name)}>[^<]*</{re.escape(tag_name)}>'
-    replacement = f'<{tag_name}>{value}</{tag_name}>'
-    result = re.sub(pattern, replacement, text)
+    replacement = f'<{tag_name}>{_xml_text(value)}</{tag_name}>'
+    result = re.sub(pattern, lambda _m: replacement, text)
     # 空タグ形式も対応
     empty_pattern = rf'<{re.escape(tag_name)}/>'
     result = result.replace(empty_pattern, replacement)
@@ -397,10 +405,11 @@ def replace_xml_tag(text, tag_name, value):
 
 
 def replace_ini_value(text, key, value):
-    """INIキー値を確実に更新"""
-    pattern = rf'^({re.escape(key)}\s*=).*$'
-    replacement = rf'\g<1>{value}'
-    return re.sub(pattern, replacement, text, flags=re.MULTILINE)
+    """INIキー値を確実に更新。値の改行は空白にし（INI に行が増えない）、置換は関数で行う（値の \\1 を後方参照にしない）。
+    行末の CR は残す（'.*$' だと CRLF の行の CR まで食べていた）"""
+    pattern = rf'^({re.escape(key)}\s*=)[^\r\n]*'
+    v = re.sub(r'[\r\n]+', ' ', '' if value is None else str(value))
+    return re.sub(pattern, lambda _m: _m.group(1) + v, text, flags=re.MULTILINE)
 
 
 

@@ -17,7 +17,8 @@ import skill_env  # noqa: E402
 
 skill_env.apply()
 import draft_estimate as _de  # noqa: E402,F401  claude_neo_pipeline を sys.path に載せる
-from estimate_to_neo import REG_NO_RE, split_address_text  # noqa: E402
+from estimate_to_neo import REG_NO_RE, split_address_text, split_reg_no  # noqa: E402
+import neo_container as nc  # noqa: E402
 
 
 def test_reg_no_division_letters_and_one_digit():
@@ -25,11 +26,42 @@ def test_reg_no_division_letters_and_one_digit():
                        ('横浜 3ZX あ 1', ('横浜', '3ZX', 'あ', '1')),
                        ('福岡 5 な 12', ('福岡', '5', 'な', '12')),          # 旧式の 1 桁
                        ('品川 346 の 1224', ('品川', '346', 'の', '1224')),
-                       ('練馬 500 さ 12-34', None),                            # 一連番号のハイフン入りは従来どおり不可
                        ('福岡 300 あ', None)):
         m = REG_NO_RE.match(text)
         got = m.groups() if m else None
         assert got == want, (text, got)
+
+
+def test_split_reg_no_plate_notation():
+    """一連番号はプレートの表記（10-31・・・12・・123）でも受けて数字だけに（2026-09-15: ハイフン区切りで 4 欄が空になっていた）"""
+    for text, want in (('北九州 539 な 10-31', ('北九州', '539', 'な', '1031')),
+                       ('北九州 539 な ・・12', ('北九州', '539', 'な', '12')),
+                       ('品川 300 あ ・123', ('品川', '300', 'あ', '123')),
+                       ('練馬 500 さ 12-34', ('練馬', '500', 'さ', '1234')),
+                       ('北九州 30A な 1', ('北九州', '30A', 'な', '1')),
+                       ('福岡 300 あ 12345', None),
+                       ('福岡 300 あ', None)):
+        assert split_reg_no(text) == want, (text, split_reg_no(text))
+
+
+def test_xml_and_ini_values_are_literal():
+    """値の \\1・\\x・& < > を正規表現の後方参照や XML の記号として解釈しない。INI の値の改行で行を増やさない"""
+    t = '<A>old</A><B/>'
+    assert nc.replace_xml_tag(t, 'A', '\\12345') == '<A>\\12345</A><B/>'
+    assert nc.replace_xml_tag(t, 'A', 'C:\\x & <y>') == '<A>C:\\x &amp; &lt;y&gt;</A><B/>'
+    assert nc.replace_xml_tag(t, 'B', 'z') == '<A>old</A><B>z</B>'
+    ini = 'Key=old\r\nNext=1'
+    assert nc.replace_ini_value(ini, 'Key', '\\1a\r\nX=2') == 'Key=\\1a X=2\r\nNext=1'
+
+
+def test_xml_owner_user_fit_like_db():
+    """XML の所有者名・使用者名も DB と同じ 20 バイトで切る（XML だけ 50 バイトのまま出ていた。2026-09-15 アプリのレビュー）"""
+    from estimate_to_neo import NeoBuilder
+    xml = '<OwnerName></OwnerName><UserName></UserName><CustomerName1></CustomerName1>'.encode('cp932')
+    out = NeoBuilder.build_xml(xml, {}, {'name': 'ア' * 25, 'owner_name': 'イ' * 25, 'user_name': 'ウ' * 25}, {}, 0, '20260915').decode('cp932')
+    assert '<OwnerName>' + 'イ' * 10 + '</OwnerName>' in out, out
+    assert '<UserName>' + 'ウ' * 10 + '</UserName>' in out, out
+    assert '<CustomerName1>' + 'ア' * 15 + '</CustomerName1>' in out, out
 
 
 def test_split_address_text_known_shape():

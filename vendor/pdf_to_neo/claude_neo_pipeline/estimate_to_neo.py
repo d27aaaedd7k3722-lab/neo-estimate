@@ -41,7 +41,26 @@ DISPOSAL_NAME = {0: '取替', 1: '脱着', 2: '修理', 3: '脱着修理', 4: '�
 
 # 登録番号「地名 分類番号 かな 一連番号」の分割。分類番号は 2〜3 桁のほか、英字入り（30A・3ZX。2018 年〜の希望番号）と
 # 旧式の 1 桁（'5'）も受ける（実機 NEO の CarRegNoDivision は半角数字 + 英字。アプリ側 doc_hints._REG_SPLIT と同じ。2026-09-15）
-REG_NO_RE = re.compile(r'^\s*(\S+?)\s*(\d[0-9A-Z]{0,2})\s*([ぁ-んア-ン])\s*[\-‐]?\s*(\d{1,4})\s*$')
+# 一連番号はプレートの表記（「10-31」「・・12」「・123」）でも受け、split_reg_no が数字だけにする（2026-09-15 アプリのバグハント:
+# ハイフン区切りの見積だと登録番号 4 欄が全部空のまま合格していた）
+REG_NO_RE = re.compile(r'^\s*(\S+?)\s*(\d[0-9A-Z]{0,2})\s*([ぁ-んア-ン])\s*[\-‐]?\s*([・･.．\s]*\d[\d\s\-‐－]*)\s*$')
+
+
+def split_reg_no(text) -> Optional[tuple]:
+    """登録番号「地名 分類番号 かな 一連番号」を (地名, 分類番号, かな, 一連番号) に分ける。一連番号は数字だけ（1〜4 桁）。分けられなければ None"""
+    m = REG_NO_RE.match(unicodedata.normalize('NFKC', str(text or '')))
+    if not m:
+        return None
+    ser = re.sub(r'\D', '', m.group(4))
+    if not 1 <= len(ser) <= 4:
+        return None
+    return (m.group(1), m.group(2), m.group(3), ser)
+
+
+def _date8_str(v) -> str:
+    """YYYYMMDD の 8 桁（区切り付きでも数字が 8 桁なら受ける）。それ以外・番兵 '00000000' は ''"""
+    d = re.sub(r'\D', '', str(v or ''))
+    return d if len(d) == 8 and d != '00000000' else ''
 
 
 def split_address_text(addr: str) -> tuple:
@@ -3017,8 +3036,7 @@ class NeoBuilder:
             cur.execute('UPDATE CarSearchEVA SET EVariationName=?, EVariationOrder=? WHERE RecordNo=?', (opts.get(code, ''), f'{i + 1:02d}', i + 1))
         # Customer
         reg = cust.get('reg_no', '')
-        m = REG_NO_RE.match(unicodedata.normalize('NFKC', reg))
-        dep, div, biz, ser = (m.groups() if m else ('', '', '', ''))
+        dep, div, biz, ser = split_reg_no(reg) or ('', '', '', '')
         reg_date = car.get('ps_CarRegDate', '')
         era, ey = nc.get_era_info(reg_date) if reg_date else ('令和', '')
         term = cust.get('term_date', '') or '00000000'
@@ -3060,7 +3078,7 @@ class NeoBuilder:
                        AgreedDate='00000000',AgreedEra='令和',AgreedEraYear='',RepairDays=?,TimelyPriceOutTax=-1,TimelyPriceInTax=-1,TimelyPriceTax=-1,AdjusterName=?,AdjusterPost=?,ConsultantName='',ConsultantFactory=?''',
                     (_fit(ins.get('policy_no', ''), 20), _fit(ins.get('contractor', ''), 20), _fit(ins.get('agency', ''), 20), acc, aera, aey, pre, pera, pey,
                      _int_or(ins.get('repair_days'), -1), _fit(ins.get('adjuster', ''), 20),
-                     _fit(ins.get('adjuster_post', ''), 20),   # アジャスターの支店・所属（速報報告書の「支店」。2026-09-14）
+                     _fit(ins.get('adjuster_post', ''), 40),   # アジャスターの支店・所属（速報報告書の「支店」。2026-09-14）。列は TEXT(40)（アプリの旧経路と同じ幅。2026-09-15）
                      _fit(ins.get('factory', ''), 30)))
         eera, eey = nc.get_era_info(est_date)
         cur.execute("UPDATE FileInfo SET EstimatedDate=?,EstimatedEra=?,EstimatedEraYear=?,AcceptNo=?,GarageInDate=?,GarageInEra=?,GarageInEraYear=?,"
@@ -3108,15 +3126,15 @@ class NeoBuilder:
     def build_xml(xml: bytes, car: dict, cust: dict, ins: dict, total: int, est_date: str) -> bytes:
         t = xml.decode('cp932', 'replace')
         reg = car.get('ps_CarRegDate', '')
-        m = REG_NO_RE.match(unicodedata.normalize('NFKC', cust.get('reg_no', '')))
-        dep, div, biz, ser = (m.groups() if m else ('', '', '', ''))
-        vals = {'CustomerName1': cust.get('name', ''), 'CustomerName2': '', 'AdjusterName': ins.get('adjuster', ''), 'AcceptNo': ins.get('accept_no', ''), 'TicketNo': ins.get('policy_no', ''),
-                'AccidentDate': (f"{ins['accident_date'][:4]}/{ins['accident_date'][4:6]}/{ins['accident_date'][6:8]}" if ins.get('accident_date') else ''),
+        dep, div, biz, ser = split_reg_no(cust.get('reg_no', '')) or ('', '', '', '')
+        _acc8 = _date8_str(ins.get('accident_date', ''))   # 区切り付き・和暦で来ても 8 桁から作る（'2026/09/01' が '2026//0/9/' になっていた）
+        vals = {'CustomerName1': _fit(cust.get('name', ''), 30), 'CustomerName2': '', 'AdjusterName': _fit(ins.get('adjuster', ''), 20), 'AcceptNo': _fit(ins.get('accept_no', ''), 37), 'TicketNo': _fit(ins.get('policy_no', ''), 20),   # DB と同じ欄幅
+                'AccidentDate': (f'{_acc8[:4]}/{_acc8[4:6]}/{_acc8[6:8]}' if _acc8 else ''),
                 'CarNo': f'{dep}{div}{biz}{ser}', 'CarName': car.get('CarNameByUser', ''), 'CarMouldNo': car.get('ps_CarMouldNo', ''), 'CarKindNo': car.get('ps_CarKindNo', ''),
-                'ColorCode': car.get('ColorCode', ''), 'OwnerName': cust.get('owner_name', cust.get('name', '')), 'UserName': cust.get('user_name', '同上'),
+                'ColorCode': car.get('ColorCode', ''), 'OwnerName': _fit(cust.get('owner_name', cust.get('name', '')), 20), 'UserName': _fit(cust.get('user_name', '同上'), 20),   # DB と同じ欄幅（XML だけ切っていなかった。2026-09-15 アプリのレビュー）
                 'CreatedDate': f'{est_date[:4]}/{est_date[4:6]}/{est_date[6:8]}', 'GarageInDate': '', 'GarageOutDate': '', 'CarSerialNo': car.get('ps_CarSerialNo', ''),
                 'CarTermEraDate': '', 'Kilometrage': str(cust.get('kilometer') or ''), 'CarRegistedDate': (f'{reg[:4]}/{reg[4:6]}' if reg else ''),
-                'ii_CustomerName': ins.get('contractor', ''), 'ii_PresenceDate': '', 'ii_AgreedDate': '', 'ii_RepairDays': '', 'ii_TimePrice': '',
+                'ii_CustomerName': _fit(ins.get('contractor', ''), 20), 'ii_PresenceDate': '', 'ii_AgreedDate': '', 'ii_RepairDays': '', 'ii_TimePrice': '',
                 'MakerName': car.get('MakerName', ''), 'CarNameName': car.get('CarNameName', ''), 'ModelName': car.get('ModelName', ''), 'CarYearName': '', 'BodyName': '', 'FVariationNameByUser': car.get('FVANameByUser', ''), 'GradeName': '',
                 'Total': str(total), 'CarNoArea': dep, 'CarNoClass': div, 'CarNoKana': biz, 'CarNoSeries': ser}
         if reg:
@@ -3495,12 +3513,13 @@ class NeoBuilder:
         # AnSvMail.ini（ネオメール連携）: テンプレートの顧客・証券情報を必ず置換（実 NEO 保存版と同形）
         if 'AnSvMail.ini' in files:
             cust = estimate.get('customer', {}); ins = insurance or {}
-            m = REG_NO_RE.match(unicodedata.normalize('NFKC', cust.get('reg_no', '')))
-            dep, div, biz, ser = (m.groups() if m else ('', '', '', ''))
-            mail = '\r\n'.join(['[General]', 'Signature=NEOMAIL2', '[Audaneo2]', f"CustomerName={ins.get('contractor', '')}",
+            dep, div, biz, ser = split_reg_no(cust.get('reg_no', '')) or ('', '', '', '')
+            def _ini1(v):   # INI の 1 行に収める（改行で行が増えない）
+                return re.sub(r'[\r\n]+', ' ', str(v or ''))
+            mail = '\r\n'.join(['[General]', 'Signature=NEOMAIL2', '[Audaneo2]', f"CustomerName={_ini1(_fit(ins.get('contractor', ''), 20))}",
                                 f'CarNoDepartment={dep}', f'CarNoDivision={div}', f'CarNoBusiness={biz}', f'CarNoSerial={ser}',
-                                f"TicketNo={ins.get('policy_no', '')}", f"AcceptNo={ins.get('accept_no', '')}", f"AccidentDate={ins.get('accident_date', '') or '00000000'}",
-                                f"AgreedName={_fit(ins.get('factory', ''), 30)}", f"CarName={car['CarNameByUser']}", ''])
+                                f"TicketNo={_ini1(_fit(ins.get('policy_no', ''), 20))}", f"AcceptNo={_ini1(_fit(ins.get('accept_no', ''), 37))}", f"AccidentDate={_date8_str(ins.get('accident_date', '')) or '00000000'}",
+                                f"AgreedName={_ini1(_fit(ins.get('factory', ''), 30))}", f"CarName={_ini1(car['CarNameByUser'])}", ''])
             files['AnSvMail.ini'] = mail.encode('cp932w', 'replace')
         # AnFlInfo: 車種データ版数を ADDATA の AnVer.DB に合わせる（コグニ保存時と同形）
         if 'AnFlInfo' in files:
@@ -3517,8 +3536,7 @@ class NeoBuilder:
         neo = nc.repack_neo(tpl, files, mgmt, entries)
         # 先頭 424B の管理領域（既存見積一覧のサマリ）を今回の見積の値で書き直す
         cust = estimate.get('customer', {}); ins = insurance or {}
-        m = REG_NO_RE.match(unicodedata.normalize('NFKC', cust.get('reg_no', '')))
-        carno = m.groups() if m else ('', '', '', '')
+        carno = split_reg_no(cust.get('reg_no', '')) or ('', '', '', '')
         neo = nh.apply(neo, agreed=_fit(ins.get('factory', ''), 30), name1=_fit(cust.get('name', ''), 30), car_name=car['CarNameByUser'],
                        created=datetime.date(int(est_date[:4]), int(est_date[4:6]), int(est_date[6:8])),
                        totals=[totals['parts'], totals['wage'], totals['paint'], totals['expense_parts'] + totals['expense_wage'], totals['total']],

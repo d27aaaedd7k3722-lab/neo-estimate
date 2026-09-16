@@ -44,6 +44,16 @@
 """
 from __future__ import annotations
 
+# 読み込みを始めたときのコードの指紋（ファイルの最後で読み直し、同じ中身のときだけ __app_src_digest__ に控える。読み込みの途中で
+# push されたら控えず、古い扱いにして読み直させる。レビュー 3 周目）
+try:
+    import hashlib as _stamp_hashlib0
+    with open(__file__, 'rb') as _stamp_f0:
+        _stamp_digest_at_start = _stamp_hashlib0.sha256(_stamp_f0.read()).hexdigest()
+    del _stamp_hashlib0, _stamp_f0
+except Exception:  # noqa: BLE001
+    _stamp_digest_at_start = None
+
 import codecs as _codecs
 import datetime
 import struct
@@ -90,6 +100,50 @@ def _build_ibm_map():
     return m
 
 
+# cp932 に無い字の代わりの字（バグハント 3 回目 L12）。以前は '?' になっていた（「𠮷田」→「?田」、全角ダッシュ — → ?）。
+# 氏名の異体字は常用の字へ、ダッシュ・ハイフンの類は cp932 にある形へ。ここに無い字は、合成文字を分けて
+# アクセントを落とした形（é → e・ü → u）を試し、それでも無ければ '?'（呼び出し側で知らせる: unencodable_chars）
+CP932_SUBST = {
+    '\U00020BB7': '吉',   # 𠮷（つちよし）
+    '\u2014': '―',        # — EM DASH → HORIZONTAL BAR（cp932 815C）
+    '\u2013': '-', '\u2011': '-', '\u2012': '-', '\u2043': '-',   # – ‑ ‒ ⁃
+    '\u00a0': ' ', '\u2002': ' ', '\u2003': ' ', '\u2009': ' ', '\u202f': ' ',
+    '\u00a9': '(C)', '\u00ae': '(R)', '\u2122': 'TM',
+}
+
+
+def _cp932_substitute(ch: str):
+    """cp932 に無い 1 字の代わり。見つからなければ None"""
+    sub = CP932_SUBST.get(ch)
+    if sub is not None:
+        return sub
+    import unicodedata as _ud
+    dec = ''.join(c for c in _ud.normalize('NFKD', ch) if not _ud.combining(c))
+    if dec and dec != ch:
+        try:
+            dec.encode('cp932')
+            return dec
+        except UnicodeEncodeError:
+            return None
+    return None
+
+
+def unencodable_chars(s: str) -> list:
+    """cp932（代わりの字を当てたあと）でも書けない字の一覧。画面で「? になる字」を知らせるのに使う"""
+    bad = []
+    for ch in (s or ''):
+        try:
+            ch.encode('cp932')
+            continue
+        except UnicodeEncodeError:
+            pass
+        if _IBM_MAP and ch in _IBM_MAP:
+            continue
+        if _cp932_substitute(ch) is None and ch not in bad:
+            bad.append(ch)
+    return bad
+
+
 def encode_cp932w(s: str, errors: str = 'replace') -> bytes:
     global _IBM_MAP
     if _IBM_MAP is None:
@@ -97,7 +151,14 @@ def encode_cp932w(s: str, errors: str = 'replace') -> bytes:
     out = bytearray()
     for ch in (s or ''):
         b = _IBM_MAP.get(ch)
-        out += b if b else ch.encode('cp932', errors)
+        if b:
+            out += b
+            continue
+        try:
+            out += ch.encode('cp932')
+        except UnicodeEncodeError:
+            sub = _cp932_substitute(ch)
+            out += sub.encode('cp932', errors) if sub is not None else ch.encode('cp932', errors)
     return bytes(out)
 
 
@@ -222,3 +283,17 @@ if __name__ == '__main__':
                    license_id=d['license'])
         print('  往復で一致:', rt == raw[:424],
               '/ 最初の相違位置', next((i for i in range(424) if rt[i] != raw[i]), None))
+
+# 読み込んだときのコードの指紋（app.sync_app_modules が「メモリのコードがディスクと同じか」を見る。読み込みの時点で
+# 控えないと、あとから初めて import したモジュールが「古い」と見なされ、偽の版ずれで変換を断っていた。バグハント 3 回目 N2）。
+# ファイルの最後に置く: 読み直しが途中で例外になったときは古い指紋のまま残り、版ずれとして断れる（先頭に置くと
+# 途中までしか新しくないモジュールを「揃った」と見ていた。レビュー 2026-09-15）
+try:
+    import hashlib as _stamp_hashlib
+    with open(__file__, 'rb') as _stamp_f:
+        _stamp_now = _stamp_hashlib.sha256(_stamp_f.read()).hexdigest()
+    if _stamp_now == globals().get('_stamp_digest_at_start'):
+        __app_src_digest__ = _stamp_now
+    del _stamp_hashlib, _stamp_f, _stamp_now
+except Exception:  # noqa: BLE001
+    pass

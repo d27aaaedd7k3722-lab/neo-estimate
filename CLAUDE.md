@@ -34,7 +34,7 @@
 **コミット固定で取り込んで**そのまま呼ぶ（`neo_skill/`）。アプリが持つのは「見積書を Claude API に読ませ、
 ページごとに検算し、落ちたページだけ読み直す」ところだけ。**`vendor/` 配下は書き換えない**（規則は files で直して取り直す）。
 
-- 取り込んでいるコミット: `vendor/pdf_to_neo/VENDOR_COMMIT.json`（いま `3551419b6f06`。2026-09-14 に `9136473db9c6` → `f3028a9` → `1bd202b` → `d43540b` → `e8d6d28` → `33ff319` → `5747932`（ADDATA_ROOT_PARTIAL）→ これ（insurance.adjuster_post ＋ 別セッションの検算修正 710aaf3）と取り直し）
+- 取り込んでいるコミット: `vendor/pdf_to_neo/VENDOR_COMMIT.json` と `neo_skill/vendor.py` の `EXPECTED_COMMIT`（コミットの番号はここに書かない。古くなるので `VENDOR_COMMIT.json` を見る。取り直しの履歴は docs/引き継ぎ書.md の表）
 - 取り直し: `python tools/vendor_sync.py --source "<files>" --commit <ID>`／改変チェック `--check`
 - 見積書を読む LLM は Claude API（`.env` の `ANTHROPIC_API_KEY`）か Gemini API（`GEMINI_API_KEY`）。両方あれば画面で選ぶ（既定 Claude）、Gemini だけならそれで動く。判断・生成・検算は同じ
 - 合格の条件は vendor の `make_neo.py` と同じ。NEO と確認箇所シート（xlsx）は必ず組で出す

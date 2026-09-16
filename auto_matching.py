@@ -8,6 +8,16 @@
 修正: 部品名フィールド[13:43], 型式コード抽出, *15/*17.DB グレードバリアント価格対応
 """
 
+# 読み込みを始めたときのコードの指紋（ファイルの最後で読み直し、同じ中身のときだけ __app_src_digest__ に控える。読み込みの途中で
+# push されたら控えず、古い扱いにして読み直させる。レビュー 3 周目）
+try:
+    import hashlib as _stamp_hashlib0
+    with open(__file__, 'rb') as _stamp_f0:
+        _stamp_digest_at_start = _stamp_hashlib0.sha256(_stamp_f0.read()).hexdigest()
+    del _stamp_hashlib0, _stamp_f0
+except Exception:  # noqa: BLE001
+    _stamp_digest_at_start = None
+
 import sys
 # Streamlit Cloud は標準出力をログ収集用の独自オブジェクトに差し替えるため、
 # reconfigure() が無い。無防備に呼ぶと import 時に AttributeError で落ち、
@@ -1289,39 +1299,69 @@ def main():
 # ============================================================
 from functools import lru_cache as _lru_cache
 
-# モジュールレベル singleton（addata_root 単位）
-_engine_singleton = None
-_engine_singleton_root = None
-# vehicle_code をキーとする dict memo（車検証→folder解決→parts_master）
-_parts_cache_by_vcode = {}
+# addata_root ごとのエンジン（錠の中で作る・引く）
+import threading as _threading
+_engine_lock = _threading.Lock()
+_engines_by_root = {}
 
 
 def _get_engine(addata_root=ADDATA_ROOT):
-    """AddataEngine (= AddataSearchEngine) の singleton を返す。
-    addata_root が変わったら作り直す。"""
-    global _engine_singleton, _engine_singleton_root
-    if _engine_singleton is None or _engine_singleton_root != addata_root:
-        _engine_singleton = AddataEngine(addata_root)
-        _engine_singleton_root = addata_root
-    return _engine_singleton
+    """AddataEngine (= AddataSearchEngine) を addata_root ごとに 1 つ返す。
+
+    以前は 1 つのインスタンスと「どの root 用か」の 2 つのグローバルを錠なしで書き換えていたため、2 つのセッションが
+    別の Addata（橋渡しフォルダなど）で同時に照合すると、片方が相手の Addata のエンジンを受け取り、別の Addata の
+    部品コード・価格が黙って NEO に載りえた（バグハント 3 回目 N4）。root ごとに分けて錠の中で扱う"""
+    key = str(addata_root or '')
+    with _engine_lock:
+        eng = _engines_by_root.get(key)
+        if eng is None:
+            eng = AddataEngine(addata_root)
+            while len(_engines_by_root) >= 8:
+                _engines_by_root.pop(next(iter(_engines_by_root)))
+            _engines_by_root[key] = eng
+        return eng
+
+
+def _parts_folder(vehicle_code, addata_root):
+    folder = str(vehicle_code)
+    try:
+        if not os.path.isdir(folder):
+            cand = os.path.join(addata_root or '', folder[:1], folder)
+            if os.path.isdir(cand):
+                folder = cand
+    except Exception:
+        pass
+    return folder
+
+
+def _parts_version(vehicle_code, addata_root) -> tuple:
+    """部品マスタ（車種フォルダの *12.DB）の版の印（名前・更新時刻・大きさ）。同じ置き場の Addata を月次更新・選び直したら変わる（N9）"""
+    try:
+        sig = []
+        for p in sorted(glob.glob(os.path.join(_parts_folder(vehicle_code, addata_root), '*12.DB')))[:4]:
+            st_ = os.stat(p)
+            sig.append((os.path.basename(p), st_.st_mtime_ns, st_.st_size))
+        return tuple(sig)
+    except Exception:
+        return ()
+
+
+def _get_all_parts_cached(vehicle_code: str, addata_root: str = ADDATA_ROOT):
+    """vehicle_code をキーに parts_master をメモ化（tuple化でhashable維持）。folder 解決失敗時は空 tuple。
+    鍵は (車種, ADDATA ルート, 部品マスタの版)。控えは lru の 64 件だけ（以前は上限の無い dict にも控え、Addata の
+    置き場ごとに増え続けていた。N7）"""
+    if not vehicle_code:
+        return tuple()
+    try:
+        _root = os.path.realpath(addata_root or '')
+    except Exception:
+        _root = str(addata_root)
+    return _get_all_parts_cached_v(str(vehicle_code), _root, addata_root, _parts_version(vehicle_code, addata_root))
 
 
 @_lru_cache(maxsize=64)
-def _get_all_parts_cached(vehicle_code: str, addata_root: str = ADDATA_ROOT):
-    """vehicle_code をキーに parts_master をメモ化（tuple化でhashable維持）。
-    folder 解決失敗時は空 tuple。"""
+def _get_all_parts_cached_v(vehicle_code: str, _root_key: str, addata_root: str, _ver: tuple):
     try:
-        if not vehicle_code:
-            return tuple()
-        # dict memo のキーは ADDATA ルート込みにする。車種コードだけを鍵にすると、
-        # Streamlit Cloud のように 1 プロセスを全利用者で共有する環境で、
-        # 別の人がアップロードした ADDATA（版が違う）の部品を再利用してしまう。
-        try:
-            _ck = (os.path.realpath(addata_root or ''), str(vehicle_code))
-        except Exception:
-            _ck = (str(addata_root), str(vehicle_code))
-        if _ck in _parts_cache_by_vcode:
-            return _parts_cache_by_vcode[_ck]
         eng = _get_engine(addata_root)
         # vehicle_code から folder 推定: AddataEngine 側の identify 経由で得る
         # ここでは外部呼出側が folder を知っている前提なので、
@@ -1331,21 +1371,12 @@ def _get_all_parts_cached(vehicle_code: str, addata_root: str = ADDATA_ROOT):
         # 'J87/*12.DB' を探して必ず空になり、照合が全行 L4（＝部品コードも
         # 品番も1つも入らない）になっていた。
         # 車種コードで来た場合は ADDATA 配下のフォルダに直す。
-        folder = str(vehicle_code)
-        try:
-            if not os.path.isdir(folder):
-                cand = os.path.join(addata_root, folder[:1], folder)
-                if os.path.isdir(cand):
-                    folder = cand
-        except Exception:
-            pass
+        folder = _parts_folder(vehicle_code, addata_root)
         try:
             parts = eng.load_parts_master(folder)
         except Exception:
             parts = []
-        result = tuple(parts) if parts else tuple()
-        _parts_cache_by_vcode[_ck] = result
-        return result
+        return tuple(parts) if parts else tuple()
     except Exception:
         return tuple()
 
@@ -1458,11 +1489,7 @@ def match_pdf_items_to_addata(items, vehicle_info, addata_root=ADDATA_ROOT):
         if _cached_parts:
             master = list(_cached_parts)
         else:
-            master = engine.load_parts_master(folder)
-            try:
-                _parts_cache_by_vcode[folder] = tuple(master) if master else tuple()
-            except Exception:
-                pass
+            master = engine.load_parts_master(folder)   # 読まれない鍵に控えるのはやめた（N7）
         widx = engine.load_work_index(folder)
 
         act_map = {'取替': 'K', '交換': 'K', '脱着': 'D', '板金': 'S', '修理': 'S', '取替塗装': 'K'}
@@ -2369,3 +2396,17 @@ AutoMatcher = MatchingEngine
 
 if __name__ == '__main__':
     main()
+
+# 読み込んだときのコードの指紋（app.sync_app_modules が「メモリのコードがディスクと同じか」を見る。読み込みの時点で
+# 控えないと、あとから初めて import したモジュールが「古い」と見なされ、偽の版ずれで変換を断っていた。バグハント 3 回目 N2）。
+# ファイルの最後に置く: 読み直しが途中で例外になったときは古い指紋のまま残り、版ずれとして断れる（先頭に置くと
+# 途中までしか新しくないモジュールを「揃った」と見ていた。レビュー 2026-09-15）
+try:
+    import hashlib as _stamp_hashlib
+    with open(__file__, 'rb') as _stamp_f:
+        _stamp_now = _stamp_hashlib.sha256(_stamp_f.read()).hexdigest()
+    if _stamp_now == globals().get('_stamp_digest_at_start'):
+        __app_src_digest__ = _stamp_now
+    del _stamp_hashlib, _stamp_f, _stamp_now
+except Exception:  # noqa: BLE001
+    pass

@@ -10,6 +10,16 @@ LLM にさせるのは「紙に書いてあるとおりに写す」だけ。部�
 """
 from __future__ import annotations
 
+# 読み込みを始めたときのコードの指紋（ファイルの最後で読み直し、同じ中身のときだけ __app_src_digest__ に控える。読み込みの途中で
+# push されたら控えず、古い扱いにして読み直させる。レビュー 3 周目）
+try:
+    import hashlib as _stamp_hashlib0
+    with open(__file__, 'rb') as _stamp_f0:
+        _stamp_digest_at_start = _stamp_hashlib0.sha256(_stamp_f0.read()).hexdigest()
+    del _stamp_hashlib0, _stamp_f0
+except Exception:  # noqa: BLE001
+    _stamp_digest_at_start = None
+
 import json
 import os
 import re
@@ -92,6 +102,10 @@ PAGE_TEMPLATE = {'page': 1, 'rows_printed': None, 'subtotal': {}, 'marks': {}, '
                  'paint_lines': [], 'expenses': []}
 
 
+# 読み手には書かせないキー（受けたら reader が落とす。指示文のキー一覧から外す。Q14）
+_NOT_FOR_READER = ('wage_round', 'tax_round', 'target_total')
+
+
 def header_task(n_pages: int, vehicle_hint: Optional[dict] = None, source_name: str = '',
                 customer_hint: Optional[dict] = None) -> str:
     hint = ''
@@ -105,7 +119,7 @@ def header_task(n_pages: int, vehicle_hint: Optional[dict] = None, source_name: 
                  + json.dumps(customer_hint, ensure_ascii=False))
     return f"""この見積書 PDF は全 {n_pages} ページです。**明細以外**を pages/header.json の形で書いてください（明細の行はここには書かない）。
 
-書くキー（無いものは省く。値が読めないキーは空文字か null）: {', '.join(HEADER_KEYS)}
+書くキー（無いものは省く。値が読めないキーは空文字か null）: {', '.join(k for k in HEADER_KEYS if k not in _NOT_FOR_READER)}
 - source: "{source_name or 'estimate.pdf'} 書式X"（書式は format_catalog.md の A〜G）
 - vehicle: 登録番号・車台番号・型式・型式指定/類別・初度登録（reg_date は "R4.3" のような印字どおり）・カラーNo・グレード名・エンジン・排気量のうち印字されているもの
 - est_date: 見積日を YYYYMMDD の 8 桁で（例 20260913。令和8年9月13日・2026/9/13 のような印字は変換する。無ければ書かない）
@@ -213,3 +227,17 @@ def page_totals_retry_task(page_no: int, fails: list, previous: dict) -> str:
 {json.dumps(previous, ensure_ascii=False, indent=1)}
 
 page_{page_no}.json 全体を JSON だけで返してください。"""
+
+# 読み込んだときのコードの指紋（app.sync_app_modules が「メモリのコードがディスクと同じか」を見る。読み込みの時点で
+# 控えないと、あとから初めて import したモジュールが「古い」と見なされ、偽の版ずれで変換を断っていた。バグハント 3 回目 N2）。
+# ファイルの最後に置く: 読み直しが途中で例外になったときは古い指紋のまま残り、版ずれとして断れる（先頭に置くと
+# 途中までしか新しくないモジュールを「揃った」と見ていた。レビュー 2026-09-15）
+try:
+    import hashlib as _stamp_hashlib
+    with open(__file__, 'rb') as _stamp_f:
+        _stamp_now = _stamp_hashlib.sha256(_stamp_f.read()).hexdigest()
+    if _stamp_now == globals().get('_stamp_digest_at_start'):
+        __app_src_digest__ = _stamp_now
+    del _stamp_hashlib, _stamp_f, _stamp_now
+except Exception:  # noqa: BLE001
+    pass

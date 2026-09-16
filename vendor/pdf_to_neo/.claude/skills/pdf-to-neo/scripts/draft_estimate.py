@@ -1777,6 +1777,11 @@ class Drafter:
             t = self.rd.get('totals') or {}
             try:
                 sub_ = int(float(_num(t.get('taxable')) or 0)); tax_ = int(float(_num(t.get('tax')) or 0))
+                if not sub_ and tax_:   # 課税小計の印字が無い見積: 総合計 − 消費税 − 非課税の費用 で課税小計を出す（2026-09-15 アプリのバグハント O11）
+                    tot_ = int(float(_num(t.get('total')) or 0))
+                    nt_ = sum(int(float(_num(e.get('amount')) or 0)) for e in (self.rd.get('expenses') or [])
+                              if isinstance(e, dict) and _flag(e.get('taxfree'), 'expenses[].taxfree'))
+                    sub_ = tot_ - tax_ - nt_ if tot_ > tax_ + nt_ else 0
             except ValueError:
                 sub_ = tax_ = 0
             if sub_ and tax_ and tax_ != (sub_ * 10 + 50) // 100:

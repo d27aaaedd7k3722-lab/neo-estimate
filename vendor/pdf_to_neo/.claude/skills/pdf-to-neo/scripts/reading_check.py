@@ -368,18 +368,25 @@ class Checker:
         frame_pw = sum(_int((pf.get(k) or {}).get('wage')) or 0 for k in ('engine_room', 'front_pillar', 'center_pillar', 'rear_floor') if isinstance(pf.get(k), dict))
         other_w = sum(_int(x.get('wage')) or 0 for x in p.get('other') or [] if isinstance(x, dict))
         paint_w = _int(p.get('total'))
+        # 内訳（塗装行・パネル・加算基礎・バンパ・付加塗装・内板骨格塗装）の合算。塗装工賃計の印字が無いときの塗装工賃で、
+        # 印字があるときは「追加項目を含めて写したか」の見分けに使う（下）
+        comp = None
+        lines = p.get('lines') or []
+        if lines:
+            comp = sum(_int(l.get('wage')) or 0 for l in lines) + frame_pw
+        elif p.get('panels') or is_bumper_only_paint(p):   # panels: [] はバンパだけの形のときだけ詳細塗装（生成器・inspect と同じ判定。Codex 指摘）
+            comp = (sum(_int(x.get('wage')) or 0 for x in p.get('panels') or [])
+                       + sum(_int((p.get(k) or {}).get('wage')) or 0 for k in ('base', 'booth', 'wax', 'bumper_front', 'bumper_rear', 'bumper_base', 'sealing', 'door_sash', 'stripe',
+                                                                               'low_cover', 'two_coat_solid', 'two_tone') if isinstance(p.get(k), dict))
+                       + frame_pw)   # 付加塗装も塗装工賃計（生成器・inspect と同じ範囲。Codex 指摘）
         if paint_w is None:
-            lines = p.get('lines') or []
-            if lines:
-                paint_w = sum(_int(l.get('wage')) or 0 for l in lines) + frame_pw
-            elif p.get('panels') or is_bumper_only_paint(p):   # panels: [] はバンパだけの形のときだけ詳細塗装（生成器・inspect と同じ判定。Codex 指摘）
-                paint_w = (sum(_int(x.get('wage')) or 0 for x in p.get('panels') or [])
-                           + sum(_int((p.get(k) or {}).get('wage')) or 0 for k in ('base', 'booth', 'wax', 'bumper_front', 'bumper_rear', 'bumper_base', 'sealing', 'door_sash', 'stripe',
-                                                                                   'low_cover', 'two_coat_solid', 'two_tone') if isinstance(p.get(k), dict))
-                           + frame_pw)   # 付加塗装も塗装工賃計（生成器・inspect と同じ範囲。Codex 指摘）
-            else:
-                paint_w = frame_pw
-        paint_w += other_w
+            paint_w = (comp if comp is not None else frame_pw) + other_w
+        elif other_w and comp is not None and paint_w == comp + other_w:
+            # 転記の塗装工賃計が「内訳 + 追加項目」とちょうど一致 = 追加項目を含めて写した（2026-09-15 N-BOX: 内訳 94,210 + アンダーコート 3,680 = 97,890）。
+            # 足し直すと塗装計（材料込）・課税小計が追加項目の分だけ多くなり、正しい転記を不合格にしていた（生成器・inspect は内訳 + 追加項目で数える）
+            self.note(f'塗装工賃計 {paint_w:,} は追加項目 {other_w:,} を含めて写されている（内訳 {comp:,} + 追加項目）。追加項目は足し直さない')
+        else:
+            paint_w += other_w
         other_in = other_w   # paint_w に含めた追加項目の工賃（材料代の割合を出すときは外す。追加項目は材料率の対象外）
         material = _int(p.get('material')) or 0
         disc = self.rd.get('discount') or {}

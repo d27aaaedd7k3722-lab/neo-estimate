@@ -75,6 +75,20 @@ def test_declared_round_10_yields_to_one_yen_evidence():
     assert [r for r in e.get('_review', []) if r.get('level') == '要確認' and r.get('kind') == 'レバーレート'], 'レートの要確認が出ていない'
 
 
+def test_tax_round_without_printed_taxable():
+    """課税小計の印字が無い見積でも、総合計 − 消費税 から切り捨ての工場を判定する（2026-09-15 アプリのバグハント O11。
+    判定しないと 1 円差で不合格になり、逃げ道のベタ打ちでも切り捨ては作れない）"""
+    if not _s89_available():
+        print('   skip test_tax_round_without_printed_taxable（この ADDATA に S89 が無い）')
+        return
+    rows = ['|部品|取替|||1|60005||M|', '|工賃|脱着|||||40000|M|']
+    for totals, want in (({'parts': 60005, 'wage': 40000, 'tax': 10000, 'total': 110005}, '切り捨て'),
+                         ({'parts': 60005, 'wage': 40000, 'tax': 10001, 'total': 110006}, None),
+                         ({'parts': 60005, 'wage': 40000, 'taxable': 100005, 'tax': 10000, 'total': 110005}, '切り捨て')):
+        e = de.Drafter(dict(READING, labor_rate=7620, totals=totals, blocks=[{'title': 'x', 'rows': rows}])).build()
+        assert e.get('tax_round') == want, (totals, e.get('tax_round'))
+
+
 def main() -> int:
     ng = 0
     for name, fn in sorted((k, v) for k, v in globals().items() if k.startswith('test_')):

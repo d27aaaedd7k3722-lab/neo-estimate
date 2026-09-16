@@ -309,17 +309,21 @@ def main() -> int:
         fails.append('ページ不合格のときの repair_bundle が空')
     shutil.rmtree(case, ignore_errors=True)
 
-    # ── 7: サイドバーの保険情報（insurance_hint）は、見積書に印字が無い項目にだけ補われる
+    # ── 7: サイドバーの保険情報（insurance_hint）は見積書の印字より優先し（利用者が画面で確かめた値。2026-09-15 バグハント 3 回目 Q13）、
+    #        サイドバーに無い項目は印字のまま残る
     case = tempfile.mkdtemp(prefix='reg_reader_')
     fake = FakeReader([HEADER, PAGE_OK])
-    hint = {'policy_no': 'P-0001', 'contractor': 'ｹﾝｼｮｳ ﾊﾅｺ', 'accident_date': '20260901', 'company': '上書きされない',
+    hint = {'policy_no': 'P-0001', 'contractor': 'ｹﾝｼｮｳ ﾊﾅｺ', 'accident_date': '20260901', 'company': 'サイドバー損保',
             'accept_no': 'A-2026-0001', 'agency': 'テスト代理店', 'adjuster': 'テスト査定', 'garage_in': '20260903', 'garage_out': '20260910', 'repair_days': '7'}
     res = reader.read_estimate(pdf, reader=fake, case_dir=case, source_name='test.pdf', insurance_hint=hint)
     ins = ((res.reading or {}).get('insurance') or {})
     if not res.ok or ins.get('policy_no') != 'P-0001' or ins.get('contractor') != 'ｹﾝｼｮｳ ﾊﾅｺ' or ins.get('accident_date') != '20260901':
         fails.append(f'insurance_hint が reading に補われていない: ok={res.ok} insurance={ins} error={res.error}')
-    if ins.get('company') != 'テスト損保':
-        fails.append(f'見積書に印字のある項目（company）がヒントで上書きされた: {ins.get("company")}')
+    if ins.get('company') != 'サイドバー損保':
+        fails.append(f'サイドバーの値（company）が見積書の印字より優先されていない: {ins.get("company")}')
+    _h2 = reader._normalise_header(json.loads(json.dumps(HEADER)), None, {'policy_no': 'P-0002'}, None)
+    if (_h2.get('insurance') or {}).get('company') != 'テスト損保' or (_h2.get('insurance') or {}).get('policy_no') != 'P-0002':
+        fails.append(f'サイドバーに無い項目の印字が消えた／サイドバーの値が入らない: {_h2.get("insurance")}')
     # 生成まで通し、受付番号・代理店・アジャスター・入出庫日・修理日数が NEO の Insurance / FileInfo に本当に入ること
     # （ソース文字列の検査だけだと、vendor の生成器が古くて無視していても通ってしまう。Codex 指摘 2026-09-14）
     if res.ok:
