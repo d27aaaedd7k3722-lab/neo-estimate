@@ -80,21 +80,39 @@ flags: `M` = manual（ADDATA に無い品目）、`R` = reserve（保留）、`N
 
 この書式では、**印字のまま写す原則の例外**として次を (100+r)/100 で割って税抜にする:
 
-- 明細の `price` / `wage`
+- 明細の `price` / `wage` / `unit`（単価。`comment` の `unit=単価` の数字も）
 - `paint.lines[].wage` / `paint.material` / `paint.total`。
   塗装を詳細キーで**直接書いている案件は、その中の金額（`wage` / `material` など）もすべて** ——
-  `panels` / `base` / `booth` / `bumper_front` / `bumper_rear` / `wax` / `sealing` / `door_sash` / `stripe` /
-  `low_cover` / `two_coat_solid` / `two_tone` / `frame` / `other`（生成器はどれも税抜として扱う）
-- `expenses[].amount`（費用を税込のまま残すと費用計・課税小計・消費税がずれる）
+  `panels` / `base` / `booth` / `bumper_front` / `bumper_rear` / **`bumper_base`** / `wax` / `sealing` / `door_sash` /
+  `stripe` / `low_cover` / `two_coat_solid` / `two_tone` / `frame` / `other`（生成器はどれも税抜として扱う）
+- 内板骨格 `frame.basic_wage` / `frame.items[].wage`、`adas[]` の金額
+- 合計欄の値引き・割増 `discount.parts` / `discount.wage`（マイナスの額も同じように割る）
+- `expenses[].amount`（費用を税込のまま残すと費用計・課税小計・消費税がずれる）。
+  **ただし非課税の費用（`in: 非課税` / `taxfree`。リサイクル預託金・自賠責・税金）は割らない** —— 税が乗っていないので、
+  印字がそのまま税抜の額。割ると御見積額と合わなくなる
 - `totals` の**金額項目すべて**（`parts` / `wage` / `paint` / `paint_total` / `material` / `expense` /
-  `expense_parts` / `expense_wage` / `frame` / `taxable` …）。
-  `tax` / `total` と制御キー（`tax_rate` / `neo_total` / `tolerance` / `tolerance_reason`）は割らない。
+  `expense_parts` / `expense_wage` / `frame` / `taxable` / `discount` / `recycle`）。
+  `tax` / `total` と制御キー（`tax_rate` / `neo_total` / `tolerance` / `tolerance_reason` / `tolerance_keys` /
+  `tax_round` / `wage_round` / `material_rate`）は割らない。
   協定額の `target_total` は `totals` の中ではなく **reading の直下**に書く（`draft_estimate.py` はそこだけ見る）
+- レバーレート `labor_rate`（税込のレートのままだと 工賃 ÷ レート の指数が合わなくなる）
 
 - 小計も税抜に直す —— ページ小計 `pages["N"]` / `pages/page_N.json` の `subtotal`、ブロック小計 `blocks[].subtotal`
   （`reading_check.py` はどちらも行合計と突き合わせるので、印字の税込のまま残すと紙上検算が落ちる。印字の値は `note` に残す）
 
 `totals.tax`（消費税額）と `totals.total`（税込の御見積金額）だけは**印字どおり**に書く。
+
+**2026-09-17 以降、この割り戻しは `reading_pages.merge` が自動でやる**（`reading_check.to_tax_excluded`）。
+印字の合計欄と明細の積み上げだけで、次がすべて成り立つときに動く:
+① 明細の積み上げ = 税込の御見積額 − 非課税費用、② 印字の消費税 = その額の内税、
+③ 税抜の見積で必ず成り立つ「課税小計 + 消費税 + 非課税 = 御見積額」が**成り立たない**、
+④ 合計欄に部品計・工賃計・塗装計・課税小計のどれかが印字されている、⑤ **ほかに紙上検算の FAIL が無い**、
+⑥ 税率が 10%（生成器の消費税は 10% 固定なので、8% は自動で直さず読み手に返す）。
+直したら `reading.tax_included` に税率を残す（紙上検算が WARN で報告文に出し、生成器が
+`Setting.TaxKindFlag=1`（コグニの消費税設定「内税」）を書いて、画面・帳票を見積書と同じ税込の金額で並べる）。
+**転記のときは、印字のまま税込で写してよい**（機械が同じ reading に直す）。
+自分で税抜に直して写したときは、`reading.tax_included` に税率を**自分で書く** ——
+書かないと機械には「もともと税抜の見積」と区別が付かず、コグニの消費税設定が外税のままになる。
 
 ## 指定合計に合わせる（協定額の NEO）
 

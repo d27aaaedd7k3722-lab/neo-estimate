@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -406,6 +407,160 @@ def test_expense_on_both_columns_profile():
     finally:
         rc.PROFILES = old
         shutil.rmtree(d, ignore_errors=True)
+
+
+def _to_tax_included(rd: dict, rate: int = 10) -> dict:
+    """税抜の読み取りを『各行の金額まで税込』の印字に戻す（to_tax_excluded の逆。テスト用）。
+    非課税の費用は税が乗らないのでそのまま（呼び出し側で戻す）"""
+    def up(v):
+        return int((int(v) * (100 + rate) + 50) // 100)
+
+    def d(o, keys):
+        for k in keys:
+            if isinstance((o or {}).get(k), (int, float)) and not isinstance(o[k], bool):
+                o[k] = up(o[k])
+    for b in rd['blocks']:
+        rows = []
+        for r in b['rows']:
+            if isinstance(r, dict):
+                d(r, ('price', 'wage', 'unit'))
+                if r.get('comment'):
+                    r['comment'] = re.sub(r'(unit\s*[=:]\s*)([\d,]+)', lambda m: m.group(1) + str(up(m.group(2).replace(',', ''))), r['comment'])
+            else:
+                r = '|'.join(str(up(float(c))) if i in (6, 7) and c.strip() else c for i, c in enumerate(r.split('|')))
+            rows.append(r)
+        b['rows'] = rows
+        d(b.get('subtotal'), ('parts', 'wage'))
+    for sub in (rd.get('pages') or {}).values():
+        d(sub, ('parts', 'wage'))
+    d(rd.get('paint'), ('total', 'material'))
+    for k in rc.PAINT_WAGE_KEYS:
+        v = (rd.get('paint') or {}).get(k)
+        if isinstance(v, dict):
+            d(v, ('wage', 'material'))
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            rd['paint'][k] = up(v)
+    d(rd.get('frame'), ('basic_wage',))
+    for it in (rd.get('frame') or {}).get('items') or []:
+        d(it, ('wage',))
+    d(rd.get('discount'), ('parts', 'wage'))
+    for e in rd.get('expenses') or []:
+        d(e, ('amount',))
+    d(rd, ('labor_rate',))
+    for k in list(rd['totals']):
+        if k in rc.TAX_TOTALS_KEYS:
+            d(rd['totals'], (k,))
+    return rd
+
+
+def test_tax_included_is_found_and_divided():
+    """『各行の金額まで税込』で刷られた見積書（judgment_rules 10-4）を、印字の合計欄と明細の積み上げだけで見分けて税抜に直す
+    （2026-09-17 トヨタ系 BP の概算見積書。同じ見積が税抜で読めた日と、印字のまま税込で読めた日があった）"""
+    printed = _to_tax_included(copy.deepcopy(BASE))
+    assert printed['totals']['taxable'] == printed['totals']['total'] == 214500, printed['totals']
+    assert printed['totals']['tax'] == 19500 and printed['labor_rate'] == 8800, printed['totals']
+    res = run(printed)
+    assert any('税込で印字された見積書' in f for f in res['fail']), res['fail']
+    assert rc.tax_included_rate(printed) == 10
+    n = rc.to_tax_excluded(printed, 10)
+    assert n == 24, n   # 明細 7 + ブロック小計 2 + ページ小計 4 + 塗装 2 + 費用 2 + 合計欄 6 + レバーレート 1
+    assert printed['totals'] == BASE['totals'], printed['totals']          # tax / total は印字どおり、ほかは税抜に戻る
+    assert printed['blocks'] == BASE['blocks'] and printed['pages'] == BASE['pages']
+    assert printed['paint'] == BASE['paint'] and printed['expenses'] == BASE['expenses']
+    assert printed['labor_rate'] == 8000
+    assert not run(printed)['fail'], run(printed)['fail']                  # 直せば紙上検算に通る
+
+
+def test_tax_excluded_estimate_is_not_touched():
+    """ふつうの（税抜で刷られた）見積書を税込と間違えない。積み上げは 御見積額 − 消費税 になる"""
+    assert rc.tax_included_rate(copy.deepcopy(BASE)) is None
+    assert not run(BASE)['fail'], run(BASE)['fail']
+    rd = copy.deepcopy(BASE)   # 合計欄に消費税が無い見積（内税か外税か決められない）は触らない
+    rd['totals'] = {k: v for k, v in rd['totals'].items() if k != 'tax'}
+    assert rc.tax_included_rate(rd) is None
+    rd2 = _to_tax_included(copy.deepcopy(BASE))   # 協定額（税込）は totals の外にあるので割らない
+    rd2['target_total'] = 214500
+    rc.to_tax_excluded(rd2, 10)
+    assert rd2['target_total'] == 214500
+
+
+def test_tax_included_with_taxfree_expense():
+    """非課税の費用（リサイクル料など）は税が乗っていないので、税込の見積でも割らない（割ると御見積額が合わなくなる）"""
+    rd = copy.deepcopy(BASE)
+    rd['expenses'] = rd['expenses'] + [{'name': 'リサイクル料金', 'amount': 5000, 'in': '非課税'}]
+    rd['totals'] = dict(rd['totals'], total=219500)
+    assert not run(rd)['fail'], run(rd)['fail']
+    printed = _to_tax_included(copy.deepcopy(rd))
+    printed['expenses'][-1]['amount'] = 5000      # 非課税の費用は税が乗らない（印字も 5,000 のまま）
+    printed['totals']['total'] = 219500
+    assert rc.tax_included_rate(printed) == 10
+    rc.to_tax_excluded(printed, 10)
+    assert printed['expenses'][-1]['amount'] == 5000, printed['expenses'][-1]   # 割ってはいけない
+    assert not run(printed)['fail'], run(printed)['fail']
+
+
+def test_tax_included_divides_discount_frame_unit_and_bumper_base():
+    """値引き・内板骨格・単価・バンパ加算基礎も税抜に直す（どれか 1 つでも残ると課税小計がずれるか、
+    バンパ加算基礎のように**黙って 1.1 倍の工賃で NEO に載る**）"""
+    rd = copy.deepcopy(BASE)
+    rd['discount'] = {'parts': -10000, 'wage': 0}
+    rd['frame'] = {'basic_wage': 12000, 'items': [{'code': '1400', 'rank': 'A', 'wage': 8000}]}
+    rd['blocks'][0]['rows'][1] = {'name': 'ﾊﾞﾝﾊﾟ ｸﾘｯﾌﾟ', 'method': '取替', 'parts_no': '90467-11111',
+                                  'qty': 10, 'price': 5000, 'unit': 500, 'comment': 'unit=500'}
+    rd['paint'] = dict(rd['paint'], bumper_front={'index': 2.0, 'wage': 16000}, bumper_base={'index': 1.0, 'wage': 8000})
+    rd['totals'] = dict(rd['totals'], taxable=205000, tax=20500, total=225500)
+    assert not run(rd)['fail'], run(rd)['fail']
+    printed = _to_tax_included(copy.deepcopy(rd))
+    assert rc.tax_included_rate(printed) == 10, run(printed)['fail']
+    rc.to_tax_excluded(printed, 10)
+    assert printed['discount'] == {'parts': -10000, 'wage': 0}, printed['discount']
+    assert printed['frame'] == rd['frame'], printed['frame']
+    assert printed['blocks'][0]['rows'][1]['unit'] == 500, printed['blocks'][0]['rows'][1]
+    assert printed['blocks'][0]['rows'][1]['comment'] == 'unit=500', printed['blocks'][0]['rows'][1]
+    assert printed['paint']['bumper_base'] == {'index': 1.0, 'wage': 8000}, printed['paint']
+    assert not run(printed)['fail'], run(printed)['fail']
+
+
+def test_tax_included_needs_a_clean_reading():
+    """転記の誤りがある読み取りは、積み上げがたまたま御見積額と揃っても直さない
+    （黙って全金額を 1/1.1 にすると、印字と 9% 違う NEO を作ってしまう）"""
+    rd = _to_tax_included(copy.deepcopy(BASE))
+    rd['blocks'][1]['rows'].append('|ﾌｪﾝﾀﾞ ﾓｰﾙ|取替|75301-11111||1|19500|||')  # 二重に写した行
+    assert rc.tax_included_rate(rd) is None, run(rd)['fail']                   # 積み上げが御見積額と合わないので判定自体しない
+    rd1 = _to_tax_included(copy.deepcopy(BASE))       # 判定は当たるが、ほかに FAIL がある読み取りは直さない
+    rd1['pages']['1']['parts'] += 1000
+    assert any('税込で印字された見積書' in f for f in run(rd1)['fail']), run(rd1)['fail']
+    why: list = []
+    assert rc.tax_included_rate(rd1, why) is None
+    assert why and 'ほかにも紙上検算の FAIL' in why[0], why
+    rd2 = _to_tax_included(copy.deepcopy(BASE))          # 合計欄に突き合わせる印字が無い読み取りも直さない
+    rd2['totals'] = {'tax': 19500, 'total': 214500}
+    del rd2['pages']
+    for b in rd2['blocks']:
+        b.pop('subtotal', None)
+    assert rc.tax_included_rate(rd2) is None
+    rd3 = _to_tax_included(copy.deepcopy(BASE), 8)       # 8% は自動で直さない（生成器の消費税は 10% 固定）
+    rd3['totals'].update({'tax_rate': 8, 'tax': 15889, 'total': 214500})
+    why = []
+    assert rc.tax_included_rate(rd3, why) is None
+    assert not why or '10% 固定' in why[0], why
+
+
+def test_tax_included_rounding_slack():
+    """割り戻しの丸めで合計欄と積み上げが数円ずれても止めない（読み取りは 1 円も間違っていない）"""
+    net = [3105 + i * 7 for i in range(30)]
+    up = (lambda v: int((v * 110 + 50) // 100))
+    P = sum(up(v) for v in net)
+    rd = {'issuer': 'テスト鈑金', 'format': 'B', 'labor_rate': 8800, 'vehicle': {'model_code': 'X'},
+          'blocks': [{'title': '明細', 'rows': [f'|部品{i:02d}|取替|9000-{i:04d}||1|{up(v)}|||' for i, v in enumerate(net)]}],
+          'paint': {}, 'expenses': [],
+          'totals': {'parts': P, 'wage': 0, 'taxable': P, 'tax': (P * 10 + 55) // 110, 'total': P}}
+    assert rc.tax_included_rate(rd) == 10, run(rd)['fail']
+    rc.to_tax_excluded(rd, 10)
+    rd['tax_included'] = 10
+    res = run(rd)
+    assert not res['fail'], res['fail']
+    assert any('割り戻した丸めの差' in w for w in res['warn']), res['warn']
 
 
 if __name__ == '__main__':

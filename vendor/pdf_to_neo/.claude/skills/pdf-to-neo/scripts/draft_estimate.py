@@ -20,6 +20,7 @@ reading の `comment` は転記メモなので NEO には書かない（NEO の�
 """
 from __future__ import annotations
 
+import copy
 import difflib
 import json
 import os
@@ -471,10 +472,31 @@ def infer_labor_rate(rows: list[dict]) -> int:
 _ADD_ITEM_RE = re.compile(r'アンダ[ー\-]?コ|内板|調色|チッピング|ヒンジ|ホ[ー\-]?スメント|インナ|レ[ー\-]?ルカバ|フ[ュユ][ー\-]?エルリ[ッツ]ド|ホイ[ー\-]?ルハウス|加算|下地|シ[ー\-]リング|材|剤|費')
 
 
+def _norm_tax_included(rd: dict, notes: list) -> dict:
+    """『各行の金額まで税込』で刷られた見積書（判断規則 10-4）の読み取りが税込のまま来たら、ここでも税抜に直す。
+    ふつうは reading_pages.merge が済ませていて何もしない。reading.json を直に渡す経路（--skip-check・回帰）の保険。
+    呼び出し元の dict は書き換えない（直したときだけ複製を返す）"""
+    if rd.get('tax_included'):
+        return rd
+    from reading_check import tax_included_rate, to_tax_excluded  # noqa: E402  reading_check が draft_estimate を読むので中で import する
+    why: list = []
+    rate = tax_included_rate(rd, why)
+    if not rate:
+        notes.extend(why)   # 「税込に見えるが直さなかった」理由も報告に出す
+        return rd
+    rd = copy.deepcopy(rd)
+    n = to_tax_excluded(rd, rate, notes.append)
+    rd['tax_included'] = rate
+    notes.append(f'金額が税込で印字された見積書（判断規則 10-4）: 読み取りが税込のままだったので、'
+                 f'{n} 個の金額を {(100 + rate) / 100:g} で割って税抜にした（消費税と御見積額は印字どおり）')
+    return rd
+
+
 class Drafter:
     def __init__(self, reading: dict):
-        self.rd = reading
         self.notes: list[str] = []
+        self.rd = _norm_tax_included(reading, self.notes)
+        reading = self.rd
         self.nb = NeoBuilder()
         v = dict(reading['vehicle'])
         self.vehicle = v
@@ -2097,6 +2119,11 @@ class Drafter:
         if tr and tr != '四捨五入':
             est['tax_round'] = tr
             self.notes.append(f'消費税の計算単位 {tr}（合計欄の消費税がそれにだけ一致）→ estimate.tax_round（Setting.tx_ArrangeFlag）')
+        ti = self.rd.get('tax_included')   # 金額が税込で印字された見積書（judgment_rules 10-4。reading_pages.merge が税抜に直したときに付く）
+        if ti:
+            est['tax_included'] = int(ti)
+            self.notes.append(f'金額が税込で印字された見積書（judgment_rules 10-4）: 読み取りを {(100 + int(ti)) / 100:g} で割って税抜にしてある。'
+                              'コグニの消費税設定を内税（Setting.TaxKindFlag=1）にするので、画面・帳票の金額は見積書と同じ税込で並ぶ')
         if self.rd.get('index_policy'):
             est['index_policy'] = self.rd['index_policy']
         hints = dict(self.rd.get('hints') or {})

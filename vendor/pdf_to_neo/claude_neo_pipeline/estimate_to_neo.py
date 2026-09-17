@@ -3085,7 +3085,10 @@ class NeoBuilder:
                     "GarageOutDate=?,GarageOutEra=?,GarageOutEraYear=?,Note1='',Note2='',Note3=''",
                     (est_date, eera, eey, _fit(ins.get('accept_no', ''), 37), gin or '00000000', giera, giey, gout or '00000000', goera, goey))
         tax_flag = {'四捨五入': 1, '切り捨て': 2, '切り上げ': 3}.get(str(getattr(self, '_tax_round', None) or '四捨五入'), 1)
-        cur.execute('UPDATE Setting SET wb_PriceBase=?, wb_Round=?, wi_Round=10, TaxKindFlag=0, TaxRate=10, tx_ArrangeFlag=?', (labor_rate, wage_unit(), tax_flag))  # 工賃単位（1/10/100 円）は wb_Round だけ（コグニ実機 2026-09-08 cogni_frame_F2_r100: wi_Round は 10 のまま）。消費税の計算単位 tx_ArrangeFlag 1=四捨五入/2=切り捨て/3=切り上げ（cogni_frame_F2_taxfloor）
+        # TaxKindFlag はコグニの「消費税設定」の表示方法（0 外税 / 1 内税）。金額が税込で印字された見積書（judgment_rules 10-4）は
+        # 内税にすると、コグニの画面・帳票が見積書と同じ税込の金額で並ぶ（明細に入れる額は外税・内税どちらでも税抜。実機 NEO 12 本で確認 2026-09-17）
+        tax_kind = 1 if getattr(self, '_tax_included', False) else 0
+        cur.execute('UPDATE Setting SET wb_PriceBase=?, wb_Round=?, wi_Round=10, TaxKindFlag=?, TaxRate=10, tx_ArrangeFlag=?', (labor_rate, wage_unit(), tax_kind, tax_flag))  # 工賃単位（1/10/100 円）は wb_Round だけ（コグニ実機 2026-09-08 cogni_frame_F2_r100: wi_Round は 10 のまま）。消費税の計算単位 tx_ArrangeFlag 1=四捨五入/2=切り捨て/3=切り上げ（cogni_frame_F2_taxfloor）
         try:  # 帳票タイトルの並びはコグニ保存版と同じ ReportID（Unicode）順
             rt = cur.execute('SELECT ReportID, ReportTitle FROM ReportTitle').fetchall()
             cur.execute('DELETE FROM ReportTitle')
@@ -3203,6 +3206,7 @@ class NeoBuilder:
                          'eva': (set(str(x) for x in ((hints or {}).get('eva_codes') or []) if x) | ({'Z'} if car.get('four_wd') else set()))
                                 - set(str(x).strip() for x in ((hints or {}).get('eva_exclude') or []) if str(x).strip())}  # 色別部品の装備条件は build 前に分かる EVA（hints と 4WD の 'Z'）で判定。**eva_exclude はここにも効かせる** —— 行生成（11/13/83.DB の変種選択）に使うので、最終 CarEVA だけ直しても品番・価格がずれる（Codex 指摘 2026-09-12）
         self._tax_round = estimate.get('tax_round')  # 消費税の計算単位（Setting.tx_ArrangeFlag と消費税額。write_ansvif / write_ansvem が参照）
+        self._tax_included = bool(estimate.get('tax_included'))  # 見積書が税込で印字されている（Setting.TaxKindFlag = 内税。コグニの「消費税設定」の表示方法）
         rows, stats = self.build_rows(estimate['items'], car['CarCode'], labor_rate, index_policy=(estimate.get('index_policy') or 'auto'))
         try:  # 「重複部品コードチェック」（12.DB のレベル欄）: コグニで開くとダイアログが出る組合せを警告する（行は変えない）
             ap_dup = getattr(self, '_last_parts', None)  # build_rows() が今回の車種で作った AddataParts（_parts_for_std はこの後で更新される）

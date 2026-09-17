@@ -105,6 +105,45 @@ def test_merge_ok_and_totals():
         shutil.rmtree(case, ignore_errors=True)
 
 
+def test_merge_divides_tax_included_estimate():
+    """『各行の金額まで税込』で刷られた見積書（judgment_rules 10-4）は、束ねるときに税抜へ直す。
+    読み手が規則どおり税抜で写しても、印字のまま税込で写しても、同じ reading.json になる
+    （2026-09-17 トヨタ系 BP の概算見積書。同じ見積が日によって違う読み取りになっていた）"""
+    def up(v):
+        return int((int(v) * 110 + 50) // 100)
+
+    def scale(o):
+        """金額のキーだけ税込に戻す（品名・数量・指数・行数・印はそのまま）"""
+        if isinstance(o, dict):
+            return {k: (up(v) if k in ('parts', 'wage', 'amount', 'total', 'material', 'taxable', 'expense', 'paint', 'labor_rate')
+                        and isinstance(v, (int, float)) and not isinstance(v, bool) else scale(v)) for k, v in o.items()}
+        if isinstance(o, list):
+            return [scale(v) for v in o]
+        if isinstance(o, str) and o.count('|') >= 7:
+            p = o.split('|')
+            for i in (6, 7):
+                if p[i].strip():
+                    p[i] = str(up(float(p[i])))
+            return '|'.join(p)
+        return o
+
+    header = scale(copy.deepcopy(HEADER))
+    header['totals']['tax'], header['totals']['total'] = 19500, 214500   # 消費税と御見積額は印字どおり
+    case, plain = make_case([scale(copy.deepcopy(PAGE1)), scale(copy.deepcopy(PAGE2))], header), make_case([PAGE1, PAGE2])
+    try:
+        assert header['totals']['taxable'] == 214500 and header['labor_rate'] == 8800, header
+        rd, msgs = rp.merge(case)
+        assert rd is not None, msgs
+        assert any('税込で印字された見積書' in m for m in msgs), msgs
+        want, _ = rp.merge(plain)
+        for k in ('blocks', 'pages', 'paint', 'expenses', 'totals', 'labor_rate'):
+            assert rd[k] == want[k], (k, rd[k], want[k])
+        assert rp.cmd_merge(case, False) == 0          # 直したあとは紙上検算にも通る
+    finally:
+        shutil.rmtree(case, ignore_errors=True)
+        shutil.rmtree(plain, ignore_errors=True)
+
+
 def test_merge_keeps_extra_header_keys():
     """一覧に無い header のキー（協定の target_total_replaces_material など）も reading.json に引き継ぐ。_ で始まる内部キーは落とす（2026-09-14）"""
     h = dict(HEADER, target_total_replaces_material=True, _ocr_guess={'x': 1})

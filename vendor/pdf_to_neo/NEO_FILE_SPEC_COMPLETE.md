@@ -99,7 +99,7 @@ PolicyNo, ContractorName, AgencyName, AccidentDate/Era/EraYear, PresenceDate（�
 
 ### FileInfo / Setting / SelfInfo / ReportTitle / Statistics / Unspecified
 - FileInfo: EstimatedDate/Era/EraYear、GarageIn/Out（'00000000'）、Note1-3
-- Setting: `WageType=0, wb_PriceBase=レバーレート円/h, wb_Round=10, wi_Round=10, TaxKindFlag=0(税抜入力), TaxRate=10, tx_CalculateFlag=1, tx_Unit=1, tx_ArrangeFlag=1`（NEW1 = 車両確定直後の保存だけ 86,100 で、これは作成時の入力ミス値。NEW2 以降は 8,610 に直してあるので NEW1 を Setting の根拠にしない）
+- Setting: `WageType=0, wb_PriceBase=レバーレート円/h, wb_Round=10, wi_Round=10, TaxKindFlag=0(消費税の表示方法 = 外税。1 は内税。§「消費税設定ダイアログ」。**明細に入れる金額はどちらでも税抜**), TaxRate=10, tx_CalculateFlag=1, tx_Unit=1, tx_ArrangeFlag=1`（NEW1 = 車両確定直後の保存だけ 86,100 で、これは作成時の入力ミス値。NEW2 以降は 8,610 に直してあるので NEW1 を Setting の根拠にしない）
 - SelfInfo: 自社情報 7 行（テンプレートの SHOUCHIKU 情報をそのまま利用）
 - ReportTitle: 帳票 15 種のタイトル。コグニが保存時に並べ替える（値は同じ）
 - Statistics / Unspecified: 統計・予備。テンプレート値のまま
@@ -332,7 +332,7 @@ DamageBlock/DamageParts の再生成、AnFlInfo の `AnVer.db` 更新、`.~ne` �
 - **骨格の組合せ指数は J52 以外（J87）でも同じ規則**: 生成器の NEO（1400 バルクヘッド取替 + 1410/1420 ステー取替、1400 取替 + 1410 脱着 + 2620 サイドシル + 5600 リヤフロア）をコグニで開き再検索しても合計・指数が変わらない（1400 1.6 / 1410 1.1 / 1420 指数なし、2620 は暫定 `$` 2.55、5600 1.9）。`unit_settings.py`
 - **脱着(1) 行で 11.DB に脱着(D) 変種が無い部品**（1410 は K/S のみ）: 再検索後は `PartsNoStandard ''`、`PartsPriceStandard -1`、`ChangeTotal -1`、`PartsCount 1`（生成器は取替行の品番を流用していたので修正。PartsCount は工場 NEO の脱着行がほぼ -1 なので -1 のまま）
 - **工賃単価変更ダイアログ**（その他 → 工賃単価変更(W)）: 基本単価と「工賃単位 1 円 / 10 円 / 100 円」。100 円にすると `Setting.wb_Round 100`、`wi_Round` は 10 のまま（生成器は両方 100 にしていたので修正）
-- **消費税設定ダイアログ**（その他 → 消費税設定(T)）: 計算する / 税率 / 表示方法 外税・内税（`TaxKindFlag`）/ 計算単位 四捨五入・切り捨て・切り上げ = `Setting.tx_ArrangeFlag 1 / 2 / 3`。生成器は `estimate.tax_round`（'四捨五入'/'切り捨て'/'切り上げ'）で書き、消費税額もその単位で計算する。draft は合計欄の消費税が切り捨て/切り上げにだけ一致するとき自動で付ける
+- **消費税設定ダイアログ**（その他 → 消費税設定(T)）: 計算する / 税率 / 表示方法 外税・内税（`TaxKindFlag` **0 = 外税 / 1 = 内税**。実案件 NEO 1,508 本中 12 本が 1 で、どれも税込の総額を先に決めた協定。`Total` が 470,000・345,000・541,000 のような丸い税込額で、`SubTotal` はその ÷1.1。明細の `*OutTax` は内税でも税抜のまま = 表示方法の設定。2026-09-17 調査）/ 計算単位 四捨五入・切り捨て・切り上げ = `Setting.tx_ArrangeFlag 1 / 2 / 3`。生成器は `estimate.tax_included`（金額が税込で印字された見積書。判断規則 10-4）があるとき `TaxKindFlag=1` を書く。生成器は `estimate.tax_round`（'四捨五入'/'切り捨て'/'切り上げ'）で書き、消費税額もその単位で計算する。draft は合計欄の消費税が切り捨て/切り上げにだけ一致するとき自動で付ける
 
 ### 10-11. 連動・吸収・WorkCode・枠を取られた行の取替合計（N-BOX J87 実機 2026-09-08、NEO_check/_eva_exp/cogni_H1〜H7.neo・cogni_G1/G2/G3.neo）
 

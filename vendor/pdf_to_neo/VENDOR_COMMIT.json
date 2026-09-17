@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "752d1a37616702ac4a4027e5d40ed701e9d76ba2",
- "subject": "fix: 単価に円未満の端数がある見積の数円差を、3 点セットで通す（コグニでは印字の合計を再現できない案件）",
- "synced_at": "2026-09-17T10:28:50",
+ "commit": "091c907da41bbc0d91d959639f226b43bdcfa179",
+ "subject": "fix: 税込を割り戻した見積で、課税小計の印字が無いと消費税の丸め方を取り違える（四捨五入の工場が「切り捨て」になっていた）",
+ "synced_at": "2026-09-17T13:41:09",
  "files": 108,
- "tree_sha256": "00ec08e8de2a5b60b9e7dbd5e35255ab631212348902c19c80756ae1ec39e0fe",
+ "tree_sha256": "3a4d06c163a4eca8377584609e4ce35e398e209ad17f7a624b7b8f52df6fe79a",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

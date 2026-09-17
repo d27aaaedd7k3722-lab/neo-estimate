@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime
 import hashlib
 import json
@@ -120,12 +121,142 @@ def _in_kind(e: dict) -> str:
     return '?'
 
 
+# ---------------------------------------------------------------------- 税込で印字された見積書（judgment_rules 10-4）
+TAX_TOTALS_KEYS = ('parts', 'wage', 'paint', 'paint_total', 'material', 'expense', 'expense_parts',
+                   'expense_wage', 'frame', 'taxable', 'discount', 'recycle')
+"""totals のうち税抜に直す金額のキー（肯定リスト）。tax（消費税）と total（税込の御見積額）は印字どおり、
+制御キーと協定額 target_total も触らない。ここに無い数値キーは「決められない」ので直さず WARN にする"""
+PAINT_WAGE_KEYS = ('base', 'booth', 'bumper_front', 'bumper_rear', 'bumper_base', 'wax', 'sealing',
+                   'door_sash', 'stripe', 'low_cover', 'two_coat_solid', 'two_tone', 'frame')
+"""paint の中で工賃・材料代が入るキー（額そのものか {index, wage} の dict）"""
+TAX_AUTO_RATE = 10
+"""自動で割り戻す税率（％）。生成器の消費税は 10% 固定（Setting.TaxRate=10）なので、8% などは自動で直さず止める（10-4）"""
+_UNIT_RE = re.compile(r'(unit\s*[=:]\s*)([\d,]+)')
+
+
+def tax_excluded_amount(v, rate: int = 10):
+    """税込の金額を税抜に直す（四捨五入）。数値でなければそのまま返す"""
+    n = _int(v)
+    if n is None:
+        return v
+    s = -1 if n < 0 else 1  # 値引きの行（マイナス）も絶対値で丸めてから符号を戻す
+    return s * int((abs(n) * 100 + (100 + rate) // 2) // (100 + rate))
+
+
+def to_tax_excluded(rd: dict, rate: int = 10, warn=None) -> int:
+    """『各行の金額まで税込』で刷られた見積書の読み取りを税抜に直す（judgment_rules 10-4 / reading_schema.md）。
+    直すのは明細の price / wage / unit、ページ小計・ブロック小計、塗装、内板骨格、費用（非課税を除く）、
+    値引き、ADAS、totals の金額項目、レバーレート。印字のまま残すのは totals の tax・total と制御キー、
+    協定額の target_total（税込）、**非課税の費用**（税が乗っていないので割ると合計が合わなくなる）。
+    warn を渡すと、割ってよいか決められなかったキーを知らせる。直した金額の数を返す"""
+    n = [0]
+
+    def d(v):
+        if _int(v) is None:
+            return v
+        n[0] += 1
+        return tax_excluded_amount(v, rate)
+
+    def d_keys(obj, keys) -> None:
+        if isinstance(obj, dict):
+            for k in keys:
+                if obj.get(k) not in (None, ''):
+                    obj[k] = d(obj[k])
+
+    def d_each(seq, keys) -> None:
+        for it in seq or []:
+            d_keys(it, keys)
+
+    def d_unit_comment(s: str) -> str:
+        """comment の `unit=単価` も税抜に直す（reading_check が単価×数量の検算に使う）"""
+        return _UNIT_RE.sub(lambda m: m.group(1) + str(tax_excluded_amount(m.group(2), rate)), s)
+
+    for b in rd.get('blocks') or []:
+        rows = b.get('rows') or []
+        for i, r in enumerate(rows):
+            if isinstance(r, dict):
+                d_keys(r, ('price', 'wage', 'unit'))
+                if r.get('comment'):
+                    r['comment'] = d_unit_comment(str(r['comment']))
+            elif isinstance(r, str) and '|' in r:  # 短縮記法 code|name|method|parts_no|index|qty|price|wage|flags|comment
+                p = r.split('|')
+                for idx in (6, 7):
+                    if len(p) > idx and _int(p[idx]) is not None:
+                        p[idx] = str(d(p[idx]))
+                if len(p) > 9:
+                    p[9] = d_unit_comment(p[9])
+                rows[i] = '|'.join(p)
+        d_keys(b.get('subtotal'), ('parts', 'wage'))
+    for sub in (rd.get('pages') or {}).values():
+        d_keys(sub, ('parts', 'wage'))
+    paint = rd.get('paint') or {}
+    d_keys(paint, ('total', 'material', 'wage'))
+    for key in ('lines', 'panels', 'other'):
+        d_each(paint.get(key), ('wage', 'material', 'price'))
+    for key in PAINT_WAGE_KEYS:
+        v = paint.get(key)
+        if isinstance(v, dict):  # frame は位置ごとの {'engine_room': {'option':.., 'index':.., 'wage':..}}
+            d_each(v.values(), ('wage', 'material'))
+            d_keys(v, ('wage', 'material'))
+        elif _int(v) is not None and not isinstance(v, bool):
+            paint[key] = d(v)
+    fr = rd.get('frame') or {}      # 内板骨格（書式 E）: 基本工賃と部位ごとの工賃
+    d_keys(fr, ('basic_wage', 'wage'))
+    d_each(fr.get('items'), ('wage',))
+    d_each(rd.get('adas'), ('wage', 'price', 'amount'))
+    for e in rd.get('expenses') or []:   # 非課税の費用（リサイクル預託金・自賠責・税金）は税が乗っていない = 印字が素の金額
+        if isinstance(e, dict) and _in_kind(e) != 'taxfree':
+            d_keys(e, ('amount',))
+    d_keys(rd.get('discount'), ('parts', 'wage'))   # 合計欄の値引き・割増（マイナスもある）
+    t = rd.get('totals') or {}
+    for k in list(t):
+        if k in TAX_TOTALS_KEYS:
+            d_keys(t, (k,))
+        elif k not in TAX_KEEP_TOTALS and not isinstance(t[k], bool) and _int(t[k]) is not None and warn:
+            warn(f'合計欄の {k} は税込・税抜のどちらか決められないので印字のまま残した（税込の見積: judgment_rules 10-4）')
+    d_keys(rd, ('labor_rate',))  # レバーレートも税込で刷られている（工賃 ÷ レートの指数が合わなくなる）
+    return n[0]
+
+
+TAX_KEEP_TOTALS = ('tax', 'total', 'tax_rate', 'tax_round', 'wage_round', 'material_rate',
+                   'neo_total', 'tolerance', 'tolerance_reason', 'tolerance_keys', 'target_total')
+"""totals のうち「触らないと分かっている」キー（消費税・御見積額・制御キー・協定額）。
+TAX_TOTALS_KEYS にもここにも無い数値キーは、割ってよいか決められないので WARN にして印字のまま残す"""
+
+
+def tax_included_rate(rd: dict, why: Optional[list] = None) -> Optional[int]:
+    """読み取りが『各行の金額まで税込』のままかどうかを Checker に判定させる。税込と決まったときだけ税率を返す。
+    印字の合計欄と明細の積み上げだけで決めるので、読み手（人・LLM）の申告には頼らない。
+    **税込の指摘以外に FAIL がある読み取りでは直さない** —— 転記の誤り（二重計上・写し落とし）で
+    積み上げがたまたま御見積額と揃っただけの読み取りを、黙って全金額 1/1.1 にしないため"""
+    try:
+        ck = Checker(copy.deepcopy(rd))
+        res = ck.run()
+    except Exception as e:  # noqa: BLE001  検算が途中で落ちる読み取りは「決められない」= 直さない
+        if why is not None:
+            why.append(f'紙上検算が途中で落ちたので税込かどうか決められない: {type(e).__name__}: {e}')
+        return None
+    if not ck.tax_included:
+        return None
+    other = [f for f in res['fail'] if '税込で印字された見積書' not in f]
+    if other:
+        if why is not None:
+            why.append('税込で印字された見積書に見えるが、ほかにも紙上検算の FAIL があるので自動では直さない: ' + other[0])
+        return None
+    if ck.tax_included != TAX_AUTO_RATE:  # 生成器の消費税は 10% 固定。8% などは税抜に直しても消費税・合計が 10% で計算される
+        if why is not None:
+            why.append(f'税率 {ck.tax_included}% の税込見積は自動で直さない（生成器の消費税は 10% 固定。judgment_rules 10-4）')
+        return None
+    return ck.tax_included
+
+
 class Checker:
     def __init__(self, rd: dict):
         self.rd = rd
         self.msgs: list[tuple[str, str]] = []  # (level, text)
         self.rows: list[dict] = []  # 明細行（注記行を除く）。_block / _page / _no を付ける
         self.settings: dict = {}
+        self.tax_included: Optional[int] = None  # 『各行の金額まで税込』で刷られた見積と決まったときの税率（judgment_rules 10-4）
 
     # ------------------------------------------------------------------ 出力
     def fail(self, t: str) -> None:
@@ -183,7 +314,11 @@ class Checker:
             if price is not None and price < 0:
                 self.fail(f'{label}: 金額 {price:,} が負')
             if unit is not None and price is not None and unit * qty != price:
-                self.fail(f'{label}: 単価 {unit:,} × 数量 {qty} = {unit * qty:,} ≠ 金額 {price:,}（price は数量分の金額）')
+                # 税込印字を税抜に割り戻した案件（10-4）は、単価と金額を別々に四捨五入するので数量分までずれる
+                if _int(self.rd.get('tax_included')) and abs(unit * qty - price) <= qty:
+                    self.warn(f'{label}: 単価 {unit:,} × 数量 {qty} = {unit * qty:,} ≠ 金額 {price:,}（差 {unit * qty - price:+,}）。税込から税抜に直した丸めの差とみて止めない')
+                else:
+                    self.fail(f'{label}: 単価 {unit:,} × 数量 {qty} = {unit * qty:,} ≠ 金額 {price:,}（price は数量分の金額）')
             elif unit is None and qty > 1 and price and price % qty != 0:
                 self.warn(f'{label}: 金額 {price:,} が数量 {qty} で割り切れない。単価ではなく数量分の金額か確認（単価なら comment に unit=単価）')
             if index is not None and index < 0:
@@ -435,6 +570,10 @@ class Checker:
         _frac_rows = [r for r in rows if (_int(r.get('qty')) or 1) > 1 and (_int(r.get('price')) or 0) > 0
                       and (_int(r.get('price')) or 0) % (_int(r.get('qty')) or 1)]
         _frac_max = min(len(_frac_rows), 10)
+        # 税込印字を税抜に割り戻した案件（10-4）は、印字の合計欄を割った値と、割った明細を積み上げた値が
+        # 行ごとの四捨五入の分だけずれる（1 か所あたり 0.5 円まで）。どちらも読み取りは正しいので止めない
+        _tax_slack = ((len(rows) + len(p.get('lines') or []) + len(self.rd.get('expenses') or []) + 3) // 2
+                      if _int(self.rd.get('tax_included')) else 0)
 
         def cmp(label: str, calc: int, given, alts: Optional[dict] = None) -> bool:
             g = _int(given)  # 印字どおり '95,000' や空欄 '' でも落ちない（空欄・非数値は未記入扱い）
@@ -450,6 +589,10 @@ class Checker:
                     self.note(f'合計欄 {label}: 印字 {g:,} は「{desc}」として一致（明細だけの合計 {calc:,} とは違う）')  # report.md に必ず出す（make_neo）
                     return True
             _cands = [calc] + [int(v) for v in (alts or {}).values() if v is not None]
+            if _tax_slack and any(abs(c - g) <= _tax_slack for c in _cands):
+                self.warn(f'合計欄 {label}: 印字を税抜に直した {g:,} / 転記から {calc:,}（差 {calc - g:+,}）。'
+                          f'税込で印字された見積書（10-4）を割り戻した丸めの差（最大 {_tax_slack:,} 円）とみて止めない')
+                return False   # 見逃すが「一致」ではない（消費税の丸めは印字の課税小計で判定させる。下の _frac_max と同じ）
             if label in ('部品計', '課税小計') and _frac_max and any(0 < c - g <= _frac_max for c in _cands):
                 # 見逃すが **False を返す**（呼び出し側の ok_sub が偽になり、消費税の丸めは「印字の課税小計」で判定される）。
                 # True を返すと base がコグニ側の合計になり、四捨五入の工場を「切り捨て」と誤判定して
@@ -488,6 +631,14 @@ class Checker:
             cmp('諸費用計', ex_by['expense'], t.get('expense'), {'作業計扱いの費用を含む': ex_by['expense'] + ex_by['wage'], '費用すべて': sum(ex_by.values()), '非課税を含む': ex_by['expense'] + ex_by['taxfree']})
         if _num(self.rd.get('target_total')) != '':
             self.note(f"target_total {self.rd.get('target_total')}: 課税小計・消費税・合計は draft が材料代で合わせるので検算しない")
+            # 協定額のある見積でも、合計欄が税込で印字されていれば気づけるように示す（自動では直さない。draft が材料代で解くので
+            # 明細が税込のままだと材料代が大きくマイナスに寄る）
+            _gs, _gt, _gx = _int(t.get('taxable')), _int(t.get('total')), _int(t.get('tax'))
+            _r = _int(t.get('tax_rate')) or 10
+            if _gs and _gt and _gx and _gs == _gt and 1 <= _r <= 30 and _gx in (
+                    _gt * _r // (100 + _r), (_gt * _r * 2 + 100 + _r) // (2 * (100 + _r))):
+                self.warn(f'合計欄: 課税小計の印字 {_gs:,} が御見積額と同じで、消費税 {_gx:,} はその内税。'
+                          '金額が税込で印字された見積書（judgment_rules 10-4）かもしれない。明細も税込なら税抜に直してから協定額を入れる')
             return
         if unknown_w and not blank_zero:  # 工賃の無い行があると明細からの課税小計は出せないが、合計欄どうしの整合（課税小計 + 消費税 + 非課税 = 御見積額、税の丸め）は必ず見る
             self.wage_unchecked = True
@@ -497,16 +648,31 @@ class Checker:
                     if f_(g_sub) == g_tax:
                         self.note(f'消費税 {g_tax:,} は課税小計 {g_sub:,} の 10% {nm_}'); break
                 else:
-                    self.fail(f'合計欄 消費税: 印字 {g_tax:,} が課税小計 {g_sub:,} の 10%（四捨五入 {(g_sub * 10 + 50) // 100:,} / 切り捨て {(g_sub * 10) // 100:,} / 切り上げ {-((-g_sub * 10) // 100):,}）のどれとも一致しない')
+                    # 課税小計の印字が御見積額と同じで、消費税がその内税なら「金額が税込で印字された見積書」（10-4）。
+                    # ただし工賃の無い行があると明細の積み上げで裏を取れないので、自動では直さず読み手に示す
+                    r_ = _int(t.get('tax_rate')) or 10
+                    hint_ = ('。課税小計の印字が御見積額と同じで、消費税はその内税（× {r} ÷ {rr}）: '
+                             '金額が税込で印字された見積書（judgment_rules 10-4）かもしれない'.format(r=r_, rr=100 + r_)
+                             if g_sub == _int(t.get('total')) and 1 <= r_ <= 30
+                             and g_tax in (g_sub * r_ // (100 + r_), (g_sub * r_ * 2 + 100 + r_) // (2 * (100 + r_))) else '')
+                    self.fail(f'合計欄 消費税: 印字 {g_tax:,} が課税小計 {g_sub:,} の 10%（四捨五入 {(g_sub * 10 + 50) // 100:,} / 切り捨て {(g_sub * 10) // 100:,} / 切り上げ {-((-g_sub * 10) // 100):,}）のどれとも一致しない' + hint_)
             _tf = ex_by['taxfree']
             if g_sub is not None and g_tax is not None and g_tot is not None and g_sub + g_tax + _tf != g_tot:
                 self.fail(f'合計欄 御見積額: 印字 {g_tot:,} ≠ 課税小計 {g_sub:,} + 消費税 {g_tax:,} + 非課税 {_tf:,} = {g_sub + g_tax + _tf:,}')
             self.warn('工賃の無い行があるので「明細からの課税小計」は未検算（合計欄どうしの整合だけ確認した）')
             return
         sub = parts_sum + wage_sum + paint_w_sub + material_sub + frame_w + ex_by['parts'] + ex_by['wage'] + ex_by['expense'] + disc_sum
+        if self._check_tax_included(sub, t, ex_by['taxfree']):
+            return   # 行が税込のまま。課税小計・消費税・御見積額を突き合わせても「税込だから合わない」としか出ない
         ok_sub = cmp('課税小計', sub, t.get('taxable'))
         g_sub = _int(t.get('taxable'))
         base = g_sub if (g_sub is not None and not ok_sub) else sub  # 課税小計が印字と違うときは、税の丸めは印字の課税小計で判定する（原因を分けるため）
+        if g_sub is None and _tax_slack:
+            # 税込を割り戻した案件で課税小計の印字が無いと、積み上げに丸めが乗っていて消費税の丸め方を取り違える
+            # （四捨五入の工場を「切り捨て」と誤判定し、Setting.tx_ArrangeFlag の違う NEO になる）。印字から出す
+            _gt, _gx = _int(t.get('total')), _int(t.get('tax'))
+            if _gt is not None and _gx is not None and _gt - _gx - ex_by['taxfree'] > 0:
+                base = _gt - _gx - ex_by['taxfree']
         tax_modes = {'四捨五入': (base * 10 + 50) // 100, '切り捨て': base * 10 // 100, '切り上げ': -(-base * 10 // 100)}
         g_tax = _int(t.get('tax'))
         if g_tax is not None:
@@ -529,6 +695,41 @@ class Checker:
             near = min((abs(rate - x), x) for x in range(10, 101, 5))
             if near[0] > 0.6:
                 self.note(f'材料代 {material:,} ÷ 塗装工賃 {paint_w - other_in:,} = {rate:.1f}%（5% 刻みでない → 行ごと四捨五入の合算か、材料代に他の費目が混ざっている）')
+
+    # ------------------------------------------------------------------ 6a. 税込で印字された見積書（judgment_rules 10-4）
+    def _check_tax_included(self, sub: int, t: dict, taxfree: int) -> bool:
+        """『各行の金額まで税込』で刷られた見積書（ディーラー・二輪）を、印字の合計欄と明細の積み上げだけで見分ける。
+        次がすべて成り立つときだけ税込と決める:
+          1. 明細の積み上げが「税込の御見積額 − 非課税費用」と同じ（税抜の見積なら 御見積額 − 消費税 になる）
+          2. 印字の消費税が、その額の内税（額 × r ÷ (100+r)）
+          3. 税抜の見積で必ず成り立つ「課税小計 + 消費税 + 非課税 = 御見積額」が**成り立たない**
+             （成り立つならふつうの税抜の見積。1 がたまたま揃っただけ）
+          4. 合計欄に部品計・工賃計・塗装計・課税小計のどれかが印字されている
+             （積み上げを突き合わせる相手が印字に無い読み取りでは、写し誤りと見分けられない）
+        見分けたら税率を self.tax_included に入れて FAIL にする（reading_pages.merge が税抜に直して束ね直す）"""
+        g_tax, g_tot = _int(t.get('tax')), _int(t.get('total'))
+        if not g_tax or not g_tot or g_tot <= g_tax:
+            return False
+        rate = _int(t.get('tax_rate')) or 10
+        if not 1 <= rate <= 30:
+            return False
+        base = g_tot - taxfree  # 非課税費用は税の対象外（御見積額には入っている）
+        # 税抜の見積なら積み上げは 御見積額 − 消費税 になる（消費税は御見積額の 1 割前後）ので、数円の幅で取り違えることはない
+        if base <= 0 or abs(sub - base) > max(2, min(len(self.rows), 10)):
+            return False
+        if g_tax not in (base * rate // (100 + rate), (base * rate * 2 + 100 + rate) // (2 * (100 + rate)),
+                         -(-base * rate // (100 + rate))):
+            return False
+        g_sub = _int(t.get('taxable'))
+        if g_sub is not None and g_sub + g_tax + taxfree == g_tot:
+            return False   # 3. 合計欄が税抜として筋が通っている
+        if not any(_int(t.get(k)) for k in ('parts', 'wage', 'paint', 'paint_total', 'taxable')):
+            return False   # 4. 突き合わせる印字が合計欄に無い
+        self.tax_included = rate
+        self.fail(f'金額が税込で印字された見積書（judgment_rules 10-4）: 明細の積み上げ {sub:,} が印字の御見積額 {g_tot:,} と同じで、'
+                  f'印字の消費税 {g_tax:,} はその内税（{base:,} × {rate} ÷ {100 + rate}）。'
+                  f'明細・塗装・費用・合計欄の金額を {(100 + rate) / 100:g} で割って税抜に直す（tax と total は印字どおり）')
+        return True
 
     # ------------------------------------------------------------------ 6b. 手入力行モード（塗装・費用を塗装/費用画面ではなく明細の手入力行で入れる工場）
     def check_layout_mode(self) -> None:
@@ -609,6 +810,16 @@ class Checker:
     # ------------------------------------------------------------------ 実行
     def run(self) -> dict:
         self.load_rows()
+        r_ = _int(self.rd.get('tax_included'))
+        if r_:  # 束ねるときに税抜へ直した見積（judgment_rules 10-4）。報告文に必ず出す（印字の金額と読み取りが違って見えるので）
+            t_ = self.rd.get('totals') or {}
+            back = ' / '.join(f'{nm} {int((v * (100 + r_) + 50) // 100):,}'
+                              for nm, k in (('部品計', 'parts'), ('工賃計', 'wage'), ('課税小計', 'taxable'))
+                              if (v := _int(t_.get(k))) is not None)
+            self.warn(f'金額が税込で印字された見積書（judgment_rules 10-4）なので、明細・塗装・費用・合計欄を {(100 + r_) / 100:g} で割って税抜に直してある。'
+                      '報告の「見積書」の欄は税抜、消費税と御見積額は印字どおり'
+                      + (f'。見積書の印字（税込）は {back}' if back else '')
+                      + '。コグニの消費税設定は内税にしてあるので、画面・帳票は印字と同じ税込で並ぶ')
         if not self.rows:
             return self.result()
         lines = list((self.rd.get('paint') or {}).get('lines') or [])

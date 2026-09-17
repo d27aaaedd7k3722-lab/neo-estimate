@@ -88,9 +88,15 @@ def main() -> int:
                 print(f'NG {d}: draft_estimate 失敗\n{out[-800:]}'); fail += 1; continue
             est = json.load(open(est_tmp, encoding='utf-8-sig'))
             cur = strip(est)
-            if a.update or not os.path.exists(exp_path):
+            if not os.path.exists(exp_path) and not a.update:
+                # 正解を黙って作らない。NEO_check には作業中の案件フォルダも置かれる（アプリ・スキルの出力先）ので、
+                # 自動で作ると **その時点の出力がそのまま正解になり**、途中の読み取りを回帰に焼き付けてしまう。
+                # 案件を回帰に足すときは --update（HANDOFF の手順）。2026-09-17
+                print(f'SKIP {d}: 正解（expected_estimate.json）が無い。回帰に足すなら --update で作る')
+                continue
+            if a.update:
                 json.dump(cur, open(exp_path, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
-                tag = '正解を更新' if a.update else '正解を新規作成'
+                tag = '正解を更新'
             else:
                 exp = json.load(open(exp_path, encoding='utf-8-sig'))
                 diffs = diff_paths(exp, cur)

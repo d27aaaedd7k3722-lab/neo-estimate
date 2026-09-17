@@ -39,6 +39,7 @@
 | tax_round | "四捨五入" / "切り捨て" / "切り上げ" | 消費税の計算単位（コグニの消費税設定 Setting.tx_ArrangeFlag）。既定は四捨五入。draft_estimate が合計欄から自動判定して書く。切り捨ての工場でここを省くと合計が 1 円ずれる |
 | wage_round | 1 / 10 / 100 | 工賃の丸め単位（工場のコグニ設定 Setting.wb_Round）。技術料に 10 円の倍数でない値があれば draft_estimate が 1 に推定する（判断規則 10-6 の 5）。100 円丸めの工場では 0.25h×11,000 = 2,750 → 2,800 と印字される（オデッセイ 2026-09-07）。draft_estimate が印字工賃から自動推定。既定 10 |
 | index_policy | auto / manual | 非コグニ書式で全指数を手入力 `#` にするとき manual |
+| tax_included | 10 | 金額が税込で印字された見積書（判断規則 10-4）の税率（％）。生成器が消費税設定の表示方法を内税（Setting.TaxKindFlag=1）にして、コグニの画面・帳票を見積書と同じ税込の金額で並べる。**明細に入れる金額は税抜のまま**（`reading_pages.merge` が割り戻し済み）。draft_estimate が `reading.tax_included` から写す |
 
 ## hints
 

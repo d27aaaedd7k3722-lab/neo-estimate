@@ -70,6 +70,13 @@ def main() -> int:
     check(tot['SubTotal'] == 162505 and tot['tx_TotalOutTax'] == 16250, f"taxfloor 162,505 → {tot['tx_TotalOutTax']}")
     rows, st, tot, rep = build(F2 + [{'name': '雑費', 'method': '', 'qty': 1, 'price': 5, 'manual': True}], tax_round='切り上げ')
     check(st['tx_ArrangeFlag'] == 3 and tot['tx_TotalOutTax'] == 16251, f"taxceil 162,505 → {tot['tx_TotalOutTax']}")
+    # 消費税の表示方法（コグニの「消費税設定」）: 既定は外税、金額が税込で印字された見積書（10-4）は内税 = 実機 NEO と同じ TaxKindFlag 1
+    rows, st, tot, rep = build(F2)
+    check(st['TaxKindFlag'] == 0, f"既定は外税 {st['TaxKindFlag']}")
+    rows2, st2, tot2, rep2 = build(F2, tax_included=10)
+    check(st2['TaxKindFlag'] == 1, f"税込印字は内税 {st2['TaxKindFlag']}")
+    check(tot2['Total'] == tot['Total'] and rows2['5600']['WageOutTax'] == rows['5600']['WageOutTax'],
+          f"表示方法だけの違いで金額は変わらない {tot2['Total']} / {tot['Total']}")
     print('unit_settings:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 

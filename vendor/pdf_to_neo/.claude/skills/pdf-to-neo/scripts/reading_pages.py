@@ -38,7 +38,7 @@ import sys
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
-from reading_check import Checker, _int  # noqa: E402
+from reading_check import Checker, _int, tax_included_rate, to_tax_excluded  # noqa: E402
 
 HEADER_KEYS = ('source', 'issuer', 'est_date', 'format', 'vehicle', 'customer', 'insurance', 'labor_rate', 'wage_round', 'index_policy', 'hints',
                'paint', 'expenses', 'totals', 'target_total', 'discount', 'frame', 'adas', 'tax_round', 'note')
@@ -287,6 +287,19 @@ def merge(case: str, force: bool = False) -> tuple[dict | None, list[str]]:
     if paint:
         rd['paint'] = paint
     rd['expenses'] = expenses
+    # 『各行の金額まで税込』で刷られた見積書（ディーラー・二輪。judgment_rules 10-4）は、印字のまま束ねると課税小計が
+    # (100+r)/100 倍になる。印字の合計欄と明細の積み上げだけで税込と決まるときは、ここで税抜に直す
+    # （読み手が規則を守ったかに関わらず同じ reading.json になる。2026-09-17 トヨタ系 BP の概算見積書で、
+    #  同じ見積が税抜で読めた日と税込のまま読めた日があった）
+    why: list = []
+    rate = tax_included_rate(rd, why)
+    if rate:
+        n = to_tax_excluded(rd, rate, msgs.append)
+        rd['tax_included'] = rate   # 直したことを reading.json に残す（Checker が WARN にして報告文に出す）
+        t = rd.get('totals') or {}
+        msgs.append(f'金額が税込で印字された見積書（judgment_rules 10-4）なので、{n} 個の金額を {(100 + rate) / 100:g} で割って税抜に直した'
+                    f"（消費税 {_int(t.get('tax')) or 0:,} / 御見積額 {_int(t.get('total')) or 0:,} は印字どおり）")
+    msgs += why   # 「税込に見えるが直さなかった」理由も残す（握り潰さない）
     rd['_merged_from'] = {'pages': len(files), 'at': datetime.datetime.now().isoformat(timespec='seconds')}
     return rd, msgs
 

@@ -136,6 +136,11 @@ def main() -> int:
             fails.append('ページの指示文に「金額欄の空欄は空のまま」が無い')
         if '同じ金額を header の paint.total にも書かない' not in _p:
             fails.append('ページの指示文に「塗装の一式を paint にも書かない」が無い')
+        # 税込で印字された見積書は読み手に割り戻させない（2026-09-17: 同じ見積が税抜で読めた日と税込のまま読めた日があり、
+        # 税込のままだと NEO の合計が +46,492 円ずれた。判断規則 10-4 の割り戻しは reading_pages.merge が機械的にやる）
+        for _t, _w in ((_p, 'ページ'), (_h, 'header')):
+            if '税込・税抜を気にせず印字どおりに写す' not in _t or '1.1 で割らない' not in _t:
+                fails.append(f'{_w} の指示文に「税込の見積でも割り戻さない」が無い')
         if '工場（発行元）の住所は issuer' not in _h:
             fails.append('header の指示文に「工場の住所は customer に入れない」が無い')
     if not os.path.isfile(os.path.join(case, 'pages', 'page_1.json')) or not os.path.isfile(os.path.join(case, 'pages', 'header.json')):
