@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "c4f53713a4ab0d6ecffeb1006203c5222510bee2",
- "subject": "fix: バグハントで見つけた 7 件（税込の割り漏れ・レバーレート・半角化の巻き戻し・誤検知）",
- "synced_at": "2026-09-17T17:34:53",
+ "commit": "7840ffbad393256428b8a8fed96602a82aba7371",
+ "subject": "fix: 税込で印字された見積書の報告文に、表の「見積書」が税抜に直した値だと書く",
+ "synced_at": "2026-09-17T17:40:10",
  "files": 108,
- "tree_sha256": "9521108a3684181f1f8084a3c1a85f4133bc946d1dc0ace3058b3fd3eb2f4f1a",
+ "tree_sha256": "dd0edf9567e258b3f881da26bc52670a2428793038173436123948d4d3afecb1",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

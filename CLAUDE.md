@@ -62,6 +62,7 @@ python reg_neoacc.py && python reg_misread.py && python reg_cache.py
 python reg_expense.py && python reg_pipeline.py && python suite.py
 python reg_reader.py      # 読む段のループ（LLM 差し替え・課金なし）
 python reg_vendor.py      # 受け入れ §5-2: NEO_check の案件で files と vendor の NEO が全列一致
+python reg_vendor_units.py   # 取り込んだ vendor 自身の単体テスト 22 本（判断規則の回帰。vendor を取り直したら必ず）
 ```
 
 3. `codex-loop` スキルで Codex レビュー（gpt-5.5 / xhigh）を通す

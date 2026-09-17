@@ -89,7 +89,13 @@ def write_report(case: str, est: dict, rep: dict, rows: list[dict], inspect_json
     L.append(f"- 元資料: {est.get('source', '')}")
     L.append(f"- 車両: {str(car.get('CarNameByUser', '')).strip()} / {car.get('CarCode')} 年式 {car.get('YearCode')} ボディ {car.get('BodyCode')} グレード {car.get('GradeCode')} FVA {car.get('FVACode')} 色 {car.get('ColorCode')}（{(rep.get('vehicle') or {}).get('confidence')}）装備 {rep.get('eva_write', rep.get('eva'))}")
     L.append(f"- レバーレート {est.get('labor_rate')} 円" + (f"、工賃丸め {est.get('wage_round')} 円" if est.get('wage_round') else '') + (f"、index_policy {est.get('index_policy')}" if est.get('index_policy') else ''))
-    L += ['', '| 項目 | 見積書 | 生成 |', '|---|---|---|']
+    _ti = est.get('tax_included')   # 税込で印字された見積書（判断規則 10-4）は、この表の「見積書」が税抜に直した値になる
+    if _ti:
+        L += ['', f'> この見積書は**各行の金額まで税込**で印字されています（判断規則 10-4）。'
+                  f'下の表の「見積書」は {(100 + int(_ti)) / 100:g} で割って税抜に直した値です'
+                  f'（消費税と合計（税込）は印字どおり）。コグニの消費税設定は**内税**にしてあるので、'
+                  f'コグニの画面・帳票は見積書と同じ税込の金額で並びます']
+    L += ['', f"| 項目 | 見積書{'（税抜に直した値）' if _ti else ''} | 生成 |", '|---|---|---|']
     for label, k_pt, k_t in (('部品計', 'parts', 'parts'), ('工賃計', 'wage', 'wage'), ('塗装計（材料込）', 'paint_total', 'paint'), ('材料代', 'material', 'paint_material'),
                             ('内板骨格', 'frame', 'frame'), ('費用部品', 'expense_parts', 'expense_parts'), ('費用工賃', 'expense_wage', 'expense_wage'),
                             ('課税小計', 'taxable', 'subtotal'), ('消費税', 'tax', 'tax'), ('合計（税込）', 'total', 'total')):
