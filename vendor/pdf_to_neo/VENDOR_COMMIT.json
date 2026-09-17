@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "091c907da41bbc0d91d959639f226b43bdcfa179",
- "subject": "fix: 税込を割り戻した見積で、課税小計の印字が無いと消費税の丸め方を取り違える（四捨五入の工場が「切り捨て」になっていた）",
- "synced_at": "2026-09-17T13:41:09",
+ "commit": "8c6382cf48fb1963ea93b40907832ce181850802",
+ "subject": "fix: NEO の名称欄のカタカナを全部半角にする（リサイクル部品・手入力の塗装行・追加塗装が全角のままだった）",
+ "synced_at": "2026-09-17T14:05:11",
  "files": 108,
- "tree_sha256": "3a4d06c163a4eca8377584609e4ce35e398e209ad17f7a624b7b8f52df6fe79a",
+ "tree_sha256": "5a50e21c91e2047ea175ea9fd29822a107adfe7444eca1566dd98be385dbfff7",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

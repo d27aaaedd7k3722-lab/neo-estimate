@@ -2218,7 +2218,7 @@ class NeoBuilder:
                                  '{"name": 名称, "price": 売価, "stock_price": 仕入値} の形で書く（true だけでは金額が決まらない）')
             price = _money(rc.get('price'), f"リサイクル部品 {rc.get('name', '')} の価格")
             stock = _money(rc.get('stock_price'), f"リサイクル部品 {rc.get('name', '')} の仕入値") or price
-            name = _fit(rc.get('name') or r['PartsName'].strip(), 20)
+            name = _fit(hw(str(rc.get('name') or '')).strip() or r['PartsName'].strip(), 20)  # 部品の名称欄は半角カナ（明細の name と同じ扱い）
             cur.execute('INSERT INTO RCParts (RecordNo, PartsName, StockingPriceOutTax, StockingPriceInTax, StockingPriceTax, PartsPriceOutTax, PartsPriceInTax, PartsPriceTax, '
                         'PartsPriceCoefficient, Comment, ContactFlag) VALUES (?,?,?,?,?,?,?,?,1,"",1)', (n_rc, name, *t3i(stock), *t3i(price)))
             src = dict(zip(cols, cur.execute('SELECT * FROM ERParts WHERE RecordNo=?', (r['RecordNo'],)).fetchone()))
@@ -2436,7 +2436,7 @@ class NeoBuilder:
             # 部品コードのあるパネルの後ろに入力順で並ぶ。塗装工賃計（材料代の対象）に入り、加算基礎の枚数には数えない
             for j, pnl in enumerate(man_panels):
                 # 名称は入力のまま（コグニは行追加の名称を直さない。実案件 NEO 209 行: 半角カナが大半だが 全角カナ 3・前後空白 4・長音 'ｰ' と '-' の両方がある）。20 バイトで切るだけ
-                nm = _fit(str(pnl.get('name') or ''), 20)
+                nm = _fit(hw(str(pnl.get('name') or '')), 20)  # 外板パネルの名称欄も半角カナ（実機 NEO 851 行中 849 行）
                 t = float(pnl.get('index') or 0)
                 w = _money(pnl.get('wage'), f"手入力の塗装行 {nm} の工賃")
                 if t > 0 and not w and rate:
@@ -2775,7 +2775,7 @@ class NeoBuilder:
                 if not free:
                     raise ValueError(f'塗装追加項目の空き行が無い: {o.get("name")}')
                 line = free[-1]
-                cur.execute('UPDATE PaintingOther SET Name=? WHERE LineNo=?', (_fit(o.get('name', ''), 20), line))
+                cur.execute('UPDATE PaintingOther SET Name=? WHERE LineNo=?', (_fit(hw(str(o.get('name') or '')), 20), line))  # 追加塗装の工程名も半角カナ（実機 2,915 行中 2,864 行）
                 notes.append(f'塗装追加項目 {o.get("name")} はテンプレートに無いため行 {line} に名称を入れて計上')
             t = float(o.get('index') or 0); w = int(o.get('wage') or rp2(t))
             cur.execute('UPDATE PaintingOther SET Time=?, WageOutTax=?, WageInTax=?, WageTax=?, WageByManual="#" WHERE LineNo=?', (t, *t3i(w), line))

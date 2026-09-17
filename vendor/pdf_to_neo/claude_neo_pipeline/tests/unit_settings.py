@@ -77,6 +77,29 @@ def main() -> int:
     check(st2['TaxKindFlag'] == 1, f"税込印字は内税 {st2['TaxKindFlag']}")
     check(tot2['Total'] == tot['Total'] and rows2['5600']['WageOutTax'] == rows['5600']['WageOutTax'],
           f"表示方法だけの違いで金額は変わらない {tot2['Total']} / {tot['Total']}")
+    # 名称欄のカタカナは半角（亮平さん指示 2026-09-17。実案件 NEO 400 本: 明細 19,454 行中 19,280 行・
+    # 外板パネル 851 行中 849 行・追加塗装 2,915 行中 2,864 行が半角）。estimate に全角で書かれていても生成器が直す
+    import re as _re
+    import sqlite3 as _sq
+    fw = _re.compile(r'[ァ-ヶ]')
+    kana = [{'code': '1400', 'name': 'Fバルクヘッド', 'method': '取替', 'qty': 1},
+            {'name': 'フロントバンパーカバー', 'method': '取替', 'qty': 1, 'price': 50000, 'manual': True},
+            {'name': 'リヤスポイラー', 'method': '', 'qty': 1, 'price': 3000, 'manual': True,
+             'recycle': {'name': 'リサイクルバンパー', 'price': 3000}}]
+    _rows, _st, _tot, _rep = build(kana, paint={'panels': [{'name': 'フロントフエンダパネル', 'index': 2.0, 'wage': 16000}],
+                                                'other': [{'name': 'プライマー塗装', 'index': 1.7, 'wage': 14880}],
+                                                'total': 40000, 'material': 10000})
+    em = neo_diff.load(os.path.join(os.environ.get('TEMP', HERE), 'unit_settings.neo'))['AnSvEm0001.sld']
+    bad = []
+    for tbl, col in (('ERParts', 'PartsName'), ('ERParts', 'PartsNameStandard'), ('RCParts', 'PartsName'),
+                     ('ReserveERParts', 'PartsName'), ('PaintingPanel', 'PanelName'), ('PaintingOther', 'Name')):
+        try:
+            vals = [v for (v,) in em.execute('select %s from %s' % (col, tbl)) if isinstance(v, str)]
+        except _sq.Error:
+            continue
+        bad += [f'{tbl}.{col} {v!r}' for v in vals if fw.search(v)]
+    check(not bad, '名称欄に全角カナが残っている: ' + ' / '.join(bad[:4]))
+    check(any('ﾘｻｲｸﾙ' in str(r.get('PartsName') or '') for r in _rows.values()), 'リサイクル部品の名称が半角カナで入っていない')
     print('unit_settings:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 

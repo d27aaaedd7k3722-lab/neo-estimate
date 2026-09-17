@@ -1264,12 +1264,13 @@ def test_manual_paint_rows_are_disposal_9():
     plan3 = tuple(em3.execute('SELECT BaseTime, BaseTimeStandard, BaseWageOutTax, BaseWageByManual FROM PaintingPlan').fetchone())
     em3.close(); os.unlink(p3)
     assert plan3 == (2.5, -1, 18400, '#'), plan3
-    # 名称は入力のまま（全角カナも長音も直さない）、20 バイトで切るだけ
+    # 名称のカタカナは半角にする（判断規則 10-22b。亮平さん指示 2026-09-17。実案件 NEO の外板パネル 851 行中 849 行が半角）。
+    # 半角にすると 22 バイト → 13 バイトになるので、以前は 20 バイトで切れていた名前も切れなくなる
     neo6, _ = NeoBuilder().build(dict(BASE, vehicle=veh, items=items, paint=dict(base_paint, panels=[{'name': 'リヤボデーフロアパネル', 'index': 2.0}])), veh, labor_rate=7360, est_date='20260913', insurance={})
     p6 = _paint_db(neo6); em6 = sqlite3.connect(p6)
     n6 = em6.execute('SELECT PanelName FROM PaintingPanel WHERE DisposalCode = 9').fetchone()[0]
     em6.close(); os.unlink(p6)
-    assert n6 == 'リヤボデーフロアパネ', n6
+    assert n6 == 'ﾘﾔﾎﾞﾃﾞｰﾌﾛｱﾊﾟﾈﾙ', n6
     # 手入力の塗装行だけでもブースの標準（BOOTH.DB。枚数と無関係）は引く（Codex 指摘）
     neo5, _ = NeoBuilder().build(dict(BASE, vehicle=veh, items=items, paint=dict(base_paint, panels=[{'name': 'Rrｹﾞ-ﾄﾊﾟﾈﾙ', 'index': 2.0}], booth={'use': True})), veh, labor_rate=7360, est_date='20260913', insurance={})
     p5 = _paint_db(neo5); em5 = sqlite3.connect(p5)
