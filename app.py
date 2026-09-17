@@ -7880,6 +7880,14 @@ def p2n_read(pdf_bytes, file_name, api_key, mime_type='application/pdf',
             # 作業フォルダは消すので、直すための pages/ と merge 結果を zip で渡す
             out['error'] = rd.error
             out['repair_zip'] = _nsk_maker.repair_bundle(case_dir, rd.reading)
+            if rd.reading:
+                # 検算に通らなくても NEO は渡す（2026-09-17 亮平さん指示）。作るのは呼び出し側（p2n_make の
+                # force_unverified）。PC の Addata を橋渡しする経路では、車種フォルダを取り寄せてから作らないと
+                # 部品コードの入らない NEO になるので、ここでは作らずに作業フォルダを残す
+                out['case_dir'] = case_dir
+                out['reading'] = rd.reading
+                out['force_unverified'] = True
+                return out
             _left = _nsk_maker.remove_case_dir(case_dir)
             if _left:
                 out['cleanup_warning'] = f'作業フォルダを消せませんでした。手で削除してください: {_left}'
@@ -7924,6 +7932,25 @@ def p2n_make(state, addata_root=None, record_profile=None, progress=None):
         _nsk_maker.remove_case_dir(case_dir)
         return out
     try:
+        if out.pop('force_unverified', False):
+            # 読み取りが検算に通らなかった案件（2026-09-17 亮平さん指示: ズレがあっても NEO は作って違いを説明する）。
+            # 検算の関門を外して作り、合格扱いにはしない。工場プロファイルは記録しない（通っていない読み取りを学習させない）
+            if progress:
+                progress('検算に通らなかった点を残したまま、確認用の NEO を作っています')
+            mk = _nsk_maker.make_neo(case_dir, 'estimate', no_profile=True, addata_root=addata_root,
+                                     skip_check=True, allow_neo_total=True)
+            out['stage'] = 'read'   # 画面は読み取りの不合格のまま（ページごとの検算結果を見せる）
+            out['make'] = {'ok': False, 'match_line': mk.match_line, 'reasons': list(mk.reasons),
+                           'error': mk.error, 'tail': '\n'.join((mk.stdout or '').splitlines()[-40:])}
+            out['report_md'] = _nsk_maker.read_text(mk.report_path) or out.get('report_md')
+            out['unverified_neo'] = _nsk_maker.read_bytes(mk.ng_neo_path or mk.neo_path)
+            out['unverified_review'] = _nsk_maker.read_bytes(mk.review_path)
+            out['unverified_review_ext'] = os.path.splitext(mk.review_path or '')[1] or '.xlsx'
+            out['diffs'] = _p2n_diff_lines(mk.stdout)
+            out['download_name'] = _p2n_download_name(mk.estimate_path, out.get('report_md'))
+            if not out['unverified_neo']:
+                out['unverified_error'] = mk.error or '検算を外しても NEO を作れませんでした（下の修正用ファイルで直してください）'
+            return out
         if progress:
             progress('下書き → ADDATA 突合せ → NEO 生成 → 検算（pdf-to-neo スキル make_neo.py）')
         # allow_neo_total: 工場の単価に円未満の端数がある見積（コグニの円計算では印字の合計を再現できない案件）を、
@@ -7944,6 +7971,12 @@ def p2n_make(state, addata_root=None, record_profile=None, progress=None):
                         _rd2['blocks'][_bi]['rows'][_ri], '要確認: 工賃欄が空欄のため 0 円で作成（標準指数では見積書合計に合わなかった）')
                 _first_report = _nsk_maker.read_text(mk.report_path)
                 _first_repair = _nsk_maker.repair_bundle(case_dir, reading)   # 1 回目の estimate/report と元の reading（再試行で上書きされる前）
+                # 1 回目の NEO と確認箇所シートも控える。作り直しは同じ作業フォルダに書くので .ng.neo が
+                # 工賃 0 円版で上書きされ、渡す NEO と画面の説明（1 回目の差額）が食い違う（レビュー指摘 2026-09-17）
+                _first_ng = _nsk_maker.read_bytes(mk.ng_neo_path or mk.neo_path)
+                _first_review = _nsk_maker.read_bytes(mk.review_path)
+                _first_review_ext = os.path.splitext(mk.review_path or '')[1] or '.xlsx'
+                _first_diffs = _p2n_diff_lines(mk.stdout)
                 _nsk_maker.write_reading(case_dir, _rd2)
                 if progress:
                     progress(f'標準指数では見積書合計に合わないので、工賃欄が空欄の {len(_bw)} 行を 0 円として作り直しています')
@@ -7963,6 +7996,10 @@ def p2n_make(state, addata_root=None, record_profile=None, progress=None):
                     out['blank_wage_retry'] = {'rows': [n for _, _, n in _bw], 'reasons': list(mk2.reasons or []), 'error': mk2.error}
                     out['_first_report_md'] = _first_report
                     out['_first_repair_zip'] = _first_repair
+                    out['_first_ng_neo'] = _first_ng          # 渡すのは 1 回目（印字どおりの工賃）の NEO
+                    out['_first_review'] = _first_review
+                    out['_first_review_ext'] = _first_review_ext
+                    out['_first_diffs'] = _first_diffs
         out['stage'] = 'make'
         out['make'] = {'ok': mk.ok, 'match_line': mk.match_line, 'reasons': list(mk.reasons),
                        'error': mk.error, 'tail': '\n'.join(mk.stdout.splitlines()[-40:])}
@@ -7970,23 +8007,32 @@ def p2n_make(state, addata_root=None, record_profile=None, progress=None):
         if not mk.ok:
             out['error'] = mk.error
             out['repair_zip'] = out.pop('_first_repair_zip', None) or _nsk_maker.repair_bundle(case_dir, reading)
+            # 検算に通らなくても NEO は渡す（2026-09-17 亮平さん指示: 一定のズレがあっても作って、違いを説明する）。
+            # 工賃 0 円で作り直した案件は、作業フォルダの .ng.neo が作り直し版で上書きされているので、
+            # **控えておいた 1 回目（印字どおり）の NEO とシート**を渡す（画面の差額の説明と揃える。レビュー指摘）
+            _un_neo = out.pop('_first_ng_neo', None)
+            _un_review = out.pop('_first_review', None)
+            _un_ext = out.pop('_first_review_ext', None)
+            _un_diffs = out.pop('_first_diffs', None)
+            mk_un = mk
+            if not _un_neo and not mk.ng_neo_path and not mk.neo_path:
+                # 読み取りの検算で止まった案件は NEO 自体が作られていない: 検算の関門を外して作り直す
+                mk_un = _nsk_maker.make_neo(case_dir, 'estimate', no_profile=True, addata_root=addata_root,
+                                            skip_check=True, allow_neo_total=True)
+                if mk_un.report_path:
+                    out['report_md'] = _nsk_maker.read_text(mk_un.report_path) or out.get('report_md')
+            out['unverified_neo'] = _un_neo or _nsk_maker.read_bytes(mk_un.ng_neo_path or mk_un.neo_path)
+            out['unverified_review'] = _un_review or _nsk_maker.read_bytes(mk_un.review_path)
+            out['unverified_review_ext'] = _un_ext or os.path.splitext(mk_un.review_path or '')[1] or '.xlsx'
+            out['diffs'] = _un_diffs or _p2n_diff_lines(mk_un.stdout or mk.stdout)
+            out['download_name'] = _p2n_download_name(mk_un.estimate_path or mk.estimate_path, out.get('report_md'))
+            if not out['unverified_neo']:
+                out['unverified_error'] = mk.error or '検算を外しても NEO を作れませんでした（下の修正用ファイルで直してください）'
             return out
         out['neo_bytes'] = _nsk_maker.read_bytes(mk.neo_path)
         out['review_bytes'] = _nsk_maker.read_bytes(mk.review_path)
         out['review_ext'] = os.path.splitext(mk.review_path or '')[1] or '.xlsx'
-        # ダウンロード名は <顧客>_<車名>_claude（HANDOFF §4 段 8 の規則）。読めなければ 見積_claude
-        cust = ''
-        car = ''
-        try:
-            est = json.load(open(mk.estimate_path, encoding='utf-8-sig')) if mk.estimate_path else {}
-            cust = str(((est.get('customer') or {}).get('name')) or '').strip()
-        except Exception:
-            est = {}
-        m = re.search(r'^- 車両: (.+?) /', out['report_md'] or '', re.M)
-        if m:
-            car = m.group(1).strip()
-        stem = '_'.join(x for x in (cust, car) if x) or '見積'
-        out['download_name'] = re.sub(r'[\\/:*?"<>|\r\n\t\s]+', '_', stem) + '_claude'
+        out['download_name'] = _p2n_download_name(mk.estimate_path, out['report_md'])
         out['ok'] = bool(out['neo_bytes'] and out['review_bytes'])
         out['stage'] = 'done' if out['ok'] else 'make'
         if not out['ok']:
@@ -8144,7 +8190,11 @@ def run_pdf_to_neo_skill(pdf_bytes, file_name, api_key, mime_type='application/p
                      insurance_hint=insurance_hint, customer_hint=customer_hint, progress=progress, record_profile=record_profile,
                      addata_root=addata_root, reader_kind=reader_kind, model_name=model_name)
     if not state.get('ok'):
-        return state
+        if not state.get('force_unverified'):
+            return state
+        # 読み取りが検算に通らなくても NEO は渡す（2026-09-17 亮平さん指示）。検算の関門を外して作り、
+        # 合格扱いにはしない（画面は読み取りの不合格のまま、印字との違いを添える）
+        return p2n_make(state, addata_root=addata_root, record_profile=False, progress=progress)
     return p2n_make(state, addata_root=addata_root, record_profile=record_profile, progress=progress)
 
 
@@ -8445,6 +8495,79 @@ def _row_with_wage_zero(row, note: str):
     else:
         d['comment'] = note + ((' / ' + cur) if cur else '')
     return d
+
+
+def _p2n_download_name(estimate_path, report_md) -> str:
+    """ダウンロード名 <顧客>_<車名>_claude（HANDOFF §4 段 8 の規則）。読めなければ 見積_claude"""
+    cust = ''
+    try:
+        est = json.load(open(estimate_path, encoding='utf-8-sig')) if estimate_path else {}
+        cust = str(((est.get('customer') or {}).get('name')) or '').strip()
+    except Exception:  # noqa: BLE001  名前が読めなくても既定名で出す
+        pass
+    m = re.search(r'^- 車両: (.+?) /', report_md or '', re.M)
+    stem = '_'.join(x for x in (cust, (m.group(1).strip() if m else '')) if x) or '見積'
+    return re.sub(r'[\\/:*?"<>|\r\n\t\s]+', '_', stem) + '_claude'
+
+
+def _p2n_unverified_ui(res, key_suffix: str = 'read') -> None:
+    """検算に通らなかった案件でも NEO と確認箇所シートを渡す（2026-09-17 亮平さん指示）。
+    合格したものと取り違えないよう、名前に `_要確認` を付け、直す場所を上に出してから渡す"""
+    if not res.get('unverified_neo'):
+        st.error("この案件は NEO を作るところまで進めませんでした"
+                 + (f": {_md_literal(res['unverified_error'])}" if res.get('unverified_error') else '')
+                 + "。下の修正用ファイルで直してから、もう一度お試しください。")
+        return
+    name = (res.get('download_name') or '見積_claude') + '_要確認'
+    st.warning("下の NEO は**検算に通っていません**。上の「印字との違い」をコグニで直してから協定に使ってください"
+               "（ファイル名に `_要確認` が付きます）。違いの詳しい内訳は報告文（下）に入っています。")
+    if res.get('report_md'):
+        st.download_button("📝 違いの説明（報告文 report.md）をダウンロード", data=str(res['report_md']).encode('utf-8'),
+                           file_name=f"{name}_報告.md", mime="text/markdown",
+                           key=f'pdf2neo_dl_report_unverified_{key_suffix}', width='stretch',
+                           disabled=bool(res.get('stale')))
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button("⚠️ NEOファイルをダウンロード（要確認）", data=res['unverified_neo'],
+                           file_name=f"{name}.neo", mime="application/octet-stream",
+                           key=f'pdf2neo_dl_neo_unverified_{key_suffix}', width='stretch',
+                           disabled=bool(res.get('stale')))
+    with c2:
+        if res.get('unverified_review'):
+            st.download_button("⚠️ 確認箇所シートをダウンロード（要確認）", data=res['unverified_review'],
+                               file_name=f"{name}_確認箇所{res.get('unverified_review_ext') or '.xlsx'}",
+                               mime="application/octet-stream", key=f'pdf2neo_dl_review_unverified_{key_suffix}',
+                               width='stretch', disabled=bool(res.get('stale')))
+        else:
+            st.caption("確認箇所シートはこの案件では作られませんでした（報告文をご覧ください）")
+
+
+def _p2n_diff_lines(stdout: str, limit: int = 12) -> list:
+    """make_neo の出力から「印字とどこが違うか」の行だけ拾う（不合格でも NEO を渡すときの説明に使う。2026-09-17）。
+    金額の差だけでなく、**前後・左右の取り違え・照合できなかった行・不合格の理由**も拾う
+    （合計が合っていてもここで落ちる案件があるので、拾い漏らすと「違い」の見出しごと消える。レビュー指摘）"""
+    out: list = []
+    for ln in (stdout or '').splitlines():
+        s = ln.strip()
+        for pre in ('FAIL: ', 'WARN: ', '★ ', '- ★ '):
+            if s.startswith(pre):
+                s = s[len(pre):].strip()
+                break
+        if s.startswith('検算 ') and '差 ' in s:
+            out.append(s)
+        elif s.startswith('見積書合計との一致:') and 'OK' not in s:
+            out.append(s)
+        elif s.startswith('合計欄 ') and '一致' not in s:
+            out.append(s)
+        elif s.startswith('不合格:') or s.startswith('紙上検算に FAIL') or s.startswith('ページ単位の検算に不合格'):
+            out.append(s)
+        elif s.startswith('未照合行:') or '食い違う' in s or s.startswith('意図と違う'):
+            out.append(s)
+    seen: set = set()
+    uniq = [x for x in out if not (x in seen or seen.add(x))]
+    if len(uniq) > limit:
+        return uniq[:limit] + [f'…ほか {len(uniq) - limit} 件（下の報告文をご覧ください）']
+    return uniq
 
 
 def _blank_wage_rows(reading) -> list:
@@ -9713,7 +9836,7 @@ def main():
                         if _p2n_bridge:
                             # PC の Addata: 読む → 車種を決める（COM だけで足りる）→ 車種フォルダが無ければ部品に頼んで待つ
                             _p2n_state = _guarded_call(p2n_read, _p2n_bytes, _p2n_file.name, _p2n_key, **_p2n_kw)
-                            if not _p2n_state.get('ok'):
+                            if not _p2n_state.get('ok') and not _p2n_state.get('force_unverified'):
                                 _p2n_out = _p2n_state
                             else:
                                 _p2n_progress('車種を決めています（PC の Addata の車種マスタ）')
@@ -9799,7 +9922,8 @@ def main():
                     # 写す前に止まったときは「検算に通らない」とは言わない。P13）
                     st.error("❌ 見積書の写しが機械検算に通りませんでした。NEO は作っていません"
                              "（合計を合わせるために行を消したり金額を動かしたりはしません）。"
-                             "下の項目を見積書と突き合わせてください。")
+                             + ("**NEO は下で渡しますが、下の項目が見積書と合っていません。** 必ず突き合わせてください。"
+                                if _p2n_res.get('unverified_neo') else "下の項目を見積書と突き合わせてください。"))
                 for _f in (_p2n_rd.get('fails') or []):
                     st.markdown(f"- {_md_literal(_f)}")
                 _p2n_tr = _p2n_rd.get('traces') or []
@@ -9808,6 +9932,12 @@ def main():
                         'ページ': t['page'], '検算': '合格' if t['ok'] else '不合格', '明細行': t['rows'],
                         '読んだ回数': t['attempts'], '不合格の理由': ' / '.join(t['fail'])[:120]} for t in _p2n_tr]),
                         hide_index=True, width='stretch')
+                _p2n_rdiffs = _p2n_res.get('diffs') or []
+                if _p2n_rdiffs:   # 生成まで進めたときの「印字との違い」（不合格でも NEO を渡す。2026-09-17）
+                    st.markdown("**印字との違い（この NEO を開いて直す場所）**")
+                    for _d in _p2n_rdiffs:
+                        st.markdown(f"- {_md_literal(_d)}")
+                _p2n_unverified_ui(_p2n_res)
                 if _p2n_res.get('repair_zip'):
                     st.download_button(
                         "🧰 修正用ファイル一式をダウンロード（pages/・reading.json）",
@@ -9816,15 +9946,25 @@ def main():
                     )
                     st.caption("NEO_check の案件フォルダに展開し、該当ページの pages/page_N.json を見積書と突き合わせて直してから"
                                " `make_neo.py <案件フォルダ>` を回すと続きができます。")
+                if _p2n_res.get('report_md'):   # 違いの詳しい内訳（読み取り不合格の枝でも必ず見られるように）
+                    with st.expander("📝 報告文（report.md）", expanded=False):
+                        st.markdown(_md_literal(_p2n_res['report_md']))
             elif _p2n_mk and not _p2n_mk.get('ok'):
-                st.error("❌ NEO の生成が不合格でした（pdf-to-neo スキル make_neo.py の判定）。NEO は出しません。")
+                st.error("⚠️ 検算に通らなかった点があります（pdf-to-neo スキル make_neo.py の判定）。"
+                         + ("**NEO は下で渡しますが、見積書と違うところが残っています。** 下の「印字との違い」を必ず確かめてください。"
+                            if _p2n_res.get('unverified_neo') else "下の「印字との違い」を見積書と突き合わせてください。"))
                 for _r in (_p2n_mk.get('reasons') or []):
                     st.markdown(f"- {_md_literal(_r)}")
+                _p2n_diffs = _p2n_res.get('diffs') or []
+                if _p2n_diffs:   # 不合格でも NEO を渡す（2026-09-17 亮平さん指示）ので、どこが違うかを最初に出す
+                    st.markdown("**印字との違い（この NEO を開いて直す場所）**")
+                    for _d in _p2n_diffs:
+                        st.markdown(f"- {_md_literal(_d)}")
                 # 読み取り（AI）は同じ見積書でも毎回少しずつ違う（欄の割り当て・費用の置き場所）。
                 # もう一度押すと通ることがあるので、先に案内する（2026-09-16 Gemini 4 回の実測）
                 st.info("もう一度「見積書からNEOを生成」を押すと、読み取りからやり直します。"
                         "AI の読み取りは同じ見積書でも毎回少し変わるので、これで通ることがあります"
-                        "（金額が印字と合わないときは NEO を出さないので、作り直しても中身が甘くなることはありません）。"
+                        "（作り直しても、違いはこの画面と報告文に必ず出ます）。"
                         "下の報告文に「差額と同じ額: 行N …」が出ていれば、その行の印字を確かめてください。")
                 if _p2n_mk.get('error'):
                     st.caption(_p2n_mk['error'])
@@ -9834,6 +9974,7 @@ def main():
                     _p2n_bwr = _p2n_res['blank_wage_retry']
                     st.caption(f"工賃欄が空欄の {len(_p2n_bwr.get('rows') or [])} 行を 0 円にして作り直しても合いませんでした: "
                                + ' / '.join(str(r)[:80] for r in (_p2n_bwr.get('reasons') or [])[:3]))
+                _p2n_unverified_ui(_p2n_res, 'make')
                 if _p2n_res.get('repair_zip'):
                     st.download_button(
                         "🧰 修正用ファイル一式をダウンロード（pages/・reading.json・report.md）",

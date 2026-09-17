@@ -36,8 +36,10 @@
 
 - 取り込んでいるコミット: `vendor/pdf_to_neo/VENDOR_COMMIT.json` と `neo_skill/vendor.py` の `EXPECTED_COMMIT`（コミットの番号はここに書かない。古くなるので `VENDOR_COMMIT.json` を見る。取り直しの履歴は docs/引き継ぎ書.md の表）
 - 取り直し: `python tools/vendor_sync.py --source "<files>" --commit <ID>`／改変チェック `--check`
-- 見積書を読む LLM は Claude API（`.env` の `ANTHROPIC_API_KEY`）か Gemini API（`GEMINI_API_KEY`）。両方あれば画面で選ぶ（既定 Claude）、Gemini だけならそれで動く。判断・生成・検算は同じ
-- 合格の条件は vendor の `make_neo.py` と同じ。NEO と確認箇所シート（xlsx）は必ず組で出す
+- 見積書を読む LLM は Gemini API（`.env` の `GEMINI_API_KEY`）が主。Claude API（`ANTHROPIC_API_KEY`）もあれば画面で選ぶ（既定 Gemini）、Gemini だけならそれで動く。判断・生成・検算は同じ
+- 合格の条件は vendor の `make_neo.py` と同じ。NEO と確認箇所シート（xlsx）は必ず組で出す。
+  **検算に通らなかった案件でも NEO と確認箇所シートは渡す**（2026-09-17 亮平さん指示）。ファイル名に `_要確認` を付け、
+  画面と報告文に「印字との違い」を必ず出す（合格したものと取り違えさせない。金額を合わせるための行の削除・改変はしない）
 - 旧経路（`pdf_to_neo_pipeline` / `auto_matching`）は UI から外した。関数は残してある
 - 詳細は `docs/引き継ぎ書.md` §12、方針は files の `docs/pdf-to-neo_アプリ移植ガイド.md`
 - **別 PC の ADDATA**: `C:\Addata`／`D:\Addata` なら設定不要（自動検出）。他の場所はサイドバーのパスか `env_check.py --save`。詳細は引き継ぎ書 §12.9
