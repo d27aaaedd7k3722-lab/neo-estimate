@@ -302,6 +302,10 @@ def main(path: str, out: str = ''):
     # 許容差（tolerance）を効かせてよいのは、工場の丸めで実際に差が出る項目だけ。
     # 部品計・材料代・費用は工場が円単位で出すので 0 円一致を求める（合計用の幅を流用しない。Codex 指摘）
     TOL_KEYS = {'wage', 'paint', 'paint_total', 'frame', 'taxable', 'tax'}
+    # 単価に円未満の端数がある見積（クリップ 単価 154.5 円 …）は部品計にも丸め差が出る。
+    # そのときだけ totals.tolerance_keys で対象を名指しする（下書きが証拠付きで書く。手書きでも 3 点セットは必要）。
+    # 広げてよいのは **部品計だけ**（材料代・費用は工場が円単位で出すので 0 円一致のまま。レビュー指摘 2026-09-17）
+    TOL_KEYS |= {str(k) for k in (pt.get('tolerance_keys') or []) if str(k) == 'parts'}
     for label, key, gen in checks:
         if pt.get(key) is None or gen is None:
             continue

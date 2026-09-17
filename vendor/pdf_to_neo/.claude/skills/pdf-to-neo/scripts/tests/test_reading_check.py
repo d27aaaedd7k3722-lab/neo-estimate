@@ -270,6 +270,39 @@ def test_paint_lump_in_rows_and_paint_is_counted_once():
     assert not r2['fail'], r2['fail']
 
 
+def test_unit_price_fraction_is_not_a_fail():
+    """単価に円未満の端数がある見積（金額が数量で割り切れない行がある）の数円差は、読み取りの誤りではないので止めない。
+    2026-09-16 フリード: 部品計 印字 234,627 / 明細 234,629（クリップの単価 154.5 円）"""
+    rd = copy.deepcopy(BASE)
+    rd['blocks'][0]['rows'][1] = '|ﾊﾞﾝﾊﾟ ｸﾘｯﾌﾟ|取替|90467-11111||7|5001|||'   # 7 個 5,001 円（単価 714.43…）
+    rd['blocks'][0]['subtotal'] = {'rows': 3, 'parts': 60001, 'wage': 12000}
+    rd['pages']['1'] = {'rows': 3, 'parts': 60001, 'wage': 12000}
+    r = run(rd)   # 印字の部品計 95,000 に対し明細 + 費用は 95,001（差 +1、端数のある行が 1 行）
+    assert not r['fail'], r['fail']
+    assert has(r['warn'], '単価に円未満の端数'), r['warn']
+    # 消費税の丸め判定は**印字の課税小計**で行う（見逃した差でコグニ側の合計を使うと、四捨五入の工場を「切り捨て」と
+    # 誤判定して Setting.tx_ArrangeFlag の違う NEO を作ってしまう。レビュー指摘 2026-09-17）
+    assert not any('切り捨て' in w for w in r['warn']), r['warn']
+    assert r['settings'].get('tax_round') in (None, '四捨五入'), r['settings']
+    rd['blocks'][0]['rows'][1] = '|ﾊﾞﾝﾊﾟ ｸﾘｯﾌﾟ|取替|90467-11111||7|5100|||'   # 差 +100 は端数（1 行なら最大 1 円）では説明できない
+    rd['blocks'][0]['subtotal'] = {'rows': 3, 'parts': 60100, 'wage': 12000}
+    rd['pages']['1'] = {'rows': 3, 'parts': 60100, 'wage': 12000}
+    r2 = run(rd)
+    assert has(r2['fail'], '部品計'), r2['fail']
+    # 方向が逆（印字のほうが多い）は端数では説明できないので止める
+    rd3 = copy.deepcopy(BASE)
+    rd3['blocks'][0]['rows'][1] = '|ﾊﾞﾝﾊﾟ ｸﾘｯﾌﾟ|取替|90467-11111||7|4999|||'
+    rd3['blocks'][0]['subtotal'] = {'rows': 3, 'parts': 59999, 'wage': 12000}
+    rd3['pages']['1'] = {'rows': 3, 'parts': 59999, 'wage': 12000}
+    assert has(run(rd3)['fail'], '部品計'), '印字のほうが多い差を端数として見逃した'
+    # 端数のある行が 1 行も無ければ、1 円でも止める
+    rd4 = copy.deepcopy(BASE)
+    rd4['blocks'][0]['rows'][1] = '|ﾊﾞﾝﾊﾟ ｸﾘｯﾌﾟ|取替|90467-11111||10|5010|||'   # 10 個 5,010 円（単価 501 円・割り切れる）
+    rd4['blocks'][0]['subtotal'] = {'rows': 3, 'parts': 60010, 'wage': 12000}
+    rd4['pages']['1'] = {'rows': 3, 'parts': 60010, 'wage': 12000}
+    assert has(run(rd4)['fail'], '部品計'), '端数のある行が無いのに見逃した'
+
+
 def test_material_counts_lines_with_only_material():
     """材料の列だけに金額のある塗装行も材料計に数える（印字と一致するときだけ）。
     2026-09-16 アクセラ: 材料計が 2,000 円足りないまま不合格になり NEO を作れなかった"""

@@ -428,6 +428,14 @@ class Checker:
         paint_w_sub = 0 if drop_paint else paint_w        # 課税小計に足す塗装工賃
         material_sub = 0 if drop_paint else material      # 同じく材料代
 
+        # 工場の単価に円未満の端数がある見積（印字の金額が数量で割り切れない行がある）は、行ごとに円で足すコグニでは
+        # 印字の合計をどうやっても再現できない（工場は端数のまま合計する）。差が「端数のある行数」に収まるなら
+        # 読み取りの誤りではないので止めない。下書きが 3 点セット（neo_total/tolerance/理由）を書いて run_case が扱う
+        # （2026-09-16 フリード: 単価 154.5・184.5 円のクリップで部品計が 2 円・課税小計が 1 円ずれた）
+        _frac_rows = [r for r in rows if (_int(r.get('qty')) or 1) > 1 and (_int(r.get('price')) or 0) > 0
+                      and (_int(r.get('price')) or 0) % (_int(r.get('qty')) or 1)]
+        _frac_max = min(len(_frac_rows), 10)
+
         def cmp(label: str, calc: int, given, alts: Optional[dict] = None) -> bool:
             g = _int(given)  # 印字どおり '95,000' や空欄 '' でも落ちない（空欄・非数値は未記入扱い）
             if g is None:
@@ -441,6 +449,16 @@ class Checker:
                 if g == alt:
                     self.note(f'合計欄 {label}: 印字 {g:,} は「{desc}」として一致（明細だけの合計 {calc:,} とは違う）')  # report.md に必ず出す（make_neo）
                     return True
+            _cands = [calc] + [int(v) for v in (alts or {}).values() if v is not None]
+            if label in ('部品計', '課税小計') and _frac_max and any(0 < c - g <= _frac_max for c in _cands):
+                # 見逃すが **False を返す**（呼び出し側の ok_sub が偽になり、消費税の丸めは「印字の課税小計」で判定される）。
+                # True を返すと base がコグニ側の合計になり、四捨五入の工場を「切り捨て」と誤判定して
+                # Setting.tx_ArrangeFlag の違う NEO を作ってしまう（レビュー指摘 2026-09-17）
+                self.warn(f'合計欄 {label}: 印字 {g:,} / 転記から {calc:,}（差 {calc - g:+,}）。'
+                          f'単価に円未満の端数がある行が {len(_frac_rows)} 行あるので、工場の端数計算とコグニの円計算の差とみて止めない'
+                          f'（例 {" / ".join(str(r.get("name") or "")[:12] for r in _frac_rows[:3])}）。'
+                          '下書きが totals.neo_total / tolerance に理由を書き、NEO は明細の金額どおりに作る')
+                return False   # 見逃したが「一致」ではない（上のコメント: 消費税の丸めは印字の課税小計で判定させる）
             self.fail(f'合計欄 {label}: 印字 {g:,} / 転記から {calc:,}（差 {calc - g:+,}）' + self._hint(calc - g, rows))
             return False
 

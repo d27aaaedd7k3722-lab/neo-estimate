@@ -7926,7 +7926,10 @@ def p2n_make(state, addata_root=None, record_profile=None, progress=None):
     try:
         if progress:
             progress('下書き → ADDATA 突合せ → NEO 生成 → 検算（pdf-to-neo スキル make_neo.py）')
-        mk = _nsk_maker.make_neo(case_dir, 'estimate', no_profile=not record_profile, addata_root=addata_root)
+        # allow_neo_total: 工場の単価に円未満の端数がある見積（コグニの円計算では印字の合計を再現できない案件）を、
+        # 下書きが書いた 3 点セット（totals.neo_total / tolerance / tolerance_reason）で合格にする。
+        # make_neo 側が 3 点セットの有無と run_case の合格を確かめるので、いつも渡してよい（2026-09-16 フリード）
+        mk = _nsk_maker.make_neo(case_dir, 'estimate', no_profile=not record_profile, addata_root=addata_root, allow_neo_total=True)
         # 検算に差があり、工賃欄が空欄（工賃も指数も無い）の行があるときは、その行を 0 円（印字どおり）にして作り直す。
         # 生成器は空欄に標準指数を補うが、実案件（精算見積・工場見積・コグニ印刷）では空欄 = 0 円のことが多く、
         # 見積書合計と合わずに不合格になっていた（2026-09-15 実機テスト 6 本中 4 本）。合うときだけ採用し、行名を注意に出す
@@ -7944,7 +7947,7 @@ def p2n_make(state, addata_root=None, record_profile=None, progress=None):
                 _nsk_maker.write_reading(case_dir, _rd2)
                 if progress:
                     progress(f'標準指数では見積書合計に合わないので、工賃欄が空欄の {len(_bw)} 行を 0 円として作り直しています')
-                mk2 = _nsk_maker.make_neo(case_dir, 'estimate', no_profile=not record_profile, addata_root=addata_root, force_draft=True)
+                mk2 = _nsk_maker.make_neo(case_dir, 'estimate', no_profile=not record_profile, addata_root=addata_root, force_draft=True, allow_neo_total=True)
                 if mk2.ok:
                     mk = mk2
                     _bw_names = [n for _, _, n in _bw]
@@ -9846,6 +9849,11 @@ def main():
                     st.code(_p2n_mk.get('tail') or '', language='text')
             elif _p2n_res.get('ok'):
                 st.success(f"✅ 合格 — {_p2n_mk.get('match_line') or '見積書合計との一致: OK'}")
+                if 'コグニ計算' in str(_p2n_mk.get('match_line') or ''):
+                    # 工場の単価に円未満の端数がある見積（コグニの円計算では印字の合計を再現できない案件。2026-09-16 フリード）
+                    st.info("この見積は**部品の単価に円未満の端数**があります（例: 単価 154.5 円 × 3 個 = 463.5 → 印字 464）。"
+                            "工場は端数のまま合計するので、行ごとに円で足すコグニとは数円ずれます。"
+                            "**明細の金額は見積書のとおり**で、差の理由は報告文と確認箇所シートの「要確認」に入れてあります。")
                 for _w in (_p2n_rd.get('warn') or []):
                     st.warning(f"⚠️ 読み取りの注意: {_md_literal(_w)}")
                 _p2n_name = _p2n_res.get('download_name') or '見積_claude'

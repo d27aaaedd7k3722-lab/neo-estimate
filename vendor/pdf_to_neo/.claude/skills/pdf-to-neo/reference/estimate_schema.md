@@ -128,6 +128,7 @@
 | frame | 内板骨格の合計 | あれば |
 | taxable / tax / total | 748081 / 74808 / 822889 | 課税小計・消費税・御見積額 |
 | page1..pageN | `[113320, 35010]` | ページ小計（部品・工賃）。生成器も run_case も読まない。ページ小計の検算は reading.json の `pages` と `blocks[].page` で行う（reading_check）。ここに書いた値は書式 A の判定ヒントになるだけ |
+| tolerance_keys | `["parts", "taxable", "tax"]` | tolerance を効かせてよい項目の名指し。既定は工賃・塗装・内骨・課税小計・消費税だけで、**部品計・材料代・費用は 0 円一致**。単価に円未満の端数がある見積（10-31）だけ下書きが `parts` を足す |
 | neo_total / tolerance / tolerance_reason | 693732 / 8 / "FAX は工賃を円未満まで計上…" | 工場書式の丸めでコグニと差が出る案件だけ。**3 つ揃えて書く**（コグニ計算の合計 / 許容幅・円 / なぜ差が出るか）。1 つでも欠けると `run_case.py` が不合格にする。理由は `tolerance_reason` が正式名（古い案件の `note` も読む） |
 | tax_rate | 10 | 消費税率（％）。省略時 10。`run_case.py` の「金額が税込で印字されている見積」の判定に使う |
 | allow_unmatched | 使わない | 照合漏れの許容件数。原則 0 |

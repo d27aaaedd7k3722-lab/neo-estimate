@@ -1997,6 +1997,71 @@ class Drafter:
                           'ぴったり一致するので、この見積の空欄は「部品代なし」。ADDATA の標準価格では埋めない）: '
                           + names + (f' ほか {len(blanks) - 6} 行' if len(blanks) > 6 else ''))
 
+    # 単価に円未満の端数がある見積（金額 ÷ 数量 が整数にならない行がある）で許す差の上限。
+    # 1 行あたり 1 円未満の丸めしか出ないので、端数のある行数と 10 円のどちらか小さい方まで
+    UNIT_FRACTION_MAX_YEN = 10
+
+    def unit_fraction_rows(self, items: list[dict]) -> list[dict]:
+        """単価に円未満の端数がある証拠の行（印字の金額が数量で割り切れない行）。
+        例: クリップ 単価 154.5 円 × 3 個 = 463.5 → 印字 464。工場は端数のまま合計し、コグニは行ごとの円で足すので数円ずれる"""
+        out = []
+        for it in items:
+            if it.get('reserve'):
+                continue
+            try:
+                q = int(it.get('qty') or 1)
+                p = int(it.get('price') or 0)
+            except (TypeError, ValueError):
+                continue
+            if q > 1 and p > 0 and p % q:
+                out.append(it)
+        return out
+
+    def _unit_fraction_tolerance(self, est: dict) -> None:
+        """工場の単価に円未満の端数がある見積は、行ごとに円で丸めるコグニでは**印字の合計を再現できない**。
+        証拠（金額が数量で割り切れない行がある・差が小さい・部品計だけが多い側にずれる）がそろうときだけ、
+        生成器を 1 回試算して 3 点セット（neo_total / tolerance / tolerance_reason）を書き、run_case の
+        「工場の印字 … / コグニ計算 …」で通す。人が見るように確認箇所シートの 要確認 にも出す
+        （2026-09-16 フリード: 単価 154.5・184.5 円のクリップがあり、部品計が印字より 2 円多くなって作れなかった）"""
+        t = est.get('totals') or {}
+        if any(t.get(k) is not None for k in ('neo_total', 'tolerance', 'target_total')) or _num(self.rd.get('target_total')) != '':
+            return   # 人が書いた 3 点セット・協定額に合わせた案件（target_total）には触らない
+        try:
+            printed_parts = int(float(_num(t.get('parts')) or 0))
+            printed_total = int(float(_num(t.get('total')) or 0))
+        except ValueError:
+            return
+        items = est.get('items') or []
+        rows_parts = sum(int(it.get('price') or 0) for it in items if not it.get('reserve'))
+        ex_parts = sum(int(e.get('amount') or 0) for e in (est.get('expenses') or []) if e.get('kind') == 'parts')
+        gap = rows_parts + ex_parts - printed_parts
+        frac = self.unit_fraction_rows(items)
+        if not (printed_parts and printed_total and frac and 0 < gap <= min(len(frac), self.UNIT_FRACTION_MAX_YEN)):
+            return
+        import copy
+        probe = copy.deepcopy(est)
+        probe.pop('totals', None)
+        try:
+            _, rep = self.nb.build(probe, probe['vehicle'], hints=probe.get('hints'), labor_rate=probe.get('labor_rate'),
+                                   est_date=probe.get('est_date'), insurance=probe.get('insurance'))
+            neo_total = int((rep.get('totals') or {}).get('total') or 0)
+        except Exception as e:  # noqa: BLE001  試算できない案件は今までどおり不合格で止める
+            self.notes.append(f'単価の端数（{gap:,} 円）を許容できるか試算しようとしたが、生成器の試算に失敗（{e}）。そのまま検算する')
+            return
+        diff = neo_total - printed_total
+        if not neo_total or not (0 < diff <= self.UNIT_FRACTION_MAX_YEN):
+            return   # 合計のずれが端数で説明できる幅を超える: 触らない（読み取りを見直す側）
+        names = ' / '.join(str(it.get('name') or '')[:12] for it in frac[:4])
+        why = (f'工場の単価に円未満の端数がある見積（金額が数量で割り切れない行 {len(frac)} 行: {names}）。'
+               f'工場は端数のまま合計し、コグニは行ごとに円で足すので部品計が {gap:,} 円・合計が {diff:,} 円多くなる。'
+               '明細の金額は印字どおり')
+        t['neo_total'] = neo_total
+        t['tolerance'] = diff
+        t['tolerance_reason'] = why
+        t['tolerance_keys'] = ['parts', 'taxable', 'tax']   # この端数で差が出る項目だけ（run_case が許容に使う）
+        self.notes.append('★ ' + why)
+        self._rev('要確認', '単価の端数', f'工場の印字 {printed_total:,} 円 / コグニ計算 {neo_total:,} 円（差 {diff:+,} 円）。' + why)
+
     def build(self) -> dict:
         items = self.items()
         paint = self.paint()
@@ -2074,6 +2139,7 @@ class Drafter:
         self.fit_paint_total(est)     # 起こしたパネルの工賃と工場の一式の差を材料代で埋める
         tt = self.apply_target_total(est)  # 生成器の実計算で材料代を決める（discount/frame を含めた後）
         est['totals'] = tt if tt else self.totals(items, paint, expenses)
+        self._unit_fraction_tolerance(est)   # 単価に円未満の端数がある見積の、コグニでは再現できない数円差
         est['_draft_notes'] = self.notes
         pos = {id(it): i + 1 for i, it in enumerate(items)}
         est['_review'] = [dict({k: v for k, v in r.items() if k != '_item'}, row=pos.get(id(r.get('_item')), '')) for r in self.review]

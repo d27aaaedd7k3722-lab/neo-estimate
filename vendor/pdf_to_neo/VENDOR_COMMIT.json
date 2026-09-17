@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "5ad2bc817f567ef7f61cb9561494cf9ba66950f4",
- "subject": "fix: 材料の列だけに金額のある塗装行も材料代に入れる（材料計が 2,000 円足りずに NEO を作れなかった）",
- "synced_at": "2026-09-16T17:04:43",
+ "commit": "752d1a37616702ac4a4027e5d40ed701e9d76ba2",
+ "subject": "fix: 単価に円未満の端数がある見積の数円差を、3 点セットで通す（コグニでは印字の合計を再現できない案件）",
+ "synced_at": "2026-09-17T10:28:50",
  "files": 108,
- "tree_sha256": "c77c4b3996346ea92d15b66f52ab85d5a3f06aebd2e12058adf684252e01b454",
+ "tree_sha256": "00ec08e8de2a5b60b9e7dbd5e35255ab631212348902c19c80756ae1ec39e0fe",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

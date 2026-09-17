@@ -506,6 +506,25 @@ def test_wage_round_1_and_material_rounding():
     assert 'material' not in de.Drafter(rd).build()['paint']        # 10 円丸めと一致すれば割合モード
 
 
+def test_unit_price_fraction_rows_are_evidence():
+    """単価に円未満の端数がある証拠の行（印字の金額が数量で割り切れない行）を拾う。
+    2026-09-16 フリード: 単価 154.5 円 × 3 個 = 463.5 → 印字 464 で、部品計が印字より 2 円多くなった"""
+    d = de.Drafter.__new__(de.Drafter)   # 車両の解決をせずに規則だけ試す
+    items = [{'name': 'ｸﾘｯﾌﾟ', 'qty': 3, 'price': 464}, {'name': 'ｸﾘｯﾌﾟ', 'qty': 2, 'price': 309},
+             {'name': 'ﾎﾞﾙﾄ', 'qty': 2, 'price': 420}, {'name': 'ﾊﾟﾈﾙ', 'qty': 1, 'price': 12345},
+             {'name': '予備', 'qty': 3, 'price': 100, 'reserve': True}]
+    got = [it['price'] for it in de.Drafter.unit_fraction_rows(d, items)]
+    assert got == [464, 309], got   # 464÷3・309÷2 は端数あり。割り切れる行（420÷2）・数量 1・保留行は証拠にしない
+
+
+def test_no_unit_fraction_no_tolerance():
+    """端数のある行（金額が数量で割り切れない行）が無ければ、部品計がずれていても 3 点セットは書かない
+    （読み取りを見直す側。単価の端数の緩和を素通りさせない）"""
+    est = est_for(['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||'], {'parts': 29999, 'total': 41800})
+    assert 'neo_total' not in est['totals'] and 'tolerance' not in est['totals'], est['totals']
+    assert not has(est['_draft_notes'], '円未満の端数'), est['_draft_notes']
+
+
 def test_material_includes_lines_with_only_material():
     """材料の列だけに金額のある塗装行（ショートパーツ・写真代 …）も材料代に入れる。
     印字の材料計と塗装行の材料の合計が一致するときだけ（2026-09-16 アクセラ: 2,000 円足りずに不合格だった）"""
