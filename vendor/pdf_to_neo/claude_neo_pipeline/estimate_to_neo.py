@@ -127,7 +127,9 @@ def tax_of(out: int) -> tuple[int, int]:
 
 
 def hw(s: str) -> str:
-    return to_halfwidth(unicodedata.normalize('NFKC', s or '')).replace('ー', '-')
+    """NEO の名称欄に書く形（半角カナ・半角英数）。長音は 'ｰ'（to_halfwidth が 'ー' を潰すのでハイフンにはならない。
+    ADDATA 由来の名称は '-' を使うので同じ NEO に両方が出るが、金額にも照合にも効かない）"""
+    return to_halfwidth(unicodedata.normalize('NFKC', s or ''))
 
 
 def _xor_lines_ref(name: str) -> list:
@@ -2435,8 +2437,10 @@ class NeoBuilder:
             # 指数あり → 工賃 = 指数 × 単価、工賃印 '#'・Manual 1 / 工賃だけ → Time -1・工賃印 '*'・Manual 2。AddedFrom 1・SortNo 15・名称は入力のまま（詰めない）。
             # 部品コードのあるパネルの後ろに入力順で並ぶ。塗装工賃計（材料代の対象）に入り、加算基礎の枚数には数えない
             for j, pnl in enumerate(man_panels):
-                # 名称は入力のまま（コグニは行追加の名称を直さない。実案件 NEO 209 行: 半角カナが大半だが 全角カナ 3・前後空白 4・長音 'ｰ' と '-' の両方がある）。20 バイトで切るだけ
-                nm = _fit(hw(str(pnl.get('name') or '')), 20)  # 外板パネルの名称欄も半角カナ（実機 NEO 851 行中 849 行）
+                # 観測: コグニで行追加する人の入力は半角カナが大半（実案件 NEO 209 行のうち 全角カナ 3・前後空白 4、長音は 'ｰ' と '-' の両方。
+                #       2026-09-17 に 400 本で数え直すと外板パネル 851 行中 849 行が半角）。
+                # 方針: 少数の全角も半角に寄せる（判断規則 10-22b。亮平さん指示 2026-09-17）。20 バイトで切るのは同じ
+                nm = _fit(hw(str(pnl.get('name') or '')), 20)
                 t = float(pnl.get('index') or 0)
                 w = _money(pnl.get('wage'), f"手入力の塗装行 {nm} の工賃")
                 if t > 0 and not w and rate:
@@ -2856,7 +2860,9 @@ class NeoBuilder:
                 if free_line < 9 or any(u[0] == free_line for u in used):  # 空き行が尽きた: 黙って同じ行に重ねると Expense 表と合計欄が食い違う（監査 8）
                     raise ValueError(f"費用の行が足りない（自由に使える行は 9〜36 の 28 行）。'{nm}' を入れられない。費用をまとめるか、明細の手入力行にする")
                 line = free_line; free_line -= 1
-                nm20 = nm.encode('cp932w', 'replace')[:20].decode('cp932', 'ignore')  # Name TEXT(20) はバイト長
+                # Name TEXT(20) はバイト長。自由行の名前は半角カナ（判断規則 10-26。既定行 1〜8 の照合（上の KEYMAP）は
+                # 印字どおりの全角で当てるので、**行を決めたあとに**半角へ直す
+                nm20 = _fit(hw(nm), 20)
                 cur.execute('UPDATE Expense SET Name=? WHERE LineNo=?', (nm20, line)); fixed[line] = nm20
             used.add((line, kind_))
             it_, tx = tax_of(amt)

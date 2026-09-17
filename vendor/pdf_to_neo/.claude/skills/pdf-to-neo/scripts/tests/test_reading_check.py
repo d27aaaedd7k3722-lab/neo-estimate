@@ -521,6 +521,37 @@ def test_tax_included_divides_discount_frame_unit_and_bumper_base():
     assert not run(printed)['fail'], run(printed)['fail']
 
 
+def test_tax_included_divides_recycle_and_keeps_a_printed_rate():
+    """リサイクル部品の売価・仕入値も割る（生成器が部品計に入れる）。
+    レバーレートは、割った工賃に合う方（印字のまま / 割った値）を選ぶ"""
+    rd = copy.deepcopy(BASE)
+    rd['blocks'][0]['rows'][2] = {'name': 'ﾊﾞﾝﾊﾟ ﾋﾟｰｽ', 'method': '取替', 'qty': 1, 'price': 5000,
+                                 'recycle': {'name': 'ﾘｻｲｸﾙ ﾊﾞﾝﾊﾟ', 'price': 5000, 'stock_price': 4000}}
+    printed = _to_tax_included(copy.deepcopy(rd))
+    printed['blocks'][0]['rows'][2]['recycle'] = {'name': 'ﾘｻｲｸﾙ ﾊﾞﾝﾊﾟ', 'price': 5500, 'stock_price': 4400}
+    assert rc.tax_included_rate(printed) == 10, run(printed)['fail']
+    rc.to_tax_excluded(printed, 10)
+    assert printed['blocks'][0]['rows'][2]['recycle'] == {'name': 'ﾘｻｲｸﾙ ﾊﾞﾝﾊﾟ', 'price': 5000, 'stock_price': 4000}
+    assert printed['labor_rate'] == 8000, printed['labor_rate']          # 工賃も税込だったので割る
+    rate_printed = _to_tax_included(copy.deepcopy(BASE))                  # レバーレートだけ税抜で刷られている見積
+    rate_printed['labor_rate'] = 8000
+    msgs: list = []
+    rc.to_tax_excluded(rate_printed, 10, msgs.append)
+    assert rate_printed['labor_rate'] == 8000, rate_printed['labor_rate']  # 割ると 7,273 になり全行の指数が合わなくなる
+    assert any('税抜のまま印字されている' in m for m in msgs), msgs
+
+
+def test_tax_included_hint_when_not_fixed():
+    """自動で直せない税込の読み取り（写し誤りがある等）でも、10-4 かもしれないと分かる FAIL を出す"""
+    rd = _to_tax_included(copy.deepcopy(BASE))
+    rd['blocks'][1]['rows'].append('|ﾌｪﾝﾀﾞ ﾓｰﾙ|取替|75301-11111||1|1100|||')  # 写し誤り（二重）
+    rd['pages']['2']['rows'] = 3
+    rd['pages']['2']['parts'] += 1100
+    assert rc.tax_included_rate(rd) is None
+    f = run(rd)['fail']
+    assert any('税込で印字された見積書（judgment_rules 10-4）の疑い' in x for x in f), f
+
+
 def test_tax_included_needs_a_clean_reading():
     """転記の誤りがある読み取りは、積み上げがたまたま御見積額と揃っても直さない
     （黙って全金額を 1/1.1 にすると、印字と 9% 違う NEO を作ってしまう）"""

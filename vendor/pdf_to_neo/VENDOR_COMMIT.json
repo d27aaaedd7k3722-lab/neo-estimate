@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "8c6382cf48fb1963ea93b40907832ce181850802",
- "subject": "fix: NEO の名称欄のカタカナを全部半角にする（リサイクル部品・手入力の塗装行・追加塗装が全角のままだった）",
- "synced_at": "2026-09-17T14:05:11",
+ "commit": "c4f53713a4ab0d6ecffeb1006203c5222510bee2",
+ "subject": "fix: バグハントで見つけた 7 件（税込の割り漏れ・レバーレート・半角化の巻き戻し・誤検知）",
+ "synced_at": "2026-09-17T17:34:53",
  "files": 108,
- "tree_sha256": "5a50e21c91e2047ea175ea9fd29822a107adfe7444eca1566dd98be385dbfff7",
+ "tree_sha256": "9521108a3684181f1f8084a3c1a85f4133bc946d1dc0ace3058b3fd3eb2f4f1a",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

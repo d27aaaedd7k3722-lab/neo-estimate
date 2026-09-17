@@ -8557,7 +8557,9 @@ def _p2n_diff_lines(stdout: str, limit: int = 12) -> list:
             out.append(s)
         elif s.startswith('見積書合計との一致:') and 'OK' not in s:
             out.append(s)
-        elif s.startswith('合計欄 ') and '一致' not in s:
+        elif s.startswith('合計欄 ') and 'として一致' not in s:   # 「…のどれとも一致しない」を落とさない（除きたいのは代替解釈で通した note）
+            out.append(s)
+        elif s.startswith('明細の積み上げ ') or '税込で印字された見積書' in s:   # 税込の見積を取り違えたときの手掛かりは必ず出す
             out.append(s)
         elif s.startswith('不合格:') or s.startswith('紙上検算に FAIL') or s.startswith('ページ単位の検算に不合格'):
             out.append(s)

@@ -475,9 +475,10 @@ _ADD_ITEM_RE = re.compile(r'アンダ[ー\-]?コ|内板|調色|チッピング|�
 def _norm_tax_included(rd: dict, notes: list) -> dict:
     """『各行の金額まで税込』で刷られた見積書（判断規則 10-4）の読み取りが税込のまま来たら、ここでも税抜に直す。
     ふつうは reading_pages.merge が済ませていて何もしない。reading.json を直に渡す経路（--skip-check・回帰）の保険。
-    呼び出し元の dict は書き換えない（直したときだけ複製を返す）"""
-    if rd.get('tax_included'):
-        return rd
+    呼び出し元の dict は書き換えない（直したときだけ複製を返す）。
+    **`tax_included` が既に書いてあっても判定はやり直す** —— 人が「税込の見積だ」という意味で自分で書くことがあり、
+    旗を信じて素通りさせると税込のままの読み取りで 1.1 倍の NEO を作ってしまう。
+    すでに税抜なら判定は成り立たない（積み上げが 御見積額 − 消費税 になる）ので、二重に割ることはない"""
     from reading_check import tax_included_rate, to_tax_excluded  # noqa: E402  reading_check が draft_estimate を読むので中で import する
     why: list = []
     rate = tax_included_rate(rd, why)

@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
@@ -601,6 +602,49 @@ def main() -> int:
         shutil.rmtree(case, ignore_errors=True)
     finally:
         reader.MAX_PAGES = old
+
+    # ── 税込で印字された見積書（判断規則 10-4）: 読み手は印字どおり（税込）に写し、束ねるときに機械が税抜へ直す。
+    #    読み直しは走らない（＝FAIL が出ない）。pages/ は印字のまま残る（人が直すときの拠り所）
+    H_TAX = copy.deepcopy(HEADER)
+    H_TAX['labor_rate'] = 8800
+    H_TAX['totals'] = {'parts': 49500, 'wage': 17600, 'taxable': 67100, 'tax': 6100, 'total': 67100}
+    P_TAX = {'page': 1, 'rows_printed': 2, 'subtotal': {'parts': 49500, 'wage': 17600}, 'marks': {},
+             'blocks': [{'title': 'リヤバンパ', 'rows': ['|Rrﾊﾞﾝﾊﾟ|取替|71501-TY0-000ZZ|1.00|1|49500|8800||',
+                                                     '|Rrﾊﾞﾝﾊﾟ|脱着||1.00|1||8800||']}]}
+    case = tempfile.mkdtemp(prefix='reg_reader_tax_')
+    fake = FakeReader([H_TAX, P_TAX])
+    res = reader.read_estimate(pdf, reader=fake, case_dir=case, source_name='tax.pdf')
+    if not res.ok:
+        fails.append(f'税込の見積が合格しない: error={res.error} fails={res.fails()}')
+    if fake.calls != 2:
+        fails.append(f'税込の見積で読み直しが走った（呼び出し {fake.calls} 回。機械が直すので FAIL は出ないはず）')
+    rd_tax = res.reading or {}
+    if rd_tax.get('tax_included') != 10:
+        fails.append(f'reading.tax_included が 10 でない: {rd_tax.get("tax_included")!r}')
+    if (rd_tax.get('totals') or {}).get('parts') != 45000 or (rd_tax.get('totals') or {}).get('taxable') != 61000:
+        fails.append(f'税抜に直っていない: {rd_tax.get("totals")}')
+    if (rd_tax.get('totals') or {}).get('tax') != 6100 or (rd_tax.get('totals') or {}).get('total') != 67100:
+        fails.append(f'消費税・御見積額が印字どおりでない: {rd_tax.get("totals")}')
+    if rd_tax.get('labor_rate') != 8000:
+        fails.append(f'レバーレートが税抜に直っていない: {rd_tax.get("labor_rate")!r}')
+    try:
+        pg1 = json.load(open(os.path.join(case, 'pages', 'page_1.json'), encoding='utf-8'))
+        if '49500' not in json.dumps(pg1, ensure_ascii=False):
+            fails.append('pages/page_1.json が印字（税込）のまま残っていない')
+    except OSError as e:
+        fails.append(f'pages/page_1.json を読めない: {e}')
+    if not any('税込' in m for m in res.merge_messages):
+        fails.append(f'「税込なので税抜に直した」の知らせが出ていない: {res.merge_messages}')
+    shutil.rmtree(case, ignore_errors=True)
+
+    # 読み直しの指示文には「印字（税込）のまま写す」断り書きが入る（税抜に直した後の金額を見せるので）
+    import neo_skill.prompts as _pr
+    if '印字されている税込の金額のまま' not in _pr.header_retry_task([], [], {}, 10):
+        fails.append('header の読み直し文に「印字（税込）のまま写す」断り書きが無い')
+    if '印字されている税込の金額のまま' not in _pr.page_totals_retry_task(1, [], {}, 10):
+        fails.append('ページの読み直し文に「印字（税込）のまま写す」断り書きが無い')
+    if '印字されている税込の金額のまま' in _pr.header_retry_task([], [], {}):
+        fails.append('税込でない見積にまで「税込のまま写す」断り書きが出ている')
 
     for f in fails:
         print('*** FAILED:', f)

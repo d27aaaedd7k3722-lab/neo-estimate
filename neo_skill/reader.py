@@ -757,7 +757,7 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
             rounds += 1
             if rounds == 1:
                 _progress(progress, '合計欄と合わないので、合計欄・費用・塗装の写しを読み直しています')
-                header = ask_header(prompts.header_retry_task(check['fail'], check.get('warn') or [], header), system, whole)
+                header = ask_header(prompts.header_retry_task(check['fail'], check.get('warn') or [], header, (rd or {}).get('tax_included')), system, whole)
                 res.header = header
             else:
                 _progress(progress, '合計欄と合わないので、各ページの写し漏れ・二重写しを確かめています')
@@ -765,7 +765,7 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
                 for i, page in enumerate(pages):
                     pg = i + 1
                     blocks = [llm_mod.document_block(page_pdfs[i]),
-                              {'type': 'text', 'text': prompts.page_totals_retry_task(pg, check['fail'], page)}]
+                              {'type': 'text', 'text': prompts.page_totals_retry_task(pg, check['fail'], page, (rd or {}).get('tax_included'))}]
                     p2, shape_err = normalise_or_fail(_ask_json(reader, system, blocks, usage, f'page_{pg}.json'), pg)
                     v = run('validate', header=header, page=p2) if p2 else {'ok': False}
                     if v.get('ok'):

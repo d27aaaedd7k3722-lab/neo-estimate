@@ -211,10 +211,22 @@ totals（見積書の合計欄）は必ず写します — 検算の拠り所で
 直した header.json 全体を JSON だけで返してください。"""
 
 
-def header_retry_task(fails: list, warns: list, previous: dict) -> str:
+def _tax_included_note(rate) -> str:
+    """税込で印字された見積書（判断規則 10-4）を機械が税抜に直したあとの読み直しに付ける断り書き。
+    これが無いと、FAIL 文の「印字 ○○」（= 税抜に直したあとの値）を見た読み手が、合計欄を税抜に書き直してしまう"""
+    if not rate:
+        return ''
+    return (f"""
+**この見積書は各行の金額まで税込で印字されています。**下の FAIL に出る金額は、プログラムが {(100 + int(rate)) / 100:g} で割って
+税抜に直したあとの値です。写しは**見積書に印字されている税込の金額のまま**にしてください（自分で割らない）。
+""")
+
+
+def header_retry_task(fails: list, warns: list, previous: dict, tax_included=0) -> str:
     """合計欄の検算（全体）に落ちたときの header の読み直し"""
     return f"""全ページを束ねて合計欄と突き合わせたところ、次の点で不合格でした。添付の見積書（全ページ）をもう一度見て、
 header.json（合計欄・塗装・レバーレート）の写しを直してください。明細の行はここでは直しません。
+{_tax_included_note(tax_included)}
 差額と同じ額の行や費用が手掛かりです。合計欄の数字は印字どおりに写します（計算して埋めない）。
 費用（expenses）と塗装行（paint.lines）は header には書きません（印字されたページ側の expenses / paint_lines に写してあります。
 「費用の同じ行が 2 回ある」は header に書いたのが原因なので、header からは消します）。
@@ -229,10 +241,11 @@ header.json（合計欄・塗装・レバーレート）の写しを直してく
 直した header.json 全体を JSON だけで返してください。"""
 
 
-def page_totals_retry_task(page_no: int, fails: list, previous: dict) -> str:
+def page_totals_retry_task(page_no: int, fails: list, previous: dict, tax_included=0) -> str:
     """合計欄の検算に落ち、header を直しても合わないとき、各ページを差額のヒント付きで読み直す"""
     return f"""全ページを束ねて合計欄と突き合わせたところ不合格でした（下の FAIL）。header（合計欄）は読み直しても同じでした。
 添付の {page_no} ページ目に、写し漏れ・二重写し・金額の読み違いが無いか確かめてください。
+{_tax_included_note(tax_included)}
 差額と同じ額の行が手掛かりです。**合計を合わせるために行を消したり金額を動かしたりしない**でください。
 このページに直すところが無ければ、前回の写しをそのまま返してください。
 

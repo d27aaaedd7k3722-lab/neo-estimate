@@ -139,7 +139,7 @@ def check(est: dict, neo_path: str) -> dict:
                 p_got = _int(r.get('PartsPriceOutTax'))
                 if p_want is not None and p_got != p_want:
                     hard.append(_e('要確認', '意図との食い違い', f'リサイクル部品の金額: 意図 {p_want!r} / NEO {p_got!r}', rec, str(it.get('name') or ''), '', it.get('_page', '')))
-                n_want = _fit(str((rc.get('name') if isinstance(rc, dict) else '') or ''), 20).strip()
+                n_want = _fit(hw(str((rc.get('name') if isinstance(rc, dict) else '') or '')).strip(), 20).strip()  # 生成器と同じ半角カナ（判断規則 10-22b）
                 n_got = str(r.get('PartsName') or '').strip()
                 if n_want and n_got != n_want:
                     soft.append(_e('要確認', '名称が変わった', f'リサイクル部品の名称: 意図「{n_want}」/ NEO「{n_got}」', rec, str(it.get('name') or ''), '', it.get('_page', '')))

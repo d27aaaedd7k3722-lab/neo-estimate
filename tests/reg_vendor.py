@@ -37,7 +37,8 @@ from neo_skill import maker, vendor  # noqa: E402
 
 PY = sys.executable
 NC = os.environ.get('NEO_CHECK_ROOT') or os.path.join(os.path.expanduser('~'), 'Documents', 'NEO_check')
-EST_KEYS = ('items', 'paint', 'expenses', 'totals', 'hints', 'wage_round', 'labor_rate', 'index_policy', 'frame', 'discount')
+EST_KEYS = ('items', 'paint', 'expenses', 'totals', 'hints', 'wage_round', 'labor_rate', 'index_policy', 'frame', 'discount',
+            'tax_round', 'tax_included')   # コグニの消費税設定（丸め・外税/内税）も files とアプリで同じでなければならない
 
 
 def git(repo: str, *args: str) -> bytes:

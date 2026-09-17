@@ -80,26 +80,38 @@ def main() -> int:
     # 名称欄のカタカナは半角（亮平さん指示 2026-09-17。実案件 NEO 400 本: 明細 19,454 行中 19,280 行・
     # 外板パネル 851 行中 849 行・追加塗装 2,915 行中 2,864 行が半角）。estimate に全角で書かれていても生成器が直す
     import re as _re
-    import sqlite3 as _sq
-    fw = _re.compile(r'[ァ-ヶ]')
+    # 半角形のある全角カナ（ヵ ヶ ヰ ヱ ヮ は半角が無いので除く）と、半角化されずに残りやすい中黒・繰り返し記号
+    fw = _re.compile(r'[ァ-ヴヷ-ヺ]|[ヽヾ・]')
     kana = [{'code': '1400', 'name': 'Fバルクヘッド', 'method': '取替', 'qty': 1},
-            {'name': 'フロントバンパーカバー', 'method': '取替', 'qty': 1, 'price': 50000, 'manual': True},
+            {'name': 'フロントバンパー・カバー', 'method': '取替', 'qty': 1, 'price': 50000, 'manual': True},
             {'name': 'リヤスポイラー', 'method': '', 'qty': 1, 'price': 3000, 'manual': True,
              'recycle': {'name': 'リサイクルバンパー', 'price': 3000}}]
-    _rows, _st, _tot, _rep = build(kana, paint={'panels': [{'name': 'フロントフエンダパネル', 'index': 2.0, 'wage': 16000}],
-                                                'other': [{'name': 'プライマー塗装', 'index': 1.7, 'wage': 14880}],
-                                                'total': 40000, 'material': 10000})
-    em = neo_diff.load(os.path.join(os.environ.get('TEMP', HERE), 'unit_settings.neo'))['AnSvEm0001.sld']
-    bad = []
-    for tbl, col in (('ERParts', 'PartsName'), ('ERParts', 'PartsNameStandard'), ('RCParts', 'PartsName'),
-                     ('ReserveERParts', 'PartsName'), ('PaintingPanel', 'PanelName'), ('PaintingOther', 'Name')):
-        try:
-            vals = [v for (v,) in em.execute('select %s from %s' % (col, tbl)) if isinstance(v, str)]
-        except _sq.Error:
-            continue
-        bad += [f'{tbl}.{col} {v!r}' for v in vals if fw.search(v)]
-    check(not bad, '名称欄に全角カナが残っている: ' + ' / '.join(bad[:4]))
-    check(any('ﾘｻｲｸﾙ' in str(r.get('PartsName') or '') for r in _rows.values()), 'リサイクル部品の名称が半角カナで入っていない')
+    def names(db, tbl, col) -> list:
+        return [v for (v,) in db.execute('select %s from %s' % (col, tbl)) if isinstance(v, str) and v.strip()]
+    import shutil as _sh
+    _neo = os.path.join(os.environ.get('TEMP', HERE), 'unit_settings.neo')
+    _neo0 = os.path.join(os.environ.get('TEMP', HERE), 'unit_settings_base.neo')
+    build(F2)   # 先に雛形そのままの NEO を作る（費用の既定行など、コグニ側の固定名を除くため）
+    _sh.copyfile(_neo, _neo0)   # build は同じ名前に上書きするので、別名にしてから読む
+    em0 = neo_diff.load(_neo0)['AnSvEm0001.sld']
+    build(kana, paint={'panels': [{'name': 'フロントフエンダパネル', 'index': 2.0, 'wage': 16000}],
+                       'other': [{'name': 'ハクリ・ミガキ工程', 'index': 1.7, 'wage': 14880}],
+                       'total': 40000, 'material': 10000},
+          expenses=[{'name': 'ボデーコーテイング', 'amount': 8000, 'kind': 'wage'}])
+    em = neo_diff.load(_neo)['AnSvEm0001.sld']
+    bad, seen = [], 0
+    for tbl, col, want in (('ERParts', 'PartsName', 'ﾌﾛﾝﾄﾊﾞﾝﾊﾟｰ･ｶﾊﾞｰ'), ('RCParts', 'PartsName', 'ﾘｻｲｸﾙﾊﾞﾝﾊﾟｰ'),
+                           ('PaintingPanel', 'PanelName', 'ﾌﾛﾝﾄﾌｴﾝﾀﾞﾊﾟﾈﾙ'), ('PaintingOther', 'Name', 'ﾊｸﾘ･ﾐｶﾞｷ工程'),
+                           ('Expense', 'Name', 'ﾎﾞﾃﾞｰｺｰﾃｲﾝｸﾞ')):
+        vals = names(em, tbl, col)
+        check(vals, f'{tbl}.{col} を 1 件も読めていない（表名・列名の打ち間違い）')
+        check(any(want in v for v in vals), f'{tbl}.{col} に半角カナの {want} が無い: {vals[:4]}')
+        fixed_ = set(names(em0, tbl, col))       # 雛形にもとから入っている固定名は見ない
+        new = [v for v in vals if v not in fixed_]
+        seen += len(new)
+        bad += [f'{tbl}.{col} {v!r}' for v in new if fw.search(v)]
+    check(seen >= 5, f'この build で書いた名称が少なすぎる（{seen} 件）')
+    check(not bad, '名称欄に全角カナ・全角中黒が残っている: ' + ' / '.join(bad[:4]))
     print('unit_settings:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 

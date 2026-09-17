@@ -176,6 +176,7 @@ def to_tax_excluded(rd: dict, rate: int = 10, warn=None) -> int:
         for i, r in enumerate(rows):
             if isinstance(r, dict):
                 d_keys(r, ('price', 'wage', 'unit'))
+                d_keys(r.get('recycle'), ('price', 'stock_price'))  # リサイクル部品の売価・仕入値（生成器が部品計に入れる）
                 if r.get('comment'):
                     r['comment'] = d_unit_comment(str(r['comment']))
             elif isinstance(r, str) and '|' in r:  # 短縮記法 code|name|method|parts_no|index|qty|price|wage|flags|comment
@@ -214,7 +215,32 @@ def to_tax_excluded(rd: dict, rate: int = 10, warn=None) -> int:
             d_keys(t, (k,))
         elif k not in TAX_KEEP_TOTALS and not isinstance(t[k], bool) and _int(t[k]) is not None and warn:
             warn(f'合計欄の {k} は税込・税抜のどちらか決められないので印字のまま残した（税込の見積: judgment_rules 10-4）')
-    d_keys(rd, ('labor_rate',))  # レバーレートも税込で刷られている（工賃 ÷ レートの指数が合わなくなる）
+    # レバーレートは税込で刷られていることも、税抜のまま刷られていることもある（同じ紙の中でレートだけ税抜の書式がある）。
+    # **割ったあとの工賃**に対して、印字のレートと割ったレートのどちらが多くの行を説明するかで決める
+    # （無条件に割ると、工賃 ÷ レート の指数が全行合わなくなり、標準工賃の違う NEO を「合格」で作ってしまう）
+    printed_rate = _int(rd.get('labor_rate'))
+    if printed_rate:
+        div_rate = tax_excluded_amount(printed_rate, rate)
+        keep = div_rate
+        try:
+            _rows = []
+            for b in rd.get('blocks') or []:
+                for r in b.get('rows') or []:
+                    try:
+                        _rows.append(expand_row(r))
+                    except ValueError:
+                        pass
+            _rows += [l for l in ((rd.get('paint') or {}).get('lines') or []) if isinstance(l, dict)]
+            _pairs = labor_pairs(_rows)
+            if _pairs and rate_score(_pairs, printed_rate) > rate_score(_pairs, div_rate):
+                keep = printed_rate   # レートだけ税抜で刷られていた
+                if warn:
+                    warn(f'レバーレート {printed_rate:,} は税抜のまま印字されている（割った {div_rate:,} より工賃÷指数に合う）ので割らない')
+        except Exception:  # noqa: BLE001  決められないときは他の金額と同じく割る
+            pass
+        rd['labor_rate'] = keep
+        if keep != printed_rate:
+            n[0] += 1
     return n[0]
 
 
@@ -572,8 +598,19 @@ class Checker:
         _frac_max = min(len(_frac_rows), 10)
         # 税込印字を税抜に割り戻した案件（10-4）は、印字の合計欄を割った値と、割った明細を積み上げた値が
         # 行ごとの四捨五入の分だけずれる（1 か所あたり 0.5 円まで）。どちらも読み取りは正しいので止めない
-        _tax_slack = ((len(rows) + len(p.get('lines') or []) + len(self.rd.get('expenses') or []) + 3) // 2
-                      if _int(self.rd.get('tax_included')) else 0)
+        _tax_on = bool(_int(self.rd.get('tax_included')))
+
+        def _slack(n: int) -> int:
+            """割り戻しの丸めで許される幅。印字を割った値と、割った明細の積み上げのそれぞれに 0.5 円まで乗る"""
+            return (n + 3) // 2 if _tax_on else 0
+        _n_price = sum(1 for r in rows if _int(r.get('price')))
+        _n_wage = sum(1 for r in rows if _int(r.get('wage')))
+        _n_lines = len(p.get('lines') or []) + len(p.get('other') or []) + len(p.get('panels') or [])
+        _n_exp = len(self.rd.get('expenses') or [])
+        _TAX_SLACK = {'部品計': _slack(_n_price), '工賃計（作業計）': _slack(_n_wage + _n_lines + _n_exp),
+                      '塗装計': _slack(_n_lines), '塗装計（材料込）': _slack(_n_lines + 1),
+                      '材料計': _slack(0), '諸費用計': _slack(_n_exp),
+                      '課税小計': _slack(_n_price + _n_wage + _n_lines + _n_exp)}
 
         def cmp(label: str, calc: int, given, alts: Optional[dict] = None) -> bool:
             g = _int(given)  # 印字どおり '95,000' や空欄 '' でも落ちない（空欄・非数値は未記入扱い）
@@ -589,9 +626,10 @@ class Checker:
                     self.note(f'合計欄 {label}: 印字 {g:,} は「{desc}」として一致（明細だけの合計 {calc:,} とは違う）')  # report.md に必ず出す（make_neo）
                     return True
             _cands = [calc] + [int(v) for v in (alts or {}).values() if v is not None]
-            if _tax_slack and any(abs(c - g) <= _tax_slack for c in _cands):
+            _sl = _TAX_SLACK.get(label, 0)
+            if _sl and any(abs(c - g) <= _sl for c in _cands):
                 self.warn(f'合計欄 {label}: 印字を税抜に直した {g:,} / 転記から {calc:,}（差 {calc - g:+,}）。'
-                          f'税込で印字された見積書（10-4）を割り戻した丸めの差（最大 {_tax_slack:,} 円）とみて止めない')
+                          f'税込で印字された見積書（10-4）を割り戻した丸めの差（この項目は最大 {_sl:,} 円）とみて止めない')
                 return False   # 見逃すが「一致」ではない（消費税の丸めは印字の課税小計で判定させる。下の _frac_max と同じ）
             if label in ('部品計', '課税小計') and _frac_max and any(0 < c - g <= _frac_max for c in _cands):
                 # 見逃すが **False を返す**（呼び出し側の ok_sub が偽になり、消費税の丸めは「印字の課税小計」で判定される）。
@@ -664,10 +702,18 @@ class Checker:
         sub = parts_sum + wage_sum + paint_w_sub + material_sub + frame_w + ex_by['parts'] + ex_by['wage'] + ex_by['expense'] + disc_sum
         if self._check_tax_included(sub, t, ex_by['taxfree']):
             return   # 行が税込のまま。課税小計・消費税・御見積額を突き合わせても「税込だから合わない」としか出ない
+        # 自動では直せなかった（写し誤りがある・合計欄だけ税抜 など）税込の見積に気づけるようにする。
+        # 明細の積み上げが「御見積額 − 消費税」より「御見積額」に近いなら、行が税込のままの疑いが濃い
+        _gt0, _gx0 = _int(t.get('total')), _int(t.get('tax'))
+        if not _tax_on and sub and _gt0 and _gx0 and \
+                abs(sub - (_gt0 - ex_by['taxfree'])) < abs(sub - (_gt0 - _gx0 - ex_by['taxfree'])):
+            self.fail(f'明細の積み上げ {sub:,} が「御見積額 {_gt0:,} − 消費税 {_gx0:,}」よりも御見積額そのものに近い: '
+                      f'各行の金額まで税込で印字された見積書（judgment_rules 10-4）の疑い。'
+                      f'そうなら明細・塗装・費用・合計欄を 1.1 で割って税抜に直す（消費税と御見積額は印字どおり）')
         ok_sub = cmp('課税小計', sub, t.get('taxable'))
         g_sub = _int(t.get('taxable'))
         base = g_sub if (g_sub is not None and not ok_sub) else sub  # 課税小計が印字と違うときは、税の丸めは印字の課税小計で判定する（原因を分けるため）
-        if g_sub is None and _tax_slack:
+        if g_sub is None and _tax_on:
             # 税込を割り戻した案件で課税小計の印字が無いと、積み上げに丸めが乗っていて消費税の丸め方を取り違える
             # （四捨五入の工場を「切り捨て」と誤判定し、Setting.tx_ArrangeFlag の違う NEO になる）。印字から出す
             _gt, _gx = _int(t.get('total')), _int(t.get('tax'))
