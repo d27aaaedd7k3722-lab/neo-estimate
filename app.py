@@ -9555,7 +9555,8 @@ def main():
             '見積書を AI（Claude または Gemini。下で選びます）が<b>印字どおり</b>に写し、ページごとに機械検算して落ちたページだけ読み直します。'
             '部品コード・標準品番・指数・塗装・費用の判断とNEOの生成・検算は '
             '<b>pdf-to-neo スキル</b>（コグニ実機で確かめた判断規則）がそのまま行います。'
-            '合格したときだけ、NEO と<b>確認箇所シート（xlsx）</b>を組でお渡しします。'
+            '検算に通れば NEO と<b>確認箇所シート（xlsx）</b>を組でお渡しします。'
+            '通らなかったときも、<b>印字との違いを添えて「_要確認」の NEO</b>をお渡しします（直してからお使いください）。'
             '合計を合わせるための金額調整はしません。</div>'
             + (f'<div style="font-size:11px;color:#64748b;margin-top:6px;">スキル: commit {_nsk_commit} ／ アプリ側 neo_skill: {_nsk_code_stamp()}</div>' if _nsk_commit else '')
             + '</div>', unsafe_allow_html=True)
