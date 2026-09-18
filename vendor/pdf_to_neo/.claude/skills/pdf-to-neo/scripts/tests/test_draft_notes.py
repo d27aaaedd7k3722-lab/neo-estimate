@@ -649,6 +649,28 @@ def test_double_paint_left_alone_when_totals_do_not_decide():
     assert not has(est2['_draft_notes'], '両方にある'), est2['_draft_notes']
 
 
+def test_two_coat_solid_is_an_addition_not_a_panel():
+    """印字の「2コートソリッドルーフ 0枚 / ルーフ以外 3枚」は付加塗装（PaintingEtcetera）の欄に入れる。
+    ここで拾わないと外板パネルの「行追加」に落ちて、原本に無いパネル行が 1 行増える
+    （2026-09-18 実機のヤリスクロスをアプリに通して見つけた）。長音が '-'・促音が 'ツ' の印字でも拾う"""
+    def paint_of(lines, coat='2コートソリッド'):
+        rd = {'source': 't', 'issuer': '', 'est_date': '20260909', 'format': 'A', 'labor_rate': 8000,
+              'vehicle': dict(VEH), 'blocks': [{'title': 'テスト', 'rows': ['0400|左ﾍｯﾄﾞﾗｲﾄ|取替|||1|50000|4000||']}],
+              'paint': {'coat': coat, 'total': 2780, 'lines': lines}, 'expenses': [], 'totals': {}}
+        return de.Drafter(rd).paint()
+    for roof_name, other_line, want in (
+            ('2ｺ-ﾄｿﾘﾂﾄﾞﾙ-ﾌ 0枚', {'name': 'ﾙ-ﾌ以外 3枚'}, {'roof': 0, 'count': 3, 'wage': 2780}),
+            ('2ｺｰﾄｿﾘｯﾄﾞﾙｰﾌ 1枚', {'name': 'ﾙｰﾌ以外 2枚'}, {'roof': 1, 'count': 2, 'wage': 2780}),
+            ('2ｺｰﾄｿﾘｯﾄﾞ ﾙｰﾌ 0枚 ﾙｰﾌ以外 4枚', None, {'roof': 0, 'count': 4, 'wage': 2780}),
+    ):
+        out = paint_of([{'name': roof_name, 'wage': 2780}] + ([other_line] if other_line else []))
+        assert out.get('two_coat_solid') == want, (roof_name, out.get('two_coat_solid'))
+        assert not [x for x in (out.get('panels') or []) if x.get('manual')], out.get('panels')
+        assert not [x for x in (out.get('other') or []) if 'ﾙ' in str(x.get('name'))], out.get('other')
+    # 塗膜がソリッドでない見積では触らない（生成器が 2 コートソリッドを弾くので、今までどおりに残す）
+    assert paint_of([{'name': '2ｺｰﾄｿﾘｯﾄﾞﾙｰﾌ 0枚 ﾙｰﾌ以外 3枚', 'wage': 2780}], '3コートパール').get('two_coat_solid') is None
+
+
 if __name__ == '__main__':
     fails = 0
     for name, fn in sorted(globals().items()):

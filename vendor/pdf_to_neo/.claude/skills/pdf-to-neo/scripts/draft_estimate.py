@@ -196,6 +196,12 @@ def _side_of(name: str) -> str:
     return ''
 
 
+# 2 コートソリッド加算（付加塗装）の塗装行。長音は 'ー' と '-' の両方、促音は印字で 'ツ' になることがある
+_ROOF = r'ル[ー\-]?フ'
+_TCS_RE = re.compile(r'2\s*コ[ー\-]?ト\s*ソリ[ッツ]ド')
+_ROOF_RE = re.compile(_ROOF)
+
+
 def _clean_name(name: str) -> str:
     """'RH ﾌﾛﾝﾄﾊﾞﾝﾊﾟｰ ﾎｰﾙｶﾊﾞｰ' → '右 ﾌﾛﾝﾄﾊﾞﾝﾊﾟｰ ﾎｰﾙｶﾊﾞｰ'、面積 '(5dm²)' を除く。半角カナに統一"""
     t = _hw_kana(name).strip()
@@ -1396,6 +1402,7 @@ class Drafter:
         panels, other = list(out.get('panels') or []), list(out.get('other') or [])
         n_other0 = len(other)   # ここから後ろが塗装行から追加項目にした行（前は転記の paint.other）
         auto_manual: list = []  # 下書きが作った手入力の塗装行（rec, 見積の名前）
+        _tcs_used: set = set()  # 2 コートソリッド加算の「ルーフ以外 N 枚」に使った行
         for ln in lines:
             name = _hw_kana(ln.get('name') or '')
             t = float(_num(ln['index'])) if _num(ln.get('index')) != '' else None
@@ -1404,10 +1411,43 @@ class Drafter:
             if re.search(r'加算基礎', n):
                 self._put_special(out, 'base', {k: v for k, v in (('index', t), ('wage', w)) if v is not None}, name)
                 continue
-            if re.search(r'ブース|ﾌﾞｰｽ', n):
+            if re.search(r'ブ[ー\-]ス', n):   # 長音が '-' で刷られる書式がある
                 self._put_special(out, 'booth', {'index': t or 0.0, 'wage': w or 0}, name)
                 continue
-            if re.search(r'ﾜｯｸｽ|ワックス|防錆', n):
+            if id(ln) in _tcs_used:   # 「ルーフ以外 N 枚」の行は 2 コートソリッド加算に取り込んだ
+                continue
+            # 2 コートソリッド加算（付加塗装）。コグニは PaintingEtcetera の専用欄に入れる。
+            # ここで拾わないと「外板パネルの行追加」に落ちて、原本に無いパネル行が 1 行増える（2026-09-18 実機で確認）。
+            # 印字は「2コートソリッドルーフ 0枚 / ルーフ以外 3枚」の 2 行に分かれることがあるので、枚数の行も一緒に見る
+            if _TCS_RE.search(n) and _ROOF_RE.search(n):
+                _roof = re.search(_ROOF + r'(?!以外)[0-9]*\s*([0-9]+)\s*枚', n)
+                _oth = re.search(_ROOF + r'以外\s*([0-9]+)\s*枚', n)
+                if _oth is None:      # 枚数が次の行に刷られる書式（金額の無い行）
+                    for l2 in lines:
+                        if l2 is ln or _num(l2.get('wage')) != '':
+                            continue
+                        n2 = _nfkc(_hw_kana(l2.get('name') or '')).replace(' ', '')
+                        m2 = re.search(_ROOF + r'以外\s*([0-9]+)\s*枚', n2)
+                        if m2:
+                            _oth = m2
+                            _tcs_used.add(id(l2))
+                            break
+                _coat = _nfkc(str((self.rd.get('paint') or {}).get('coat') or out.get('coat') or ''))
+                _n_roof = int(_roof.group(1)) if _roof else 0
+                _n_oth = int(_oth.group(1)) if _oth else 0
+                if (_n_roof or _n_oth) and ('ソリッド' in _coat or not _coat):  # 塗膜がソリッドのときだけ（生成器の関門と同じ）
+                    rec = {'roof': 1 if _n_roof else 0, 'count': _n_oth}
+                    if t is None and w:   # 指数の印字が無い書式（コグニ印刷）: 工賃 ÷ レートが 0.1 刻みに乗るときだけ起こす
+                        t = index_from_wage(w, getattr(self, 'labor', 0) or 0, getattr(self, 'wage_round', 10) or 10)
+                    if t is not None:
+                        rec['index'] = t
+                    if w is not None:
+                        rec['wage'] = w
+                    self._put_special(out, 'two_coat_solid', rec, name)
+                    self.notes.append(f'塗装 {name}: 2 コートソリッド加算（付加塗装）として書いた'
+                                      f'（ルーフ {_n_roof} 枚 / ルーフ以外 {_n_oth} 枚）。外板パネルの行追加にはしない')
+                    continue
+            if re.search(r'ワ[ッツ][ク][ス]|防錆', n):   # 促音が 'ツ'・長音が '-' の印字も拾う
                 cnt = int(ln.get('count') or (round(t * 10) if t else 1))
                 self._put_special(out, 'wax', {k: v for k, v in (('count', cnt), ('index', t), ('wage', w)) if v is not None}, name)
                 continue

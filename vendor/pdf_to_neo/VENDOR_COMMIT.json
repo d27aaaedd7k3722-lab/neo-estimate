@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "7840ffbad393256428b8a8fed96602a82aba7371",
- "subject": "fix: 税込で印字された見積書の報告文に、表の「見積書」が税抜に直した値だと書く",
- "synced_at": "2026-09-17T17:40:10",
+ "commit": "43b6dc0bd2766144a6a21ad73dba38b144996673",
+ "subject": "fix: 2 コートソリッド加算の指数を工賃から起こす（指数 0.3・工賃 2,780 の食い違いを無くす）",
+ "synced_at": "2026-09-18T18:55:09",
  "files": 108,
- "tree_sha256": "dd0edf9567e258b3f881da26bc52670a2428793038173436123948d4d3afecb1",
+ "tree_sha256": "4501eba09bfe3ac9ec367273a2d51abec0bfac34fa50889de4a61b68137248e7",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }
