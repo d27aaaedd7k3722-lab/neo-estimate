@@ -136,6 +136,19 @@ def main() -> int:
     check(tt2[2] == tt[2], f'入力方式で総額が変わってはいけない: {tt2[2]} / {tt[2]}')
     pl3, _pt3, _tt3, _n3, oth3 = paint_neo({'total': 100000, 'input_type': '実額', 'other': [{'name': 'ﾌﾟﾗｲﾏ-塗装', 'index': 1.0}]})
     check(pl3[:2] == (1, '指数'), f'追加項目があるのに実額にしている（内訳を持てない）: {pl3}')
+    # コグニに無い修理方法（再封印）は、部品コードも品番も指数も無い手入力の作業行なら印字どおり写す。
+    # 実機は DisposalCode -1・標準欄は空（実案件 NEO 300 本で確認。judgment_rules 10-27）
+    rows, _st, _tot, _rep = build([{'name': 'ﾘﾔﾅﾝﾊﾞｰ', 'method': '再封印', 'qty': 1, 'wage': 9000, 'manual': True}])
+    r = rows['']
+    check(r['DisposalCode'] == -1 and r['DisposalName'] == '再封印' and r['DisposalNameStandard'] == '',
+          f"自由な修理方法が写っていない: {r['DisposalCode']} {r['DisposalName']!r} {r['DisposalNameStandard']!r}")
+    check(r['WageOutTax'] == 9000, f"自由な修理方法の行の工賃: {r['WageOutTax']}")
+    try:      # 部品の行（品番あり）で知らない修理方法は、今までどおり止める
+        build([{'code': '3810', 'name': 'Rﾊﾞﾝﾊﾟﾌｴｲｽ', 'method': '再封印', 'qty': 1, 'parts_no': '71501-TDK-010ZF', 'price': 1000}])
+        check(False, '品番のある行の未知の修理方法を止めていない')
+    except ValueError as e:
+        check('不明' in str(e), f'止め方が変わった: {e}')
+
     print('unit_settings:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 

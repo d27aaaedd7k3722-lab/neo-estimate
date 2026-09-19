@@ -1850,12 +1850,20 @@ class NeoBuilder:
             pprice = _money(it.get('parts_price') if it.get('parts_price') is not None else it.get('price'), f"明細 '{_nm}' の部品代（price）")
             wage = _money(it.get('wage'), f"明細 '{_nm}' の工賃（wage）")
             _m = unicodedata.normalize('NFKC', method).replace('鈑', '板').replace(' ', '')
+            free_method = ''   # 部品コードも品番も指数も無い手入力の作業行だけは、印字の修理方法をそのまま書ける
             if method and method not in DISPOSAL and _m not in DISPOSAL:  # 未知の修理方法を黙って取替にしない（'脱着修正' 等の表記ゆれ・転記ミスを止める）
-                raise ValueError(f"修理方法 '{method}' が不明（{it.get('name') or it.get('code')}）。{sorted(set(DISPOSAL))} のいずれかにするか、手入力行なら method を空にする")
+                # 実機 NEO の作業区分は自由文字列（DisposalCode -1 で '施工' '作業' '再発行' '充填' '一部脱着' '再封印'。
+                # 2026-09-19 に実案件 NEO 300 本で確認）。手入力の作業行に限り、印字の語を写す（judgment_rules 10-27）
+                if not str(it.get('code') or '').strip() and not str(it.get('parts_no') or '').strip() and not it.get('index'):
+                    free_method = _fit(hw(_m), 8)
+                else:
+                    raise ValueError(f"修理方法 '{method}' が不明（{it.get('name') or it.get('code')}）。{sorted(set(DISPOSAL))} のいずれかにするか、手入力行なら method を空にする")
             dcode = DISPOSAL.get(method, DISPOSAL.get(_m, 0 if pprice > 0 else (1 if wage > 0 else 0)))  # 正規化した名称（'脱着　板金' 等）でも引く
             if method == '部品':
                 dcode = 0
             disp_name = _m if (_m in ('取替', '脱着', '修理', '脱着修理', '脱着板金', '点検', '調整', '点検調整', '分解調整', '板金') and DISPOSAL.get(_m, dcode) == dcode) else DISPOSAL_NAME.get(dcode, method)  # W/S の名称をそのまま（NEW2: 脱着板金/脱着修理、点検/調整）。別名（部品・交換・取付 等）は既定名
+            if free_method:   # コグニに無い修理方法（再封印 など）は手入力の作業行として印字の語を写す
+                dcode = -1; disp_name = free_method
             if it.get('manual') and not _m.strip():  # 修理方法が空欄の手入力行（塗装費用・産廃・材料代を明細に手入力する工場）: コグニ実機 2026-09-08 exp_manual.neo = DisposalCode -1・名称欄空
                 dcode = -1; disp_name = ''
             std_pn, std_price, std_name, block, work_code, wi_used, sec_used = '', -1, '', '', '', -1, ''
@@ -1989,7 +1997,8 @@ class NeoBuilder:
             row = {
                 'RecordNo': i + 1, 'LineNo': (i + 1) * 10,
                 'PartsCode': f'{ref:04d}' if ref is not None else '', 'PartsCodeSub': -1,
-                'DisposalCode': dcode, 'DisposalName': disp_name, 'DisposalNameStandard': disp_name,  # 同じコードでも W/S で選んだ名称を保存（3: 脱着修理/脱着板金、4: 点検/調整/点検調整。NEW2）
+                # 標準欄は手入力行（DisposalCode -1）では空（実案件 NEO 300 本・-1 の行 1,400 件すべて空。2026-09-19）
+                'DisposalCode': dcode, 'DisposalName': disp_name, 'DisposalNameStandard': ('' if dcode == -1 else disp_name),  # 同じコードでも W/S で選んだ名称を保存（3: 脱着修理/脱着板金、4: 点検/調整/点検調整。NEW2）
                 'PartsName': _fit(pn_disp if pn_disp is not None else (('  ' if is_sub else '') + name_disp), 24), 'PartsNameStandard': ('' if dcode == -1 else _fit(pn_std if pn_std is not None else ((' ' + std_name) if std_name else name_disp), 24)),  # 修理方法空欄の手入力行は標準名称欄も空（実機）
                 '_smb_tail': (parts.tail_by_ref.get(ref, '') if ref is not None else ''),
                 '_smb_disp': (parts.disp_by_ref.get(ref, '') if ref is not None else ''),

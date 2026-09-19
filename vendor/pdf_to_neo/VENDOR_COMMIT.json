@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "fa945729ad404bbd9b22333e568f7034604e4155",
- "subject": "fix: 作業区分の付いた行は費用でなく明細（実機の協定見積書で確定。再封印・脱着・点検）",
- "synced_at": "2026-09-19T20:41:03",
+ "commit": "d32850bccc3d42d8fcc014aede2621c532bd3939",
+ "subject": "fix: コグニに無い修理方法（再封印 など）を手入力の作業行なら印字どおり書く（標準欄は空）",
+ "synced_at": "2026-09-19T21:03:57",
  "files": 108,
- "tree_sha256": "f5cc5251694383f3fdde331587dd312ca07872cd39bfb59fbdc1a509353ef140",
+ "tree_sha256": "c452bbefd57d4592975edf4134dd2d04874f0d0dd4d179796eddb354d67d96bd",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }
