@@ -2353,6 +2353,10 @@ class NeoBuilder:
             n_p = len(panels); n_rows = n_p + len(man_panels)
             pcols = [r[1] for r in cur.execute('PRAGMA table_info(PaintingPanel)')]
             notes = []
+            if unicodedata.normalize('NFKC', str(((estimate or {}).get('paint') or {}).get('input_type') or '')).strip() == '実額'                     or _truthy(((estimate or {}).get('paint') or {}).get('actual')):
+                # 実額は総額 1 つだけの欄で、パネル・加算基礎・材料計を持てない。パネルがあるのに指定されたら黙って捨てない
+                notes.append('paint.input_type「実額」は塗装パネルのある見積では使えないので、指数（パネル別）のままにした'
+                             '（実額は外板パネル・加算基礎・材料計を持てない。判断規則 10-15）')
             def t3(v):
                 v = int(v or 0); return (v, *tax_of(v))
             def rp(x):

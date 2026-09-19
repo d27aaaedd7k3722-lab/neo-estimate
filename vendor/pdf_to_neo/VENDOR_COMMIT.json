@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "17bd84b7cf93cfc3d548dfc8046e80656fba139c",
- "subject": "fix: 一式の塗装の報告文が古い（実額で入れたのに「塗装費用(工場見積) 1 行」と書いていた）",
- "synced_at": "2026-09-19T11:47:08",
+ "commit": "9a9b44825646b3d392ecd5838c3187522baaf462",
+ "subject": "fix: パネルのある見積で paint.input_type「実額」を指定されたら、黙って捨てずに注記する",
+ "synced_at": "2026-09-19T11:54:40",
  "files": 108,
- "tree_sha256": "ce841784e85a7e51594c7d5bc8221d614a5345a23d418966f0f069b0cb952c6e",
+ "tree_sha256": "208e35c0b2a6e51fecf6afea7a4d53d88e2091f35cf6fda36a4f68794b48b01f",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }
