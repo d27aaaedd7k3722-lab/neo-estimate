@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "9a9b44825646b3d392ecd5838c3187522baaf462",
- "subject": "fix: パネルのある見積で paint.input_type「実額」を指定されたら、黙って捨てずに注記する",
- "synced_at": "2026-09-19T11:54:40",
+ "commit": "43e424de1a5b27a0062636b0b9413114d7f6102c",
+ "subject": "fix: 価格差・印の違いが ADDATA の版ずれで出ているときは、そう書く",
+ "synced_at": "2026-09-19T13:01:03",
  "files": 108,
- "tree_sha256": "208e35c0b2a6e51fecf6afea7a4d53d88e2091f35cf6fda36a4f68794b48b01f",
+ "tree_sha256": "ae18fbb6abfc8deb836631e19d349f75d0fb6d9eb17cac82926b9bf381b27e15",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

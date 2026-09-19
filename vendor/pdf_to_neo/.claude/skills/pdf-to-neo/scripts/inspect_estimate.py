@@ -458,6 +458,7 @@ def _inspect(path: str, out_json: str = '') -> int:
         print(f"6. 塗装: パネル明細なし → {p.get('total')} を {_how}")
 
     _totals(est, warn, rep, str(car.get('CarFormCode', '') or ''), labor, coat_c if (p.get('panels') or is_bumper_only_paint(p)) else None)
+    _addata_version_note(est, warn, rep)
     _finish(warn, rep, out_json)
     return 0
 
@@ -618,6 +619,28 @@ def _wage_alts(base: int, paint: int, material: int, frame: int, ex_w: int) -> s
         for comb in combinations(range(4), n):
             out.add(base + sum(extras[i] for i in comb))
     return out
+
+
+def _addata_version_note(est: dict, warn: list, rep: dict) -> None:
+    """価格差・指数差の要確認が、この PC の ADDATA が見積書より**新しい**せいで出ていないか。
+    部品価格は年に何度も改定されるので、古い見積を新しい ADDATA で見ると差が並ぶ。
+    「部品の取り違え」と読み違えて直そうとすると時間を失うので、1 行にまとめて理由を添える
+    （2026-09-19 実機: 作成日 2026/04 の見積を ADDATA 2026/09 で通すと ★価格差 5 行・印の違い 1 行）"""
+    hits = [w for w in warn if '価格差' in w or '印字 $' in w]
+    if not hits:
+        return
+    try:
+        ver = skill_env.addata_version(os.environ.get('ADDATA_ROOT') or '')
+    except Exception:  # noqa: BLE001  版が読めないだけなら何も言わない
+        return
+    d = ''.join(ch for ch in str(ver) if ch.isdigit())[:6]
+    e = ''.join(ch for ch in str(est.get('est_date') or '') if ch.isdigit())[:6]
+    if len(d) != 6 or len(e) != 6 or d <= e:
+        return
+    rep['addata_newer_than_estimate'] = {'addata': ver, 'est_date': est.get('est_date')}
+    warn.append(f'★価格差・印の違い {len(hits)} 件: この PC の ADDATA は {ver} 版で、見積書（{e[:4]}/{e[4:]}）より新しい。'
+                '部品価格は改定されるので、版違いで差が出ているだけのことがある（部品の取り違えとは限らない）。'
+                '見積書の「部品価格適応日」と見比べて、版違いなら印字の金額のままでよい')
 
 
 def _finish(warn: list[str], rep: dict, out_json: str) -> None:
