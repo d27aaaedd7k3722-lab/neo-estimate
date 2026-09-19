@@ -1034,8 +1034,17 @@ class Drafter:
                 if _keep and ref2 != ref:   # 残した行は「単価で決めた行」と同じく、次の行の部位の文脈を動かさない（下の _moved_by_price）
                     why = f'単価一致({_unit:,} 円・名称一致) ← {why}'
                 elif ref2 is not None and s2 >= 0.55:
-                    why = f'ブロック内名称照合({s2:.2f}) ← 全体照合は {ref}'
-                    ref = ref2
+                    # 部品代も指数も無い「工賃だけの行」（ガラス脱着 等）は、ブロックに並ぶ部品に引っ張られやすい。
+                    # 頭が長く同じ名前どうし（Rrｳｲﾝﾄﾞｼｰﾙﾄﾞｶﾞﾗｽ ←→ ｳｲﾝﾄﾞｼ-ﾙﾄﾞﾉｽﾞﾙ は 0.77）で別部品に化け、
+                    # 工賃 19,550 の「ガラス脱着」が「ノズル」になっていた（2026-09-19 フリード）。
+                    # 部品の行と、指数の印字がある作業行は今までどおり（部位の文脈で左右・枝番を直すのが効くため。
+                    # JPN タクシーの ﾙｰﾑﾊﾟｰﾃｨｼｮﾝﾊﾟﾈﾙ 0.4 / ｸｫｰﾀｳｲﾝﾄﾞ 1.5 はブロック内照合が正しい）
+                    _g = AddataParts._why_score(re.sub(r'^語順入替「.*?」\s*', '', why or ''))
+                    if price <= 0 and wage and index is None and _g > s2:
+                        why = f'{why}（ブロック内の候補 {ref2} は {s2:.2f} で弱いので替えない）'
+                    else:
+                        why = f'ブロック内名称照合({s2:.2f}) ← 全体照合は {ref}'
+                        ref = ref2
             if ref is None and ctx_block:
                 ref2, s2 = self._match_in_block(name, ctx_block, side)
                 if inh and (ref2 is None or s2 < 0.55):

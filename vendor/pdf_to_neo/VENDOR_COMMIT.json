@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "d32850bccc3d42d8fcc014aede2621c532bd3939",
- "subject": "fix: コグニに無い修理方法（再封印 など）を手入力の作業行なら印字どおり書く（標準欄は空）",
- "synced_at": "2026-09-19T21:03:57",
+ "commit": "2b19738386fb93e7987a9f66e0ec420a306b92e4",
+ "subject": "fix: 工賃だけの行で、ブロック内の弱い似た名前が名称一致を上書きしていた（ガラス脱着がノズルに化けた）",
+ "synced_at": "2026-09-19T21:27:31",
  "files": 108,
- "tree_sha256": "c452bbefd57d4592975edf4134dd2d04874f0d0dd4d179796eddb354d67d96bd",
+ "tree_sha256": "65a47bf4195cc5c8582a14ce2fde5b445b14f3faa11eec6f904af2b6153b4fa8",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }
