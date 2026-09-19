@@ -594,6 +594,52 @@ def test_tax_included_rounding_slack():
     assert any('割り戻した丸めの差' in w for w in res['warn']), res['warn']
 
 
+def test_expense_or_row_side_drift():
+    """同じ名前が前回は費用・今回は明細（またはその逆）になったら知らせる。
+    費用の区画が印字されていない見積では振り分けがぶれるが、金額はどちらでも合うので検算では出ない
+    （2026-09-19 同じ PDF の 2 回の読み取りで「リヤナンバー再封印」が明細→費用に動いた）"""
+    import json, shutil, tempfile
+    d = tempfile.mkdtemp(prefix='prof_')
+    old = rc.PROFILES
+    rc.PROFILES = os.path.join(d, 'factory_profiles.json')
+    try:
+        row = '|ﾘﾔﾅﾝﾊﾞｰ再封印|||||0|9000||'        # 部品番号も指数も無い手入力の行
+        assert rc._confusable_row_names({'blocks': [{'rows': [row]}]}) == {'リヤナンバー再封印'}
+        assert not rc._confusable_row_names({'blocks': BASE['blocks']}), '部品・作業の行は取り違えようがないので入れない'
+
+        prof = {'テスト鈑金': {'expense_in': {'リヤナンバー再封印': 'wage'}, 'row_names': [], 'count': 2}}
+        json.dump(prof, open(rc.PROFILES, 'w', encoding='utf-8'), ensure_ascii=False)
+        rd = copy.deepcopy(BASE)                    # 過去は費用 → 今回は明細行
+        rd['blocks'][1]['rows'].append(row)
+        rd['blocks'][1].pop('subtotal', None)
+        rd['pages']['2']['rows'] = 3
+        rd['pages']['2']['wage'] = 25000
+        rd['totals']['wage'] = 37000
+        rd['totals']['taxable'] = 204000
+        w = run(rd)['warn']
+        assert any('リヤナンバー再封印' in x and '今回 明細行' in x for x in w), w
+
+        prof['テスト鈑金'] = {'expense_in': {}, 'row_names': ['リヤナンバー再封印'], 'count': 2}
+        json.dump(prof, open(rc.PROFILES, 'w', encoding='utf-8'), ensure_ascii=False)
+        rd2 = copy.deepcopy(BASE)                   # 過去は明細行 → 今回は費用
+        rd2['expenses'] = list(BASE['expenses']) + [{'name': 'ﾘﾔﾅﾝﾊﾞｰ再封印', 'amount': 9000, 'in': '諸費用計'}]
+        rd2['totals']['expense'] = 19000
+        rd2['totals']['taxable'] = 204000
+        w2 = run(rd2)['warn']
+        assert any('リヤナンバー再封印' in x and '今回 費用' in x for x in w2), w2
+
+        prof['テスト鈑金']['expense_in'] = {'リヤナンバー再封印': 'expense'}   # 両方の印字を見たことがある名前は黙る
+        json.dump(prof, open(rc.PROFILES, 'w', encoding='utf-8'), ensure_ascii=False)
+        assert not any('今回 費用' in x or '今回 明細行' in x for x in run(rd2)['warn']), run(rd2)['warn']
+
+        rc.PROFILES = os.path.join(d, 'saved.json')                    # 明細行の名前を覚えて次回に備える
+        rc.save_profile(rd, {'labor_rate': 8000, 'wage_round': 10, 'format': 'B'})
+        assert 'リヤナンバー再封印' in rc.load_profiles()['テスト鈑金']['row_names'], rc.load_profiles()
+    finally:
+        rc.PROFILES = old
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == '__main__':
     fails = 0
     for name, fn in sorted(globals().items()):

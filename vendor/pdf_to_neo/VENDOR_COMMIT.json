@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "43e424de1a5b27a0062636b0b9413114d7f6102c",
- "subject": "fix: 価格差・印の違いが ADDATA の版ずれで出ているときは、そう書く",
- "synced_at": "2026-09-19T13:01:03",
+ "commit": "469599afdfcbf6d3ae790488f196750b0399eb59",
+ "subject": "fix: 費用と明細の振り分けが前回と違うときは知らせる（同じ見積で読み取りごとにぶれ、検算では出ない）",
+ "synced_at": "2026-09-19T20:25:11",
  "files": 108,
- "tree_sha256": "ae18fbb6abfc8deb836631e19d349f75d0fb6d9eb17cac82926b9bf381b27e15",
+ "tree_sha256": "089bc06cca13caf588a58bcc9234ff65dfa88a79b0bffc1bf48f27582aaacdee",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

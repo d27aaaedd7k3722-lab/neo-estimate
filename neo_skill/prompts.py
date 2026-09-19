@@ -121,6 +121,9 @@ def header_task(n_pages: int, vehicle_hint: Optional[dict] = None, source_name: 
 
 書くキー（無いものは省く。値が読めないキーは空文字か null）: {', '.join(k for k in HEADER_KEYS if k not in _NOT_FOR_READER)}
 - source: "{source_name or 'estimate.pdf'} 書式X"（書式は format_catalog.md の A〜G）
+- issuer: **見積書を発行した工場・販売店の名前**（用紙の上端・右上・下端に社判や住所・電話と一緒に印字されている会社名。
+  「○○自動車株式会社 △△店」のように店舗名まで印字されていれば続けて写す。宛名（お客様）や保険会社と取り違えない）。
+  印字があれば**必ず書く**。ここが空だと、その工場の工賃の丸め・費用の集計先を過去の案件と照合できず、読み取りのぶれを検出できない
 - vehicle: 登録番号・車台番号・型式・型式指定/類別・初度登録（reg_date は "R4.3" のような印字どおり）・カラーNo・グレード名・エンジン・排気量のうち印字されているもの
 - est_date: 見積日を YYYYMMDD の 8 桁で（例 20260913。令和8年9月13日・2026/9/13 のような印字は変換する。無ければ書かない）
 - customer: お客様（宛名）の氏名・登録番号・郵便番号（postal）・住所（address）のうち印字されているもの。工場（発行元）の住所は issuer に書き、customer には入れない

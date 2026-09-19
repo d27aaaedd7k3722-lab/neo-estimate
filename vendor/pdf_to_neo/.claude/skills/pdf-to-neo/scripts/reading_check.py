@@ -100,6 +100,34 @@ def _expense_kinds(expenses: list) -> dict:
     return {n: '+'.join(sorted(ks)) for n, ks in kinds.items()}
 
 
+def _side_key(name) -> str:
+    return _nfkc(name or '').replace(' ', '')
+
+
+def _expense_names(expenses: list) -> set:
+    return {k for k in (_side_key(e.get('name')) for e in expenses or []) if k}
+
+
+def _confusable_row_names(rd: dict) -> set:
+    """明細行のうち **費用に回されてもおかしくない行** の名前。部品番号も指数も無い手入力の実費・手続き行
+    （リヤナンバー再封印・写真代 など）だけを拾う。部品や作業の行は費用と取り違えようがないので入れない。
+    費用と明細のどちらに写すかは印字に区画が無いと読み手ごとにぶれ、金額は合うので検算では気づけない
+    （2026-09-19 同じ見積の 2 回の読み取りで「リヤナンバー再封印 9,900」が明細→費用に動いた）"""
+    out = set()
+    for blk in rd.get('blocks') or []:
+        for row in blk.get('rows') or []:
+            try:
+                r = expand_row(row)
+            except ValueError:
+                continue
+            if str(r.get('code') or '').strip() or str(r.get('parts_no') or '').strip() or _num(r.get('index')):
+                continue
+            nm = _side_key(r.get('name'))
+            if nm and not r.get('note'):
+                out.add(nm)
+    return out
+
+
 def _in_kind(e: dict) -> str:
     """expenses[].in（見積書のどの合計欄に入っているか）→ parts / wage / expense / taxfree / ''（不明）"""
     s = _nfkc(e.get('in') or '').replace(' ', '')
@@ -852,6 +880,19 @@ class Checker:
             # 旧形式（同名 2 行を 1 つの区分で保存: 'wage'）→ 今回 'parts+wage' への移行だけ許す。'parts+wage' から片方に減ったときは写し漏れの疑いなので WARN（Codex 指摘）
             if past and past != now and not (now == 'parts+wage' and past in ('parts', 'wage')):   # 例外は旧形式の単一区分 → 'parts+wage' だけ（expense+wage 等は区分の変更として WARN。Codex 指摘）
                 self.warn(f"費用 {nm}: 過去この工場では {past} 扱い、今回は {now}。合計欄で確かめる")
+        self.check_side_drift(prof)
+
+    def check_side_drift(self, prof: dict) -> None:
+        """同じ名前が、前は費用・今度は明細（またはその逆）になっていないか。
+        費用の区画が印字されていない見積では読み手ごとに振り分けがぶれるが、金額は合うので検算では出ない。
+        NEO では費用画面と明細画面のどちらに出るかが変わるので、過去と違うときだけ知らせる"""
+        past_ex = set(prof.get('expense_in') or {})
+        past_rows = set(prof.get('row_names') or [])
+        both = past_ex & past_rows   # この工場では両方に印字される名前（判断の material にならない）
+        for nm in sorted((_confusable_row_names(self.rd) & past_ex) - both):
+            self.warn(f"「{nm}」は今回 明細行。過去この工場では費用に写していた（金額は合っていても NEO で出る画面が変わる）。印字の区画で確かめる")
+        for nm in sorted((_expense_names(self.rd.get('expenses')) & past_rows) - both):
+            self.warn(f"「{nm}」は今回 費用。過去この工場では明細行に写していた（金額は合っていても NEO で出る画面が変わる）。印字の区画で確かめる")
 
     # ------------------------------------------------------------------ 実行
     def run(self) -> dict:
@@ -983,6 +1024,8 @@ def _save_profile_locked(rd: dict, settings: dict, issuer: str) -> str:
         if str(_past) == 'parts+wage' and _now in ('parts', 'wage'):
             continue   # 'parts+wage' を今回の片方だけで上書きしない（1 回の写し漏れで次から WARN が消えるのを防ぐ。Codex 指摘）
         ex_in[_nm] = _now
+    # 費用に回されてもおかしくない明細行の名前を覚えておく（次に費用へ動いたら check_side_drift が気づく）
+    rn = sorted(set(p.get('row_names') or []) | _confusable_row_names(rd))[:200]
     t = rd.get('totals') or {}
     case_id = hashlib.sha1(f"{rd.get('est_date', '')}|{t.get('total', '')}|{t.get('parts', '')}".encode('utf-8')).hexdigest()[:10]  # 案件の識別（顧客情報は使わない）
     seen = list(p.get('seen') or [])
@@ -991,7 +1034,7 @@ def _save_profile_locked(rd: dict, settings: dict, issuer: str) -> str:
     p.update({'labor_rate': settings.get('labor_rate'), 'wage_round': settings.get('wage_round'), 'format': settings.get('format'),
               'tax_round': settings.get('tax_round', p.get('tax_round')), 'material_rate': settings.get('material_rate', p.get('material_rate')),
               'manual_rows_mode': bool(settings.get('manual_rows_mode', p.get('manual_rows_mode'))),
-              'expense_in': ex_in, 'count': len(seen), 'seen': seen[-50:], 'last': datetime.date.today().isoformat()})
+              'expense_in': ex_in, 'row_names': rn, 'count': len(seen), 'seen': seen[-50:], 'last': datetime.date.today().isoformat()})
     profs[issuer] = p
     tmp = f'{PROFILES}.{os.getpid()}.tmp'  # 並行実行で一時ファイルを共有しない
     with open(tmp, 'w', encoding='utf-8') as fh:
