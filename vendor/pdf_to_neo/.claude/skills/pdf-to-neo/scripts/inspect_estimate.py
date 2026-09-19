@@ -453,7 +453,9 @@ def _inspect(path: str, out_json: str = '') -> int:
             if int(p.get('material') or 0) and int(p['material']) != lump:
                 print("      → コグニ既定値と違う。paint.material に見積値を入れると PaintingTotal は '*'（手入力）で保持される")
     else:
-        print(f"6. 塗装: パネル明細なし → 一括 {p.get('total')}（塗装費用(工場見積) 1 行）")
+        _how = ('コグニの入力方式「実額」（総額 1 つ。パネルも加算基礎も作らない）'
+                if str(p.get('input_type') or '') == '実額' or p.get('actual') else '塗装費用(工場見積) 1 行の一括計上')
+        print(f"6. 塗装: パネル明細なし → {p.get('total')} を {_how}")
 
     _totals(est, warn, rep, str(car.get('CarFormCode', '') or ''), labor, coat_c if (p.get('panels') or is_bumper_only_paint(p)) else None)
     _finish(warn, rep, out_json)

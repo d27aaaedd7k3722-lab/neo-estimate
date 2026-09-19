@@ -112,6 +112,30 @@ def main() -> int:
         bad += [f'{tbl}.{col} {v!r}' for v in new if fw.search(v)]
     check(seen >= 5, f'この build で書いた名称が少なすぎる（{seen} 件）')
     check(not bad, '名称欄に全角カナ・全角中黒が残っている: ' + ' / '.join(bad[:4]))
+    # 塗装の入力方式「実額」（コグニ: その他 → 塗装 → 入力方式。実案件 NEO 400 本中 91 本）。
+    # 工場見積が「塗装費用 一式」しか出していない案件を、パネルを作らず総額 1 つで書く
+    def paint_neo(paint):
+        build(F2, paint=paint)
+        d = neo_diff.load(os.path.join(os.environ.get('TEMP', HERE), 'unit_settings.neo'))
+        em = d['AnSvEm0001.sld']
+        pl = tuple(em.execute('SELECT InputType, InputTypeName, BoothFlag, BaseTime FROM PaintingPlan').fetchone())
+        pt = tuple(em.execute('SELECT WageTotalOutTax, MaterialTotalOutTax, TotalOutTax, WageTotalByManual FROM PaintingTotal').fetchone())
+        tt = tuple(em.execute('SELECT pn_TotalOutTax, pn_MaterialTotalOutTax, Total FROM Total').fetchone())
+        npan = em.execute('SELECT COUNT(*) FROM PaintingPanel').fetchone()[0]
+        oth = [r[0] for r in em.execute('SELECT Name FROM PaintingOther WHERE WageOutTax > 0')]
+        return pl, pt, tt, npan, oth
+    pl, pt, tt, npan, oth = paint_neo({'total': 100000, 'input_type': '実額'})
+    check(pl[:2] == (0, '実額'), f'実額の入力方式が書かれていない: {pl}')
+    check(pl[2] == 0 and pl[3] == -1, f'実額なのにブース・加算基礎が生きている: {pl}')
+    check(npan == 0 and not oth, f'実額なのに塗装パネル {npan} 枚 / 追加項目 {oth}')
+    check(pt == (0, 0, 100000, ''), f'実額の塗装計がおかしい（工賃計・材料計は 0、計に総額、印は付かない）: {pt}')
+    check(tt[:2] == (100000, 0), f'合計欄の塗装計がおかしい: {tt}')
+    pl2, pt2, tt2, npan2, oth2 = paint_neo({'total': 100000})          # 指定が無ければ今までどおり（追加項目に 1 行）
+    check(pl2[:2] == (1, '指数'), f'指定が無いのに実額になっている: {pl2}')
+    check(oth2 == ['塗装費用(工場見積)'], f'一式の追加項目が今までどおりでない: {oth2}')
+    check(tt2[2] == tt[2], f'入力方式で総額が変わってはいけない: {tt2[2]} / {tt[2]}')
+    pl3, _pt3, _tt3, _n3, oth3 = paint_neo({'total': 100000, 'input_type': '実額', 'other': [{'name': 'ﾌﾟﾗｲﾏ-塗装', 'index': 1.0}]})
+    check(pl3[:2] == (1, '指数'), f'追加項目があるのに実額にしている（内訳を持てない）: {pl3}')
     print('unit_settings:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0
 

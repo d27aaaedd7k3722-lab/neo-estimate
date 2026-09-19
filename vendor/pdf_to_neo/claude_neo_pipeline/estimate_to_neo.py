@@ -2730,12 +2730,37 @@ class NeoBuilder:
             mt_in, mt_tax = tax_of(paint_material)
             pt_all = paint_total + paint_material
             pt_in, pt_tax = tax_of(pt_all)
-            cur.execute('UPDATE PaintingOther SET Name=?, Time=-1, WageOutTax=?, WageInTax=?, WageTax=?, WageByManual="*" WHERE LineNo=0',
-                        ('塗装費用(工場見積)', paint_total, pn_in, pn_tax))
-            cur.execute('UPDATE PaintingTotal SET WageTotalOtherOutTax=?,WageTotalOtherInTax=?,WageTotalOtherTax=?,WageTotalOutTax=?,WageTotalInTax=?,WageTotalTax=?,'
-                        'MaterialTotalOutTax=?,MaterialTotalInTax=?,MaterialTotalTax=?,MaterialTotalbyManual=?,TotalOutTax=?,TotalInTax=?,TotalTax=?',
-                        (paint_total, pn_in, pn_tax, paint_total, pn_in, pn_tax, paint_material, mt_in, mt_tax, ('*' if paint_material else ''), pt_all, pt_in, pt_tax))
-            paint_total = pt_all
+            _pdx0 = (estimate or {}).get('paint') or {}
+            _adds = [k for k in PAINT_DETAIL_KEYS + ('frame', 'sealing', 'other') if _pdx0.get(k)]
+            _jitsu = (_truthy(_pdx0.get('actual')) or unicodedata.normalize('NFKC', str(_pdx0.get('input_type') or '')).strip() == '実額') and not _adds
+            if _jitsu:
+                # コグニの塗装「実額」入力（その他 → 塗装 → 入力方式）。総額を 1 つの金額で入れる方式で、
+                # 外板パネル・加算基礎・ブース・材料代の内訳を持たない（実案件 NEO 400 本中 91 本がこれ。NEO 仕様 §塗装）。
+                # 工場見積が「塗装費用 一式」しか出していない案件を、印字どおりに 1 行で書くために使う
+                cur.execute('UPDATE PaintingPlan SET InputType=0, InputTypeName=?, BoothFlag=0, '
+                            'BoothTime=-1, BoothTimeStandard=-1, BoothWageOutTax=-1, BoothWageInTax=-1, BoothWageTax=-1, '
+                            'BoothWageStandardOutTax=-1, BoothWageStandardInTax=-1, BoothWageStandardTax=-1, BoothWageByManual="", '
+                            'BaseTime=-1, BaseTimeStandard=-1, BaseWageOutTax=-1, BaseWageInTax=-1, BaseWageTax=-1, '
+                            'BaseWageStandardOutTax=-1, BaseWageStandardInTax=-1, BaseWageStandardTax=-1, BaseWageByManual=""', ('実額',))
+                cur.execute('UPDATE PaintingTotal SET TimeTotalPanel=0,TimeTotalBumper=0,TimeTotalFrame=0,TimeTotalEtcetera=0,TimeTotalOther=0,TimeTotal=0,'
+                            'WageTotalPanelOutTax=0,WageTotalPanelInTax=0,WageTotalPanelTax=0, WageTotalBumperOutTax=0,WageTotalBumperInTax=0,WageTotalBumperTax=0,'
+                            'WageTotalFrameOutTax=0,WageTotalFrameInTax=0,WageTotalFrameTax=0, WageTotalEtceteraOutTax=0,WageTotalEtceteraInTax=0,WageTotalEtceteraTax=0,'
+                            'WageTotalOtherOutTax=0,WageTotalOtherInTax=0,WageTotalOtherTax=0, WageTotalOutTax=0,WageTotalInTax=0,WageTotalTax=0, WageTotalByManual="",'
+                            'MaterialTotalOutTax=0,MaterialTotalInTax=0,MaterialTotalTax=0,MaterialTotalbyManual="", TotalOutTax=?,TotalInTax=?,TotalTax=?',
+                            (pt_all, pt_in, pt_tax))
+                if paint_material:   # 実額は内訳を持たない欄なので、材料代は総額に含めて 1 つにする
+                    self._paint_notes = (getattr(self, '_paint_notes', None) or []) + [
+                        f'塗装は実額入力（総額 {pt_all:,} 円）。材料代 {paint_material:,} 円は内訳を持てないので総額に含めた']
+                    print(f'塗装: 実額入力（総額 {pt_all:,} 円）。材料代 {paint_material:,} 円は総額に含めた')
+                paint_total = pt_all
+                paint_material = 0
+            else:
+                cur.execute('UPDATE PaintingOther SET Name=?, Time=-1, WageOutTax=?, WageInTax=?, WageTax=?, WageByManual="*" WHERE LineNo=0',
+                            ('塗装費用(工場見積)', paint_total, pn_in, pn_tax))
+                cur.execute('UPDATE PaintingTotal SET WageTotalOtherOutTax=?,WageTotalOtherInTax=?,WageTotalOtherTax=?,WageTotalOutTax=?,WageTotalInTax=?,WageTotalTax=?,'
+                            'MaterialTotalOutTax=?,MaterialTotalInTax=?,MaterialTotalTax=?,MaterialTotalbyManual=?,TotalOutTax=?,TotalInTax=?,TotalTax=?',
+                            (paint_total, pn_in, pn_tax, paint_total, pn_in, pn_tax, paint_material, mt_in, mt_tax, ('*' if paint_material else ''), pt_all, pt_in, pt_tax))
+                paint_total = pt_all
         # --- 塗装の追加要素（内板骨格塗装 / ボデーシーリング / 追加項目）: コグニ実験保存版（CHR_ETO_exp）と同形
         est = estimate or {}; pdx = est.get('paint') or {}
         rate_x = int(getattr(self, '_labor_rate', 0) or 0)

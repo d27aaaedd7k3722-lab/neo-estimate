@@ -1398,7 +1398,7 @@ class Drafter:
                 out['total'] = sum(int(float(_num(l.get('wage')) or 0)) for l in lines)
                 out['_total_from_lines'] = 0   # 塗装行から作った total（印字の塗装工賃計ではない）。数字は total に含めた追加項目の工賃（inspect が二重に数えないため）
             self._material_from_lines(out, lines)   # 汎用車種・塗装行を組み立てない経路でも材料代は合わせる（検算と同じ条件にする）
-            return out
+            return self._paint_input_type(out)
         panels, other = list(out.get('panels') or []), list(out.get('other') or [])
         n_other0 = len(other)   # ここから後ろが塗装行から追加項目にした行（前は転記の paint.other）
         auto_manual: list = []  # 下書きが作った手入力の塗装行（rec, 見積の名前）
@@ -1580,6 +1580,37 @@ class Drafter:
             self.notes.append(f'材料代 {mat:,} = 塗装工賃計 {tot:,} × {rate:g}%（10 円丸め）と一致 → 費用割合モード（material を渡さない）')
         elif mat and rate and tot and mat == int(tot * rate / 100 + 0.5):
             self.notes.append(f'材料代 {mat:,} は 塗装工賃計 {tot:,} × {rate:g}% の 1 円四捨五入。コグニの割合計算（10 円丸め {material_default(tot, rate):,}）とは違うので額を手入力（*）で渡す')
+        return self._paint_input_type(out)
+
+    # 塗装の入力方式（コグニ: その他 → 塗装 → 入力方式）。パネルも内訳も無い「一式」の見積は **実額**で入れる。
+    # 実額はコグニが持っている入れ方（実案件 NEO 400 本中 91 本）で、総額を 1 つの金額として書く。
+    # そうしないと「塗装費用(工場見積)」という印字に無い追加項目が 1 行できる（判断規則 10-15）
+    PAINT_DETAIL_FOR_INPUT = ('panels', 'lines', 'bumper_front', 'bumper_rear', 'bumper_base', 'frame', 'sealing',
+                              'other', 'base', 'booth', 'wax', 'door_sash', 'stripe', 'low_cover',
+                              'two_coat_solid', 'two_tone', 'auto_panels')
+
+    def _paint_input_type(self, out: dict) -> dict:
+        """一式しか無い塗装なら input_type='実額' を付ける。reading に指定があればそれを優先する"""
+        if not isinstance(out, dict) or not out:
+            return out
+        said = self.rd.get('paint') or {}
+        want = _nfkc(str(said.get('input_type') or '')).strip()
+        if want:
+            out['input_type'] = want
+            return out
+        if _flag(said.get('actual'), 'paint.actual'):
+            out['input_type'] = '実額'
+            return out
+        if int(float(_num(out.get('total')) or 0)) > 0 and not any(out.get(k) for k in self.PAINT_DETAIL_FOR_INPUT):
+            if out.get('material') or out.get('material_rate'):
+                # 材料代が別に出ている見積は実額にしない。実額は総額 1 つだけの欄で、**材料計を持てない**ので
+                # 印字の材料代が NEO から消え、検算（材料計）も突き合わせられなくなる
+                self.notes.append(f"塗装は一式だが材料代 {int(float(_num(out.get('material')) or 0)):,} 円が別に出ているので、"
+                                  '入力方式は実額にしない（実額は材料計の欄を持てない）')
+                return out
+            out['input_type'] = '実額'
+            self.notes.append(f"塗装は一式（{int(float(_num(out.get('total')))):,} 円）だけなので、コグニの入力方式を"
+                              '**実額**にした（パネルも加算基礎も作らない。印字どおり 1 つの金額で入る）')
         return out
 
     # ------------------------------------------------------------------ 費用・合計

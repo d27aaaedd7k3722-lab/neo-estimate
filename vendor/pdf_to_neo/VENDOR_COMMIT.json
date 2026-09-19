@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "43b6dc0bd2766144a6a21ad73dba38b144996673",
- "subject": "fix: 2 コートソリッド加算の指数を工賃から起こす（指数 0.3・工賃 2,780 の食い違いを無くす）",
- "synced_at": "2026-09-18T18:55:09",
+ "commit": "17bd84b7cf93cfc3d548dfc8046e80656fba139c",
+ "subject": "fix: 一式の塗装の報告文が古い（実額で入れたのに「塗装費用(工場見積) 1 行」と書いていた）",
+ "synced_at": "2026-09-19T11:47:08",
  "files": 108,
- "tree_sha256": "4501eba09bfe3ac9ec367273a2d51abec0bfac34fa50889de4a61b68137248e7",
+ "tree_sha256": "ce841784e85a7e51594c7d5bc8221d614a5345a23d418966f0f069b0cb952c6e",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }
