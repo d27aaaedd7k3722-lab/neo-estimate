@@ -88,7 +88,17 @@ def write_report(case: str, est: dict, rep: dict, rows: list[dict], inspect_json
     L.append(f"- 出力: `{neo}`" + (f"  納品: `{delivered}`" if delivered else ''))
     L.append(f"- 元資料: {est.get('source', '')}")
     L.append(f"- 車両: {str(car.get('CarNameByUser', '')).strip()} / {car.get('CarCode')} 年式 {car.get('YearCode')} ボディ {car.get('BodyCode')} グレード {car.get('GradeCode')} FVA {car.get('FVACode')} 色 {car.get('ColorCode')}（{(rep.get('vehicle') or {}).get('confidence')}）装備 {rep.get('eva_write', rep.get('eva'))}")
-    L.append(f"- レバーレート {est.get('labor_rate')} 円" + (f"、工賃丸め {est.get('wage_round')} 円" if est.get('wage_round') else '') + (f"、index_policy {est.get('index_policy')}" if est.get('index_policy') else ''))
+    # NEO に書いたレート（生成器が工賃÷指数から決めたものを含む）を出す。見積の labor_rate だけだと、印字の無い見積で
+    # 「レバーレート 0 円」と書いてしまう（2026-09-19 本番検証: NEO は 8,500 円なのに報告文は 0 円）
+    _rate_neo = (rep.get('stats') or {}).get('labor_rate') or est.get('labor_rate')
+    _from = est.get('_labor_rate_from')   # 下書きが残すレートの出どころ（printed / inferred）。古い estimate.json には無い
+    if (rep.get('stats') or {}).get('labor_rate_assumed'):
+        _rate_note = '（★ 見積書に印字が無く、工賃÷指数からも決められないので仮定）'
+    elif _from == 'printed' or (not _from and str(_rate_neo) == str(est.get('labor_rate'))):
+        _rate_note = ''
+    else:
+        _rate_note = '（見積書に印字なし。工賃÷指数から決めた）'
+    L.append(f"- レバーレート {_rate_neo} 円{_rate_note}" + (f"、工賃丸め {est.get('wage_round')} 円" if est.get('wage_round') else '') + (f"、index_policy {est.get('index_policy')}" if est.get('index_policy') else ''))
     _ti = est.get('tax_included')   # 税込で印字された見積書（判断規則 10-4）は、この表の「見積書」が税抜に直した値になる
     if _ti:
         L += ['', f'> この見積書は**各行の金額まで税込**で印字されています（判断規則 10-4）。'
@@ -318,6 +328,7 @@ def main() -> int:
     rep: dict = {}
     rows: list[dict] = []
     audit_lines: list[str] = []
+    build_err = ''
     try:
         rep, rows = build_rows(est)
         marks = mark_check(est, rows)
@@ -326,6 +337,7 @@ def main() -> int:
             for m in marks:
                 print('  -', m)
     except Exception as e:  # noqa: BLE001
+        build_err = f'{type(e).__name__}: {e}'
         print('印の照合/報告文の生成で例外（合否には影響しない）:', e)
     if rep:
         try:  # 装備監査（合否には影響しない。★ が出たら reading の hints.eva_codes を検討する）
@@ -386,6 +398,21 @@ def main() -> int:
             except OSError as e:
                 neo_for_report = src_ng
                 print('不合格の NEO を .ng.neo に置けなかった:', src_ng, e)
+        if not a.no_report and not rep:
+            # 生成器が NEO を組み立てられなかった（車両特定失敗など）ときも、理由だけの報告文を残す。
+            # 無いと、アプリの「修正用ファイル一式（pages/・reading.json・report.md）」に report.md が入らず、何を直すか分からない
+            # （2026-09-19 本番検証: 輸入車で車両特定失敗 → report.md の無い一式が渡った）
+            try:
+                _tail = [ln.strip() for ln in out.splitlines() if re.search(r'Error|失敗|例外|★', ln)][-8:]
+                with open(os.path.join(case, 'report.md'), 'w', encoding='utf-8') as fh:
+                    fh.write(f'# NEO 化報告: {name}（NEO を作れなかった）\n\n'
+                             f'- 理由: {build_err or "生成器が NEO を組み立てられなかった"}\n'
+                             + ''.join(f'- 生成ログ: {ln}\n' for ln in _tail)
+                             + '- 次にすること: 車両なら reading.json の vehicle（型式指定・類別・車台番号）を見直す。'
+                               'コグニに無い車種（輸入車など）は vehicle.generic=true と car_code（Z10 乗用 / Z20 1BOX / Z30 トラック）を書く\n')
+                print('報告文（理由だけ）:', os.path.join(case, 'report.md'))
+            except OSError as e:
+                print('報告文の生成で例外:', e)
         if not a.no_report and rep:
             try:
                 write_report(case, est, rep, rows, inspect_json, out, marks, neo_for_report, '', check, audit_lines)  # 不合格の報告は実際に残った NEO（.ng.neo）を指す（Codex 指摘）

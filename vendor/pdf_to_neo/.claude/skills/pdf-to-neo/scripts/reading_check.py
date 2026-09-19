@@ -436,6 +436,9 @@ class Checker:
             for s in ('R', 'L'):
                 same = [r for sd, r in sides if sd == s]
                 for a, b in combinations(same, 2):
+                    ca, cb = str(a.get('code') or '').strip(), str(b.get('code') or '').strip()
+                    if ca and cb and ca != cb:
+                        continue   # 部品コードが違う＝コグニで別の部位として入れた行（ﾌｱｽﾅB 4344 と 4348 など）。重複ではない（2026-09-19 本番検証で 2 件とも誤報）
                     if a['_bi'] == b['_bi'] and _plain(a) == _plain(b) and str(a.get('method') or '') == str(b.get('method') or ''):
                         self.warn(f"品番 {rs[0].get('parts_no')} {a.get('name')} が同じブロックの {'右' if s == 'R' else '左'} に 2 行（行{a['_no']}, 行{b['_no']}）。重複か、片方は反対側の写し違いか確認")
             both = [r for sd, r in sides if sd == 'R'], [r for sd, r in sides if sd == 'L']
@@ -459,14 +462,26 @@ class Checker:
                 return {}
             lines = [l for l in ((self.rd.get('paint') or {}).get('lines') or []) if isinstance(l, dict) and str(l.get('page')) == str(pg)]
             exps = [e for e in (self.rd.get('expenses') or []) if isinstance(e, dict) and str(e.get('page')) == str(pg)]
+            # 内板骨格（header の frame）: コグニ印刷は【内板骨格修正】の区画を明細の続きに刷り、そのページの小計に含める
+            # （2026-09-19 本番検証のシエンタ）。frame.page があればそのページだけ、無ければ下の _cmp が最初に合った 1 ページだけに許す
+            # （全ページに許すと、別ページの小計の読み違いが「+ 内板骨格」で通ってしまう。Codex 指摘）
+            fr = self.rd.get('frame') if isinstance(self.rd.get('frame'), dict) else {}
+            frame_w = (sum(_int(x.get('wage')) or 0 for x in fr.get('items') or [] if isinstance(x, dict)) + (_int(fr.get('basic_wage')) or 0)) if fr else 0
+            if fr and fr.get('page') not in (None, '') and str(fr.get('page')) != str(pg):
+                frame_w = 0
             return {'塗装行': sum(_int(l.get('wage')) or 0 for l in lines),
                     '費用（部品計）': sum(_int(e.get('amount')) or 0 for e in exps if _in_kind(e) == 'parts'),   # 集計先の語彙は _in_kind に揃える（Codex 指摘）
-                    '費用（作業計）': sum(_int(e.get('amount')) or 0 for e in exps if _in_kind(e) == 'wage')}
+                    '費用（作業計）': sum(_int(e.get('amount')) or 0 for e in exps if _in_kind(e) == 'wage'),
+                    '内板骨格': frame_w}
+
+        frame_pages: list = []   # 「+ 内板骨格」の別解を使ったページ（1 ページだけ許す）
 
         def _cmp(where: str, sub: dict, rows: list[dict], pg=None) -> None:
             n, p, w, marks = _sum(rows)
             extras = _page_extras(pg)
-            alts = {'parts': [('費用（部品計）',)], 'wage': [('塗装行',), ('費用（作業計）',), ('塗装行', '費用（作業計）')]}
+            alts = {'parts': [('費用（部品計）',)], 'wage': [('塗装行',), ('費用（作業計）',), ('塗装行', '費用（作業計）'),
+                                                           ('内板骨格',), ('塗装行', '内板骨格'), ('費用（作業計）', '内板骨格'),
+                                                           ('塗装行', '費用（作業計）', '内板骨格')]}
             for key, got, label in (('rows', n, '行数'), ('parts', p, '部品計'), ('wage', w, '工賃計')):
                 exp = _int(sub.get(key))
                 if exp is None:
@@ -474,6 +489,11 @@ class Checker:
                 if exp != got:
                     hit = next((names for names in alts.get(key, []) if all(extras.get(nm) for nm in names)
                                 and got + sum(extras[nm] for nm in names) == exp), None)
+                    if hit and '内板骨格' in hit:
+                        if frame_pages and frame_pages[0] != str(pg):
+                            hit = None   # 内板骨格の区画は 1 ページにしか無い。2 ページ目で同じ別解が合うのは読み違い
+                        elif not frame_pages:
+                            frame_pages.append(str(pg))
                     if hit:  # 印字の小計が、そのページに写した塗装行・費用を含んでいる（コグニ印刷の最終ページ）
                         self.note(f'{where}: {label} 印字 {exp:,} = 明細 {got:,} + ' + ' + '.join(f'{nm} {extras[nm]:,}' for nm in hit) + '（小計が塗装・費用を含む書式）')
                         continue
@@ -527,6 +547,22 @@ class Checker:
                 self.fail(f"費用 {e.get('name')}: in（どの合計欄に入っているか: {' / '.join(('部品計', '作業計', '諸費用計', '非課税'))}）が無い")
             elif k == '?':
                 self.warn(f"費用 {e.get('name')}: in={e.get('in')!r} は既知の語彙（{', '.join(IN_KNOWN)}）に無い。draft は部品計以外を工賃扱いにする")
+
+    def _check_parts_expense_side(self, parts_sum: int, ex_parts: int, printed: Optional[int], tol: int, disc_parts: int = 0) -> None:
+        """部品計に入れた費用（in=部品計）が、印字の部品計に入っていないときに**注意**を出す（止めない）。
+        印字の部品計が「部品の列の費用」を含まない書式は実在する（回帰の 2 案件。正解 NEO でも費用は費用画面の部品欄に別に入る）ので、
+        これだけでは読み違いと決められない。ただ、工賃の列に刷られた費用を in=部品計 と読むと、費用画面の部品欄・工賃欄が入れ替わる
+        （2026-09-19 本番検証: 工賃の列の写真代 800 を in=部品計 と読んだ。合計は同じなので検算では出ない）。
+        部品値引（discount.parts。負の値）が部品計に反映される書式もあるので、値引あり・なしの両方で比べる（Codex 指摘）"""
+        if not ex_parts or printed is None:
+            return
+        bases = {parts_sum, parts_sum + disc_parts}
+        without = any(abs(b - printed) <= tol for b in bases)
+        with_ex = any(abs(b + ex_parts - printed) <= tol for b in bases)
+        if without and not with_ex:
+            names = ' / '.join(f"{e.get('name')} {_int(e.get('amount')) or 0:,}" for e in self.rd.get('expenses') or [] if _in_kind(e) == 'parts')
+            self.warn(f'費用（{names}）は in=部品計 だが、印字の部品計 {printed:,} は明細だけ（{parts_sum:,}）で合う（費用を足すと {parts_sum + ex_parts:,}）。'
+                      '部品の列に刷られた費用なら問題ない。工賃（技術料）の列に刷られているなら in=作業計（費用画面の部品欄・工賃欄が入れ替わる）')
 
     # ------------------------------------------------------------------ 6. 合計欄と設定の推定
     def check_totals(self, labor: int, wage_round: int) -> None:
@@ -677,7 +713,10 @@ class Checker:
             self.fail(f'合計欄 {label}: 印字 {g:,} / 転記から {calc:,}（差 {calc - g:+,}）' + self._hint(calc - g, rows))
             return False
 
-        cmp('部品計', parts_sum, t.get('parts'), {'明細 + 費用（部品計）': parts_sum + ex_by['parts'], '明細 − 値引': parts_sum + (_int(disc.get('parts')) or 0)})
+        cmp('部品計', parts_sum, t.get('parts'), {'明細 + 費用（部品計）': parts_sum + ex_by['parts'], '明細 − 値引': parts_sum + (_int(disc.get('parts')) or 0),
+                                                 '明細 + 費用（部品計）− 値引': parts_sum + ex_by['parts'] + (_int(disc.get('parts')) or 0)})
+        self._check_parts_expense_side(parts_sum, ex_by['parts'], _int(t.get('parts')), max(_TAX_SLACK.get('部品計', 0), _frac_max or 0),
+                                       _int(disc.get('parts')) or 0)
         # 工賃も指数も無い行があっても、印字の工賃計が明細の工賃の合計（＋費用の工賃分）とぴったり一致するなら
         # その空欄は 0 円（下書きが 0 円で渡し、生成器は標準指数で埋めない。draft_estimate._blank_wage_is_zero と同じ条件）
         blank_zero = bool(unknown_w) and _gw > 0 and _gw in (wage_sum, wage_sum + _ex_nonparts)
@@ -889,7 +928,7 @@ class Checker:
         self.check_side_drift(prof)
 
     def check_expense_looks_like_work(self) -> None:
-        """作業区分の付いた費用は、明細の手入力行に写すのが実機の書き方（judgment_rules 10-27）。
+        """作業区分の付いた費用は、明細の手入力行に写すのが実機の書き方（judgment_rules 10-32）。
         コグニの協定見積書では「リヤナンバー／再封印」「ドライブレコーダーリヤカ／脱着」が
         修理方法つきの明細行、費用は「ショートパーツ 1,000」のように区分なしで印字されていた。
         末尾が 費/費用/代/料 の名前（ソナー点検調整費 など）は費用の既定行にあるので対象にしない"""

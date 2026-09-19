@@ -587,6 +587,45 @@ class Drafter:
             best = max(best, s)
         return best
 
+    @staticmethod
+    def _prefix_key(s: str) -> str:
+        """前方一致を見るための名前のキー。norm_name と違い**括弧の中身を残す**（(FREED)・(HYBRID)・(H) を区別したいので）"""
+        t = _hw_kana(_nfkc(s or '')).replace('Rr', 'R').replace('Fr', 'F').replace('左', 'L').replace('右', 'R')
+        t = t.translate(str.maketrans('ｧｨｩｪｫｬｭｮｯ', 'ｱｲｳｴｵﾔﾕﾖﾂ'))
+        return re.sub(r'[\s\-ｰー‐･・]', '', t).upper()
+
+    def _truncated_name_ref(self, name: str, side: str, price: int, qty: int):
+        """名前が途中で切れて印字された行（協定見積書は名称を 10 文字ほどで切る: 「Rrエンブレム（ＦＲＥＥ」「Rrウインドシールドガラ」）を、
+        ADDATA の名前との**前方一致**で引く。候補が複数なら単価がちょうど合うものだけ、1 つなら閉じていない括弧（切れた証拠）があるときだけ採る。
+        （2026-09-19 本番検証: 括弧の中身を落とす名称近似で、FREED・HYBRID の 2 行とも ｴﾝﾌﾞﾚﾑ(H) に、ガラスファスナがガラス本体に当たった）"""
+        k = self._prefix_key(name)
+        if len(k) < 6:
+            return None
+        unit = price // qty if (price > 0 and qty > 0 and price % qty == 0) else 0
+        cands = set()
+        for ref, n20s in self.parts.name20_by_ref.items():
+            for n20 in n20s:
+                s20 = _side20(n20)
+                if side and s20 and s20 != side:
+                    continue
+                c = self._prefix_key(n20)
+                if c == k:
+                    return None   # 同じ名前の部品がある = 切れていない。いつもの照合に任せる
+                if c.startswith(k):
+                    cands.add(ref)
+        if not cands:
+            return None
+        opened = name.count('(') + name.count('（') > name.count(')') + name.count('）')
+        if len(cands) == 1:
+            # 候補が 1 つだけのときは、閉じていない括弧（切れた証拠）があるときだけ採る。単価が合うだけでは採らない
+            # （切れていない普通の略称を別部品へ飛ばさない。Codex 指摘）
+            return (next(iter(cands)), '名前が途中で切れた印字の前方一致（閉じていない括弧。候補 1 つ）') if opened else None
+        if unit:   # 候補が複数: 単価がちょうど合う 1 つだけを採る
+            hit = [r for r in cands if self._std_unit(r) == unit]
+            if len(hit) == 1:
+                return hit[0], f'名前が途中で切れた印字の前方一致（{len(cands)} 候補のうち単価 {unit:,} 円が一致）'
+        return None
+
     QTY_FROM_PRICE_MAX = 99   # 数量として読み替える上限（これより多い倍数は偶然の一致とみなす）
     QTY_FROM_PRICE_UNIT_MAX = 3000  # 数量を自動で読み替えるのは標準単価がこれ以下の小物だけ（それより高い部品の倍数一致は 要確認 に挙げるだけ。Codex 指摘）
 
@@ -606,6 +645,11 @@ class Drafter:
                 s0 = self._name_sim(name, ref, next(iter(_s_ref)))
         colored = ref in (self.raw83 or {})  # 色別部品は色で単価が変わるので数量の読み替えはしない
         n0 = price // u0 if (qty == 1 and price % u0 == 0) else 0
+        # ただし名前に「(13個)」「(各2個)」と個数が印字され、それが金額 ÷ 標準単価とちょうど同じなら、色別部品でも数量として読む
+        # （2026-09-19 本番検証: ﾊﾞﾂｸﾄﾞｱﾄﾘﾑｸﾘﾂﾌﾟ(13個) 1,040 円 = 80 円 × 13 が数量 1 のまま手入力金額になっていた）
+        _m_n = re.search(r'[(（]\s*各?\s*(\d{1,3})\s*個\s*[)）]', _nfkc(name) if isinstance(name, str) else '')
+        if colored and n0 >= 2 and _m_n and int(_m_n.group(1)) == n0:
+            colored = False
         # 名前だけで決めた行（may_switch）は、名前がほぼ同じ（0.9 以上）部品のときだけ数量を読み替える。名前が近いだけの別部品を
         # 標準単価の倍数で 2 個・3 個にしない（部品コード・品番で決まった行はこれまでどおり。2026-09-14 Codex 指摘）
         div_ok = ((not colored) and 2 <= n0 <= self.QTY_FROM_PRICE_MAX and u0 <= self.QTY_FROM_PRICE_UNIT_MAX
@@ -884,8 +928,11 @@ class Drafter:
             for _bk in ('manual', 'reserve'):   # recycle は真偽値ではなくリサイクル部品の情報（dict）
                 if _bk in _r:
                     _r[_bk] = _flag(_r[_bk], f'rows[].{_bk}')
-        labor = _money_or(self.rd.get('labor_rate'), name='labor_rate') or infer_labor_rate(rows_flat + list((self.rd.get('paint') or {}).get('lines') or []))
+        _printed_rate = _money_or(self.rd.get('labor_rate'), name='labor_rate')
+        labor = _printed_rate or infer_labor_rate(rows_flat + list((self.rd.get('paint') or {}).get('lines') or []))
         self.labor = labor
+        # レートの出どころ（報告文で「印字」「工賃÷指数から決めた」を書き分ける。make_neo が読む。Codex 指摘）
+        self.labor_from = 'printed' if _printed_rate else ('inferred' if labor else '')
         self.wage_round = _money_or(self.rd.get('wage_round'), name='wage_round') or detect_wage_round(rows_flat + list((self.rd.get('paint') or {}).get('lines') or []), labor)  # 塗装行も証拠に（レート推定と同じ集合）
         if self.wage_round != 10:
             self.notes.append(f'工賃の丸め単位 {self.wage_round} 円（印字の工賃が指数×レートの {self.wage_round} 円丸めと一致）→ estimate.wage_round')
@@ -929,9 +976,8 @@ class Drafter:
                 # 部品代が付くのは取替（と手入力行）。実 NEO 211 本 5,400 行のうち、修理・板金・点検調整・分解調整は 1 例も無く、脱着も 2 行だけ
                 self.notes.append(f'{name_raw}: {METHOD_NAME.get(dcode, dcode)} の行に部品代 {price:,} 円がある。'
                                   '取替の行と取り違えていないか、部品代が別行のものでないか確かめる（合計が合っていても区分が変わる）')
-            if method.strip() and method.strip() not in DISPOSAL and _nfkc(method).replace(' ', '') not in DISPOSAL:
-                self.notes.append(f'{name_raw}: 修理方法「{method}」はコグニの区分に無いので {METHOD_NAME.get(dcode, dcode)} として扱った。違うなら reading の method を直す')
-            item: dict = {'code': '', 'name': name, 'method': ('' if (row.get('manual') and not method.strip()) else METHOD_NAME.get(dcode, '取替')), 'parts_no': pn, 'qty': qty}
+            item: dict = {'code': '', 'name': name, 'method': ('' if (row.get('manual') and not method.strip()) else METHOD_NAME.get(dcode, '取替')), 'parts_no': pn, 'qty': qty,
+                          '_method_print': method, '_name_raw': name_raw}
             if price_raw != '':
                 item['price'] = price  # 印字された金額（0 も含む）。欄が無い行は省略 → 生成器が標準価格で補完（取替）/ 0（脱着等）
             if wage is not None:
@@ -1074,6 +1120,11 @@ class Drafter:
                     u_np = self._std_unit(ref_np, pn)
                     if u_np and u_np <= self.QTY_FROM_PRICE_UNIT_MAX and price % u_np == 0 and 2 <= price // u_np <= self.QTY_FROM_PRICE_MAX:
                         ref, why = ref_np, f'{why_np}（金額が標準単価 {u_np:,} 円の {price // u_np} 倍）'
+            if not pn and not code_in and (ref is None or AddataParts._why_score(re.sub(r'^語順入替「.*?」\s*', '', why or '')) < 1.0):
+                _tr = self._truncated_name_ref(name_raw, side, price, qty)
+                if _tr is not None and _tr[0] != ref:
+                    self.notes.append(f'{name}: {_tr[1]}' + (f'（名称近似の {ref:04d} より優先）' if ref is not None else ''))
+                    ref, why = _tr[0], _tr[1]
             if ref is None:
                 if side and ((wage or 0) > 0 or (index or 0) > 0):   # 照合できなかった主作業も、左右があればどの部位の引き継ぎにも加える
                     grp_unknown.add(side)
@@ -1186,8 +1237,32 @@ class Drafter:
             self._labor_from_wages(out)
         for it in out:
             it.pop('_bankin_area', None)
+            self._keep_printed_method(it)
             self._fit_manual_name(it)
         return out
+
+    # 生成器が印字の名前のまま書く作業区分（コグニの作業区分の画面にある名前。estimate_to_neo の disp_name と同じ並び）
+    KEEP_METHODS = ('取替', '脱着', '修理', '脱着修理', '脱着板金', '点検', '調整', '点検調整', '分解調整', '板金')
+
+    def _keep_printed_method(self, it: dict) -> None:
+        """区分は印字の語で書く（2026-09-19 本番検証: 印字「調整」が「点検調整」に、「再封印」が「脱着」に置き換わっていた）。
+        - コグニの区分にある名前（調整・点検・脱着板金 …）は、区分コードが同じなら印字どおり
+        - コグニに無い名前（再封印・施工 …）は、部品コードも品番も指数も無い手入力の作業行だけ印字どおり（生成器が DisposalCode -1 で書く。
+          実案件 NEO でも手入力行の区分は自由な語）。それ以外の行は今までどおりコードの既定名にして注記する"""
+        mp = re.sub(r'[\s・･/／]', '', _nfkc(it.pop('_method_print', '') or '')).replace('鈑', '板')   # 「点検・調整」も「点検調整」
+        name_raw = it.pop('_name_raw', '') or it.get('name', '')
+        cur = it.get('method') or ''
+        if not mp or not cur or mp == cur:
+            return
+        if mp in DISPOSAL:
+            if mp in self.KEEP_METHODS and DISPOSAL.get(mp) == DISPOSAL.get(cur):
+                it['method'] = mp
+            return
+        if not str(it.get('code') or '').strip() and not str(it.get('parts_no') or '').strip() and not it.get('index'):
+            it['method'] = mp
+            self.notes.append(f'{name_raw}: 修理方法「{mp}」はコグニの区分に無いが、部品コードの無い手入力の作業行なので印字どおり書いた（区分コードは手入力 -1）')
+        else:
+            self.notes.append(f'{name_raw}: 修理方法「{mp}」はコグニの区分に無いので {cur} として扱った。違うなら reading の method を直す')
 
     def _fit_texts(self, d: dict, keys: tuple, label: str) -> dict:
         """顧客名・工場名など 30 バイトの欄に入らない会社名を (株) 等に略す（入らないまま渡すと生成器が途中で切る）。略しても入らなければ要確認"""
@@ -1280,6 +1355,7 @@ class Drafter:
                           + ' 円）。速報の工賃単価か工場に確かめて reading の labor_rate に書く')
                 return
         self.labor = pick
+        self.labor_from = 'inferred'
         self.notes.append(f'レバーレート {pick:,} 円: 技術料を 0.1 刻みの指数で説明できるレート{why}')
         self._rev('判断', 'レバーレート', f'{pick:,} 円（技術料だけの書式。技術料 ÷ レートが 0.1 刻みの指数になるレート{why}）')
         for it in items:  # レートが決まる前に印 `#` だけ分かっていた行の指数を起こす（指数の列が無く技術料だけの書式）
@@ -2138,9 +2214,13 @@ class Drafter:
         items = est.get('items') or []
         rows_parts = sum(int(it.get('price') or 0) for it in items if not it.get('reserve'))
         ex_parts = sum(int(e.get('amount') or 0) for e in (est.get('expenses') or []) if e.get('kind') == 'parts')
-        gap = rows_parts + ex_parts - printed_parts
         frac = self.unit_fraction_rows(items)
-        if not (printed_parts and printed_total and frac and 0 < gap <= min(len(frac), self.UNIT_FRACTION_MAX_YEN)):
+        _lim = min(len(frac), self.UNIT_FRACTION_MAX_YEN) if frac else 0
+        # 印字の部品計が「部品の列の費用」を含む書式と含まない書式の両方がある（含まない書式で費用込みの差を見ると、
+        # 802 円のように費用分ふくらんで許容を外れ、+2 円の端数差で不合格になった。2026-09-19 本番検証のフリード）
+        gaps = [g for g in (rows_parts + ex_parts - printed_parts, rows_parts - printed_parts) if 0 < g <= _lim]
+        gap = gaps[0] if gaps else 0
+        if not (printed_parts and printed_total and frac and gap):
             return
         import copy
         probe = copy.deepcopy(est)
@@ -2178,6 +2258,7 @@ class Drafter:
             'vehicle': self.vehicle, 'customer': self._fit_texts(self.rd.get('customer') or {}, ('name', 'owner_name', 'user_name'), '顧客'),
             'insurance': self._insurance(),
             'labor_rate': self.labor,
+            '_labor_rate_from': getattr(self, 'labor_from', ''),   # printed / inferred / ''（報告文用。生成器は読まない）
         }
         if getattr(self, 'wage_round', 10) != 10:
             est['wage_round'] = self.wage_round

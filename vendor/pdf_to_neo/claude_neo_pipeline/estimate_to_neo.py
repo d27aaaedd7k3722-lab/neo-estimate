@@ -353,6 +353,26 @@ def _norm_hint_flags(hints):
     return out
 
 
+_VIN_RE = re.compile(r'[A-HJ-NPR-Z0-9]{17}')   # 国際 VIN（I・O・Q を使わない 17 桁）。国産車の車台番号は「型式-番号」で 17 桁の VIN にならない
+# 車名欄に出ていれば輸入車とみなすメーカー名。国産車の車名と紛れる短い語（ミニ・MINI 等。ミニキャブと紛れる）は入れない
+_IMPORT_BRANDS = ('ボルボ', 'VOLVO', 'BMW', 'ベンツ', 'メルセデス', 'MERCEDES', 'アウディ', 'AUDI', 'フォルクスワーゲン', 'VOLKSWAGEN',
+                  'ポルシェ', 'PORSCHE', 'プジョー', 'PEUGEOT', 'ルノー', 'RENAULT', 'シトロエン', 'CITROEN', 'フィアット', 'FIAT',
+                  'アルファロメオ', 'ジープ', 'JEEP', 'ランドローバー', 'ジャガー', 'JAGUAR', 'テスラ', 'TESLA')
+
+
+def imported_signal(v: dict) -> str:
+    """車両の読み取りに輸入車のしるしがあれば、その説明を返す（無ければ ''）。
+    車種マスタに候補が無いときに汎用車種へ切り替えてよいかの判断にだけ使う（しるしの無い候補ゼロは止める）"""
+    s = re.sub(r'[\s\-‐−]', '', unicodedata.normalize('NFKC', str(v.get('serial_no') or ''))).upper()
+    if _VIN_RE.fullmatch(s):
+        return f'車台番号が 17 桁の国際 VIN（{s[:3]}…）'
+    txt = unicodedata.normalize('NFKC', ' '.join(str(v.get(k) or '') for k in ('car_name', 'maker', 'maker_name', 'name'))).upper()
+    for b in _IMPORT_BRANDS:
+        if unicodedata.normalize('NFKC', b).upper() in txt:
+            return f'車名に輸入車のメーカー名（{b}）'
+    return ''
+
+
 def _flag(v, name: str, default: bool = False) -> bool:
     """人が書いた JSON の真偽値欄を厳密に読む。判断できない値は ValueError。
     `if d.get('generic'):` だと文字列 "false" が真になり、実在車種を汎用車種で作ってしまう"""
@@ -1853,7 +1873,7 @@ class NeoBuilder:
             free_method = ''   # 部品コードも品番も指数も無い手入力の作業行だけは、印字の修理方法をそのまま書ける
             if method and method not in DISPOSAL and _m not in DISPOSAL:  # 未知の修理方法を黙って取替にしない（'脱着修正' 等の表記ゆれ・転記ミスを止める）
                 # 実機 NEO の作業区分は自由文字列（DisposalCode -1 で '施工' '作業' '再発行' '充填' '一部脱着' '再封印'。
-                # 2026-09-19 に実案件 NEO 300 本で確認）。手入力の作業行に限り、印字の語を写す（judgment_rules 10-27）
+                # 2026-09-19 に実案件 NEO 300 本で確認）。手入力の作業行に限り、印字の語を写す（judgment_rules 10-32）
                 if not str(it.get('code') or '').strip() and not str(it.get('parts_no') or '').strip() and not it.get('index'):
                     free_method = _fit(hw(_m), 8)
                 else:
@@ -3212,6 +3232,16 @@ class NeoBuilder:
         hints = _norm_hint_flags(hints)  # hints の真偽値欄も同じく厳密に読む
         veh = self.generic_vehicle(vehicle_inputs) if _generic else self.resolve_vehicle(vehicle_inputs, hints)
         car = veh['neo_car']
+        if not car and not _generic and not veh.get('candidates'):
+            # 車種マスタに候補が 1 つも無く、輸入車のしるし（17 桁の国際 VIN・輸入車メーカー名）があるときだけ、
+            # コグニ実機と同じ「メーカー→車名 汎用」の汎用車種で作る（VOLVO_gen.neo が正。部品コード・標準指数は入らない）。
+            # 国産車の読み違いで候補ゼロになったときは今までどおり止める（しるしが無いので）。2026-09-19 本番検証のボルボで止まっていた
+            _why = imported_signal(vehicle_inputs)
+            if _why:
+                veh = self.generic_vehicle(vehicle_inputs)
+                veh['auto_generic'] = _why
+                veh['evidence'] = [f'{_why}で、コグニの車種マスタに候補が無い → 輸入車として汎用車種 {veh["neo_car"]["CarCode"]} で作った'] + list(veh.get('evidence') or [])
+                car = veh['neo_car']
         if not car:
             raise RuntimeError(f"車両特定失敗: {veh['evidence']}")
         if not _generic and veh.get('confidence') not in ('confirmed', 'high') and car.get('CarCode'):

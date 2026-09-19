@@ -671,6 +671,24 @@ def test_two_coat_solid_is_an_addition_not_a_panel():
     assert paint_of([{'name': '2ｺｰﾄｿﾘｯﾄﾞﾙｰﾌ 0枚 ﾙｰﾌ以外 3枚', 'wage': 2780}], '3コートパール').get('two_coat_solid') is None
 
 
+def test_truncated_names_from_an_agreed_estimate():
+    """協定見積書は名称を途中で切って印字する（「Rrエンブレム（ＦＲＥＥ」「Rrウインドシールドガラ」）。
+    括弧の中身を落とす名称近似だと、FREED・HYBRID が両方 ｴﾝﾌﾞﾚﾑ(H) に、ガラスファスナがガラス本体に当たっていた（2026-09-19 本番検証）。
+    前方一致で、単価がちょうど合う候補か、閉じていない括弧で候補が 1 つのときだけ採る。切れていない名前はいつもどおり"""
+    veh = {'model_code': 'GB8', 'serial_no': 'GB8-0000001', 'desig': '19367', 'category': '0015', 'reg_date': 'R5.12', 'color_code': 'NH883P'}
+    rows = ['|Rrウインドシールドガラ|取替||||830|||', '|Rrエンブレム（ＦＲＥＥ|取替||||2549|||', '|Rrエンブレム（ＨＹＢＲ|取替||||3469|||',
+            '|Rrウインドシールドガラス|脱着||||0|19550||', '|エンブレム（Ｈ）|取替||||1959|||']
+    rd = {'source': 't', 'issuer': '', 'est_date': '20260919', 'format': 'A', 'labor_rate': 8500, 'vehicle': veh,
+          'blocks': [{'title': '', 'rows': rows}], 'paint': {}, 'expenses': [], 'totals': {}}
+    try:
+        items = de.Drafter(rd).build()['items']
+    except Exception as e:  # noqa: BLE001  ADDATA にこの車種（J55）が無い PC では見ない
+        print('  （J55 の ADDATA が無いので飛ばす）', type(e).__name__)
+        return
+    codes = [it.get('code') for it in items]
+    assert codes == ['4341', '4412', '4414', '4315', '4410'], codes
+
+
 if __name__ == '__main__':
     fails = 0
     for name, fn in sorted(globals().items()):

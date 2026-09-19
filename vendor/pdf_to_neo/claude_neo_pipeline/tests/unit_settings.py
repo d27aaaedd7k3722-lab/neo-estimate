@@ -137,7 +137,7 @@ def main() -> int:
     pl3, _pt3, _tt3, _n3, oth3 = paint_neo({'total': 100000, 'input_type': '実額', 'other': [{'name': 'ﾌﾟﾗｲﾏ-塗装', 'index': 1.0}]})
     check(pl3[:2] == (1, '指数'), f'追加項目があるのに実額にしている（内訳を持てない）: {pl3}')
     # コグニに無い修理方法（再封印）は、部品コードも品番も指数も無い手入力の作業行なら印字どおり写す。
-    # 実機は DisposalCode -1・標準欄は空（実案件 NEO 300 本で確認。judgment_rules 10-27）
+    # 実機は DisposalCode -1・標準欄は空（実案件 NEO 300 本で確認。judgment_rules 10-32）
     rows, _st, _tot, _rep = build([{'name': 'ﾘﾔﾅﾝﾊﾞｰ', 'method': '再封印', 'qty': 1, 'wage': 9000, 'manual': True}])
     r = rows['']
     check(r['DisposalCode'] == -1 and r['DisposalName'] == '再封印' and r['DisposalNameStandard'] == '',
@@ -148,6 +148,42 @@ def main() -> int:
         check(False, '品番のある行の未知の修理方法を止めていない')
     except ValueError as e:
         check('不明' in str(e), f'止め方が変わった: {e}')
+
+    # 車種マスタに候補が無い輸入車（17 桁の国際 VIN）は、コグニ実機と同じ汎用車種 Z10 で作る（2026-09-19 本番検証のボルボ）。
+    # しるしの無い候補ゼロ（国産車の読み違い）は今までどおり止める
+    import estimate_to_neo as e2n
+    check(e2n.imported_signal({'serial_no': 'YV1ZZZ00000000000'}).startswith('車台番号が 17 桁'), 'VIN を輸入車のしるしにしていない')
+    check(e2n.imported_signal({'serial_no': 'GB8-0000001'}) == '', '国産車の車台番号を輸入車にしている')
+    check(e2n.imported_signal({'car_name': 'ボルボ V40'}) != '' and e2n.imported_signal({'car_name': 'ﾐﾆｷｬﾌﾞ'}) == '', '車名のメーカー判定がおかしい')
+    nb = NeoBuilder()
+    gen_items = [{'name': 'Rrﾊﾞﾝﾊﾟ', 'method': '取替', 'qty': 1, 'price': 116000, 'wage': 90000, 'manual': True}]
+    neo, rep = nb.build({'source': 'unit_settings', 'issuer': '', 'est_date': '20260919', 'vehicle': {}, 'customer': {}, 'insurance': {},
+                         'labor_rate': 10000, 'items': gen_items, 'paint': {}, 'expenses': [], 'totals': {}, 'hints': {}},
+                        {'serial_no': 'YV1ZZZ00000000000', 'model_code': 'ZZZ999', 'desig': '', 'category': '', 'reg_date': 'H26.2', 'color_code': '452'},
+                        hints={}, labor_rate=10000, est_date='20260919', insurance={})
+    check(rep['car'].get('CarCode') == 'Z10' and rep['car'].get('_generic') and rep['vehicle'].get('auto_generic'),
+          f"輸入車を汎用車種にしていない: {rep['car'].get('CarCode')} {rep['vehicle'].get('auto_generic')}")
+    try:
+        nb.build({'source': 'unit_settings', 'issuer': '', 'est_date': '20260919', 'vehicle': {}, 'customer': {}, 'insurance': {},
+                  'labor_rate': 10000, 'items': gen_items, 'paint': {}, 'expenses': [], 'totals': {}, 'hints': {}},
+                 {'serial_no': 'ZZZ9-0000000', 'model_code': 'ZZZ999', 'desig': '', 'category': '', 'reg_date': 'H26.2', 'color_code': ''},
+                 hints={}, labor_rate=10000, est_date='20260919', insurance={})
+        check(False, '輸入車のしるしが無い候補ゼロで止まっていない')
+    except RuntimeError as e:
+        check('車両特定失敗' in str(e), f'止め方が変わった: {e}')
+
+    # 品番の 1 文字違い（読み違い・新旧品番）は ★ で知らせる。色の枝番の有無や、まったく違う品番は対象外
+    import io as _io, contextlib as _cl, run_case as _rc
+    _buf = _io.StringIO()
+    with _cl.redirect_stdout(_buf):
+        _rc._report_pn_typo({'rows': [
+            {'PartsCode': '4527', 'PartsName': 'ｵｰﾌﾟﾅｽｲﾂﾁ', 'PartsNo': '84840-58011', 'PartsNoStandard': '84840-58010'},
+            {'PartsCode': '4570', 'PartsName': 'ｸﾘﾂﾌﾟ', 'PartsNo': '90467-08186-C3', 'PartsNoStandard': '90467-08186'},
+            {'PartsCode': '0010', 'PartsName': 'Fﾊﾞﾝﾊﾟ', 'PartsNo': '52119-10919', 'PartsNoStandard': '52119-10919'},
+            {'PartsCode': '0020', 'PartsName': 'ｸﾞﾘﾙ', 'PartsNo': '53111-12345', 'PartsNoStandard': '53112-54321'}]})
+    _out = _buf.getvalue()
+    check('84840-58011' in _out and '90467-08186-C3' not in _out and '52119-10919' not in _out and '53111-12345' not in _out,
+          f'品番の 1 文字違いの知らせ方がおかしい: {_out!r}')
 
     print('unit_settings:', 'all ok' if not fails else f'{fails} failed')
     return 1 if fails else 0

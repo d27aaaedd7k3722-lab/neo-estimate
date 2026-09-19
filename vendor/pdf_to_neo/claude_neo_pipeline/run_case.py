@@ -141,6 +141,20 @@ def _check_side_front_rear(est: dict, rep: dict) -> list:
     return out
 
 
+def _report_pn_typo(rep: dict) -> None:
+    """印字（読み取り）の品番が、同じ部品コードの標準品番と 1 文字だけ違う行を知らせる。
+    読み違い（0 と 1・8 と 3 など）は金額が同じなので検算では出ない（2026-09-19 本番検証: 84840-58010 を 84840-58011 と読んだ）。
+    メーカーの品番改定（新旧品番）でも 1 文字違いになるので、止めずに確かめてもらう"""
+    for r in rep.get('rows') or []:
+        a = re.sub(r'[\s\-‐−]', '', str(r.get('PartsNo') or '')).upper()
+        b = re.sub(r'[\s\-‐−]', '', str(r.get('PartsNoStandard') or '')).upper()
+        if not a or not b or a == b or len(a) != len(b) or not re.search(r'\d', a):
+            continue
+        if sum(1 for x, y in zip(a, b) if x != y) == 1:
+            print(f"  ★ 品番の 1 文字違い: {r.get('PartsCode')} {str(r.get('PartsName') or '').strip()} 印字 {r.get('PartsNo')} / 標準 {r.get('PartsNoStandard')}。"
+                  '読み違いか、品番の改定（新旧品番）か見積書で確かめる')
+
+
 def _report_standard_price(rep: dict) -> None:
     """見積の部品金額が ADDATA の標準価格と合っている割合を出す。
     純正定価で出す工場なら、照合が正しければほぼ全部一致する。
@@ -181,7 +195,7 @@ def _warn_too_many_manual(est: dict, rep: dict, st: dict) -> None:
     全行を手入力にすると、部品コード・標準品番・標準価格・部位ブロックが入らない NEO になる
     （2026-09-09 アクアで実際にやってしまった）"""
     rows = rep.get('rows') or []
-    if len(rows) < 5 or _flag((est.get('vehicle') or {}).get('generic'), 'vehicle.generic'):
+    if len(rows) < 5 or _flag((est.get('vehicle') or {}).get('generic'), 'vehicle.generic') or (rep.get('vehicle') or {}).get('auto_generic'):
         return  # 汎用車種（二輪・輸入車）は照合先が無いので対象外
     matched = int(st.get('matched') or 0)
     if matched * 2 >= len(rows):
@@ -235,6 +249,9 @@ def main(path: str, out: str = ''):
     v = rep['vehicle']; car = rep['car']; t = rep['totals']; st = rep['stats']
     print(f"車両: {car.get('CarNameByUser')} / {car.get('CarCode')} Year {car.get('YearCode')} Body {car.get('BodyCode')} Grade {car.get('GradeCode')} FVA {car.get('FVACode')} 色 {car.get('ColorCode')} 車形 {car.get('CarFormCode')} ({v.get('confidence')})")
     print(f"装備 {rep.get('eva_write', rep['eva'])} | レバーレート {st.get('labor_rate')} | 照合 {st.get('matched')}/{len(rep['rows'])}")
+    if v.get('auto_generic'):
+        print(f"  ★ 車両: {v['auto_generic']}で、コグニの車種マスタに候補が無い → 輸入車として汎用車種 {car.get('CarCode')} で作った"
+              '（コグニ実機と同じ「メーカー→車名 汎用」。部品コード・標準指数は入らない）。国産車なら車検証の型式指定・類別を見直す')
     _warn_too_many_manual(est, rep, st)
     for _ku in _warn_known_unresolved(est):
         print(f'  ★ {_ku}')
@@ -246,6 +263,7 @@ def main(path: str, out: str = ''):
         print('  ★ 車両特定の確度が low。グレードが決まっていない可能性がある。'
               'scripts/pick_grade.py <estimate.json> で部品金額から絞り、hints.grade_name に書く（判断規則 10-9-3）')
     _report_standard_price(rep)
+    _report_pn_typo(rep)
     # 前後・左右の食い違いは ref の取り違えそのもの。検算自身を不合格にする
     side_ng = _check_side_front_rear(est, rep)
     _report_weak_matches(est, rep)

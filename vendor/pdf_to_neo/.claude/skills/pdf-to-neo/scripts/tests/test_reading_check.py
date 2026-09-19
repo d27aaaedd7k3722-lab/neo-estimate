@@ -114,6 +114,66 @@ def test_same_pn_both_sides():
     assert not has(r2['warn'], '左右両方'), r2['warn']
 
 
+def test_same_pn_same_side_with_different_codes_is_not_a_duplicate():
+    """同じ品番・同じ側でも、印字の部品コードが違えばコグニで別の部位として入れた行（重複ではない）。
+    2026-09-19 本番検証: ﾌｱｽﾅB 4344 と 4348、ｸｯｼｮﾝ 3986 と 3988 の 2 件とも「重複か」と誤報していた"""
+    def _rd(c1, c2):
+        rd = copy.deepcopy(BASE)
+        rd['blocks'][1]['rows'] += [f'{c1}|左 ｳｲﾝﾄﾞｼｰﾙﾄﾞﾌｧｽﾅB|取替|91501-S70-003||1|175|||',
+                                    f'{c2}|左 ｳｲﾝﾄﾞｼｰﾙﾄﾞﾌｧｽﾅB|取替|91501-S70-003||1|175|||']
+        rd['pages']['2'].update({'rows': 4, 'parts': 33350})
+        rd['totals'].update({'parts': 95350, 'taxable': 195350, 'tax': 19535, 'total': 214885})
+        return run(rd)
+    r = _rd('4344', '4348')
+    assert not has(r['warn'], 'が同じブロックの'), r['warn']
+    assert not r['fail'], r['fail']
+    r2 = _rd('4344', '4344')     # 同じコードの 2 行は今までどおり確かめてもらう
+    assert has(r2['warn'], 'が同じブロックの'), r2['warn']
+    r3 = _rd('', '')             # コードの印字が無い書式も今までどおり
+    assert has(r3['warn'], 'が同じブロックの'), r3['warn']
+
+
+def test_parts_expense_outside_printed_parts_total_is_a_warning():
+    """in=部品計 の費用が印字の部品計に入っていないときは注意だけ（止めない）。印字の部品計が部品の列の費用を含まない書式は実在する
+    （回帰の 2 案件）。工賃の列の費用を in=部品計 と読んだときは費用画面の部品欄・工賃欄が入れ替わるので知らせる（2026-09-19 本番検証）"""
+    assert not has(run(BASE)['warn'], 'は in=部品計 だが'), '印字の部品計に費用が入っている正しい読み取りに注意を出している'
+    rd = copy.deepcopy(BASE)
+    rd['totals']['parts'] = 93000            # 印字の部品計は明細だけ（ショートパーツ 2,000 は入っていない）
+    r = run(rd)
+    assert has(r['warn'], 'ショートパーツ 2,000）は in=部品計 だが'), r['warn']
+    assert not has(r['fail'], 'は in=部品計 だが'), r['fail']
+    rd2 = copy.deepcopy(BASE)                 # 部品値引 -3,000 が部品計に入る書式: 印字 90,000 = 明細 93,000 − 3,000（費用は入っていない）
+    rd2['discount'] = {'parts': -3000}
+    rd2['totals']['parts'] = 90000
+    assert has(run(rd2)['warn'], 'ショートパーツ 2,000）は in=部品計 だが'), run(rd2)['warn']
+    rd3 = copy.deepcopy(rd2)                  # 値引も費用も入った正しい部品計 92,000 = 93,000 − 3,000 + 2,000 は何も言わない
+    rd3['totals']['parts'] = 92000
+    r3 = run(rd3)
+    assert not has(r3['warn'], 'は in=部品計 だが') and not has(r3['fail'], '合計欄 部品計'), (r3['fail'], r3['warn'])   # 合計欄の部品計も「明細 + 費用 − 値引」で合う（Codex 指摘）
+
+
+def test_page_subtotal_may_include_the_frame_section():
+    """コグニ印刷は【内板骨格修正】を明細の続きに刷り、そのページの小計に含める。行は header の frame に写して明細からは外すので、
+    ページ小計の別解「明細 + 内板骨格」を受ける（2026-09-19 本番検証のシエンタ）。合わなければ従来どおり FAIL"""
+    rd = copy.deepcopy(BASE)
+    rd['frame'] = {'basic': True, 'basic_wage': 28000, 'items': [{'code': '1388', 'rank': 'B', 'wage': 12000}]}
+    rd['pages']['2']['wage'] = 16000 + 40000          # ページ 2 の小計に内板骨格 40,000 が入っている
+    rd['totals'].update({'wage': 28000 + 40000, 'taxable': 235000, 'tax': 23500, 'total': 258500})
+    r = run(rd)
+    assert not has(r['fail'], 'ページ 2: 工賃計'), r['fail']
+    rd['pages']['2']['wage'] = 16000 + 39000           # 1,000 円ずれていれば止める
+    assert has(run(rd)['fail'], 'ページ 2: 工賃計'), run(rd)['fail']
+    # 別解は 1 ページだけ（内板骨格の区画は 1 ページにしか無い）。frame.page があればそのページだけ（Codex 指摘）
+    rd2 = copy.deepcopy(rd)
+    rd2['pages']['2']['wage'] = 16000 + 40000
+    rd2['pages']['1']['wage'] = 12000 + 40000         # ページ 1 の小計の読み違いが、たまたま「+ 内板骨格」と同じ額
+    assert has(run(rd2)['fail'], 'ページ 2: 工賃計'), run(rd2)['fail']   # 1 ページ目で使ったので 2 ページ目は許さない
+    rd3 = copy.deepcopy(rd2)
+    rd3['frame']['page'] = 2                          # 区画のページが分かっていれば、そのページだけで許す
+    r3 = run(rd3)
+    assert has(r3['fail'], 'ページ 1: 工賃計') and not has(r3['fail'], 'ページ 2: 工賃計'), r3['fail']
+
+
 def test_wage_round_100():
     rd = copy.deepcopy(BASE)
     rd['blocks'][0]['rows'][0] = '|ﾌﾛﾝﾄﾊﾞﾝﾊﾟ ｶﾊﾞｰ|取替|52119-11111|1.55|1|50000|12400||'  # 12,400 = 100 円丸め（10 円なら 12,400 でも同じ）→ 1.53 で差を出す
@@ -595,7 +655,7 @@ def test_tax_included_rounding_slack():
 
 
 def test_expense_with_a_work_method_is_flagged():
-    """作業区分の付いた費用は、コグニでは明細の手入力行にする（実機の協定見積書で確認。10-27）。
+    """作業区分の付いた費用は、コグニでは明細の手入力行にする（実機の協定見積書で確認。10-32）。
     費用の既定行にある「◯◯費」「◯◯料」は対象にしない"""
     rd = copy.deepcopy(BASE)
     rd['expenses'] = [{'name': 'リヤナンバー再封印', 'amount': 9000, 'in': '諸費用計'}]
