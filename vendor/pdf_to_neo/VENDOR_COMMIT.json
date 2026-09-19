@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "469599afdfcbf6d3ae790488f196750b0399eb59",
- "subject": "fix: 費用と明細の振り分けが前回と違うときは知らせる（同じ見積で読み取りごとにぶれ、検算では出ない）",
- "synced_at": "2026-09-19T20:25:11",
+ "commit": "fa945729ad404bbd9b22333e568f7034604e4155",
+ "subject": "fix: 作業区分の付いた行は費用でなく明細（実機の協定見積書で確定。再封印・脱着・点検）",
+ "synced_at": "2026-09-19T20:41:03",
  "files": 108,
- "tree_sha256": "089bc06cca13caf588a58bcc9234ff65dfa88a79b0bffc1bf48f27582aaacdee",
+ "tree_sha256": "f5cc5251694383f3fdde331587dd312ca07872cd39bfb59fbdc1a509353ef140",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

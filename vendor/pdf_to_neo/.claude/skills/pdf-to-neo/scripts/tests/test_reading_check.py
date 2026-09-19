@@ -594,6 +594,21 @@ def test_tax_included_rounding_slack():
     assert any('割り戻した丸めの差' in w for w in res['warn']), res['warn']
 
 
+def test_expense_with_a_work_method_is_flagged():
+    """作業区分の付いた費用は、コグニでは明細の手入力行にする（実機の協定見積書で確認。10-27）。
+    費用の既定行にある「◯◯費」「◯◯料」は対象にしない"""
+    rd = copy.deepcopy(BASE)
+    rd['expenses'] = [{'name': 'リヤナンバー再封印', 'amount': 9000, 'in': '諸費用計'}]
+    rd['totals']['expense'] = 9000
+    rd['totals']['taxable'] = 194000
+    w = run(rd)['warn']
+    assert any('リヤナンバー再封印' in x and '再封印' in x and '明細' in x for x in w), w
+    for nm in ('ソナー点検調整費', 'エーミング費用', '部品廃棄料', '車両回送費', '写真代', 'ショートパーツ'):
+        rd2 = copy.deepcopy(rd)
+        rd2['expenses'] = [{'name': nm, 'amount': 9000, 'in': '諸費用計'}]
+        assert not any('作業区分' in x for x in run(rd2)['warn']), (nm, run(rd2)['warn'])
+
+
 def test_expense_or_row_side_drift():
     """同じ名前が前回は費用・今回は明細（またはその逆）になったら知らせる。
     費用の区画が印字されていない見積では振り分けがぶれるが、金額はどちらでも合うので検算では出ない

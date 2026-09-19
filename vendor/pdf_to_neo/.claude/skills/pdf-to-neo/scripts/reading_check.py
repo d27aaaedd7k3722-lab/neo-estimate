@@ -100,6 +100,12 @@ def _expense_kinds(expenses: list) -> dict:
     return {n: '+'.join(sorted(ks)) for n, ks in kinds.items()}
 
 
+# 費用の名前に付いていたら「本当は明細の手入力行では」と疑う作業区分（費用の既定行に無い語だけ。
+# 点検・調整・診断・エーミングはコグニの費用既定行にあるので入れない）
+_WORK_METHOD_RE = re.compile(r'取替|脱着|修理|板金|鈑金|交換|再封印|溶接|脱脂|組替')
+_MONEY_TAIL_RE = re.compile(r'(費|費用|代|料|料金)$')
+
+
 def _side_key(name) -> str:
     return _nfkc(name or '').replace(' ', '')
 
@@ -882,6 +888,20 @@ class Checker:
                 self.warn(f"費用 {nm}: 過去この工場では {past} 扱い、今回は {now}。合計欄で確かめる")
         self.check_side_drift(prof)
 
+    def check_expense_looks_like_work(self) -> None:
+        """作業区分の付いた費用は、明細の手入力行に写すのが実機の書き方（judgment_rules 10-27）。
+        コグニの協定見積書では「リヤナンバー／再封印」「ドライブレコーダーリヤカ／脱着」が
+        修理方法つきの明細行、費用は「ショートパーツ 1,000」のように区分なしで印字されていた。
+        末尾が 費/費用/代/料 の名前（ソナー点検調整費 など）は費用の既定行にあるので対象にしない"""
+        for e in self.rd.get('expenses') or []:
+            nm = str(e.get('name') or '').strip()
+            if not nm or _MONEY_TAIL_RE.search(_nfkc(nm)):
+                continue
+            m = _WORK_METHOD_RE.search(_nfkc(nm))
+            if m:
+                self.warn(f"費用「{nm}」は作業区分「{m.group(0)}」が付いている。"
+                          f"コグニでは修理方法を入れた明細の手入力行にするのがふつう（費用画面ではなく明細に出す）。印字で確かめる")
+
     def check_side_drift(self, prof: dict) -> None:
         """同じ名前が、前は費用・今度は明細（またはその逆）になっていないか。
         費用の区画が印字されていない見積では読み手ごとに振り分けがぶれるが、金額は合うので検算では出ない。
@@ -924,6 +944,7 @@ class Checker:
         self.check_long_names()
         self.check_subtotals()
         self.check_expenses()
+        self.check_expense_looks_like_work()
         self.check_totals(labor, wage_round)
         self.check_layout_mode()
         self.check_format()
