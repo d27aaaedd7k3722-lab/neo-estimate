@@ -1197,6 +1197,16 @@ class Drafter:
             if 0 < price <= 1000 and dcode == 0 and wage is not None and wage >= 10000:
                 # 1,000 円以下の小物に 1 万円以上の技術料（2026-09-13 ランクル: エンジンサービスラベル 200 円に 19,200 円 = 次の行の工賃と同額）
                 self._rev('要確認', '小物に大きな工賃', f'部品代 {price:,} 円の行に技術料 {wage:,} 円。別の行の工賃を写し間違えていないか、工場の書き間違いでないか確かめる（印字どおりに入れた）', row=row, item=item)
+            if price > 0 and qty >= 2 and dcode == 0 and not row.get('reserve') and not row.get('recycle'):
+                # 数量が名前の「(N個)」と同じで、金額がこの部品の標準価格（1 個分）とぴったり同じ = 「N 個入り」の部品が 1 つ。
+                # 読み手が名前の個数を数量に写した回があった（印字の数量欄は空 = 1。正解 NEO も数量 1・210 円。2026-09-20 手元の実読み取り シエンタ
+                # 「Rrﾗｲｾﾝｽﾌﾟﾚｰﾄｸﾂｼﾖﾝ(2個)」）。金額は動かさない（数量だけ印字どおりに戻す）
+                _mn = re.search(r'[(（]\s*(\d{1,3})\s*個\s*[)）]', _nfkc(name_raw))
+                if _mn and int(_mn.group(1)) == qty and self._std_unit(ref, pn) == price:
+                    self.notes.append(f'{name_raw}: 数量 {qty} は名前の「({qty}個)」と同じで、金額 {price:,} 円がこの部品の標準価格（1 個分）と同じ。'
+                                      f'{qty} 個入りの部品 1 つとみて数量 1 にした（名前の個数を数量に写した読み取りとみる。金額はそのまま）')
+                    self._rev('判断', '数量', f'数量 {qty} → 1（名前の「({qty}個)」は部品の入り数。金額 {price:,} 円 = 標準価格 1 つ分）', row=row, item=item)
+                    item['qty'] = qty = 1
             if price > 0 and dcode == 0 and not row.get('reserve') and not row.get('recycle'):
                 ref0, qty0 = ref, qty
                 ref, why, qty2, did = self._price_fit(ref, why, name_raw, side, price, qty, pn, may_switch=not (code_in or pn), ctx_block=ctx_block)

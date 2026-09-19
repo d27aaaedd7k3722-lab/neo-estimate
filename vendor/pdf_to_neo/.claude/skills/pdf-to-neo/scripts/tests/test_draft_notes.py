@@ -586,6 +586,25 @@ def test_blank_wage_is_zero_when_printed_total_matches():
     assert has(est['_draft_notes'], '工賃欄が空欄'), est['_draft_notes']
 
 
+def test_piece_count_in_the_name_is_not_the_quantity():
+    """数量が名前の「(N個)」と同じで、金額が標準価格 1 つ分とぴったり同じなら「N 個入り」の部品 1 つ（数量 1）。
+    2026-09-20 手元の実読み取り: 印字の数量欄が空の「Rrﾗｲｾﾝｽﾌﾟﾚｰﾄｸﾂｼﾖﾝ(2個) 210 円」を読み手が数量 2 と写した（正解 NEO は数量 1）。
+    金額が標準価格の N 倍（本当に N 個）の行は今までどおり数量 N"""
+    base = {'source': 't', 'issuer': '', 'est_date': '20260909', 'format': 'A', 'labor_rate': 8000, 'vehicle': dict(VEH),
+            'blocks': [{'title': 'テスト', 'rows': ['0010|Fﾊﾞﾝﾊﾟﾌｪｲｽ|取替|||1|50000|4000||']}], 'paint': {}, 'expenses': [], 'totals': {}}
+    d = de.Drafter(base)
+    d.build()
+    std = d._std_unit(10, '')
+    assert std and std > 0, std
+    rd = dict(base, blocks=[{'title': 'テスト', 'rows': [f'0010|Fﾊﾞﾝﾊﾟﾌｪｲｽ(2個)|取替|||2|{std}|4000||',
+                                                        f'0010|Fﾊﾞﾝﾊﾟﾌｪｲｽ(2個)|取替|||2|{std * 2}|4000||']}])
+    est = de.Drafter(rd).build()
+    a, b = est['items']
+    assert a['qty'] == 1 and a['price'] == std, a
+    assert b['qty'] == 2 and b['price'] == std * 2, b
+    assert has(est['_draft_notes'], '入りの部品 1 つとみて数量 1'), est['_draft_notes']
+
+
 def test_printed_code_with_m_is_not_a_manual_row():
     """部品コードが印字された行の M（手入力）は外す（コグニの手入力行は部品コードが空）。2026-09-20 手元の実読み取り:
     読み手が印字の印 * を M と写し、部品コードのある 5 行が部品コード無しの行になった。コードの無い M 行は今までどおり手入力"""

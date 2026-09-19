@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "c11d7a4c190e6f8596243bbc2ea8cbb940654296",
- "subject": "fix: 読み取りの揺れを受ける（手元の実読み取りで見つけた所）／部品コードが印字された行の M は外す・名前に手続きの語（再封印 等）がある工賃だけの行は手入力行・空欄の工賃を 0 円にする判定を工賃計の別解（塗装・材料・内板骨格・費用）まで広げ紙上検算と同じ計算を共有（codex-loop 第13周で合格）",
- "synced_at": "2026-09-20T01:41:42",
+ "commit": "ada31324f3e5c864805ada10ec66ca70cbd088bb",
+ "subject": "fix: 名前の「(N個)」を数量に写した読み取りを受ける（数量が名前の個数と同じで金額が標準価格 1 つ分なら数量 1。codex-loop 第14周で合格）",
+ "synced_at": "2026-09-20T02:02:32",
  "files": 108,
- "tree_sha256": "4b1a69a1e22edf8458f833eb90f5ed79bdec1fec90a3767200dec9e939dc708c",
+ "tree_sha256": "dd13aebaae6857059e7f98a993aff3e4ad9ed7e84821cdf457da85bc7c0a0d8e",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }
