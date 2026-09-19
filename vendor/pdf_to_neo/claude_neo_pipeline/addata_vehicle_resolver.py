@@ -266,17 +266,23 @@ class AddataVehicleResolver:
         n = int(digits)
         # 'DBA-ZRR80G' → 'ZRR80G' → 'ZRR80'（KA06 は末尾の仕様記号を持たない型式で収録されることがある）
         model = re.sub(r'^[0-9A-Z]{1,4}-', '', model) if re.match(r'^[0-9A-Z]{1,4}-[A-Z]', model) else model
-        cands = [model]
-        m2 = model
-        while len(m2) > 3 and m2[-1].isalpha():
-            m2 = m2[:-1]
-            cands.append(m2)
-        for cand in cands:
-            for car, year, m, lo, hi in self.ka06():
-                if m == cand and lo <= n <= hi:
-                    out.append({'car_code': car, 'year_code': year, 'model': m, 'range': (lo, hi)})
-            if out:
-                break
+        # 型式が先で後ろに類別記号が付く書き方（'GB8-WHCHS6A'）もある。上の処理は先頭を排ガス記号とみて外すので、
+        # それで見つからなければ、元の型式をハイフンで分けた各部分も試す（車台番号の範囲も合う行だけ採るので取り違えにくい。
+        # 2026-09-19 本番検証: 'GB8-WHCHS6A' で候補ゼロ → 車両特定失敗）
+        raw_parts = [p for p in re.split(r'[-‐−]', unicodedata.normalize('NFKC', model_code or '').upper().strip()) if p]
+        bases = [model] + [p for p in raw_parts if p != model and len(p) >= 2]
+        for base in bases:
+            cands = [base]
+            m2 = base
+            while len(m2) > 3 and m2[-1].isalpha():
+                m2 = m2[:-1]
+                cands.append(m2)
+            for cand in cands:
+                for car, year, m, lo, hi in self.ka06():
+                    if m == cand and lo <= n <= hi:
+                        out.append({'car_code': car, 'year_code': year, 'model': m, 'range': (lo, hi)})
+                if out:
+                    return out
         return out
 
     # ------------------------------------------------------------ KA81: 型式指定+類別

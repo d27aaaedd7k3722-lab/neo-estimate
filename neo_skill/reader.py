@@ -637,6 +637,86 @@ def _index_policy_guard(header: dict, pages: list) -> Optional[str]:
             '区分の語彙が違う書式だけ。指数欄が空欄でも技術料だけでも、コグニ語彙なら標準指数と突き合わせて写す）')
 
 
+_VIN_RE = re.compile(r'[A-HJ-NPR-Z0-9]{17}')
+# 輸入車のしるし（vendor の estimate_to_neo.imported_signal と同じ語。このプロセスでは vendor を import しないので写しを持つ）
+_IMPORT_BRANDS = ('ボルボ', 'VOLVO', 'BMW', 'ベンツ', 'メルセデス', 'MERCEDES', 'アウディ', 'AUDI', 'フォルクスワーゲン', 'VOLKSWAGEN',
+                  'ポルシェ', 'PORSCHE', 'プジョー', 'PEUGEOT', 'ルノー', 'RENAULT', 'シトロエン', 'CITROEN', 'フィアット', 'FIAT',
+                  'アルファロメオ', 'ジープ', 'JEEP', 'ランドローバー', 'ジャガー', 'JAGUAR', 'テスラ', 'TESLA')
+
+
+def _is_true(v) -> bool:
+    return v is True or (isinstance(v, (int, float)) and not isinstance(v, bool) and v == 1) \
+        or str(v).strip().lower() in ('true', '1', 'yes', 'y', 'on')
+
+
+def _looks_imported(veh: dict) -> bool:
+    s = re.sub(r'[\s\-‐−]', '', unicodedata.normalize('NFKC', str(veh.get('serial_no') or ''))).upper()
+    if _VIN_RE.fullmatch(s):
+        return True
+    txt = unicodedata.normalize('NFKC', ' '.join(str(veh.get(k) or '') for k in ('car_name', 'maker', 'maker_name', 'name'))).upper()
+    return any(unicodedata.normalize('NFKC', b).upper() in txt for b in _IMPORT_BRANDS)
+
+
+def _row_code(r) -> str:
+    if isinstance(r, str):
+        return unicodedata.normalize('NFKC', r.split('|')[0]).strip()
+    if isinstance(r, dict):
+        return unicodedata.normalize('NFKC', str(r.get('code') or '')).strip()
+    return ''
+
+
+def _manual_rows_guard(header: dict, pages: list) -> tuple:
+    """読み手が明細に付けた M（手入力）を外す。戻り値は (pages, 外した理由の文 or None)。
+    M を付けてよいのは ADDATA に無い品目だけで（判断規則 10-7）、ADDATA を見られない読み手には決められない。
+    部品コードの印字が 1 つも無い見積（協定見積書・他システムの見積）に「コード欄が空 = 手入力」（書式 A の規則）を当てはめ、
+    2 ページ目の 16 行が部品コード無しの手入力行になった（2026-09-20 本番 フリード協定見積。前の回は同じ行に部品コードが付いた
+    = 読み取りの揺れで NEO が変わっていた）。外しても金額は印字のまま。ADDATA で照合できない行は下書きが手入力にする。
+    外さない: 汎用車種・輸入車（全行手入力）/ 部品コードの印字がある見積（コードの無い行は工場のコグニでも手入力行）/
+    書式 B（素材欄の * = 手入力品目が印字されている）"""
+    veh = header.get('vehicle') if isinstance(header.get('vehicle'), dict) else {}
+    if _is_true(veh.get('generic')) or _looks_imported(veh):
+        return pages, None
+    if str(header.get('format') or '').strip().upper()[:1] == 'B':
+        return pages, None
+    rows = [r for p in (pages or []) if isinstance(p, dict) for b in (p.get('blocks') or []) if isinstance(b, dict)
+            for r in (b.get('rows') or [])]
+    # 部品コードの印字 = 4 桁（枝番付き 0010-02 も）。行番号や OCR のかけらの数字 1 つでは「コードのある見積」にしない（Codex 指摘）
+    if any(re.fullmatch(r'\d{4}(?:\s*-\s*\d{1,2})?', _row_code(r)) for r in rows if not _is_note_row(r)):
+        return pages, None
+    out = copy.deepcopy(pages)
+    n = 0
+    for p in out:
+        if not isinstance(p, dict):
+            continue
+        for b in p.get('blocks') or []:
+            if not isinstance(b, dict):
+                continue
+            rs = b.get('rows') or []
+            for i, r in enumerate(rs):
+                if _is_note_row(r):
+                    continue
+                if isinstance(r, str):
+                    parts = r.split('|')
+                    if len(parts) > 8 and 'M' in unicodedata.normalize('NFKC', parts[8]).upper():
+                        parts[8] = re.sub('[Mm]', '', unicodedata.normalize('NFKC', parts[8]))
+                        rs[i] = '|'.join(parts)
+                        n += 1
+                elif isinstance(r, dict):
+                    hit = False
+                    fl = unicodedata.normalize('NFKC', str(r.get('flags') or ''))
+                    if 'M' in fl.upper():
+                        r['flags'] = re.sub('[Mm]', '', fl)
+                        hit = True
+                    if 'manual' in r:
+                        hit = hit or _is_true(r.get('manual'))
+                        r.pop('manual')
+                    n += 1 if hit else 0
+    if not n:
+        return pages, None
+    return out, (f'読み手が手入力（M）にした明細 {n} 行を部品の照合に戻した（部品コードの印字が無い見積では「コード欄が空 = 手入力」は'
+                 '当てはまらない。ADDATA に有るかは下書きが決め、照合できない行は手入力にする。金額は印字のまま）')
+
+
 def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str = '',
                   vehicle_hint: Optional[dict] = None, insurance_hint: Optional[dict] = None, max_retries: int = 3,
                   customer_hint: Optional[dict] = None,
@@ -745,7 +825,10 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
             header = {k: v for k, v in header.items() if k != 'index_policy'}; res.header = header
             if _g not in guard_notes:
                 guard_notes.append(_g)
-        maker.write_pages(case_dir, *_pages_for_merge(header, pages))
+        # 読み手の M を外すのは書き出す写しだけ（pages は読み手の写しのまま残す。あとで header を読み直して書式 B・輸入車に
+        # 変わったら、外した M を戻せるように毎回元から掛け直す。Codex 指摘）
+        _pages_w, m_note = _manual_rows_guard(header, pages)
+        maker.write_pages(case_dir, *_pages_for_merge(header, _pages_w))
         # 3) 束ねて合計欄を検算
         m = run('merge', case_dir=case_dir)
         rd, check = m.get('reading'), (m.get('check') or {})
@@ -780,11 +863,12 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
                 header = {k: v for k, v in header.items() if k != 'index_policy'}; res.header = header
                 if _g not in guard_notes:
                     guard_notes.append(_g)
-            maker.write_pages(case_dir, *_pages_for_merge(header, pages))
+            _pages_w, m_note = _manual_rows_guard(header, pages)
+            maker.write_pages(case_dir, *_pages_for_merge(header, _pages_w))
             m = run('merge', case_dir=case_dir)
             rd, check = m.get('reading'), (m.get('check') or {})
             res.merge_messages = list(m.get('messages') or [])
-        _extra = list(guard_notes) + [m_ for m_ in (res.merge_messages or []) if m_]   # merge の注意（重複行など）も合格時に見える所へ（G11）
+        _extra = list(guard_notes) + ([m_note] if m_note else []) + [m_ for m_ in (res.merge_messages or []) if m_]   # merge の注意（重複行など）も合格時に見える所へ（G11）。M の注意は最後に書き出した写しの分だけ
         if _extra:   # 戻した理由は合計欄の検算の注意と同じ列に（app は check.warn を「読み取りの注意」に出す）
             check = dict(check or {})
             _w0 = list(check.get('warn') or [])

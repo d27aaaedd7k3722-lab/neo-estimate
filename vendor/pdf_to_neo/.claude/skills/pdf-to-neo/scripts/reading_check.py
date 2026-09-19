@@ -155,6 +155,78 @@ def _in_kind(e: dict) -> str:
     return '?'
 
 
+def expense_by_kind(rd: dict) -> dict:
+    """費用を集計先ごとに合計する（parts / wage / expense / taxfree。in が読めない費用は wage）。紙上検算と下書きで共通"""
+    ex_by = {'parts': 0, 'wage': 0, 'expense': 0, 'taxfree': 0}
+    for e in rd.get('expenses') or []:
+        k = _in_kind(e)
+        if k in ex_by:
+            ex_by[k] += _int(e.get('amount')) or 0
+        elif k == '?':
+            ex_by['wage'] += _int(e.get('amount')) or 0
+    return ex_by
+
+
+def paint_frame_wages(rd: dict) -> dict:
+    """印字の工賃計に入ることがある明細以外の工賃: paint_w（塗装工賃。追加項目込み）/ other_in（paint_w に含めた追加項目）/
+    material（材料代）/ frame_w（内板骨格）と、紙上検算が出す注記 notes。
+    紙上検算の工賃計の別解と、下書きの「工賃欄の空欄は 0 円」判定（draft_estimate._blank_wage_is_zero）で**同じ計算を使う**
+    （片方だけ数え方が違うと、紙上検算は空欄 0 円とみて通し、下書きは標準指数で埋めて make_neo で止まる。Codex 指摘 2026-09-20）"""
+    notes: list = []
+    t = rd.get('totals') or {}
+    p = rd.get('paint') or {}
+    # 塗装工賃 = 印字の塗装工賃計（無ければ塗装行・パネル＋内板骨格塗装の合算）＋ 追加項目（paint.other）。
+    # 印字の塗装工賃計は内板骨格塗装を含み、追加項目（コグニ印刷の「追加塗装費用計」）を含まない（2026-09-14 C-HR: 180,280 = 塗装行 167,150 + ﾗｼﾞｴｰﾀｻﾎﾟｰﾄ 13,130、
+    # 塗装費用計 251,050 = 180,280 + 材料代 55,890 + プライマー塗装 14,880）。追加項目はどの書き方でも 1 回だけ足す
+    pf = p.get('frame') if isinstance(p.get('frame'), dict) else {}
+    frame_pw = sum(_int((pf.get(k) or {}).get('wage')) or 0 for k in ('engine_room', 'front_pillar', 'center_pillar', 'rear_floor') if isinstance(pf.get(k), dict))
+    other_w = sum(_int(x.get('wage')) or 0 for x in p.get('other') or [] if isinstance(x, dict))
+    paint_w = _int(p.get('total'))
+    # 内訳（塗装行・パネル・加算基礎・バンパ・付加塗装・内板骨格塗装）の合算。塗装工賃計の印字が無いときの塗装工賃で、
+    # 印字があるときは「追加項目を含めて写したか」の見分けに使う（下）
+    comp = None
+    lines = p.get('lines') or []
+    if lines:
+        comp = sum(_int(l.get('wage')) or 0 for l in lines) + frame_pw
+    elif p.get('panels') or is_bumper_only_paint(p):   # panels: [] はバンパだけの形のときだけ詳細塗装（生成器・inspect と同じ判定。Codex 指摘）
+        comp = (sum(_int(x.get('wage')) or 0 for x in p.get('panels') or [])
+                   + sum(_int((p.get(k) or {}).get('wage')) or 0 for k in ('base', 'booth', 'wax', 'bumper_front', 'bumper_rear', 'bumper_base', 'sealing', 'door_sash', 'stripe',
+                                                                           'low_cover', 'two_coat_solid', 'two_tone') if isinstance(p.get(k), dict))
+                   + frame_pw)   # 付加塗装も塗装工賃計（生成器・inspect と同じ範囲。Codex 指摘）
+    if paint_w is None:
+        paint_w = (comp if comp is not None else frame_pw) + other_w
+    elif other_w and comp is not None and paint_w == comp + other_w:
+        # 転記の塗装工賃計が「内訳 + 追加項目」とちょうど一致 = 追加項目を含めて写した（2026-09-15 N-BOX: 内訳 94,210 + アンダーコート 3,680 = 97,890）。
+        # 足し直すと塗装計（材料込）・課税小計が追加項目の分だけ多くなり、正しい転記を不合格にしていた（生成器・inspect は内訳 + 追加項目で数える）
+        notes.append(f'塗装工賃計 {paint_w:,} は追加項目 {other_w:,} を含めて写されている（内訳 {comp:,} + 追加項目）。追加項目は足し直さない')
+    else:
+        paint_w += other_w
+    material = _int(p.get('material')) or 0
+    # 材料の列に金額のある塗装行が塗装一式のほかにもある書式（ショートパーツ・写真代 … を材料の列に刷る工場）。
+    # 印字の材料計と塗装行の材料の合計が一致するならそれで数える（下書き draft_estimate.paint と同じ条件。
+    # 2026-09-16 アクセラ: 材料計 39,440 = 塗装一式 37,440 + 1,000 + 1,000 で、2,000 円足りないまま不合格になっていた）
+    _mat_lines = sum(_int(l.get('material')) or 0 for l in lines if isinstance(l, dict))
+    if _mat_lines and _mat_lines != material and _int(t.get('material')) == _mat_lines:
+        notes.append(f'材料計 {_mat_lines:,} は塗装行の材料の合計（材料の列だけに金額のある行を含む）。印字と一致するのでそれで数える')
+        material = _mat_lines
+    frame = rd.get('frame') or {}
+    frame_w = sum(_int(x.get('wage')) or 0 for x in frame.get('items') or []) + (_int(frame.get('basic_wage')) or 0) if frame else 0
+    return {'paint_w': paint_w, 'other_in': other_w, 'material': material, 'frame_w': frame_w, 'notes': notes}
+
+
+def wage_total_alternatives(wage_sum: int, rd: dict) -> set:
+    """印字の工賃計（作業計）としてあり得る額: 明細の工賃 wage_sum ＋（費用の工賃分）＋ 塗装工賃・材料代・内板骨格・費用の組み合わせ。
+    紙上検算の「工賃欄の空欄は 0 円」と下書きの同じ判定がこの集合を共有する（片方だけ広げない）"""
+    ex_by = expense_by_kind(rd)
+    wp = paint_frame_wages(rd)
+    out = {wage_sum, wage_sum + ex_by['wage'] + ex_by['expense'] + ex_by['taxfree']}
+    parts_ = (wp['paint_w'], wp['material'], wp['frame_w'], ex_by['wage'], ex_by['expense'])
+    for n in range(1, len(parts_) + 1):
+        for comb in combinations(parts_, n):
+            out.add(wage_sum + sum(comb))
+    return out
+
+
 # ---------------------------------------------------------------------- 税込で印字された見積書（judgment_rules 10-4）
 TAX_TOTALS_KEYS = ('parts', 'wage', 'paint', 'paint_total', 'material', 'expense', 'expense_parts',
                    'expense_wage', 'frame', 'taxable', 'discount', 'recycle')
@@ -583,54 +655,14 @@ class Checker:
                 wage_sum += _round_to(round(idx * labor, 2), wage_round)
             elif idx is None and w is None and (_int(r.get('price')) or 0) <= 0 and not r.get('manual'):
                 unknown_w.append(r)  # 工賃も指数も金額も無い行（脱着・修理など）: 生成器が標準指数で補完する
-        ex = self.rd.get('expenses') or []
-        ex_by = {'parts': 0, 'wage': 0, 'expense': 0, 'taxfree': 0}
-        for e in ex:
-            k = _in_kind(e)
-            if k in ex_by:
-                ex_by[k] += _int(e.get('amount')) or 0
-            elif k == '?':
-                ex_by['wage'] += _int(e.get('amount')) or 0
+        ex_by = expense_by_kind(self.rd)
         p = self.rd.get('paint') or {}
-        # 塗装工賃 = 印字の塗装工賃計（無ければ塗装行・パネル＋内板骨格塗装の合算）＋ 追加項目（paint.other）。
-        # 印字の塗装工賃計は内板骨格塗装を含み、追加項目（コグニ印刷の「追加塗装費用計」）を含まない（2026-09-14 C-HR: 180,280 = 塗装行 167,150 + ﾗｼﾞｴｰﾀｻﾎﾟｰﾄ 13,130、
-        # 塗装費用計 251,050 = 180,280 + 材料代 55,890 + プライマー塗装 14,880）。追加項目はどの書き方でも 1 回だけ足す
-        pf = p.get('frame') if isinstance(p.get('frame'), dict) else {}
-        frame_pw = sum(_int((pf.get(k) or {}).get('wage')) or 0 for k in ('engine_room', 'front_pillar', 'center_pillar', 'rear_floor') if isinstance(pf.get(k), dict))
-        other_w = sum(_int(x.get('wage')) or 0 for x in p.get('other') or [] if isinstance(x, dict))
-        paint_w = _int(p.get('total'))
-        # 内訳（塗装行・パネル・加算基礎・バンパ・付加塗装・内板骨格塗装）の合算。塗装工賃計の印字が無いときの塗装工賃で、
-        # 印字があるときは「追加項目を含めて写したか」の見分けに使う（下）
-        comp = None
-        lines = p.get('lines') or []
-        if lines:
-            comp = sum(_int(l.get('wage')) or 0 for l in lines) + frame_pw
-        elif p.get('panels') or is_bumper_only_paint(p):   # panels: [] はバンパだけの形のときだけ詳細塗装（生成器・inspect と同じ判定。Codex 指摘）
-            comp = (sum(_int(x.get('wage')) or 0 for x in p.get('panels') or [])
-                       + sum(_int((p.get(k) or {}).get('wage')) or 0 for k in ('base', 'booth', 'wax', 'bumper_front', 'bumper_rear', 'bumper_base', 'sealing', 'door_sash', 'stripe',
-                                                                               'low_cover', 'two_coat_solid', 'two_tone') if isinstance(p.get(k), dict))
-                       + frame_pw)   # 付加塗装も塗装工賃計（生成器・inspect と同じ範囲。Codex 指摘）
-        if paint_w is None:
-            paint_w = (comp if comp is not None else frame_pw) + other_w
-        elif other_w and comp is not None and paint_w == comp + other_w:
-            # 転記の塗装工賃計が「内訳 + 追加項目」とちょうど一致 = 追加項目を含めて写した（2026-09-15 N-BOX: 内訳 94,210 + アンダーコート 3,680 = 97,890）。
-            # 足し直すと塗装計（材料込）・課税小計が追加項目の分だけ多くなり、正しい転記を不合格にしていた（生成器・inspect は内訳 + 追加項目で数える）
-            self.note(f'塗装工賃計 {paint_w:,} は追加項目 {other_w:,} を含めて写されている（内訳 {comp:,} + 追加項目）。追加項目は足し直さない')
-        else:
-            paint_w += other_w
-        other_in = other_w   # paint_w に含めた追加項目の工賃（材料代の割合を出すときは外す。追加項目は材料率の対象外）
-        material = _int(p.get('material')) or 0
-        # 材料の列に金額のある塗装行が塗装一式のほかにもある書式（ショートパーツ・写真代 … を材料の列に刷る工場）。
-        # 印字の材料計と塗装行の材料の合計が一致するならそれで数える（下書き draft_estimate.paint と同じ条件。
-        # 2026-09-16 アクセラ: 材料計 39,440 = 塗装一式 37,440 + 1,000 + 1,000 で、2,000 円足りないまま不合格になっていた）
-        _mat_lines = sum(_int(l.get('material')) or 0 for l in lines if isinstance(l, dict))
-        if _mat_lines and _mat_lines != material and _int(t.get('material')) == _mat_lines:
-            self.note(f'材料計 {_mat_lines:,} は塗装行の材料の合計（材料の列だけに金額のある行を含む）。印字と一致するのでそれで数える')
-            material = _mat_lines
+        _wp = paint_frame_wages(self.rd)   # 塗装工賃・材料代・内板骨格（下書きの「空欄の工賃は 0 円」判定と同じ計算。Codex 指摘）
+        for _nt in _wp['notes']:
+            self.note(_nt)
+        paint_w, other_in, material, frame_w = _wp['paint_w'], _wp['other_in'], _wp['material'], _wp['frame_w']
         disc = self.rd.get('discount') or {}
         disc_sum = (_int(disc.get('parts')) or 0) + (_int(disc.get('wage')) or 0)
-        frame = self.rd.get('frame') or {}
-        frame_w = sum(_int(x.get('wage')) or 0 for x in frame.get('items') or []) + (_int(frame.get('basic_wage')) or 0) if frame else 0
         _ex_nonparts = ex_by['wage'] + ex_by['expense'] + ex_by['taxfree']   # 下書きが「費用の工賃分」として数える範囲（部品計に入る費用以外）
         # 塗装の一式が明細の手入力行と paint の両方にある reading（読み取りの二重計上）。
         # 下書き（draft_estimate._drop_double_paint）は印字の工賃計で片方に寄せるので、検算も同じ寄せ方で数える。
@@ -719,7 +751,9 @@ class Checker:
                                        _int(disc.get('parts')) or 0)
         # 工賃も指数も無い行があっても、印字の工賃計が明細の工賃の合計（＋費用の工賃分）とぴったり一致するなら
         # その空欄は 0 円（下書きが 0 円で渡し、生成器は標準指数で埋めない。draft_estimate._blank_wage_is_zero と同じ条件）
-        blank_zero = bool(unknown_w) and _gw > 0 and _gw in (wage_sum, wage_sum + _ex_nonparts)
+        # 印字の工賃計が塗装工賃・材料代・内板骨格まで含む書式（コグニ印刷の小計の工賃列）でも同じ（下の工賃計の別解と同じ範囲。
+        # 読み手が作業計でなくその額を写した回だけ止まっていた。2026-09-20）
+        blank_zero = bool(unknown_w) and _gw > 0 and _gw in wage_total_alternatives(wage_sum, self.rd)
         if unknown_w and not blank_zero:
             self.warn(f'工賃も指数も無い行が {len(unknown_w)} 行（{", ".join(str(r.get("name") or "")[:10] for r in unknown_w[:4])}）。生成器が標準指数で補完するので、工賃計は検算できない。印字に工賃があるなら写す')
         else:
@@ -727,7 +761,7 @@ class Checker:
                 self.note(f'工賃も指数も無い行が {len(unknown_w)} 行あるが、印字の工賃計 {_gw:,} は明細の工賃の合計と一致する。'
                           'この見積の空欄は 0 円（下書きが 0 円で渡すので標準指数では埋めない）')
             wage_alts = {}
-            for n in range(1, 5):
+            for n in range(1, 6):   # 5 つ全部も（wage_total_alternatives と同じ範囲。片方だけ広いと空欄 0 円と判断したあと工賃計で落ちる。Codex 指摘）
                 for comb in combinations((('塗装工賃', paint_w), ('材料代', material), ('内板骨格', frame_w), ('費用（作業計）', ex_by['wage']), ('費用（諸費用）', ex_by['expense'])), n):
                     wage_alts['明細 + ' + ' + '.join(c[0] for c in comb)] = wage_sum + sum(c[1] for c in comb)
             cmp('工賃計（作業計）', wage_sum, t.get('wage'), wage_alts)

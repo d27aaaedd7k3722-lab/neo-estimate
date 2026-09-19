@@ -428,6 +428,33 @@ def test_index_policy_format_c():
     chk(reader._index_policy_guard({'index_policy': 'manual', 'format': 'B'}, pages) is not None, '既存: 書式 B の manual を外さない')
 
 
+def test_manual_rows_guard():
+    """読み手が付けた M（手入力）: 部品コードの印字が無い見積では外す（ADDATA に有るかは下書きが決める。2026-09-20 本番 フリード協定見積）。
+    コードの印字がある見積・書式 B・汎用車種・輸入車では外さない"""
+    veh = {'model_code': 'GB8', 'serial_no': 'GB8-0000001'}
+    pages = [{'blocks': [{'rows': ['|左　テールゲートアツパ|取替||||1319||M*|', '|エンブレム（Ｈ）|取替||||1959||Ｍ|',
+                                   {'name': 'ｶﾞﾗｽｾﾂﾁﾔｸｻﾞｲ', 'method': '取替', 'price': 7999, 'manual': True},
+                                   {'name': 'ﾄﾗﾝｸﾄﾞﾚﾝﾌﾟﾗｸﾞ', 'price': 320, 'flags': 'M'},
+                                   '|インテリジェントクリアランスソナー|||||||N|', '|Rrバンパフェイス|取替||||51399|7650|*|']}]}]
+    out, why = reader._manual_rows_guard({'format': 'F', 'vehicle': veh}, pages)
+    rows = out[0]['blocks'][0]['rows']
+    chk(why is not None and '4 行' in why, f'M を外した行数の注意が無い: {why}')
+    chk(rows[0].split('|')[8] == '*' and rows[1].split('|')[8] == '', f'文字列行の M（全角含む）を外していない: {rows[:2]}')
+    chk('manual' not in rows[2] and rows[3].get('flags') == '', f'dict 行の manual / flags の M を外していない: {rows[2:4]}')
+    chk(rows[4] == pages[0]['blocks'][0]['rows'][4] and rows[5] == pages[0]['blocks'][0]['rows'][5], '注記行・M の無い行を変えている')
+    chk('M' in pages[0]['blocks'][0]['rows'][0].split('|')[8], '元の pages を書き換えている')
+    coded = [{'blocks': [{'rows': ['3810|Rrﾊﾞﾝﾊﾟﾌｪｲｽ|取替||||51399|7650||', '|塗装費用||||||94664|M|']}]}]
+    chk(reader._manual_rows_guard({'format': 'A', 'vehicle': veh}, coded)[1] is None, 'コードの印字がある見積の M を外している')
+    coded2 = [{'blocks': [{'rows': [{'code': '０２３０-02', 'name': 'x', 'price': 1}, '|塗装費用||||||94664|M|']}]}]
+    chk(reader._manual_rows_guard({'format': 'A', 'vehicle': veh}, coded2)[1] is None, '枝番付き・全角の部品コードを「コードの印字」とみなしていない')
+    numbered = [{'blocks': [{'rows': ['1|左 ﾃｰﾙｹﾞｰﾄｱﾂﾊﾟ|取替||||1319||M|', '12|ｴﾝﾌﾞﾚﾑ(H)|取替||||1959||M|']}]}]
+    chk(reader._manual_rows_guard({'format': 'F', 'vehicle': veh}, numbered)[1] is not None, '行番号（1・12）を部品コードとみなして M を残している')
+    chk(reader._manual_rows_guard({'format': 'B', 'vehicle': veh}, pages)[1] is None, '書式 B（素材欄の *）の M を外している')
+    chk(reader._manual_rows_guard({'format': 'D', 'vehicle': {'generic': 'true'}}, pages)[1] is None, '汎用車種の M を外している')
+    chk(reader._manual_rows_guard({'format': 'D', 'vehicle': {'serial_no': 'YV1XXXXXXXX000001'}}, pages)[1] is None, '輸入車（VIN）の M を外している')
+    chk(reader._manual_rows_guard({'format': 'D', 'vehicle': {'car_name': 'ボルボ V40'}}, pages)[1] is None, '輸入車（車名）の M を外している')
+
+
 if __name__ == '__main__':
     sys.stdout.reconfigure(encoding='utf-8')
     for name, fn in sorted(globals().items()):

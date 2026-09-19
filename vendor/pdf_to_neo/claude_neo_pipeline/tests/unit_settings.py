@@ -172,6 +172,14 @@ def main() -> int:
     except RuntimeError as e:
         check('車両特定失敗' in str(e), f'止め方が変わった: {e}')
 
+    # 型式が先で後ろに類別記号が付く書き方（'GB8-WHCHS6A'）でも車種を引く。先頭の排ガス記号（'6AA-GB8' 'DBA-ZRR80G'）は従来どおり
+    # （2026-09-19 本番検証: 'GB8-WHCHS6A' の先頭を排ガス記号とみて外し、'WHCHS6A' を探して候補ゼロになった）。車台番号は架空（範囲内の値）
+    _rv = NeoBuilder().resolver
+    for _mc in ('GB8-WHCHS6A', '6AA-GB8', 'GB8'):
+        _hit = [x['car_code'] for x in _rv.lookup_by_model_serial(_mc, 'GB8-3200010')]
+        check('J55' in _hit, f'型式 {_mc} から J55 を引けない: {_hit}')
+    check([x['car_code'] for x in _rv.lookup_by_model_serial('GB8-WHCHS6A', 'GB8-0000001')] == [], '車台番号の範囲外まで拾っている')
+
     # 品番の 1 文字違い（読み違い・新旧品番）は ★ で知らせる。色の枝番の有無や、まったく違う品番は対象外
     import io as _io, contextlib as _cl, run_case as _rc
     _buf = _io.StringIO()

@@ -297,6 +297,23 @@ def test_wage_unknown_row_still_checks_totals():
     assert not r['fail'], r['fail']
 
 
+def test_wage_unknown_row_is_zero_when_total_has_every_component():
+    """印字の工賃計が 明細 + 塗装工賃 + 材料代 + 内板骨格 + 費用（作業計）+ 費用（諸費用） の 5 つ全部を含む書式でも、
+    空欄は 0 円と判断し、工賃計の検算も同じ範囲で通す（判断と検算の範囲がずれると、0 円と決めたあと工賃計で落ちる。Codex 指摘 2026-09-20）"""
+    rd = copy.deepcopy(BASE)
+    rd['blocks'][1]['rows'][1] = '|RH ﾌｪﾝﾀﾞ ﾗｲﾅ|脱着|53875-11111||1||||'
+    rd['pages']['2'] = {'rows': 2, 'parts': 30000, 'wage': 16000}
+    rd['frame'] = {'basic': True, 'basic_wage': 5000, 'items': []}
+    rd['expenses'] = [{'name': 'ショートパーツ', 'amount': 2000, 'in': '部品計'}, {'name': '写真代', 'amount': 3000, 'in': '作業計'},
+                      {'name': 'コーティング', 'amount': 10000, 'in': '諸費用計'}]
+    wage_total = 28000 + 40000 + 22000 + 5000 + 3000 + 10000
+    rd['totals'] = {'parts': 92000, 'wage': wage_total, 'taxable': 92000 + wage_total, 'tax': (92000 + wage_total) // 10,
+                    'total': (92000 + wage_total) * 11 // 10}
+    r = run(rd)
+    assert not r['fail'], r['fail']
+    assert has(r['note'], '空欄は 0 円'), r['note']
+
+
 def test_wage_unknown_row_is_zero_when_printed_total_matches():
     """工賃も指数も無い行があっても、印字の工賃計が明細の工賃の合計と一致するなら空欄は 0 円（下書きと同じ判断）。
     未検算にせず課税小計まで検算する（2026-09-16 シエンタ: 空欄に標準指数が入って +106,400 円になっていた）"""
