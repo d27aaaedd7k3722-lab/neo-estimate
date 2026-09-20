@@ -457,44 +457,47 @@ def test_manual_rows_guard():
 
 
 def test_paint_actual_guard():
-    """塗装が一式だけの見積は、コグニの入力方式を実額にする（2026-09-20 亮平さん指示）。
-    材料代の金額が印字されているときと、塗装の内訳があるときは実額にしない"""
+    """塗装は**常に**コグニの入力方式「実額」で入れる（2026-09-20 亮平さん指示）。
+    人の指定（指数・参考・auto_panels）があるときと、塗装がどこにも無いときだけ付けない"""
     pages = [{'page': 1, 'blocks': [{'rows': ['0010|ﾊﾞﾝﾊﾟ|取替||||38600|8000||']}]}]
+
+    # 一式だけ
     lump = {'paint': {'total': 99080}}
     h, note = reader._paint_actual_guard(lump, pages)
     chk(h['paint'].get('input_type') == '実額' and note, '一式だけの塗装を実額にしていない')
     chk(lump['paint'].get('input_type') is None, '元の header を書き換えている（読み手の写しは触らない）')
 
-    # 材料代の割合だけ（金額 0）でも実額にする ← 本番検証で実額にならなかった形
-    h2, note2 = reader._paint_actual_guard({'paint': {'total': 200000, 'material': 0, 'material_rate': 26}}, pages)
-    chk(h2['paint'].get('input_type') == '実額' and note2, '材料代 0 円（割合だけ）で実額にしていない')
+    # 材料代の金額が印字されていても実額（総額にまとめる）
+    h2, note2 = reader._paint_actual_guard({'paint': {'total': 85520, 'material': 19226}}, pages)
+    chk(h2['paint'].get('input_type') == '実額' and '材料代' in (note2 or ''), '材料代がある塗装を実額にしていない')
 
-    # 材料代の金額が印字されている → 実額にしない（実額は材料計の欄を持てない）
-    h3, note3 = reader._paint_actual_guard({'paint': {'total': 85520, 'material': 19226}}, pages)
-    chk(h3['paint'].get('input_type') is None and not note3, '印字の材料代があるのに実額にした')
+    # 合計欄の材料代でも同じ
+    h2b, note2b = reader._paint_actual_guard({'paint': {'total': 66294}, 'totals': {'material': 19226}}, pages)
+    chk(h2b['paint'].get('input_type') == '実額', '合計欄の材料代があると実額にしていない')
 
-    # 塗装の内訳（パネル・バンパ・内板骨格・追加項目 等）がある → 実額を勧めない
+    # 塗装の内訳（パネル・追加項目・内板骨格 等）があっても実額にする（下書きが畳む）
     for k, v in (('panels', [{'name': 'ﾄﾞｱ'}]), ('other', [{'name': 'ｱﾝﾀﾞｰｺｰﾄ'}]),
-                 ('frame', {'wage': 1000}), ('bumper_front', {'wage': 1000}), ('auto_panels', True)):
+                 ('frame', {'engine_room': 1}), ('bumper_front', {'wage': 1000})):
         hx, nx = reader._paint_actual_guard({'paint': {'total': 99080, k: v}}, pages)
-        chk(hx['paint'].get('input_type') is None and not nx, f'塗装の内訳（{k}）があるのに実額にした')
+        chk(hx['paint'].get('input_type') == '実額' and nx, f'塗装の内訳（{k}）があると実額にしていない')
 
-    # 塗装行だけのとき（「塗装費用 一式」が塗装行で読まれる書式）は実額を勧める。
-    # パネルに当てられる見積なら生成器が実額を無視して指数のままにするので、ここでは行の有無で決めない
+    # 塗装行だけのときも実額
     h4, note4 = reader._paint_actual_guard({'paint': {}}, [{'page': 1, 'paint_lines': [{'name': '塗装費用', 'wage': 200000}], 'blocks': []}])
-    chk(h4['paint'].get('input_type') == '実額' and note4, 'ページの塗装行だけのときに実額を勧めていない')
-    h4b, note4b = reader._paint_actual_guard({'paint': {'lines': [{'name': '塗装費用', 'wage': 200000}]}}, pages)
-    chk(h4b['paint'].get('input_type') == '実額' and note4b, 'header の塗装行だけのときに実額を勧めていない')
+    chk(h4['paint'].get('input_type') == '実額' and note4, 'ページの塗装行だけのときに実額にしていない')
 
-    # 合計欄の材料代が印字されている → 実額にしない
-    h4c, note4c = reader._paint_actual_guard({'paint': {'total': 99080}, 'totals': {'material': 12000}}, pages)
-    chk(h4c['paint'].get('input_type') is None and not note4c, '合計欄の材料代があるのに実額にした')
+    # 人の指定が先（実額にも指数にも勝手に変えない）
+    for want in ('指数', '参考'):
+        h5, note5 = reader._paint_actual_guard({'paint': {'total': 99080, 'input_type': want}}, pages)
+        chk(h5['paint'].get('input_type') == want and not note5, f'読み取りの input_type（{want}）を上書きした')
+    # auto_panels は日本語の真偽値でも指定できる（スキルの _flag と同じ語。Codex 第27周）
+    for v in (True, 'true', '有り', 'あり', 'はい', '○', 1):
+        h5b, note5b = reader._paint_actual_guard({'paint': {'total': 99080, 'auto_panels': v}}, pages)
+        chk(h5b['paint'].get('input_type') is None and not note5b, f'auto_panels（{v!r}）の指定を上書きした')
+    for v in (False, 'false', '無し', 'なし', 0, '', None):
+        h5c, note5c = reader._paint_actual_guard({'paint': {'total': 99080, 'auto_panels': v}}, pages)
+        chk(h5c['paint'].get('input_type') == '実額', f'auto_panels が偽（{v!r}）なのに実額にしていない')
 
-    # 読み取りの指定が先（実額にも指数にも勝手に変えない）
-    h5, note5 = reader._paint_actual_guard({'paint': {'total': 99080, 'input_type': '指数'}}, pages)
-    chk(h5['paint'].get('input_type') == '指数' and not note5, '読み取りの input_type を上書きした')
-
-    # 塗装が無い・0 円なら何もしない
+    # 塗装が無ければ何もしない
     for pa in ({}, {'paint': {}}, {'paint': {'total': 0}}):
         h6, n6 = reader._paint_actual_guard(pa, pages)
         chk((h6.get('paint') or {}).get('input_type') is None and not n6, f'塗装が無い（{pa}）のに実額を付けた')

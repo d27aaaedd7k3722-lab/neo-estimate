@@ -113,6 +113,15 @@ def write_report(case: str, est: dict, rep: dict, rows: list[dict], inspect_json
         if a is None and not b:
             continue
         L.append(f"| {label} | {'' if a is None else f'{int(a):,}'} | {'' if b is None else f'{int(b):,}'} |")
+    import unicodedata as _ud2
+    _pd2 = est.get('paint') or {}
+    _ptype = _ud2.normalize('NFKC', str(_pd2.get('input_type') or '')).strip()
+    # 実額を指定されたら生成器は必ず実額の形で書くので、そのときだけ注記する
+    if _ptype == '実額' or _pd2.get('actual') is True:
+        # 実額は総額 1 つの欄で、塗装工賃計・材料代の内訳を持てない（reference/painting.md §2）。
+        # 表の「生成」が 0 になるので、理由を添える（検算も塗装計（材料込）で見ている）
+        L += ['', '> 塗装は**実額**（総額 1 つ）で入れています。塗装工賃計・材料代は NEO に内訳を持てないので'
+                  '「生成」は 0 で、**塗装計（材料込）**で突き合わせています']
     ok_line = next((l for l in run_out.splitlines() if '見積書合計との一致' in l), '')
     L += ['', f"- 検算: {ok_line.strip() or '（run_case の出力なし）'}", f"- 明細 {len(rows)} 行（手入力 {sum(1 for r in rows if r.get('_manual'))} 行）"]
     marks_rows = [r for r in rows if str(r.get('WageByManual') or '') in ('#', '*', '@') or str(r.get('PartsPriceByManual') or '') == '*']

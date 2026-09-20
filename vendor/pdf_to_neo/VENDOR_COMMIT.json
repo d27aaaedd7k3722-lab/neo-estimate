@@ -1,10 +1,10 @@
 {
  "source": "C:\\Users\\R-T\\OneDrive - 株式会社SHOUCHIKU\\○竹下バックアップ\\【自動集計システム※作成中】\\files",
  "branch_at_sync": "pdf-to-neo",
- "commit": "ada31324f3e5c864805ada10ec66ca70cbd088bb",
- "subject": "fix: 名前の「(N個)」を数量に写した読み取りを受ける（数量が名前の個数と同じで金額が標準価格 1 つ分なら数量 1。codex-loop 第14周で合格）",
- "synced_at": "2026-09-20T02:02:32",
- "files": 108,
- "tree_sha256": "dd13aebaae6857059e7f98a993aff3e4ad9ed7e84821cdf457da85bc7c0a0d8e",
+ "commit": "50cbb6fee1e638c7073da25d04a5d51f8345175f",
+ "subject": "fix: 材料代の行を塗装工賃計からも外し、全角の別名も拾う（Codex 第27周）",
+ "synced_at": "2026-09-20T21:10:56",
+ "files": 111,
+ "tree_sha256": "752c03674c64e9ee96f092e6aa14854ad0a6a210b25c0c28742751ab3d924a0e",
  "note": "アプリ側でこの配下を書き換えない。規則の修正は files（pdf-to-neo ブランチ）で行い、tools/vendor_sync.py で取り直す"
 }

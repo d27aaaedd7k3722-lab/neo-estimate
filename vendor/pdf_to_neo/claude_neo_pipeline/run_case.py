@@ -285,9 +285,18 @@ def main(path: str, out: str = ''):
         print(f"同じ部品コード・同じ修理方法の行が複数: {', '.join(st['dup_refs'])} —— コグニはこの形を保持するが、左右・前後の取り違えがないか見直す")
     pt = est.get('totals', {})
     # 項目別の検算: 見積書に印字された部品計/工賃計/塗装計/費用計と生成値を突合（読み取りミスの検出用）
-    checks = [('部品計', 'parts', t.get('parts')), ('工賃計', 'wage', t.get('wage')),
-              ('塗装工賃計', 'paint', (t.get('paint') or 0) - (t.get('paint_material') or 0)),  # estimate.json の paint.total/ totals.paint は塗装工賃（材料別）
-              ('材料代', 'material', t.get('paint_material')), ('塗装計(材料込)', 'paint_total', t.get('paint')), ('内板骨格', 'frame', t.get('frame')),
+    # 塗装の入力方式「実額」は**総額 1 つ**の欄で、塗装工賃計と材料計の内訳を持てない（reference/painting.md §2）。
+    # そのときは内訳どうしを突き合わせず、**塗装計（材料込）**で見る（材料代を総額に含めるので工賃計・材料代は 0 になる）
+    _pd_ = est.get('paint') or {}
+    _jitsu_req = unicodedata.normalize('NFKC', str(_pd_.get('input_type') or '')).strip() == '実額'         or _flag(_pd_.get('actual'), 'paint.actual')
+    # 実額を指定されたら生成器は**必ず**実額の形で書く（内訳が残っていても、計算した塗装計を総額 1 つにする）。
+    # そのとき NEO は塗装工賃計・材料代の欄を持たない（0）ので、内訳どうしは突き合わせない（塗装計と合計で見る）
+    _jitsu_paint = _jitsu_req
+    checks = [('部品計', 'parts', t.get('parts')), ('工賃計', 'wage', t.get('wage'))]
+    if not _jitsu_paint:
+        checks += [('塗装工賃計', 'paint', (t.get('paint') or 0) - (t.get('paint_material') or 0)),  # estimate.json の paint.total/ totals.paint は塗装工賃（材料別）
+                   ('材料代', 'material', t.get('paint_material'))]
+    checks += [('塗装計(材料込)', 'paint_total', t.get('paint')), ('内板骨格', 'frame', t.get('frame')),
               ('費用部品', 'expense_parts', t.get('expense_parts')), ('費用工賃', 'expense_wage', t.get('expense_wage')),
               ('費用計', 'expense', (t.get('expense_parts') or 0) + (t.get('expense_wage') or 0)),
               ('課税小計', 'taxable', t.get('subtotal')), ('消費税', 'tax', t.get('tax'))]

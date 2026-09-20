@@ -37,7 +37,7 @@ flag = skill_env.flag  # 人が書いた真偽値欄の厳密な読み取り（�
 sys.path.insert(0, os.path.join(FILES, 'claude_neo_pipeline'))
 
 from estimate_to_neo import (AddataParts, NeoBuilder, BUMPER_DISPOSAL, BUMPER_DRAFT_ADD, COAT_CODES, DISPOSAL, HF_CODE,  # noqa: E402
-                             _xor_lines_ref, bankin_time, default_material_rate, is_bumper_only_paint, material_default, r10, r10_even, wage_unit)
+                             _xor_lines_ref, bankin_time, default_material_rate, is_bumper_only_paint, material_default, material_round_of, r10, r10_even, wage_unit)
 from paint_index import PaintIndex  # noqa: E402
 
 
@@ -443,9 +443,10 @@ def _inspect(path: str, out_json: str = '') -> int:
             wage_total_p = mat_base   # 材料率の対象 = パネル・付加塗装・内板骨格塗装の工賃（生成器と同じ。印字の塗装工賃計は追加項目を含まないので total から引くと二重に引く）
         rate = float(p.get('material_rate') or 0)
         if rate:
-            lump = material_default(wage_total_p, rate)  # コグニ既定値（10 円四捨五入）= 生成器と同じ
+            lump = material_default(wage_total_p, rate, p.get('material_round'))  # 工場の端数処理（既定 10 円四捨五入）= 生成器と同じ
             per_line = sum(int(w * rate / 100.0 + 0.5) for w in wages) + int((wage_total_p - sum(wages)) * rate / 100.0 + 0.5)  # 工場書式によくある行ごと 1 円四捨五入（内訳が無い残りは 1 行扱い）
-            print(f"   材料代: 工賃計 {wage_total_p} × {rate}% = コグニ既定(10円四捨五入) {lump} / 行ごと1円四捨五入 {per_line} / 見積 {p.get('material')}"
+            _u, _m = material_round_of(p.get('material_round'))
+            print(f"   材料代: 工賃計 {wage_total_p} × {rate}% = コグニ計算({_u}円{_m}) {lump} / 行ごと1円四捨五入 {per_line} / 見積 {p.get('material')}"
                   + ('' if (int(p.get('material') or 0) or None) in (None, lump, per_line) else ' ★どちらとも違う（読み取りか割合を確認）'))
             if ((int(p.get('material') or 0) or None) not in (None, lump, per_line) and not flag(p.get('auto_panels'), 'paint.auto_panels')  # auto_panels は材料代で工場の一式に合わせる設計（10-15）
                     and not p.get('_material_from_target')):   # 協定額に合わせて下書きが決めた材料代は既定値と違って当然
@@ -567,7 +568,7 @@ def _totals(est: dict, warn: list[str], rep: dict, form_x: str = '', labor: int 
     elif detailed:  # 生成器: 詳細塗装で material が 0/未指定なら material_rate → AnUsrTblPnt の既定率 → 26% で自動計算
         cc = coat_c if coat_c in (1, 2, 3, 4) else (_coat_code(p.get('coat', '')) or 2)
         mr = float(p.get('material_rate') or default_material_rate(_paint_code(p.get('paint', '２Ｋ')), cc, _hf_code(p.get('hf', 'しない'))) or 26)
-        material = material_default(mat_base_t, mr)  # 追加項目 paint.other は材料率の対象外。内板骨格塗装は対象
+        material = material_default(mat_base_t, mr, p.get('material_round'))  # 追加項目 paint.other は材料率の対象外。内板骨格塗装は対象
         _t_mat = (est.get('totals') or {}).get('material')
         if _t_mat is None or int(_t_mat) != material:  # 下書きが割合モードにした（印字の材料代 = 工賃計 × 割合）ときは合っているので挙げない
             warn.append(f'塗装 material 未指定: 生成器は {mr}% で {material} 円を自動計算する（見積書に材料代があるなら paint.material に入れる）')

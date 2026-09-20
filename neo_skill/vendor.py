@@ -32,7 +32,7 @@ import sys
 from typing import Optional
 
 # 取り込んでいる files（pdf-to-neo ブランチ）のコミット。tools/vendor_sync.py が取り直すときに書き換える
-EXPECTED_COMMIT = 'ada31324f3e5c864805ada10ec66ca70cbd088bb'
+EXPECTED_COMMIT = '50cbb6fee1e638c7073da25d04a5d51f8345175f'
 
 APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENDOR_ROOT = os.path.join(APP_ROOT, 'vendor', 'pdf_to_neo')

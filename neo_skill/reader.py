@@ -673,19 +673,29 @@ _PAINT_DETAIL_KEYS = ('panels', 'bumper_front', 'bumper_rear', 'bumper_base', 'f
                       'base', 'booth', 'wax', 'door_sash', 'stripe', 'low_cover', 'two_coat_solid', 'two_tone', 'auto_panels')
 
 
+# スキル（vendor draft_estimate._flag）が真として読む語。人が書いた読み取りの真偽値欄をここでも同じに読む
+_VENDOR_TRUE = ('1', 'true', 'yes', 'y', 'on', '有り', 'あり', '有', 'はい', 'する', '要', '○', '◯', '●')
+
+
+def _vendor_true(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v == 1
+    return unicodedata.normalize('NFKC', str(v or '')).strip().lower() in _VENDOR_TRUE
+
+
 def _paint_actual_guard(header: dict, pages: list) -> tuple:
-    """塗装が「一式」だけの見積は、コグニの入力方式を**実額**にする（このアプリの方針。2026-09-20 亮平さん指示）。
+    """塗装は**常に**コグニの入力方式「実額」で入れる（このアプリの方針。2026-09-20 亮平さん指示）。
     戻り値は (header, 付けた理由の文 or None)。header は直したときだけ複製を返す（読み手の写しは書き換えない）。
 
-    実額は総額を 1 つの金額で入れる方式で、印字どおり 1 行で収まる。付けないと NEO に
-    「塗装費用(工場見積)」という**印字に無い行**が 1 行できる（判断規則 10-15）。
-    下書き（vendor draft_estimate）は材料代の**割合**（material_rate）が付いているだけでも実額を見送るが、
-    割合は金額ではないので、**印字の材料代が 0 円なら実額にして構わない**
-    （本番検証 2026-09-19 のボルボ・シエンタが「材料代 0 円が別に出ている」で実額にならなかった）。
+    実額は総額を 1 つの金額で入れる方式で、**塗装費用 ＋ 材料代**をまとめて書く（下書きが内訳を畳み、
+    生成器が材料代を総額に足す）。実額にしないと NEO に「塗装費用(工場見積)」という**印字に無い行**ができる。
+    金額の合計は動かない（印字の塗装計と同じ額が 1 つの欄に入るだけ）。
 
-    付けない: 塗装の内訳（パネル・塗装行・バンパ・内板骨格・シーリング・追加項目・加算基礎・ブース 等）があるとき／
-    ページに塗装行があるとき／**材料代の金額が印字されているとき**（実額は材料計の欄を持てず、印字の材料代が消える）／
-    読み取りに input_type・actual の指定があるとき。最後は生成器が判断する（内訳があれば実額は無視される）"""
+    付けない: 読み取りに `input_type`（指数・参考）や `actual` の指定があるとき（人の指定が優先）／
+    `auto_panels`（協定でパネル別の内訳を求められる案件）のとき／塗装がどこにも無いとき。
+    なお**ベタ打ち（Addata なし）は別の経路**なので、ここは効かない（ベタ打ちは印字どおりそのまま）"""
     def _int(v) -> int:
         try:
             return int(float(str(v if v is not None else 0).replace(',', '') or 0))
@@ -696,20 +706,22 @@ def _paint_actual_guard(header: dict, pages: list) -> tuple:
     totals = header.get('totals') if isinstance(header.get('totals'), dict) else {}
     if str(paint.get('input_type') or '').strip() or _is_true(paint.get('actual')):
         return header, None            # 読み取りの指定が優先
-    if any(paint.get(k) for k in _PAINT_DETAIL_KEYS):
-        return header, None            # 塗装の内訳があるので触らない
-    if _int(paint.get('material')) > 0 or _int(totals.get('material')) > 0:
-        return header, None            # 印字の材料代は消せない（実額は材料計の欄を持てない）
+    if _vendor_true(paint.get('auto_panels')):
+        # パネル別に組み直す指定（協定で内訳が要る案件）。スキルの `_flag` と同じ語を真に読む
+        # （見落として畳むと例外案件の内訳が消える。Codex 第27周）
+        return header, None
     n_lines = len(paint.get('lines') or []) + sum(len((p or {}).get('paint_lines') or [])
                                                   for p in (pages or []) if isinstance(p, dict))
-    total = _int(paint.get('total')) or _int(totals.get('paint'))
-    if total <= 0 and not n_lines:
-        return header, None            # 塗装の金額がどこにも無い
+    has_detail = any(paint.get(k) for k in _PAINT_DETAIL_KEYS)
+    total = _int(paint.get('total')) or _int(totals.get('paint')) or _int(totals.get('paint_total'))
+    if total <= 0 and not n_lines and not has_detail:
+        return header, None            # 塗装がどこにも無い
     hdr = copy.deepcopy(header)
     hdr['paint'] = dict(hdr.get('paint') or {}, input_type='実額')
-    amt = f'（{total:,} 円）' if total > 0 else ''
-    return hdr, (f'塗装{amt}はコグニの入力方式を**実額**にする（印字どおり 1 つの金額で入る。材料代の印字は無し）。'
-                 'パネル別に組める見積では生成器が指数のままにする')
+    mat = _int(paint.get('material')) or _int(totals.get('material'))
+    amt = f'（塗装費用 {total:,} 円' + (f' ＋ 材料代 {mat:,} 円' if mat else '') + '）' if total > 0 else ''
+    return hdr, (f'塗装はコグニの入力方式を**実額**にする{amt}。'
+                 '塗装費用と材料代をまとめて総額 1 つで入れる（印字に無い「塗装費用(工場見積)」の行を作らない）')
 
 
 def _manual_rows_guard(header: dict, pages: list) -> tuple:

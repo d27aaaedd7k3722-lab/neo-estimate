@@ -501,9 +501,12 @@ def test_wage_round_1_and_material_rounding():
                     'lines': [{'name': '左 フロントフェンダパネル 取替', 'wage': 127466}]},
           'expenses': [], 'totals': {}}
     est = de.Drafter(rd).build()
-    assert est['paint'].get('material') == 20395, est['paint']      # 10 円丸めは 20,390 なので額のまま
+    # 2026-09-20: 10 円丸めで戻らない材料代も、工場の端数処理（ここでは 1 円四捨五入）を割り出して割合モードで渡す
+    assert 'material' not in est['paint'] and est['paint'].get('material_rate') == 16, est['paint']
+    assert est['paint'].get('material_round') == {'unit': 1, 'mode': '四捨五入'}, est['paint']
     rd['paint']['material'] = 20390
-    assert 'material' not in de.Drafter(rd).build()['paint']        # 10 円丸めと一致すれば割合モード
+    p2 = de.Drafter(rd).build()['paint']
+    assert 'material' not in p2 and not p2.get('material_round'), p2   # 10 円丸め（コグニ既定）と一致すれば端数処理は書かない
 
 
 def test_unit_price_fraction_rows_are_evidence():
@@ -535,8 +538,9 @@ def test_material_includes_lines_with_only_material():
     assert est['paint'].get('material') == 10000, est['paint']
     assert has(est['_draft_notes'], '塗装行の材料の合計'), est['_draft_notes']
     est2 = est_for(['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||'], {'paint': 20000, 'material': 8000}, paint)
-    assert est2['paint'].get('material') == 8000, est2['paint']      # 印字の材料計と合わなければ触らない
-    assert not has(est2['_draft_notes'], '塗装行の材料の合計'), est2['_draft_notes']
+    assert not has(est2['_draft_notes'], '塗装行の材料の合計'), est2['_draft_notes']   # 印字の材料計と合わなければ足さない
+    # 材料代 8,000 は塗装工賃計 20,000 のちょうど 40%。一括計上なので額はそのままで、割合を参考に書く（2026-09-20）
+    assert est2['paint'].get('material') == 8000 and est2['paint'].get('material_rate') == 40, est2['paint']
     # 汎用車種（塗装行を組み立てない経路）でも同じにする。片方だけ直ると「検算は合格・生成で不合格」になる
     rd_g = {'source': 't', 'issuer': '', 'est_date': '20260909', 'format': 'A', 'labor_rate': 8000,
             'vehicle': dict(VEH, generic=True),
@@ -547,7 +551,8 @@ def test_material_includes_lines_with_only_material():
     # 材料欄の写し崩れ（'1,0OO' のような値）があっても落ちない（HEAD は落ちなかった）
     paint_bad = dict(paint, lines=[dict(paint['lines'][0]), {'name': 'ｼｮｰﾄﾊﾟｰﾂ', 'material': '1,0OO'}])
     est4 = est_for(['0800|左Fﾌｪﾝﾀﾞﾊﾟﾈﾙ|取替|||1|30000|8000||'], {'paint': 20000, 'material': 10000}, paint_bad)
-    assert est4['paint'].get('material') == 8000, est4['paint']      # 読めない行があるときは触らない（検算で止まる）
+    # 読めない行があるときは材料の列を足さない（検算で止まる）
+    assert est4['paint'].get('material') == 8000, est4['paint']
 
 
 def test_accept_no_goes_to_the_policy_no_field():
@@ -767,6 +772,101 @@ def test_agreed_estimate_rows_do_not_depend_on_manual_flags():
     assert got[3][:3] == ('', '', True), got
     assert got[4][:3] == ('4600', '修理', False), got                          # コグニの区分の作業行は今までどおり照合する
     assert got[5][:3] == ('', '', True), got                                    # 名前に「再封印」: 照合せず手入力行・区分は印字どおり空
+
+
+def _paint_est(lines, paint_extra=None, totals=None):
+    """塗装行だけの小さな見積を下書きに通し、estimate の paint を返す（N-BOX JF1）"""
+    rd = {'source': 't', 'issuer': '', 'est_date': '20260920', 'format': 'B', 'labor_rate': 8000, 'vehicle': dict(VEH),
+          'blocks': [{'title': '', 'rows': ['0600|ﾌｰﾄﾞﾊﾟﾈﾙ|取替||1.0|1|50000|8000||']}],
+          'paint': dict({'paint': '2K', 'coat': 'メタリック', 'lines': lines}, **(paint_extra or {})),
+          'expenses': [], 'totals': totals or {}}
+    return de.Drafter(rd).build().get('paint') or {}
+
+
+def test_paint_frame_lines_go_to_the_frame_tab():
+    """塗装明細の「ラジエータサポート 両側新品」「フロントフェンダエプロン 片側新品または修正」は
+    コグニの内板骨格タブ（paint.frame）。外板パネルの行追加（手入力の塗装行）にしない"""
+    p = _paint_est([{'name': 'ﾎﾞﾝﾈｯﾄ 取替', 'index': 2.0, 'wage': 16000},
+                    {'name': 'ﾗｼﾞｴｰﾀｻﾎﾟｰﾄ 両側新品', 'index': 1.5, 'wage': 12000},
+                    {'name': 'ﾌﾛﾝﾄﾌｪﾝﾀﾞｴﾌﾟﾛﾝ 片側新品または修正'}])
+    fr = (p.get('frame') or {}).get('engine_room') or {}
+    assert fr.get('option') == 2 and fr.get('wage') == 12000, p
+    assert not any(pn.get('manual') for pn in (p.get('panels') or [])), p   # 手入力の塗装行にしていない
+    assert int(p.get('total') or 0) == 28000, p                            # 塗装工賃計は内板骨格塗装を含む
+
+
+def test_auto_panels_one_panel_per_area():
+    """auto_panels: 同じ部位に本体（4801 ｸｵ-ﾀﾊﾟﾈﾙ）と工賃の行（4802 ｸｵ-ﾀﾊﾟﾈﾙ(ｺｳﾁﾝ)）があっても塗装パネルは 1 枚。
+    コグニも 1 部位 1 枚しか起こさない（実案件 1,800 本の集計。2 枚だと塗装工賃が 1 枚分多くなる）"""
+    veh = {'model_code': 'NHP170', 'serial_no': 'NHP170-7207367', 'desig': '19020', 'category': '0005', 'reg_date': 'R2.2', 'color_code': '209'}
+    rows = ['4801|左 ｸｵｰﾀﾊﾟﾈﾙ|修理|||1||16000||', '4802|左 ｸｵｰﾀﾊﾟﾈﾙ(ｺｳﾁﾝ)|取替|-||1|0|||',
+            '0600|ﾌｰﾄﾞﾊﾟﾈﾙ|取替|||1|50000|16000||']
+    rd = {'source': 't', 'issuer': '', 'est_date': '20260920', 'format': 'A', 'labor_rate': 8000, 'vehicle': veh,
+          'blocks': [{'title': '', 'rows': rows}],
+          'paint': {'paint': '2K', 'coat': 'メタリック', 'total': 65000, 'auto_panels': True},
+          'expenses': [], 'totals': {}}
+    if not _has_car('W66'):
+        print('  （W66 の ADDATA が無いので飛ばす）')
+        return
+    p = de.Drafter(rd).build()['paint']
+    codes = sorted(x.get('code') for x in (p.get('panels') or []))
+    assert codes.count('4801') + codes.count('4802') == 1, p    # クオータは 1 枚だけ
+    assert '4802' not in codes, p                               # 残すのは本体の行
+    q = [x for x in p['panels'] if x.get('code') == '4801'][0]
+    assert q.get('method') == '修理' and q.get('ratio'), q       # 金額の無い「(ｺｳﾁﾝ) 取替」で新品塗装にしない
+
+
+def test_paint_frame_with_a_lump_total_is_not_counted_twice():
+    """一括計上（20.DB のパネルに当たらない）＋内板骨格塗装: 生成器は「一式 + 内板骨格塗装」を足すので、
+    一式の額から内板骨格塗装を引いておく（印字の塗装工賃計 100,000 が二重に乗らない。Codex 指摘）"""
+    p = _paint_est([{'name': '塗装一式', 'wage': 90400},
+                    {'name': 'ﾗｼﾞｴｰﾀｻﾎﾟｰﾄ 両側新品', 'index': 1.2, 'wage': 9600}], {'total': 100000})
+    assert p.get('total') == 90400 and (p.get('frame') or {}).get('engine_room', {}).get('wage') == 9600, p
+
+
+def test_lump_paint_keeps_the_material_amount():
+    """一括計上は生成器が材料代を割合から計算しない（額をそのまま書く）ので、割合モードにしない（額が消える）"""
+    p = _paint_est([{'name': '塗装一式', 'wage': 100000}], {'total': 100000, 'material': 26000})
+    assert int(p.get('material') or 0) == 26000 and p.get('material_rate') == 26, p
+
+
+def test_paint_frame_line_is_not_confused_with_a_panel():
+    """外板パネルの「フロントピラー 修理 1/2」は内板骨格にしない（区分の語が無い）"""
+    p = _paint_est([{'name': 'ﾎﾞﾝﾈｯﾄ 取替', 'index': 2.0, 'wage': 16000},
+                    {'name': 'ﾌﾛﾝﾄﾋﾟﾗｰ 修理 1/2', 'index': 1.0, 'wage': 8000}])
+    assert not p.get('frame'), p
+
+
+def test_material_rate_is_derived_from_the_printed_amount():
+    """材料代の割合が印字されていない見積でも、材料代 ÷ 塗装工賃計 から割合を割り出して費用割合モードで渡す"""
+    p = _paint_est([{'name': 'ﾎﾞﾝﾈｯﾄ 取替', 'index': 2.0, 'wage': 16000}], {'total': 16000, 'material': 4160})
+    assert p.get('material_rate') == 26 and 'material' not in p and 'material_round' not in p, p
+
+
+def test_material_round_of_the_factory_is_kept():
+    """10 円四捨五入で戻らない材料代は、工場の端数処理（10 円切り上げ など）を割り出して渡す"""
+    p = _paint_est([{'name': 'ﾎﾞﾝﾈｯﾄ 取替', 'index': 10.0, 'wage': 80230}], {'total': 80230, 'material': 22470})
+    assert p.get('material_rate') == 28 and p.get('material_round') == {'unit': 10, 'mode': '切り上げ'}, p
+
+
+def test_stale_material_round_is_dropped():
+    """転記に書かれた端数処理では印字の材料代に戻らないとき、その指定を外す
+    （残すと生成器が別の額で計算し直す。Codex 指摘）"""
+    # 80,230 × 28% = 22,464.4 → 四捨五入 22,460 / 切り上げ 22,470。印字が 22,460 なら「切り上げ」の指定は外す
+    p = _paint_est([{'name': 'ﾎﾞﾝﾈｯﾄ 取替', 'index': 10.0, 'wage': 80230}],
+                   {'total': 80230, 'material': 22460, 'material_round': '10円切り上げ'})
+    assert p.get('material_rate') == 28 and 'material_round' not in p and 'material' not in p, p
+    # 印字の材料代に戻る指定は残す（書き方は正規化されてもよい）
+    from estimate_to_neo import material_round_of
+    p2 = _paint_est([{'name': 'ﾎﾞﾝﾈｯﾄ 取替', 'index': 10.0, 'wage': 80230}],
+                    {'total': 80230, 'material': 22470, 'material_round': '10円切り上げ'})
+    assert material_round_of(p2.get('material_round')) == (10, '切り上げ') and 'material' not in p2, p2
+
+
+def test_material_that_is_not_a_percentage_stays_an_amount():
+    """割合で説明できない材料代は、今までどおり額を手入力（*）で渡す"""
+    p = _paint_est([{'name': 'ﾎﾞﾝﾈｯﾄ 取替', 'index': 2.0, 'wage': 16000}], {'total': 16000, 'material': 4163})
+    assert int(p.get('material') or 0) == 4163 and not p.get('material_rate'), p
 
 
 if __name__ == '__main__':

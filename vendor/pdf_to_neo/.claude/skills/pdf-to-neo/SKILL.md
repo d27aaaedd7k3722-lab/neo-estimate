@@ -17,6 +17,7 @@ description: 工場見積 PDF（どの書式でも）＋車検証から、コグ
 | `HANDOFF.md` | **引き継ぎの入口**。全体の地図・絶対ルール・実機で確かめた事実・落とし穴 |
 | `reference/estimate_schema.md` | estimate.json の全キーと意味・例（生成器が読むキーの正） |
 | `reference/format_catalog.md` | 届く見積書式の分類と、書式ごとの読み取り・写像規則 |
+| `reference/painting.md` | **塗装の正本**。コグニの塗装画面（塗装条件・外板パネル・バンパ・内板骨格・付加塗装・追加項目・塗装計）と NEO の表の対応、入力方式（指数 / 実額 / 参考）、明細からの自動連動、塗り数値の出どころ、内板骨格塗装、材料代の割合と端数処理、reading への書き方 |
 | `reference/judgment_rules.md` | ref 選択・左右分割・装備・板金ランク・塗装・材料代・費用分類・手入力の判断規則（根拠付き） |
 | `reference/checklist.md` | 納品前チェックリスト（検算 11 項目・コグニ画面確認・納品・記録） |
 | `reference/template_estimate.json` | 空の雛形（estimate.json を直接書くとき用） |

@@ -16,7 +16,9 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 import skill_env  # noqa: E402
 
-ROOT = os.path.join(tempfile.gettempdir(), 'pdf_to_neo_env_test')
+# 作業用のフォルダはプロセスごとに分ける。固定名だと、2 つのセッションが同時にテストを回したとき
+# 片方が消した偽の ADDATA をもう片方が探して「次の手段に進んでいない（C:\Addata）」と誤検知する（2026-09-20）
+ROOT = os.path.join(tempfile.gettempdir(), f'pdf_to_neo_env_test_{os.getpid()}')
 
 
 def _make_addata(base: str) -> str:
