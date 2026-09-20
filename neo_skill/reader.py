@@ -84,6 +84,36 @@ class RunnerError(RuntimeError):
     pass
 
 
+# 画面に出してよい行だけを拾う型（例外の名前 / File "...", line N）。ほかの行は見積書の中身が混じりうるので出さない
+_SAFE_EXC_RE = re.compile(r'^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning))\b')
+_SAFE_FILE_RE = re.compile(r'^File "([^"]*)", line (\d+)')
+
+
+def _safe_tail(lines: list) -> str:
+    """別プロセスの出力から、**例外の名前とファイル・行番号だけ**を取り出す。
+    当てはまる行が無ければ何も出さない —— 元の文には見積書の中身（氏名・登録番号・車台番号）が混じりうるので、
+    「分からなかったから生のまま出す」はしない（Codex 第28周）"""
+    keep = []
+    for raw in (lines or []):
+        t = str(raw).strip()
+        m = _SAFE_EXC_RE.match(t)
+        if m:
+            keep.append(m.group(1))
+            continue
+        m = _SAFE_FILE_RE.match(t)
+        if m:
+            keep.append(f'{os.path.basename(m.group(1))}:{m.group(2)}')
+    if not keep:
+        return '（理由は画面に出せません。見積書の中身が混じるため）'
+    # 同じものは 1 回だけ・最大 4 つ（順序は出てきた順）
+    seen, out = set(), []
+    for k in keep:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return ' / '.join(out[:4])[:200]
+
+
 def _runner(op: str, timeout: float = 300.0, addata_root: Optional[str] = None, **kw) -> dict:
     """vendor の検算関数を別プロセスで呼ぶ（_runner.py）。戻りは JSON（dict）。
     addata_root はアプリが決めた ADDATA（無ければ vendor の skill_env が設定ファイル→自動検出で決める）"""
@@ -98,8 +128,10 @@ def _runner(op: str, timeout: float = 300.0, addata_root: Optional[str] = None, 
         raise RunnerError(f'検算（{op}）を起動できない: {e}')
     line = next((l for l in reversed((p.stdout or '').splitlines()) if l.startswith(RUNNER_MARK)), '')
     if p.returncode != 0 or not line:
+        # 別プロセスの出力には見積書の中身（顧客名・登録番号・車台番号）が混じりうるので、
+        # 画面に出す文は**例外の名前と場所だけ**に絞り、数字の並びは伏せる（バグハント 2026-09-20）
         tail = (p.stderr or p.stdout or '').strip().splitlines()[-6:]
-        raise RunnerError(f'検算（{op}）が失敗（終了コード {p.returncode}）: ' + ' / '.join(t.strip() for t in tail)[:600])
+        raise RunnerError(f'検算（{op}）が失敗（終了コード {p.returncode}）: ' + _safe_tail(tail))
     try:
         return json.loads(line[len(RUNNER_MARK):])
     except ValueError as e:
@@ -369,7 +401,8 @@ def _normalise_values(out: dict, notes: Optional[list]) -> None:
                 cu['reg_no'] = ' '.join(parts)
             else:
                 cu.pop('reg_no', None)
-                note(f'見積書の登録番号「{str(rn)[:20]}」を地名・分類番号・かな・一連番号に分けられないので、車検証の値（あれば）を使う')
+                # 登録番号の値そのものは画面・報告文に載るので出さない（顧客情報。バグハント 2026-09-20）
+                note('見積書の登録番号を地名・分類番号・かな・一連番号に分けられないので、車検証の値（あれば）を使う')
         if cu.get('kilometer') not in (None, ''):
             km = _dh.parse_km(cu['kilometer'])
             if km.strip('0'):
@@ -704,12 +737,13 @@ def _paint_actual_guard(header: dict, pages: list) -> tuple:
 
     paint = header.get('paint') if isinstance(header.get('paint'), dict) else {}
     totals = header.get('totals') if isinstance(header.get('totals'), dict) else {}
-    if str(paint.get('input_type') or '').strip() or _is_true(paint.get('actual')):
-        return header, None            # 読み取りの指定が優先
-    if _vendor_true(paint.get('auto_panels')):
-        # パネル別に組み直す指定（協定で内訳が要る案件）。スキルの `_flag` と同じ語を真に読む
-        # （見落として畳むと例外案件の内訳が消える。Codex 第27周）
-        return header, None
+    # ここで見ているのは**読み手（AI）が書いた写し**なので、`input_type` や `auto_panels` が入っていても
+    # それは人の指定ではない。AI の気まぐれで実額になったりならなかったりすると、同じ見積書から違う NEO が出る。
+    # このアプリは**常に実額**なので、読み手が何を書いていても上書きする（バグハント 2026-09-20）。
+    # 人が指定する道（スキルで reading.json を直に書く）は vendor 側で今までどおり尊重される
+    _said = str(paint.get('input_type') or '').strip()
+    _said_auto = _vendor_true(paint.get('auto_panels'))
+    _over = (f'読み手が書いた入力方式「{_said}」' if _said else '') + ('・auto_panels' if _said_auto else '')
     n_lines = len(paint.get('lines') or []) + sum(len((p or {}).get('paint_lines') or [])
                                                   for p in (pages or []) if isinstance(p, dict))
     has_detail = any(paint.get(k) for k in _PAINT_DETAIL_KEYS)
@@ -717,11 +751,15 @@ def _paint_actual_guard(header: dict, pages: list) -> tuple:
     if total <= 0 and not n_lines and not has_detail:
         return header, None            # 塗装がどこにも無い
     hdr = copy.deepcopy(header)
-    hdr['paint'] = dict(hdr.get('paint') or {}, input_type='実額')
+    _p = dict(hdr.get('paint') or {}, input_type='実額')
+    _p.pop('actual', None)
+    _p.pop('auto_panels', None)          # 読み手が書いていても、このアプリでは実額に寄せる
+    hdr['paint'] = _p
     mat = _int(paint.get('material')) or _int(totals.get('material'))
     amt = f'（塗装費用 {total:,} 円' + (f' ＋ 材料代 {mat:,} 円' if mat else '') + '）' if total > 0 else ''
     return hdr, (f'塗装はコグニの入力方式を**実額**にする{amt}。'
-                 '塗装費用と材料代をまとめて総額 1 つで入れる（印字に無い「塗装費用(工場見積)」の行を作らない）')
+                 '塗装費用と材料代をまとめて総額 1 つで入れる（印字に無い「塗装費用(工場見積)」の行を作らない）'
+                 + (f'。{_over}は使わない（このアプリは常に実額）' if _over else ''))
 
 
 def _manual_rows_guard(header: dict, pages: list) -> tuple:

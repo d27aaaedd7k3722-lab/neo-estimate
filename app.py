@@ -9003,6 +9003,17 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded"
     )
+    # 放置された作業フォルダ（顧客情報を含む reading.json 入り）を、**どの経路で使っても**掃除する。
+    # 以前は「PC の Addata をこの画面から使う」を開いたときしか掃除しておらず、車種フォルダ待ちのまま
+    # タブを閉じられると残っていた（バグハント 2026-09-20）。1 セッションにつき数分に 1 回だけ走らせる
+    try:
+        _sw_last = float(st.session_state.get('_case_sweep_at') or 0)
+        if time.time() - _sw_last > 300:
+            st.session_state['_case_sweep_at'] = time.time()
+            from neo_skill import maker as _nsk_sweep
+            _nsk_sweep.sweep_case_dirs()
+    except Exception:  # noqa: BLE001  掃除で画面を止めない
+        pass
     if APP_PASSCODE and not st.session_state.get('_passcode_ok'):
         st.markdown("### 🔒 合言葉")
         _pc = st.text_input("このアプリの合言葉を入力してください", type="password", key="app_passcode_input")
@@ -9625,8 +9636,14 @@ def main():
             # 同じファイルで再実行するたびに展開し直さないよう、
             # 何を展開済みかを名前とサイズで覚えておく。別のZIPが
             # 選ばれたら、前の展開先を消してから入れ替える。
-            _zip_id = (f'{_addata_zip.name}:{_addata_zip.size}'
-                       if _addata_zip is not None else None)
+            # 名前と大きさだけだと、**同じ名前・同じ大きさの別版**に差し替えても展開し直さず、
+            # 前の Addata（別のデータ版）で部品コード・指数を引いてしまう。中身のハッシュで見分ける（バグハント 2026-09-20）
+            _zip_id = None
+            if _addata_zip is not None:
+                try:
+                    _zip_id = f'{_addata_zip.name}:{_addata_zip.size}:{hashlib.sha256(_addata_zip.getvalue()).hexdigest()[:16]}'
+                except Exception:  # noqa: BLE001  読めないときは名前と大きさで（展開のところで失敗が出る）
+                    _zip_id = f'{_addata_zip.name}:{_addata_zip.size}'
             if _zip_id and st.session_state.get('_addata_zip_id') != _zip_id:
                 _discard_uploaded_addata()
                 with st.spinner("Addataを展開しています…"):
@@ -9718,6 +9735,9 @@ def main():
             st.session_state[_k] = _v
         st.markdown("---")
         st.header("💰 費用（Expense）")
+        # ここに入れても見積書 PDF からの生成では NEO に入らない（印字された費用だけを写す）。
+        # 知らずに入れて「反映されない」と思われるので、欄のすぐ上で断る（2026-09-20 使う人の立場での点検）
+        st.caption("⚠️ この欄は**見積書 PDF からの生成では使いません**（見積書に印字された費用だけを NEO に写します）。Addata なしの「ベタ打ちで生成」でだけ、そこに出るチェックを入れたときに使われます。")
         exp_towing    = st.number_input("レッカー費用（税抜）",  value=st.session_state.get('exp_towing', 0),    min_value=0, step=1000, key=f'exp_towing_input_{_fseq}')
         exp_rental    = st.number_input("代車費用（税抜）",      value=st.session_state.get('exp_rental', 0),    min_value=0, step=1000, key=f'exp_rental_input_{_fseq}')
         exp_exempt    = st.number_input("非課税費用",            value=st.session_state.get('exp_exempt', 0),    min_value=0, step=1000, key=f'exp_exempt_input_{_fseq}')
@@ -9889,35 +9909,13 @@ def main():
                 'AI が<b>印字どおり</b>に写し、機械検算に通れば <b>NEO と確認箇所シート（xlsx）</b>を組でお渡しします。'
                 '<b>合計を合わせるための金額調整はしません</b>。</div>'
                 '</div>', unsafe_allow_html=True)
-        with st.expander("このアプリが何をするか（詳しく）", expanded=False):
-            st.markdown(
-                "- 見積書を AI（Claude または Gemini。下で選びます）が**印字どおり**に写し、ページごとに機械検算して"
-                "落ちたページだけ読み直します\n"
-                "- 部品コード・標準品番・指数・塗装・費用の判断と NEO の生成・検算は **pdf-to-neo スキル**"
-                "（コグニ実機で確かめた判断規則）がそのまま行います\n"
-                "- 検算に通れば NEO と**確認箇所シート（xlsx）**を組でお渡しします。通らなかったときも、"
-                "**印字との違いを添えて「_要確認」の NEO** をお渡しします（直してからお使いください）\n"
-                "- **合計を合わせるための金額調整はしません**（見積書に印字された金額がすべてです）"
-                + (f"\n- スキル: commit `{_nsk_commit}` ／ アプリ側 neo_skill: `{_nsk_code_stamp()}`" if _nsk_commit else ""))
-        # 税区分のラジオは下の CSV 取り込みが session_state['tax_override'] を読むので残す。
-        # この経路（PDF→NEO）は見積書の合計欄から税込印字を見分ける（reading_schema.md）ので使わない。
+        # 説明のたたみ（このアプリが何をするか・金額表記の設定）は**結果より下**に置く。
+        # 主導線（見積書を入れる → 生成 → 受け取る）の上に置くと、生成後のダウンロードが画面の外に出ていた
+        # （2026-09-20 実測: ダウンロードが y=1013 で画面 950px の外）。ここでは値だけ読む
         _pdf_tax_options = ['税抜き（外税）', '税込み（内税）']
         _saved_pdf_tax = st.session_state.get('pdf_tax_override',
                                               st.session_state.get('tax_override', '税抜き（外税）'))
-        _pdf_tax_idx = 1 if ('内税' in str(_saved_pdf_tax) or '税込' in str(_saved_pdf_tax)) else 0
-        # この経路（見積書 PDF → NEO）では使わない設定なので、主導線から外してたたんでおく（2026-09-20 画面の作り直し）
-        with st.expander(f"💴 金額表記の設定（いまは {_saved_pdf_tax}）— CSV 取り込み・ベタ打ちのときだけ使います", expanded=False):
-            st.caption("見積書 PDF からの生成では、見積書の合計欄から税込・税抜を自動で見分けるので、この設定は使いません。")
-            _pdf_tax_sel = st.radio(
-                "見積書の金額表記",
-                options=_pdf_tax_options,
-                index=_pdf_tax_idx,
-                horizontal=True,
-                key='pdf_tax_radio',
-                label_visibility='collapsed',
-            )
-        st.session_state['pdf_tax_override'] = _pdf_tax_sel
-        st.session_state['tax_override'] = _pdf_tax_sel
+        _pdf_tax_sel = _saved_pdf_tax
 
         _p2n_file = st.file_uploader(
             "📄 見積書（PDF・写真）をここにドロップ、またはクリックして選択",
@@ -10030,13 +10028,7 @@ def main():
             _p2n_file_key = f"{_p2n_file.name}|{len(_p2n_bytes)}|{hashlib.sha256(_p2n_bytes).hexdigest()}"
             _p2n_beta_ui_shown = False   # この run でベタ打ちの UI を描いたか（Addata なしの枝で立てる。結果の下の逃げ道と二重に描かない）
             # ファイル名・大きさは上の入れ物に出ているので、ここでは繰り返さない（2026-09-20 画面の作り直し）
-            with st.expander("サイドバーの入力はどう使われるか", expanded=False):
-                st.markdown(
-                    "- **事故・保険情報**（証券番号・契約者名・事故日・受付番号・代理店・アジャスター・入出庫日・修理日数）は、"
-                    "見積書に印字が無ければ NEO に補われます\n"
-                    "- **費用（Expense）欄はこの経路では使いません** — 見積書に印字された費用だけを写します"
-                    "（印字に無い費用を足すと、原本との照合が崩れるため）\n"
-                    "- Addata なしの「ベタ打ちで生成」だけは、そこに出るチェックを入れたときに限りサイドバーの費用を NEO に入れます")
+            # 「サイドバーの入力はどう使われるか」は結果より下に置いた（主導線を短くする。2026-09-20 使い勝手の点検）
             if not _nsk_ready:
                 st.error("❌ pdf-to-neo スキル（vendor/pdf_to_neo）が使えません: " + _nsk_why
                          + "  → `python tools/vendor_sync.py --source <files> --commit <ID>` で取り込み、"
@@ -10076,7 +10068,7 @@ def main():
                     st.session_state['_p2n_reader_label'] = _p2n_pick
                 else:
                     _p2n_kind = _p2n_choices[0][0]
-                    st.caption(f"読み取りに使う AI: {_p2n_choices[0][1]}")
+                    # 使う AI は上の帯（モデル: …）に出ているので繰り返さない（2026-09-20 使い勝手の点検）
                 _p2n_key = claude_api_key if _p2n_kind == 'claude' else api_key
                 _p2n_model = '' if _p2n_kind == 'claude' else selected_model
                 from neo_skill import bridge as _br
@@ -10139,8 +10131,13 @@ def main():
                     st.rerun()
                 if (_att_cap := _attached_docs_caption(api_key, selected_model)):
                     st.caption(_att_cap)
-                if st.button("🚀 見積書からNEOを生成", key='pdf2neo_run', type="primary",
-                             width='stretch'):
+                # すでにこの見積書の NEO ができているなら、ボタンは「作り直す」と分かる形にする。
+                # 押すと AI の読み取りからやり直すので、結果が前と変わることがある（バグハント 2026-09-20）
+                _p2n_again = bool(_p2n_give_now)
+                if st.button(("🔄 もう一度作り直す（AI で読み直します）" if _p2n_again else "🚀 見積書からNEOを生成"),
+                             key='pdf2neo_run', type="primary", width='stretch',
+                             help=("できあがった NEO は下にあります。作り直すと読み取りからやり直すので、"
+                                   "読み取りのゆれで結果が変わることがあります" if _p2n_again else None)):
                     _p2n_skew = sync_app_modules()   # push 後にプロセスが残る本番で古い neo_skill を使わない（ベタ打ちと同じ扱い。バグハント H4）
                     if _p2n_skew:
                         st.error(_version_skew_message(_p2n_skew))
@@ -10399,6 +10396,33 @@ def main():
                 st.info("ℹ️ pdf-to-neo スキルの経路では NEO を作れませんでした。部品コード・標準指数の無い **ベタ打ち** で作る手もあります"
                         "（明細・金額・品名は見積書のとおり。合計に合わせる金額調整の行が入ることがあるので、結果の警告を確かめてください）。")
                 _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_early_key, api_key, selected_model, _pdf_tax_sel, fallback=True)
+
+        # ── 説明（ふだんは読まない）: 主導線と結果の下に置く（2026-09-20 使い勝手の点検） ──────────
+        with st.expander("このアプリが何をするか（詳しく）", expanded=False):
+            st.markdown(
+                "- 見積書を AI（Claude または Gemini。上で選びます）が**印字どおり**に写し、ページごとに機械検算して"
+                "落ちたページだけ読み直します\n"
+                "- 部品コード・標準品番・指数・塗装・費用の判断と NEO の生成・検算は **pdf-to-neo スキル**"
+                "（コグニ実機で確かめた判断規則）がそのまま行います\n"
+                "- 検算に通れば NEO と**確認箇所シート（xlsx）**を組でお渡しします。通らなかったときも、"
+                "**印字との違いを添えて「_要確認」の NEO** をお渡しします（直してからお使いください）\n"
+                "- **合計を合わせるための金額調整はしません**（見積書に印字された金額がすべてです）"
+                + (f"\n- スキル: commit `{_nsk_commit}` ／ アプリ側 neo_skill: `{_nsk_code_stamp()}`" if _nsk_commit else ""))
+        with st.expander("サイドバーの入力はどう使われるか", expanded=False):
+            st.markdown(
+                "- **事故・保険情報**（証券番号・契約者名・事故日・受付番号・代理店・アジャスター・入出庫日・修理日数）は、"
+                "見積書に印字が無ければ NEO に補われます\n"
+                "- **費用（Expense）欄はこの経路では使いません** — 見積書に印字された費用だけを写します"
+                "（印字に無い費用を足すと、原本との照合が崩れるため）\n"
+                "- Addata なしの「ベタ打ちで生成」だけは、そこに出るチェックを入れたときに限りサイドバーの費用を NEO に入れます")
+        _pdf_tax_idx = 1 if ("内税" in str(_saved_pdf_tax) or "税込" in str(_saved_pdf_tax)) else 0
+        with st.expander(f"💴 金額表記の設定（いまは {_saved_pdf_tax}）— CSV 取り込み・ベタ打ちのときだけ使います", expanded=False):
+            st.caption("見積書 PDF からの生成では、見積書の合計欄から税込・税抜を自動で見分けるので、この設定は使いません。")
+            _pdf_tax_pick = st.radio(
+                "見積書の金額表記", options=_pdf_tax_options, index=_pdf_tax_idx, horizontal=True,
+                key="pdf_tax_radio", label_visibility="collapsed")
+        st.session_state["pdf_tax_override"] = _pdf_tax_pick
+        st.session_state["tax_override"] = _pdf_tax_pick
 
         # ================================================================
         # STEP 1-B: 車検証・テンプレートNEO（任意）

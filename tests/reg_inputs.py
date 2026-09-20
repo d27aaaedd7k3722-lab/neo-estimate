@@ -485,22 +485,40 @@ def test_paint_actual_guard():
     h4, note4 = reader._paint_actual_guard({'paint': {}}, [{'page': 1, 'paint_lines': [{'name': '塗装費用', 'wage': 200000}], 'blocks': []}])
     chk(h4['paint'].get('input_type') == '実額' and note4, 'ページの塗装行だけのときに実額にしていない')
 
-    # 人の指定が先（実額にも指数にも勝手に変えない）
-    for want in ('指数', '参考'):
+    # **読み手（AI）が書いた指定には従わない**。このアプリは常に実額（同じ見積書から違う NEO を出さない。
+    # バグハント 2026-09-20）。人が指定する道（スキルで reading.json を直に書く）は vendor 側で尊重される
+    for want in ('指数', '参考', '実額'):
         h5, note5 = reader._paint_actual_guard({'paint': {'total': 99080, 'input_type': want}}, pages)
-        chk(h5['paint'].get('input_type') == want and not note5, f'読み取りの input_type（{want}）を上書きした')
-    # auto_panels は日本語の真偽値でも指定できる（スキルの _flag と同じ語。Codex 第27周）
-    for v in (True, 'true', '有り', 'あり', 'はい', '○', 1):
+        chk(h5['paint'].get('input_type') == '実額' and note5, f'読み手の input_type（{want}）に引きずられた')
+    for v in (True, 'true', '有り', 'あり', 'はい', '○', 1, False, 'false', 0, '', None):
         h5b, note5b = reader._paint_actual_guard({'paint': {'total': 99080, 'auto_panels': v}}, pages)
-        chk(h5b['paint'].get('input_type') is None and not note5b, f'auto_panels（{v!r}）の指定を上書きした')
-    for v in (False, 'false', '無し', 'なし', 0, '', None):
-        h5c, note5c = reader._paint_actual_guard({'paint': {'total': 99080, 'auto_panels': v}}, pages)
-        chk(h5c['paint'].get('input_type') == '実額', f'auto_panels が偽（{v!r}）なのに実額にしていない')
+        chk(h5b['paint'].get('input_type') == '実額' and 'auto_panels' not in h5b['paint'],
+            f'読み手の auto_panels（{v!r}）に引きずられた')
+    h5d, _ = reader._paint_actual_guard({'paint': {'total': 99080, 'actual': True}}, pages)
+    chk(h5d['paint'].get('input_type') == '実額' and 'actual' not in h5d['paint'], 'actual の指定が残っている')
 
     # 塗装が無ければ何もしない
     for pa in ({}, {'paint': {}}, {'paint': {'total': 0}}):
         h6, n6 = reader._paint_actual_guard(pa, pages)
         chk((h6.get('paint') or {}).get('input_type') is None and not n6, f'塗装が無い（{pa}）のに実額を付けた')
+
+
+
+def test_safe_tail_keeps_no_customer_data():
+    """検算（別プロセス）の出力から画面に出すのは、例外の名前とファイル:行だけ（顧客情報を出さない。2026-09-20）"""
+    got = reader._safe_tail(['Traceback (most recent call last):',
+                             '  File "C:/x/run_case.py", line 42, in main',
+                             'ValueError: 契約者 ｹﾝｼｮｳﾀﾛｳ の登録番号 北九州 300 あ 1234 が読めない'])
+    chk('run_case.py:42' in got and 'ValueError' in got, f'例外の名前・場所が出ていない: {got}')
+    for ng in ('ｹﾝｼｮｳﾀﾛｳ', '北九州', '1234', '契約者'):
+        chk(ng not in got, f'画面に出してはいけない語が残っている（{ng}）: {got}')
+    # 当てはまる行が無ければ**何も出さない**（生のまま出す逃げ道を作らない）
+    for lines in ([], ['顧客名: ｹﾝｼｮｳﾀﾛｳ'], ['登録番号 北九州 300 あ 1234'], ['ただのメモ']):
+        g2 = reader._safe_tail(lines)
+        chk('出せません' in g2, f'生の出力が漏れている: {g2}')
+    _rp = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'neo_skill', 'reader.py')
+    chk(chr(8) not in io.open(_rp, encoding='utf-8').read(),
+        '正規表現に制御文字（\b のつもりの U+0008）が入っている')
 
 
 if __name__ == '__main__':
