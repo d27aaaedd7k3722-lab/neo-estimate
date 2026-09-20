@@ -7911,6 +7911,64 @@ def p2n_read(pdf_bytes, file_name, api_key, mime_type='application/pdf',
         raise
 
 
+# 検算表の見出し。2 列目（見積書）は税込のとき名前が変わるが、3 列目は必ず「生成」。
+# 「| 項目 | … | … |」だけで見ると、ほかの 3 列の表を検算表と取り違える（Codex 第31周 P1）
+_TBL_HEAD_RE = re.compile(r'^\|\s*項目\s*\|[^|\n]*\|\s*生成\s*\|[ \t]*$', re.M)
+_PAINT_ROW_RE = re.compile(r'^\|\s*塗装計（材料込）\s*\|([^|]*)\|([^|]*)\|', re.M)
+# NFKC 後（＋ → +、全角カンマ → ,）で見る。材料代は印字が無ければ注記にも出ない（Codex 第31周 P2）
+_PAINT_NOTE_RE = re.compile(r'塗装費用\s*([\d,]+)\s*円(?:\s*\+\s*材料代\s*([\d,]+)\s*円)?')
+# 「＋材料代」と書いてあるのに数字が読めないときは、塗装費用だけ拾って 0 円扱いにしない（Codex 第32周）
+_PAINT_MAT_RE = re.compile(r'塗装費用\s*[\d,]+\s*円\s*\+\s*材料代')
+_YEN_RE = re.compile(r'-?\d+')
+
+
+def _yen(s):
+    """表の升目・注記の金額を整数にする。数字でなければ None（全角・カンマ・「円」を均す。Codex 第30周）"""
+    t = unicodedata.normalize('NFKC', str(s or '')).replace(',', '').replace('円', '').strip()
+    return int(t) if _YEN_RE.fullmatch(t) else None
+
+
+def _paint_made_total(base: str):
+    """報告文の**検算表**（`| 項目 | 見積書 | 生成 |`）から、NEO に入った塗装計（材料込）を読む。
+
+    表を見出しから 1 つずつ切り出して見る（報告文のどこかに同じ名前の行があっても拾わない）。
+    表がいくつもある報告文では**最後の表**＝納品した NEO の表を採る（Codex 第30周 P1）"""
+    made = None
+    for h in _TBL_HEAD_RE.finditer(base or ''):
+        rows = []
+        for line in re.sub(r'^\r?\n', '', base[h.end():]).splitlines():   # 見出しの行末の改行を落としてから次の行へ
+            if not line.strip().startswith('|'):
+                break                      # 表はここで終わり
+            rows.append(line)
+        m = _PAINT_ROW_RE.search(chr(10).join(rows))
+        if m:
+            made = _yen(m.group(2))        # 2 列目 ＝ 「生成」（NEO に入った額）
+    return made
+
+
+def _paint_note_with_real_total(note: str, base: str) -> str:
+    """「実額にする（塗装費用 X 円 ＋ 材料代 Y 円）」の注記に、**NEO に実際に入る塗装計**を添える。
+
+    この注記は生成の**前**（読み取りの写しを直すとき）に書くので、印字の塗装費用と材料代しか知らない。
+    コグニの塗装計には内板骨格塗装・付加塗装・追加項目も入るので、実額の総額が X+Y より大きくなる案件がある
+    （2026-09-20 本番のバグハント: 印字 76,000＋21,280 = 97,280 に対し NEO は 104,660 だった）。
+    報告文の検算表に出ている「塗装計（材料込）」の**生成**側が NEO に入る額なので、食い違うときだけ添える"""
+    t = unicodedata.normalize('NFKC', str(note or ''))
+    m = _PAINT_NOTE_RE.search(t)
+    if not m or (_PAINT_MAT_RE.search(t) and not m.group(2)):
+        return note        # 「＋材料代」と書いてあるのに数字が読めないときは触らない
+    x = _yen(m.group(1))
+    y = _yen(m.group(2)) if m.group(2) else 0      # 材料代の印字が無い見積では注記にも出ない
+    made = _paint_made_total(base)
+    if x is None or y is None or made is None or made == x + y:
+        return note        # 読めない・合っているときは何も足さない（0 円は「読めない」ではない）
+    said = x + y
+    # 差の中身は案件で違う（材料代・内板骨格塗装・付加塗装・追加項目）。どれと言い切らず、入りうるものを並べる
+    return note + (f'。**NEO に入る塗装計（材料込）は {made:,} 円**です'
+                   f'（コグニの塗装計には材料代・内板骨格塗装・付加塗装・追加項目も入るため、'
+                   f'印字の塗装費用{"＋材料代" if y else ""} {said:,} 円と {abs(made - said):,} 円ちがいます）')
+
+
 def _with_app_notes(md, notes) -> str:
     """報告文の末尾に、アプリ側が読み取りの写しに書いた指定（塗装の実額・読み手の M を外した 等）を残す。
     画面の「読み取りの注意」にも出るが、**納品する報告文にも残す**（あとから何をしたか追えるように。2026-09-20 本番のバグハント）。
@@ -7923,7 +7981,7 @@ def _with_app_notes(md, notes) -> str:
     if head in base:
         return md          # 同じ報告文に二度足さない（要確認の逃げ道で二度通ることがある）
     nl = chr(10)
-    body = nl.join('- ' + n for n in notes)
+    body = nl.join('- ' + _paint_note_with_real_total(n, base) for n in notes)
     return base.rstrip(nl) + nl + nl + head + nl + body + nl
 
 
@@ -10351,7 +10409,9 @@ def main():
                             "工場は端数のまま合計するので、行ごとに円で足すコグニとは数円ずれます。"
                             "**明細の金額は見積書のとおり**で、差の理由は報告文と確認箇所シートの「要確認」に入れてあります。")
                 # 注意が何件もあるとダウンロードのボタンが下へ追いやられるので、2 件以上はたたんで置く（中身は変えない。2026-09-20）
-                _p2n_warns = list(_p2n_rd.get('warn') or [])
+                # 塗装の実額の注記だけは、**NEO に実際に入る塗装計**を添える（印字の塗装費用＋材料代と食い違う案件がある）
+                _p2n_warns = [_paint_note_with_real_total(_w, _p2n_res.get('report_md') or '')
+                              for _w in (_p2n_rd.get('warn') or [])]
                 if len(_p2n_warns) >= 2:
                     with st.expander(f"⚠️ 読み取りの注意 {len(_p2n_warns)} 件（金額には影響しません。内容を確かめたいとき）", expanded=False):
                         for _w in _p2n_warns:
