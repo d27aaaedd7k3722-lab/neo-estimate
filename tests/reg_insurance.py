@@ -398,7 +398,55 @@ chk(app._p2n_inputs_signature('f1', _st9, beta=True) != app._p2n_inputs_signatur
 chk(app._p2n_inputs_signature('f1', _st9) == app._p2n_inputs_signature('f1', dict(_st9, custom_neo_bytes=b'tpl', pdf_tax_radio='税込み（内税）')),
     '9o2: スキル経路はテンプレート・税区分の選択を見ない（Codex 78）')
 chk(app._p2n_inputs_signature('f1', _st9, beta=True) != app._p2n_inputs_signature('f1', dict(_st9, pdf_tax_radio='税込み（内税）'), beta=True), '9o3: ベタ打ちは税区分が違えば指紋が違う')
-chk(_app_src.count('st.caption(_attached_docs_caption(api_key, selected_model))') == 2, '9k: 添付の案内が読めたかで出ていない（2 か所）')
+_n9k = _app_src.count('(_att_cap := _attached_docs_caption(api_key, selected_model))')
+chk(_n9k == 2 and _app_src.count('st.caption(_att_cap)') == 2, f'9k: 添付の案内が読めたかで出ていない（2 か所）: {_n9k}')
+chk("return ''" in inspect.getsource(app._attached_docs_caption).split('if fv is None and fd is None:')[1][:160],
+    '9k2: 何も添えていないときに添付の案内を出している（画面作り直し 2026-09-20。案内は「任意の書類を添える」の見出しに出る）')
+# 上の案内カードは 3 通り（要確認の NEO・合格・まだ）。要確認を「まだ生成していない」扱いにすると、帯（3 段目）と食い違う（Codex 第17周）
+_9m_card = _app_src.split("_p2n_card_res = st.session_state.get('pdf2neo_result') or {}")[1][:1800]
+chk("_p2n_card_res.get('unverified_neo')" in _9m_card and '_要確認' in _9m_card and "elif _p2n_give_now and _p2n_card_res.get('ok')" in _9m_card,
+    '9m: 「_要確認」の NEO を渡すときの案内カードが無い（帯は「NEO を受け取る」なのに「入れて押すだけ」と出る）')
+chk("out['total'] = cells[1] or cells[2]" in inspect.getsource(app._p2n_summary),
+    '9m2: まとめの帯の合計に生成側の額を出している（印字＝見積書の額が正。Codex 第17周）')
+_9m3 = app._p2n_summary('| 合計（税込） | 208,450 | 208,447 |')
+chk(_9m3['total'] == '208,450' and _9m3['total_made'] == '208,447', f'9m3: 印字と生成が違うときの拾い方が違う: {_9m3}')
+chk(app._p2n_summary('| 合計（税込） | 208,450 | 208,450 |')['total_made'] == '', '9m4: 印字と生成が同じなのに生成側も出している')
+# 画面の CSS: 入れたファイルを外す ✕ は、ドロップ欄の小さな文字・span の一括非表示に巻き込まれないこと
+# （2026-09-20 実画面のバグハントで、外せなくなっていた。Streamlit 1.63 では ✕ の中身は svg だが、版が上がって span になっても消えないように）
+chk('[data-testid="stFileUploaderDropzone"] [data-testid="stFileChipDeleteBtn"] span' in _app_src
+    and 'display:revert !important' in _app_src,
+    '9r: ✕ の中身（span）を戻す指定が無い（一括非表示と同じ強さで書かないと勝てない。Codex 第19周）')
+chk("_p2n_render_summary(_p2n_res.get('report_md'), stale=bool(_p2n_res.get('stale')))" in _app_src
+    and 'total-strip-stale' in _app_src,
+    '9s: 前の入力で作った結果の帯を、いまの見積書の数字と同じ見た目で出している（Codex 第19周）')
+chk('small:not([data-testid="stFileChipDeleteBtn"]):not([data-testid="stFileUploaderDeleteBtn"])' in _app_src,
+    '9r2: 小さな文字の一括非表示が ✕ を除いていない')
+chk('[data-testid="stFileUploaderDropzone"] [data-testid="stBaseButton-borderlessIcon"] { display:none !important; }' in _app_src,
+    '9r3: 見積書は 1 件だけなのに「＋（追加）」のボタンを出している（アイコンだけ消えて 4×4 の点になる）')
+# たたみ（expander）の入れ子を作らない: 1.63 では動くが、中身が読みづらく、版によっては例外になる（Codex 第20/21周）
+import ast as _ast  # noqa: E402
+
+
+def _nested_expanders(src):
+    def _is_exp(n):
+        return isinstance(n, _ast.With) and any(
+            isinstance(i.context_expr, _ast.Call) and getattr(i.context_expr.func, 'attr', '') == 'expander' for i in n.items)
+    found = []
+
+    def _walk(node, stack):
+        for ch in _ast.iter_child_nodes(node):
+            if _is_exp(ch):
+                if stack:
+                    found.append((ch.lineno, stack[-1]))
+                _walk(ch, stack + [ch.lineno])
+            else:
+                _walk(ch, stack)
+    _walk(_ast.parse(src), [])
+    return found
+
+
+_nest = _nested_expanders(_app_src)
+chk(not _nest, f'9t: たたみの入れ子がある（中の行 → 外の行）: {_nest[:3]}')
 
 # ── 10. 実機テスト（2026-09-15）とバグハント D/E/F の採用分 ──────────────────
 # R1: 工賃欄が空欄の行

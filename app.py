@@ -8198,6 +8198,28 @@ def run_pdf_to_neo_skill(pdf_bytes, file_name, api_key, mime_type='application/p
     return p2n_make(state, addata_root=addata_root, record_profile=record_profile, progress=progress)
 
 
+# Gemini に見積書を CSV 化させるときの指示文（画面の「プロンプトをコピー」で渡す。関数の中に置くと節ごとたためないのでここに出した）
+_CSV_PROMPT = """添付の自動車修理見積書PDFを、以下のCSV形式で全明細行を転写してください。
+【出力形式（ヘッダー行必須）】 品名,区分,数量,部品金額,工賃,部品コード
+【各列の抽出・加工ルール】
+* 品名：元の記載から「取替」「脱着」「修理」「鈑金」「塗装」などの作業を示す文言（後述の区分ルールに該当する語）を削除した、純粋な部品名・対象名。
+* 区分：元の記載から下記のいずれか1語を割り当てる。上に書いたものほど優先する。 【最優先・空欄】「研磨」「磨き」「写真代」「ショートパーツ」を含む行は空欄にする。**部品金額だけの行でも空欄のまま**（「取替」にしない）。ただし「磨き調整」は区分なので次の行を採る。 【重要】次の語群は**見積書に書かれていた語をそのまま**出すこと（言い換えない）: 「脱着修理」「脱着鈑金」「脱着板金」／「点検調整」「点検清掃」／「分解調整」「分解清掃」／「鈑金」「板金」。この文字列は帳票の「修理方法」欄にそのまま印字されるため。 ・磨き調整：「磨き調整」 ・取替：「取替」「交換」「取換」（※部品金額のみで工賃0の行も「取替」とする。ただし上の空欄ルールに当たる行を除く） ・脱着：「脱着」「取外」「取付」「組付」 ・塗装：「塗装」「ペイント」「ワックス」「加算」「ブース」 ・分解調整：単に「分解」とだけ書かれている場合 ・点検：「点検」「診断」 ・調整：「調整」「光軸」「フィッティング」「コーディング」「設定」「消去」 ・修理：「修理」「補修」「修正」「穴あけ」「シーリング」 ・該当なし：空欄
+* 数量：見積書の数量（半角。整数でなければ 2.5 のようにそのまま。空欄や不明な場合は 1 を補完）
+* 部品金額：「部品、油脂」列の金額。半角整数・カンマなし（記載なしは 0）
+* 工賃：「技術料」列の金額。半角整数・カンマなし（記載なしは 0）
+* 部品コード：品番・部品番号（記載なしは空欄）
+【データ処理の重要ルール（高速化・精度向上）】
+1. 1行1明細：1つの項目に「部品、油脂」「技術料」両方の金額がある場合も、見積書と同じ1行のまま部品金額と工賃の両方を書く（2行に分けない。行数を見積書と同じにする）。
+2. 品名などにカンマ（,）が入るときは、その欄を「"」で囲む。金額にはカンマを入れない。
+3. 列の厳密照合：金額が部品列か技術料列か、PDFの表ヘッダーを厳密に確認する（例：「ショートパーツ」等、技術料列のみの数値を部品列に入れない）。
+4. 対象外：合計行、小計行、消費税行は出力しない。全ページ・全明細行を漏れなく処理する。
+【合計額の自動検算と出力】 明細抽出後、内部で以下の検算を実施すること。
+1. 抽出した全明細の「部品金額」の合計と「工賃」の合計を算出。
+2. 見積書原本の最終的な「部品代合計」「技術料（工賃）合計」と照合。
+3. 不一致の場合のみ、CSVの末尾に改行して以下を出力（一致時は出力しない）。行全体を「"」で囲むこと。 "部品相違〇,〇〇〇円 工賃相違●,●●●円"
+出力はCSVデータおよび相違確認結果のみ。説明文・コメントは一切不要。"""
+
+
 def _md_literal(text) -> str:
     """vendor の報告文・検算の理由・読み取りの注意を Markdown として描くときの逃がし（バグハント 3 回目 Q8）。
     「45,000(*)」が 2 つある行で間が斜体になり手入力の印が消える、「印字 $ / 生成 #*」の $ … $ が数式になる、
@@ -8209,8 +8231,77 @@ def _md_literal(text) -> str:
     return s
 
 
+def html_escape(s) -> str:
+    """画面に HTML で出す値の逃がし（パスや名前に < > & " が入っても表示が壊れない）"""
+    return (str(s if s is not None else '')
+            .replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;'))
+
+
+def _p2n_summary(report_md) -> dict:
+    """報告文から「ひと目で見たい数字」だけ拾う（車両・合計・明細の行数・レバーレート）。読めない項目は空のまま。
+    顧客名・登録番号・車台番号は報告文に載らない（スキルが書かない）ので拾わない"""
+    out = {'vehicle': '', 'total': '', 'total_made': '', 'total_is_printed': False, 'rows': '', 'manual': '', 'rate': ''}
+    for ln in str(report_md or '').splitlines():
+        s = ln.strip()
+        s = re.sub(r'^[-*・]\s+', '', s)      # 報告文は Markdown の箇条書き（「- 車両: …」）
+        s = re.sub(r'^\*\*(.+?)\*\*', r'\1', s)
+        if s.startswith('車両:') and not out['vehicle']:
+            out['vehicle'] = s.split(':', 1)[1].strip()
+            continue
+        if s.startswith('レバーレート') and not out['rate']:
+            out['rate'] = s
+            continue
+        m = re.match(r'明細\s*([\d,]+)\s*行(?:\s*（手入力\s*([\d,]+)\s*行）)?', s)
+        if m:
+            out['rows'], out['manual'] = m.group(1), (m.group(2) or '')
+            continue
+        cells = [c.strip() for c in (s.strip('|').split('|') if s.startswith('|') else s.split('\t'))]
+        if len(cells) >= 3 and cells[0].startswith('合計') and not out['total']:
+            # 報告文の表は「項目 | 見積書 | 生成」。帯に大きく出すのは**印字（見積書）の額**。
+            # コグニの円計算で数円ずれる案件があるので、違うときだけ生成側も小さく添える（Codex 第17周）
+            out['total'] = cells[1] or cells[2]
+            out['total_made'] = cells[2] if (cells[2] and cells[2] != cells[1]) else ''
+            out['total_is_printed'] = bool(cells[1])   # 印字の欄が空なら「見積書の印字」とは言わない
+            if out['total_made'] == out['total']:
+                out['total_made'] = ''                 # 同じ額を二度出さない
+    return out
+
+
+def _p2n_render_summary(report_md, stale: bool = False) -> None:
+    """合格したときに、車両・合計（税込）・明細の行数を帯で見せる（報告文を開かなくても要点が分かる。2026-09-20）。
+    stale（生成のあとに入力が変わった）のときは、いまの見積書の数字に見えないよう色を落として「前の入力」と書く（Codex 第19周）"""
+    s = _p2n_summary(report_md)
+    if not any((s['vehicle'], s['total'], s['rows'])):
+        return
+    def _esc(v):
+        return str(v or '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    parts = []
+    if s['total']:
+        parts.append('<div class="total-item"><div class="total-label">'
+                     + ('合計（税込・見積書の印字）' if s.get('total_is_printed') else '合計（税込・生成）') + '</div>'
+                     f'<div class="total-value-highlight">{_esc(s["total"])} 円</div>'
+                     + (f'<div class="total-label" style="margin-top:2px">生成 {_esc(s["total_made"])} 円</div>'
+                        if s.get('total_made') else '')
+                     + '</div>')
+    if s['rows']:
+        _man = s['manual'].replace(',', '')
+        _rows = f'{_esc(s["rows"])} 行' + (f'（手入力 {_esc(s["manual"])}）' if _man.isdigit() and int(_man) > 0 else '')
+        parts.append(f'<div class="total-item"><div class="total-label">明細</div><div class="total-value">{_rows}</div></div>')
+    _m_rate = re.search(r'([\d,]+)\s*円', s['rate'] or '')
+    if _m_rate:
+        parts.append('<div class="total-item"><div class="total-label">レバーレート</div>'
+                     f'<div class="total-value">{_esc(_m_rate.group(1))} 円</div></div>')
+    _veh = _esc(s['vehicle'][:52])
+    _cls = 'total-strip total-strip-stale' if stale else 'total-strip'
+    _veh_label = '車両（前の入力で作った結果）' if stale else '車両'
+    st.markdown(f'<div class="{_cls}">'
+                + (f'<div style="flex:1;min-width:200px"><div class="total-label">{_veh_label}</div>'
+                   f'<div style="font-size:15px;font-weight:700;line-height:1.5">{_veh}</div></div>' if _veh else '')
+                + ''.join(parts) + '</div>', unsafe_allow_html=True)
+
+
 # 入力そのものが読めない（ベタ打ちでも同じ理由で読めない）ときの文言。検算の不合格とは分けて出す（P13）
-_P2N_INPUT_ERRORS = ('パスワード', 'ページあります', 'ページが多すぎ', '開けません')
+_P2N_INPUT_ERRORS = ('パスワード', 'ページあります', 'ページが多すぎ', '開けません', '開けない', '大きすぎます')
 
 
 def _items_sig(items) -> str:
@@ -8430,8 +8521,7 @@ def _attached_docs_caption(api_key, model_name) -> str:
     _kv, _kd = _doc_upload_keys()
     fv, fd = st.session_state.get(_kv), st.session_state.get(_kd)
     if fv is None and fd is None:
-        return ("📎 車検証や事故・保険の書類（速報報告書など）があれば、上の「車検証」「事故・保険の書類」に入れてから生成すると、"
-                "車両・顧客・保険の情報が NEO に入ります")
+        return ''   # 何も添えていないときは案内を出さない（「任意の書類を添える」のたたみの見出しに同じことが書いてある。2026-09-20）
     if not api_key:
         return "📎 添付の書類はまだ読めていません（Gemini API キーが無いため）。このまま生成すると書類の値は NEO に入りません"
     vd, doc = _attached_docs_ocr(api_key, model_name)
@@ -8514,9 +8604,16 @@ def _p2n_unverified_ui(res, key_suffix: str = 'read') -> None:
     """検算に通らなかった案件でも NEO と確認箇所シートを渡す（2026-09-17 亮平さん指示）。
     合格したものと取り違えないよう、名前に `_要確認` を付け、直す場所を上に出してから渡す"""
     if not res.get('unverified_neo'):
-        st.error("この案件は NEO を作るところまで進めませんでした"
-                 + (f": {_md_literal(res['unverified_error'])}" if res.get('unverified_error') else '')
-                 + "。下の修正用ファイルで直してから、もう一度お試しください。")
+        _err = str(res.get('unverified_error') or res.get('error') or '')
+        if any(k in _err for k in _P2N_INPUT_ERRORS):
+            # 見積書そのものを読めなかったとき（壊れた PDF・パスワード付き・ページが多すぎ）。
+            # 「修正用ファイルで直す」は当てはまらないので、入れ直しを案内する（2026-09-20 実画面のバグハント）
+            st.error("この見積書は読み取れませんでした（理由は上の行にあります）。"
+                     "見積書のページだけの PDF か、写真で入れ直してください。")
+        else:
+            st.error("この案件は NEO を作るところまで進めませんでした"
+                     + (f": {_md_literal(res['unverified_error'])}" if res.get('unverified_error') else '')
+                     + "。下の修正用ファイルで直してから、もう一度お試しください。")
         return
     name = (res.get('download_name') or '見積_claude') + '_要確認'
     st.warning("下の NEO は**検算に通っていません**。上の「印字との違い」をコグニで直してから協定に使ってください"
@@ -8602,7 +8699,8 @@ def _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_mo
     _p2n_beta_exp = {'towing': safe_int(st.session_state.get('exp_towing', 0)),
                      'rental_car': safe_int(st.session_state.get('exp_rental', 0)),
                      'tax_exempt': safe_int(st.session_state.get('exp_exempt', 0))}
-    st.caption(_attached_docs_caption(api_key, selected_model))
+    if (_att_cap := _attached_docs_caption(api_key, selected_model)):
+        st.caption(_att_cap)
     _p2n_beta_use_exp = False
     if st.session_state.get('_beta_exp_file_key') != _p2n_file_key:
         # 見積が変わったらチェックは外す（前の見積で入れた同意を次の見積に持ち越さない。Codex 52）
@@ -8840,129 +8938,228 @@ def main():
         st.stop()
     st.markdown("""
     <style>
+    /* ══ 配色・余白・字の決め（ここだけ直せば全体の見た目が変わる） ══════════════ */
+    :root {
+      --bg:#f5f7fb; --surface:#ffffff; --line:#e4e9f2; --line-soft:#f1f5f9;
+      --ink:#0f172a; --ink-2:#334155; --ink-3:#64748b; --ink-4:#94a3b8;
+      --brand:#1d4ed8; --brand-2:#2563eb; --brand-soft:#eff6ff; --brand-line:#bfdbfe;
+      --ok:#15803d; --ok-soft:#f0fdf4; --ok-line:#bbf7d0;
+      --warn:#b45309; --warn-soft:#fffbeb; --warn-line:#fde68a;
+      --bad:#b91c1c; --bad-soft:#fef2f2; --bad-line:#fecaca;
+      --r:12px; --r-sm:9px;
+      --shadow:0 1px 2px rgba(15,23,42,.04), 0 6px 18px rgba(15,23,42,.06);
+      --shadow-sm:0 1px 2px rgba(15,23,42,.05);
+    }
     *, *::before, *::after { box-sizing: border-box; }
-    body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; }
+    html, body, .stApp, [class^="st-"], [class*=" st-"], button, input, textarea, select {
+      font-family: "Yu Gothic UI", "Noto Sans JP", "Hiragino Sans", "Meiryo", system-ui, -apple-system, "Segoe UI", sans-serif;
+      font-feature-settings: "palt" 1;   /* 日本語の字間を詰めて読みやすく */
+    }
+    /* アイコン（Streamlit の Material Symbols）は上の指定から外す。外さないと
+       「keyboard_arrow_down」「visibility」などの字がそのまま画面に出る（2026-09-20 実画面で確認） */
+    [data-testid="stIconMaterial"], .material-symbols-rounded, [class*="material-symbols"],
+    [data-testid="stIconMaterial"] * {
+      font-family: "Material Symbols Rounded" !important; font-feature-settings: normal !important;
+    }
+    .stApp { background: var(--bg); color: var(--ink); }
+    p, li, label, .stMarkdown { line-height: 1.75; }
 
-    /* 上部の余白を完全に詰める */
-    .block-container { padding-top: 0px !important; margin-top: 0px !important; }
+    /* 上の余白を詰める（Streamlit のヘッダは使わない） */
     header[data-testid="stHeader"] { display: none !important; height: 0 !important; }
-    #root > div:first-child { padding-top: 0 !important; }
     .stApp > header { display: none !important; }
     .stApp { margin-top: 0 !important; }
     section.main > div { padding-top: 0 !important; }
-
-    /* file_uploader の「Drag and drop」「Limit」テキストを非表示（複数セレクタで対応） */
-    [data-testid="stFileUploaderDropzoneInstructions"] { display: none !important; }
-    [data-testid="stFileUploaderDropzone"] small,
-    [data-testid="stFileUploaderDropzone"] span:not(.st-emotion-cache-9ycgxx),
-    .uploadedFileName ~ small,
-    section[data-testid="stFileUploaderDropzone"] div > small { display: none !important; }
-    [data-testid="stFileUploaderDropzone"] { min-height: 56px !important; padding: 8px 12px !important; }
-    /* アイコンとBrowseボタンだけ残す */
-    [data-testid="stFileUploaderDropzone"] > div > div:first-child > span { display: none !important; }
-    [data-testid="stFileUploaderDropzone"] > div > div:first-child > small { display: none !important; }
-
-    /* Topbar */
-    .topbar { background: #1a2744; color: #fff; padding: 0 24px; height: 52px;
-              display: flex; align-items: center; justify-content: space-between;
-              box-shadow: 0 2px 8px rgba(0,0,0,.25); border-radius: 8px; margin-bottom: 20px; }
-    .topbar-title { font-size: 16px; font-weight: 700; letter-spacing: .04em;
-                    display: flex; align-items: center; gap: 10px; }
-    .topbar-badge { background: #3b82f6; font-size: 10px; padding: 2px 7px;
-                    border-radius: 10px; font-weight: 600; }
-    .topbar-right { display: flex; align-items: center; gap: 16px; font-size: 12px; color: #94a3b8; }
-    .api-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 4px; vertical-align: middle; }
-
-    /* Step bar */
-    .step-bar { display: flex; align-items: center; background: #fff; border-radius: 10px;
-                padding: 16px 24px; margin-bottom: 20px; box-shadow: 0 1px 4px rgba(0,0,0,.07); }
-    .step-item { display: flex; align-items: center; gap: 10px; }
-    .step-circle { width: 32px; height: 32px; border-radius: 50%; display: inline-flex;
-                   align-items: center; justify-content: center; font-weight: 700; font-size: 13px; flex-shrink: 0; }
-    .step-circle-done { background: #22c55e; color: #fff; }
-    .step-circle-active { background: #1d4ed8; color: #fff; box-shadow: 0 0 0 4px #bfdbfe; }
-    .step-circle-pending { background: #e2e8f0; color: #94a3b8; }
-    .step-label-active { font-size: 12px; font-weight: 600; color: #1d4ed8; }
-    .step-label-done { font-size: 12px; font-weight: 600; color: #15803d; }
-    .step-label-pending { font-size: 12px; font-weight: 600; color: #94a3b8; }
-    .step-connector { flex: 1; height: 2px; background: #e2e8f0; margin: 0 8px; min-width: 20px; }
-    .step-connector-done { background: #22c55e; }
-
-    /* Mode selector */
-    .mode-selector { display: flex; gap: 8px; margin-bottom: 16px; }
-    .mode-btn { flex: 1; padding: 12px 16px; border: 2px solid #e2e8f0; border-radius: 8px;
-                background: #fff; text-align: center; }
-    .mode-btn-active { border-color: #1d4ed8; background: #eff6ff; }
-    .mode-icon { font-size: 22px; display: block; margin-bottom: 4px; }
-    .mode-label { font-size: 13px; font-weight: 700; color: #1e293b; }
-    .mode-label-active { color: #1d4ed8; }
-    .mode-desc { font-size: 11px; color: #94a3b8; margin-top: 2px; }
-
-    /* Vehicle strip */
-    .vehicle-strip { background: linear-gradient(135deg, #1a2744 0%, #1e3a5f 100%); color: #fff;
-                     border-radius: 10px; padding: 16px 20px; margin-bottom: 16px;
-                     display: flex; align-items: flex-start; gap: 16px; }
-    .vehicle-strip-name { font-size: 18px; font-weight: 700; }
-    .vehicle-strip-detail { font-size: 12px; color: #94a3b8; margin-top: 2px; }
-    .vehicle-strip-badges { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
-
-    /* Total strip */
-    .total-strip { background: #1a2744; color: #fff; border-radius: 10px; padding: 16px 24px;
-                   display: flex; align-items: center; gap: 20px; margin-top: 16px; flex-wrap: wrap; }
-    .total-item { text-align: center; }
-    .total-label { font-size: 10px; color: #94a3b8; font-weight: 600; letter-spacing: .05em; }
-    .total-value { font-size: 18px; font-weight: 700; }
-    .total-value-highlight { font-size: 22px; font-weight: 700; color: #fbbf24; }
-    .total-sep { color: #334155; font-size: 18px; }
-
-    /* Badges */
-    .badge-green  { background: #dcfce7; color: #15803d; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
-    .badge-blue   { background: #dbeafe; color: #1d4ed8; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
-    .badge-orange { background: #ffedd5; color: #c2410c; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
-    .badge-red    { background: #fee2e2; color: #b91c1c; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
-    .badge-gray   { background: #f1f5f9; color: #475569; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
-    .badge-purple { background: #f3e8ff; color: #7e22ce; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
-
-    /* Alert boxes */
-    .alert { border-radius: 8px; padding: 12px 16px; margin-bottom: 12px; font-size: 13px; }
-    .alert-info    { background: #eff6ff; border: 1px solid #bfdbfe; color: #1d4ed8; }
-    .alert-warn    { background: #fffbeb; border: 1px solid #fde68a; color: #92400e; }
-    .alert-success { background: #f0fdf4; border: 1px solid #bbf7d0; color: #15803d; }
-    .alert-error   { background: #fef2f2; border: 1px solid #fca5a5; color: #991b1b; }
-
-    /* Mismatch banner */
-    .mismatch-banner { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
-    .mismatch-title  { font-weight: 700; color: #991b1b; font-size: 14px; margin-bottom: 4px; }
-    .mismatch-body   { font-size: 12px; color: #7f1d1d; line-height: 1.6; margin-bottom: 8px; }
-
-    /* DB status */
-    .db-status-item { font-size: 11px; color: #475569; line-height: 1.8; }
-    .db-dot-green { color: #22c55e; }
-    .db-dot-yellow { color: #f59e0b; }
-
-    /* Section title */
-    .section-title { font-size: 13px; font-weight: 700; color: #334155; margin-bottom: 12px;
-                     padding-bottom: 8px; border-bottom: 1px solid #f1f5f9; display: flex; align-items: center; gap: 8px; }
-
-    /* Legacy classes (keep for backward compat) */
-    .main-title   { font-size: 1.8rem; font-weight: bold; color: #1a5276; margin-bottom: 0.5rem; }
-    .step-header  { font-size: 1.3rem; font-weight: bold; color: #2c3e50; padding: 0.5rem 0; border-bottom: 2px solid #3498db; margin-bottom: 1rem; }
-    .success-box  { background: #d4edda; border: 1px solid #c3e6cb; border-radius: 8px; padding: 1rem; margin: 0.5rem 0; }
-    .warning-box  { background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 8px; padding: 1rem; margin: 0.5rem 0; }
-    .error-box    { background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 8px; padding: 1rem; margin: 0.5rem 0; }
-    .info-box     { background: #d1ecf1; border: 1px solid #bee5eb; border-radius: 8px; padding: 1rem; margin: 0.5rem 0; }
-    .tax-box      { background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 8px; padding: 0.8rem; margin: 0.5rem 0; font-size: 0.9rem; }
-
-    /* File uploader */
-    [data-testid="stFileUploader"] {
-        border: 2px dashed #cbd5e1 !important;
-        border-radius: 10px !important;
-        padding: 12px !important;
-        background-color: #f8fafc !important;
+    /* 本文は中央寄せ・読みやすい行長に（広い画面で間延びしない） */
+    [data-testid="stMainBlockContainer"], .block-container {
+      padding: 12px 28px 72px !important; margin-top: 0 !important; max-width: 1240px;
     }
-    [data-testid="stFileUploader"]:hover {
-        border-color: #3b82f6 !important;
-        background-color: #eff6ff !important;
+
+    /* ══ サイドバー ══════════════════════════════════════════════ */
+    [data-testid="stSidebar"] { background: var(--surface); border-right: 1px solid var(--line); }
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: .5rem; }
+    [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {
+      font-size: 13.5px !important; font-weight: 700 !important; color: var(--ink-2) !important;
+      /* 下の余白が無いと、次のラベル（「レッカー費用（税抜）」など）が見出しに重なる（2026-09-20 実画面で確認） */
+      margin: 16px 0 6px !important; padding: 0 !important; letter-spacing: .01em; line-height: 1.5 !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stHeadingWithActionElements"] { margin-bottom: 4px !important; }
+    [data-testid="stSidebar"] [data-testid="stCaptionContainer"] { margin-top: 2px !important; }
+    [data-testid="stSidebar"] hr { margin: 12px 0 !important; border-color: var(--line-soft); }
+    [data-testid="stSidebar"] label { font-size: 12.5px !important; color: var(--ink-2); }
+    [data-testid="stSidebar"] .stCaption, [data-testid="stSidebar"] small { color: var(--ink-3); }
+    .side-label { font-size: 10px; font-weight: 700; color: var(--ink-4); letter-spacing: .09em;
+                  text-transform: uppercase; padding: 10px 0 2px; }
+    /* サイドバーの中身が横にはみ出さないようにする（長いパス・Streamlit のヘッダ） */
+    [data-testid="stSidebarContent"], [data-testid="stSidebarHeader"] { overflow-x: hidden !important; }
+    [data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] code,
+    [data-testid="stSidebar"] [data-testid="stAlert"] { overflow-wrap: anywhere; }
+    [data-testid="stSidebar"] [data-testid="stExpander"] { margin-bottom: 2px; }
+
+    /* ══ 上のバー ════════════════════════════════════════════════ */
+    .topbar { background: linear-gradient(135deg,#17203a 0%,#1e3358 100%); color:#fff;
+              padding: 0 22px; height: 56px; display:flex; align-items:center; justify-content:space-between;
+              border-radius: var(--r); margin-bottom: 16px; box-shadow: var(--shadow); }
+    .topbar-title { font-size: 15.5px; font-weight: 700; letter-spacing:.03em; display:flex; align-items:center; gap:10px; }
+    .topbar-badge { background: var(--brand-2); font-size: 10px; padding: 2px 8px; border-radius: 999px; font-weight: 700; }
+    .topbar-right { display:flex; align-items:center; gap:16px; font-size:12px; color:#a8b6cc; }
+    .api-dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:5px; vertical-align:middle; }
+
+    /* ══ ステップ ════════════════════════════════════════════════ */
+    .step-bar { display:flex; align-items:center; flex-wrap:wrap; gap:6px 4px; background:var(--surface);
+                border:1px solid var(--line); border-radius:var(--r); padding:14px 20px; margin-bottom:18px;
+                box-shadow: var(--shadow-sm); }
+    .step-item { display:flex; align-items:center; gap:9px; white-space:nowrap; }
+    .step-circle { width:30px; height:30px; border-radius:50%; display:inline-flex; align-items:center;
+                   justify-content:center; font-weight:700; font-size:13px; flex-shrink:0; }
+    .step-circle-done { background:#22c55e; color:#fff; }
+    .step-circle-active { background:var(--brand); color:#fff; box-shadow:0 0 0 4px var(--brand-line); }
+    .step-circle-pending { background:#eef2f7; color:var(--ink-4); }
+    .step-label-active, .step-label-done, .step-label-pending { font-size:12.5px; font-weight:600; white-space:nowrap; }
+    .step-label-active { color:var(--brand); }
+    .step-label-done { color:var(--ok); }
+    .step-label-pending { color:var(--ink-4); }
+    .step-connector { flex:1; height:2px; background:#e6ebf2; margin:0 8px; min-width:16px; border-radius:2px; }
+    .step-connector-done { background:#22c55e; }
+
+    /* ══ 見出し・カード ═════════════════════════════════════════ */
+    .section-title { font-size:15px; font-weight:700; color:var(--ink); margin:20px 0 10px;
+                     padding-bottom:8px; border-bottom:2px solid var(--line-soft);
+                     display:flex; align-items:center; gap:8px; }
+    [data-testid="stExpander"] { border:1px solid var(--line) !important; border-radius:var(--r-sm) !important;
+                                 background:var(--surface); box-shadow:none !important; }
+    [data-testid="stExpander"] summary { font-size:13.5px !important; font-weight:600; color:var(--ink-2); }
+    [data-testid="stExpander"] summary:hover { color:var(--brand); }
+    [data-testid="stExpander"] [data-testid="stExpanderDetails"] { padding-top:2px; }
+
+    /* ══ ボタン ══════════════════════════════════════════════════ */
+    .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {
+      border-radius:10px; font-weight:600; font-size:13.5px; padding:.5rem 1rem;
+      border:1px solid var(--line); background:var(--surface); color:var(--ink-2);
+      transition: background .15s, border-color .15s, box-shadow .15s, transform .05s; }
+    .stButton > button:hover, .stDownloadButton > button:hover { border-color:var(--brand-line); background:var(--brand-soft); color:var(--brand); }
+    .stButton > button:active, .stDownloadButton > button:active { transform: translateY(1px); }
+    .stButton > button[kind="primary"], [data-testid="stBaseButton-primary"] {
+      background:linear-gradient(180deg,var(--brand-2),var(--brand)); border:none; color:#fff;
+      box-shadow:0 2px 10px rgba(29,78,216,.30); font-size:14.5px; padding:.62rem 1.2rem; }
+    .stButton > button[kind="primary"]:hover, [data-testid="stBaseButton-primary"]:hover {
+      background:linear-gradient(180deg,#3b82f6,var(--brand-2)); color:#fff; box-shadow:0 4px 14px rgba(29,78,216,.36); }
+    .stButton > button:disabled, [data-testid="stBaseButton-primary"]:disabled { opacity:.45; box-shadow:none; }
+    .stDownloadButton > button { border-color:var(--ok-line); color:var(--ok); background:var(--ok-soft); }
+    .stDownloadButton > button:hover { background:#dcfce7; color:var(--ok); border-color:#86efac; }
+
+    /* ══ 入力・アップローダ ══════════════════════════════════════ */
+    [data-testid="stFileUploaderDropzoneInstructions"] { display:none !important; }
+    /* 「Drag and drop」「Limit 200MB」などの説明は消す。ただし**入れたファイルを外す ✕** は消さない
+       （小さな文字の一括非表示に巻き込まれて、画面からファイルを外せなくなっていた。2026-09-20 実画面のバグハント） */
+    [data-testid="stFileUploaderDropzone"] small:not([data-testid="stFileChipDeleteBtn"]):not([data-testid="stFileUploaderDeleteBtn"]),
+    /* span の一括非表示から外すのは「入れたファイルの行（チップ）」の中身。以前はハッシュ付きの class
+       （.st-emotion-cache-…）で除いていたが、版が変わると当たらなくなる（1.63 では 0 個だった）。
+       Streamlit が保証している data-testid で書く（2026-09-20 実機で確認） */
+    [data-testid="stFileUploaderDropzone"] span:not([data-testid="stFileChipName"] span):not([data-testid="stFileChip"] span),
+    .uploadedFileName ~ small,
+    section[data-testid="stFileUploaderDropzone"] div > small:not([data-testid="stFileChipDeleteBtn"]):not([data-testid="stFileUploaderDeleteBtn"]) { display:none !important; }
+    [data-testid="stFileUploaderDropzone"] { min-height:56px !important; padding:10px 14px !important; background:transparent !important; }
+    [data-testid="stFileUploaderDropzone"] > div > div:first-child > span,
+    [data-testid="stFileUploaderDropzone"] > div > div:first-child > small { display:none !important; }
+    /* 入れたファイルを外す「✕」は必ず見せる（上の small を消す指定に巻き込まれて消えており、
+       画面からファイルを外せなくなっていた。2026-09-20 実画面のバグハント） */
+    [data-testid="stFileChipDeleteBtn"], [data-testid="stFileChipDeleteBtn"] button,
+    [data-testid="stFileUploaderDeleteBtn"], [data-testid="stFileUploaderDeleteBtn"] button {
+      display:inline-flex !important; align-items:center; }
+    /* 版が上がって ✕ の中身が span（Material アイコン）になっても、上の一括非表示で消えないようにしておく
+       （1.63 では svg なので今は当たらない。実機で確認済み。Codex 第18周） */
+    [data-testid="stFileUploaderDropzone"] [data-testid="stFileChipDeleteBtn"] span,
+    [data-testid="stFileUploaderDropzone"] [data-testid="stFileUploaderDeleteBtn"] span,
+    [data-testid="stFileChipDeleteBtn"] span, [data-testid="stFileUploaderDeleteBtn"] span { display:revert !important; }
+    /* ✕ は 14px で小さいので、押せる範囲だけ広げる（印はそのまま。2026-09-20） */
+    [data-testid="stFileChipDeleteBtn"] button, [data-testid="stFileUploaderDeleteBtn"] button {
+      padding:5px !important; box-sizing:content-box !important; border-radius:50%; }
+    [data-testid="stFileChipDeleteBtn"] button:hover, [data-testid="stFileUploaderDeleteBtn"] button:hover { background:#fee2e2; }
+    /* 見積書は 1 件だけなので「＋（ファイルを追加）」は使わない。アイコンだけ消えて 4×4 の押せない点になっていたので、
+       ボタンごと出さない（別の見積書に替えるのは、ドロップ欄をクリックするか ✕ で外してから。2026-09-20 実機で確認） */
+    [data-testid="stFileUploaderDropzone"] [data-testid="stBaseButton-borderlessIcon"] { display:none !important; }
+    [data-testid="stFileChip"] { padding-right:4px; }
+    [data-testid="stFileUploader"] { border:1.5px dashed #cbd5e1 !important; border-radius:var(--r) !important;
+                                     padding:6px 10px !important; background:#fbfdff !important; transition:.15s; }
+    [data-testid="stFileUploader"]:hover { border-color:var(--brand-2) !important; background:var(--brand-soft) !important; }
+    input, textarea, select, [data-baseweb="input"], [data-baseweb="select"] > div { border-radius:var(--r-sm) !important; font-size:13.5px !important; }
+    [data-testid="stTextInput"] input, [data-testid="stNumberInput"] input { padding-top:.42rem; padding-bottom:.42rem; }
+    [data-testid="stTextArea"] textarea { line-height:1.65; }
+
+    /* ══ 知らせ（Streamlit 標準の success / info / warning / error） ══ */
+    [data-testid="stAlert"] { border-radius:var(--r-sm); font-size:13.5px; border-width:1px; box-shadow:none; }
+    [data-testid="stAlert"] p { line-height:1.7; }
+
+    /* ══ 車両・合計の帯 ═════════════════════════════════════════ */
+    .vehicle-strip { background:linear-gradient(135deg,#17203a 0%,#1e3358 100%); color:#fff; border-radius:var(--r);
+                     padding:16px 20px; margin-bottom:14px; display:flex; align-items:flex-start; gap:16px; box-shadow:var(--shadow); }
+    .vehicle-strip-name { font-size:18px; font-weight:700; }
+    .vehicle-strip-detail { font-size:12px; color:#a8b6cc; margin-top:2px; }
+    .vehicle-strip-badges { display:flex; gap:6px; margin-top:8px; flex-wrap:wrap; }
+    .total-strip { background:linear-gradient(135deg,#17203a 0%,#1e3358 100%); color:#fff; border-radius:var(--r);
+                   padding:16px 22px; display:flex; align-items:center; gap:18px; margin-top:16px; flex-wrap:wrap; box-shadow:var(--shadow); }
+    .total-item { text-align:center; }
+    .total-label { font-size:10px; color:#a8b6cc; font-weight:700; letter-spacing:.06em; }
+    .total-value { font-size:18px; font-weight:700; }
+    .total-value-highlight { font-size:23px; font-weight:800; color:#fbbf24; }
+    .total-sep { color:#3b4a66; font-size:18px; }
+    /* 前の入力で作った結果の帯（いまの見積書の数字に見えないよう、色を落として枠線にする。2026-09-20 Codex 第19周） */
+    .total-strip-stale { background:linear-gradient(135deg,#4b5563 0%,#586274 100%); box-shadow:none;
+                         border:1px dashed #9aa4b2; opacity:.72; }
+    .total-strip-stale .total-value-highlight { color:#e5e7eb; }
+
+    /* ══ 目印（バッジ）══════════════════════════════════════════ */
+    .badge-green, .badge-blue, .badge-orange, .badge-red, .badge-gray, .badge-purple {
+      padding:2px 9px; border-radius:999px; font-size:11px; font-weight:700; white-space:nowrap; }
+    .badge-green  { background:var(--ok-soft);  color:var(--ok);   border:1px solid var(--ok-line); }
+    .badge-blue   { background:var(--brand-soft); color:var(--brand); border:1px solid var(--brand-line); }
+    .badge-orange { background:#fff7ed; color:#c2410c; border:1px solid #fed7aa; }
+    .badge-red    { background:var(--bad-soft); color:var(--bad); border:1px solid var(--bad-line); }
+    .badge-gray   { background:#f8fafc; color:var(--ink-3); border:1px solid var(--line); }
+    .badge-purple { background:#faf5ff; color:#7e22ce; border:1px solid #e9d5ff; }
+
+    /* ══ 枠つきの知らせ（アプリ独自）════════════════════════════ */
+    .alert { border-radius:var(--r-sm); padding:12px 16px; margin-bottom:12px; font-size:13.5px; line-height:1.7; }
+    .alert-info    { background:var(--brand-soft); border:1px solid var(--brand-line); color:var(--brand); }
+    .alert-warn    { background:var(--warn-soft); border:1px solid var(--warn-line); color:var(--warn); }
+    .alert-success { background:var(--ok-soft); border:1px solid var(--ok-line); color:var(--ok); }
+    .alert-error   { background:var(--bad-soft); border:1px solid var(--bad-line); color:var(--bad); }
+    .mismatch-banner { background:var(--bad-soft); border:1px solid var(--bad-line); border-left:4px solid #ef4444;
+                       border-radius:var(--r-sm); padding:14px 16px; margin-bottom:14px; }
+    .mismatch-title { font-weight:700; color:var(--bad); font-size:14px; margin-bottom:4px; }
+    .mismatch-body  { font-size:12.5px; color:#7f1d1d; line-height:1.7; }
+    /* 以前からのクラス名（中身は新しい配色にそろえる） */
+    .success-box { background:var(--ok-soft);   border:1px solid var(--ok-line);   color:var(--ok);   border-radius:var(--r-sm); padding:10px 14px; margin:6px 0; font-size:13.5px; }
+    .warning-box { background:var(--warn-soft); border:1px solid var(--warn-line); color:var(--warn); border-radius:var(--r-sm); padding:10px 14px; margin:6px 0; font-size:13.5px; }
+    .error-box   { background:var(--bad-soft);  border:1px solid var(--bad-line);  color:var(--bad);  border-radius:var(--r-sm); padding:10px 14px; margin:6px 0; font-size:13.5px; }
+    .info-box    { background:var(--brand-soft);border:1px solid var(--brand-line);color:var(--brand);border-radius:var(--r-sm); padding:10px 14px; margin:6px 0; font-size:13.5px; }
+    .tax-box     { background:var(--ok-soft);   border:1px solid var(--ok-line);   color:var(--ok);   border-radius:var(--r-sm); padding:10px 14px; margin:6px 0; font-size:13px; }
+    .main-title  { font-size:1.6rem; font-weight:800; color:var(--ink); margin-bottom:.4rem; }
+    .step-header { font-size:1.15rem; font-weight:700; color:var(--ink); padding:.3rem 0; border-bottom:2px solid var(--brand-line); margin-bottom:.9rem; }
+
+    /* ══ 表 ═════════════════════════════════════════════════════ */
+    [data-testid="stDataFrame"], [data-testid="stDataEditor"] { border:1px solid var(--line); border-radius:var(--r-sm); overflow:hidden; }
+    [data-testid="stTable"] table { font-size:13px; }
+    [data-testid="stMetric"] { background:var(--surface); border:1px solid var(--line); border-radius:var(--r-sm); padding:10px 14px; }
+    [data-testid="stMetricLabel"] { color:var(--ink-3); font-size:12px !important; }
+
+    /* ══ 選ぶ（ラジオ・チェック）════════════════════════════════ */
+    [data-testid="stRadio"] label, [data-testid="stCheckbox"] label { font-size:13.5px; }
+    .db-status-item { font-size:11.5px; color:var(--ink-3); line-height:1.9; }
+    .db-dot-green { color:#22c55e; } .db-dot-yellow { color:#f59e0b; }
+
+    /* ══ 画面が狭いとき ═════════════════════════════════════════ */
+    @media (max-width: 1100px) {
+      [data-testid="stMainBlockContainer"], .block-container { padding:10px 16px 56px !important; }
+      .step-label-active, .step-label-done, .step-label-pending { font-size:11.5px; }
+      .step-connector { min-width:10px; margin:0 4px; }
+      .topbar { padding:0 14px; }
+      .topbar-right { gap:10px; font-size:11px; }
+    }
+    @media (max-width: 760px) {
+      .topbar-right { display:none; }
+      .step-bar { padding:10px 12px; }
+      .total-strip, .vehicle-strip { padding:12px 14px; }
     }
     </style>
     """, unsafe_allow_html=True)
@@ -8994,48 +9191,49 @@ def main():
 
         # ── 設定 ──
         st.markdown('<div style="font-size:10px;font-weight:700;color:#94a3b8;letter-spacing:.08em;text-transform:uppercase;padding:4px 0">設定</div>', unsafe_allow_html=True)
-        st.header("🔑 APIキー設定")
-        # 見積書 PDF → NEO（pdf-to-neo スキル経路）は Claude か Gemini で読む（両方あれば画面で選ぶ）。
-        # Gemini は CSV 取り込み・車検証 OCR・旧経路でも使う。
-        if ANTHROPIC_API_KEY:
-            claude_api_key = ANTHROPIC_API_KEY
-            st.success("Claude APIキー: 設定済み (.env)")
-        else:
-            claude_api_key = (st.text_input(
-                "Claude APIキー（見積書の読み取り）",
-                type="password",
-                key='claude_api_key_input',
-                help=".envファイルの ANTHROPIC_API_KEY にキーを設定すれば毎回入力不要"
-            ) or '').strip()   # 空白だけの入力を「キーあり」にしない
-        if GEMINI_API_KEY:
-            api_key = GEMINI_API_KEY
-            st.success("Gemini APIキー: 設定済み (.env)")
-        else:
-            api_key = (st.text_input(
-                "Gemini APIキー（見積書の読み取り・CSV取り込み・車検証OCR）",
-                type="password",
-                help=".envファイルの GEMINI_API_KEY にキーを設定すれば毎回入力不要"
-            ) or '').strip()
-        # 利用可能なモデルをAPIで動的取得（APIキーがある場合のみ）
-        if api_key:
-            _ck = _model_cache_key(api_key)
-            if _ck in _availability_cache():
-                _avail_models = _availability_cache()[_ck]
+        # APIキーは .env / Secrets に入れてあれば触らない。サイドバーの上に居座らせず、たたんでおく
+        with st.expander("🔑 APIキー・AIモデル", expanded=not (ANTHROPIC_API_KEY and GEMINI_API_KEY)):
+            # 見積書 PDF → NEO（pdf-to-neo スキル経路）は Claude か Gemini で読む（両方あれば画面で選ぶ）。
+            # Gemini は CSV 取り込み・車検証 OCR・旧経路でも使う。
+            if ANTHROPIC_API_KEY:
+                claude_api_key = ANTHROPIC_API_KEY
+                st.success("Claude APIキー: 設定済み (.env)")
             else:
-                with st.spinner("利用可能なモデルを確認中..."):
-                    _avail_models = get_available_gemini_models(api_key)
-        else:
-            _avail_models = [_FALLBACK_MODEL]
-        # 自動切り替え済みのモデルがあればそれを初期選択にする
-        _pref_model = st.session_state.get('selected_model')
-        _model_index = _avail_models.index(_pref_model) if _pref_model in _avail_models else 0
-        selected_model = st.selectbox(
-            "🤖 AIモデル",
-            options=_avail_models,
-            index=_model_index,
-            key="model_selector_v2",
-            help="Gemini APIで実際に利用可能なモデルを自動検出（提供終了モデルは除外）。Flash=高速・コスパ良好、Pro=高精度"
-        )
+                claude_api_key = (st.text_input(
+                    "Claude APIキー（見積書の読み取り）",
+                    type="password",
+                    key='claude_api_key_input',
+                    help=".envファイルの ANTHROPIC_API_KEY にキーを設定すれば毎回入力不要"
+                ) or '').strip()   # 空白だけの入力を「キーあり」にしない
+            if GEMINI_API_KEY:
+                api_key = GEMINI_API_KEY
+                st.success("Gemini APIキー: 設定済み (.env)")
+            else:
+                api_key = (st.text_input(
+                    "Gemini APIキー（見積書の読み取り・CSV取り込み・車検証OCR）",
+                    type="password",
+                    help=".envファイルの GEMINI_API_KEY にキーを設定すれば毎回入力不要"
+                ) or '').strip()
+            # 利用可能なモデルをAPIで動的取得（APIキーがある場合のみ）
+            if api_key:
+                _ck = _model_cache_key(api_key)
+                if _ck in _availability_cache():
+                    _avail_models = _availability_cache()[_ck]
+                else:
+                    with st.spinner("利用可能なモデルを確認中..."):
+                        _avail_models = get_available_gemini_models(api_key)
+            else:
+                _avail_models = [_FALLBACK_MODEL]
+            # 自動切り替え済みのモデルがあればそれを初期選択にする
+            _pref_model = st.session_state.get('selected_model')
+            _model_index = _avail_models.index(_pref_model) if _pref_model in _avail_models else 0
+            selected_model = st.selectbox(
+                "🤖 AIモデル",
+                options=_avail_models,
+                index=_model_index,
+                key="model_selector_v2",
+                help="Gemini APIで実際に利用可能なモデルを自動検出（提供終了モデルは除外）。Flash=高速・コスパ良好、Pro=高精度"
+            )
         st.markdown("---")
         st.markdown("**🗂 Addata（車種データベース）**")
         # ── PC の Addata をブラウザ経由で使う（クラウド向け。neo_skill.bridge / addata_bridge/index.html）──
@@ -9108,8 +9306,6 @@ def main():
         addata_status = find_addata_dir()
         if addata_status:
             _ka06 = find_ka06_path(addata_status)
-            st.success("Addata検出済み")
-            st.caption(addata_status)
             # データ版（COM/AnVer.DB の Number）。版が違うと標準品番・標準指数が
             # 変わるため、どの版で照合したかを見えるようにしておく。
             # 社内で版が揃っているかの確認にも使う。
@@ -9118,10 +9314,16 @@ def main():
                 _ver = _ad_ver(addata_status)
             except Exception:
                 _ver = ''
-            st.caption(f"データ版: {_ver}" if _ver
-                       else "データ版: 不明（COM/AnVer.DB が読めません）")
-            st.caption(("車種マスタ KA06_ALL.DB あり" if _ka06
-                        else "※ COM/KA06_ALL.DB が無いため車種の自動特定はできません"))
+            # 場所・版・車種マスタは 1 つの囲みにまとめる（前はバラバラの小さい字で縦に伸びていた。2026-09-20 画面の作り直し）
+            _ad_ok = '✅' if _ka06 else '⚠️'
+            st.markdown(
+                '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:9px;padding:9px 12px;font-size:12px;line-height:1.75">'
+                f'<b style="color:#15803d">{_ad_ok} Addata を使えます</b><br>'
+                f'<span style="color:#334155;word-break:break-all">{html_escape(str(addata_status))}</span><br>'
+                f'<span style="color:#64748b">データ版: {html_escape(_ver) if _ver else "不明（COM/AnVer.DB が読めません）"}</span><br>'
+                f'<span style="color:{"#64748b" if _ka06 else "#b45309"}">'
+                + ('車種マスタ KA06_ALL.DB あり' if _ka06 else '※ COM/KA06_ALL.DB が無いため車種の自動特定はできません')
+                + '</span></div>', unsafe_allow_html=True)
             # この PC に、いま使っているものより**新しい版**の Addata が
             # 置いてあることがある（古い C:\Addata を残したまま新しい版を
             # 別の場所に入れた PC）。版が違うと標準品番・標準指数が変わり、
@@ -9369,22 +9571,22 @@ def main():
                     st.session_state['_addata_zip_id'] = _zip_id
                     st.error(f"❌ {_why}")
         st.markdown("---")
-        st.header("🔬 精度オプション")
-        use_fax_filter = st.checkbox(
-            "FAXページ自動除外",
-            value=True,
-            help="FAX送付状が混在するPDFの1ページ目を自動検出・除外します。APIコールが1回増えます。"
-        )
-        use_rasterize = st.checkbox(
-            "PDF→画像変換（行ズレ防止）",
-            value=False,
-            help="PDFをJPEG画像に変換してからAIに送ります。通常はOFFのままで精度が高くなります。"
-        )
-        use_enhance = st.checkbox(
-            "画像前処理（FAX品質改善）",
-            value=True,
-            help="コントラスト・シャープネスを強化してFAX品質の画像を読みやすくします。ラスタライズ有効時のみ機能します。"
-        )
+        with st.expander("🔬 精度オプション（ふだんは既定のまま）", expanded=False):
+            use_fax_filter = st.checkbox(
+                "FAXページ自動除外",
+                value=True,
+                help="FAX送付状が混在するPDFの1ページ目を自動検出・除外します。APIコールが1回増えます。"
+            )
+            use_rasterize = st.checkbox(
+                "PDF→画像変換（行ズレ防止）",
+                value=False,
+                help="PDFをJPEG画像に変換してからAIに送ります。通常はOFFのままで精度が高くなります。"
+            )
+            use_enhance = st.checkbox(
+                "画像前処理（FAX品質改善）",
+                value=True,
+                help="コントラスト・シャープネスを強化してFAX品質の画像を読みやすくします。ラスタライズ有効時のみ機能します。"
+            )
         st.markdown("---")
         st.header("🛡️ 事故・保険情報")
         st.caption("コグニセブンの受付／保険欄に書き込まれます。空欄はテンプレートの値を維持します。")
@@ -9504,15 +9706,44 @@ def main():
     """, unsafe_allow_html=True)
 
     # ── Step progress bar ──
-    step_labels = ["① アップロード", "② AI解析", "③ プレビュー・修正", "④ NEO生成"]
+    # 進み具合は**実際の状態**で出す（以前は常に「①」のままで、どこまで進んだか分からなかった。2026-09-20 画面の作り直し）。
+    # current_step は画面の切り替えに使う値なので触らない（CSV 経路の分岐がこれを見ている）
+    if current_step == 1:
+        step_labels = ["見積書を入れる", "「生成」を押す", "NEO を受け取る"]
+        # 「NEO を受け取る」に進むのは、**いまの見積書から渡せるものができたとき**だけ（Codex 指摘 2026-09-20）:
+        #  - 見積書を外したら 1 に戻す（前の結果が残っていても「受け取る」にしない）
+        #  - 検算に通らなくても「_要確認」の NEO を渡せるなら、次にすることは受け取り・突き合わせなので 3
+        #  - 生成のあとに入力（見積書・添付・保険欄・費用・Addata）が変わった結果は、下でダウンロードを止めるので数えない
+        _bar_res = st.session_state.get('pdf2neo_result') or {}
+        _bar_file = st.session_state.get('pdf2neo_upload')
+        _bar_key = ''
+        if _bar_file is not None:
+            try:
+                _bar_b = _bar_file.getvalue()
+                _bar_key = f"{_bar_file.name}|{len(_bar_b)}|{hashlib.sha256(_bar_b).hexdigest()}"
+            except Exception:  # noqa: BLE001
+                _bar_key = f"{getattr(_bar_file, 'name', '')}|?"
+        _bar_beta = bool(_bar_res.get('legacy_beta'))
+        _bar_fresh = bool(_bar_res.get('inputs_sig')) and not _bar_res.get('stale') and _bar_res['inputs_sig'] == _p2n_inputs_signature(
+            _bar_key, api_key=api_key, model_name=selected_model, beta=_bar_beta,
+            addata_id='' if _bar_beta else _p2n_addata_identity(find_addata_dir()))
+        # 下の「できました」の帯もこの判定を使う（画面の上と下で食い違わせない）
+        _p2n_give_now = _bar_fresh and bool(_bar_res.get('ok') or _bar_res.get('unverified_neo'))
+        if _bar_file is None:
+            bar_step = 1
+        else:
+            bar_step = 3 if _p2n_give_now else 2
+    else:
+        step_labels = ["見積書を入れる", "AI が読み取る", "中身を確かめる", "NEO を受け取る"]
+        bar_step = current_step
     step_html = '<div class="step-bar">'
     for i, label in enumerate(step_labels):
         sn = i + 1
-        if sn < current_step:
+        if sn < bar_step:
             c_cls = "step-circle step-circle-done"
             c_txt = "✓"
             l_cls = "step-label-done"
-        elif sn == current_step:
+        elif sn == bar_step:
             c_cls = "step-circle step-circle-active"
             c_txt = str(sn)
             l_cls = "step-label-active"
@@ -9522,7 +9753,7 @@ def main():
             l_cls = "step-label-pending"
         step_html += f'<div class="step-item"><div class="{c_cls}">{c_txt}</div><span class="{l_cls}" style="font-size:12px;font-weight:600;margin-left:8px">{label}</span></div>'
         if i < len(step_labels) - 1:
-            conn_cls = "step-connector step-connector-done" if sn < current_step else "step-connector"
+            conn_cls = "step-connector step-connector-done" if sn < bar_step else "step-connector"
             step_html += f'<div class="{conn_cls}"></div>'
     step_html += '</div>'
     st.markdown(step_html, unsafe_allow_html=True)
@@ -9548,33 +9779,67 @@ def main():
         except Exception as _e:
             _nsk_why, _nsk_commit = f'neo_skill を読み込めない: {_e}', ''
         _nsk_ready = not _nsk_why
-        st.markdown(
-            '<div style="background:#eff6ff;border:2px dashed #60a5fa;'
-            'border-radius:14px;padding:20px 22px;margin-bottom:14px;">'
-            '<div style="font-size:18px;font-weight:800;color:#1d4ed8;'
-            'letter-spacing:.02em;">📄 見積書（PDF・写真）をここに入れてください</div>'
-            '<div style="font-size:13px;color:#334155;margin-top:8px;line-height:1.7;">'
-            '見積書を AI（Claude または Gemini。下で選びます）が<b>印字どおり</b>に写し、ページごとに機械検算して落ちたページだけ読み直します。'
-            '部品コード・標準品番・指数・塗装・費用の判断とNEOの生成・検算は '
-            '<b>pdf-to-neo スキル</b>（コグニ実機で確かめた判断規則）がそのまま行います。'
-            '検算に通れば NEO と<b>確認箇所シート（xlsx）</b>を組でお渡しします。'
-            '通らなかったときも、<b>印字との違いを添えて「_要確認」の NEO</b>をお渡しします（直してからお使いください）。'
-            '合計を合わせるための金額調整はしません。</div>'
-            + (f'<div style="font-size:11px;color:#64748b;margin-top:6px;">スキル: commit {_nsk_commit} ／ アプリ側 neo_skill: {_nsk_code_stamp()}</div>' if _nsk_commit else '')
-            + '</div>', unsafe_allow_html=True)
+        # 最初に読む案内は 1 行だけ（毎回読む必要のない説明は下のたたみに入れる。2026-09-20 画面の作り直し）。
+        # できあがっているときは「次にすること」（受け取り・次の見積書）に差し替える
+        _p2n_card_res = st.session_state.get('pdf2neo_result') or {}
+        if _p2n_give_now and not _p2n_card_res.get('ok') and _p2n_card_res.get('unverified_neo'):
+            # 検算に通らないまま渡す「_要確認」の NEO。帯は 3 段目まで進むので、案内も「次にすること」に合わせる
+            # （ここで最初の案内に戻ると「もう一度入れて押せ」と読めてしまう。Codex 第17周）
+            st.markdown(
+                '<div style="background:#fffbeb;border:1.5px solid #fcd34d;'
+                'border-radius:14px;padding:16px 20px;margin-bottom:10px;">'
+                '<div style="font-size:18px;font-weight:800;color:#b45309;letter-spacing:.02em;">'
+                '⚠️ NEO はできましたが、見積書と合っていないところがあります</div>'
+                '<div style="font-size:13px;color:#334155;margin-top:6px;line-height:1.7;">'
+                '名前に <b>_要確認</b> の付いた NEO です。下の「印字との違い」を見積書と突き合わせ、'
+                '<b>直してから</b>保険会社にお渡しください（確認箇所シートと組で受け取ります）。</div>'
+                '</div>', unsafe_allow_html=True)
+        elif _p2n_give_now and _p2n_card_res.get('ok'):
+            st.markdown(
+                '<div style="background:#f0fdf4;border:1.5px solid #86efac;'
+                'border-radius:14px;padding:16px 20px;margin-bottom:10px;">'
+                '<div style="font-size:18px;font-weight:800;color:#15803d;letter-spacing:.02em;">'
+                '✅ NEO ができました — 下の「📥 NEOファイルをダウンロード」と「📥 確認箇所シート」を組で受け取ってください</div>'
+                '<div style="font-size:13px;color:#334155;margin-top:6px;line-height:1.7;">'
+                '次の見積書を作るときは、下の「見積書（PDF・写真）」を入れ替えます（前の案件の添付・保険欄・結果は自動で消えます）。</div>'
+                '</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<div style="background:#eff6ff;border:1.5px dashed #60a5fa;'
+                'border-radius:14px;padding:16px 20px;margin-bottom:10px;">'
+                '<div style="font-size:18px;font-weight:800;color:#1d4ed8;letter-spacing:.02em;">'
+                '📄 見積書（PDF・写真）を入れて、下の「見積書からNEOを生成」を押すだけ</div>'
+                '<div style="font-size:13px;color:#334155;margin-top:6px;line-height:1.7;">'
+                'AI が<b>印字どおり</b>に写し、機械検算に通れば <b>NEO と確認箇所シート（xlsx）</b>を組でお渡しします。'
+                '<b>合計を合わせるための金額調整はしません</b>。</div>'
+                '</div>', unsafe_allow_html=True)
+        with st.expander("このアプリが何をするか（詳しく）", expanded=False):
+            st.markdown(
+                "- 見積書を AI（Claude または Gemini。下で選びます）が**印字どおり**に写し、ページごとに機械検算して"
+                "落ちたページだけ読み直します\n"
+                "- 部品コード・標準品番・指数・塗装・費用の判断と NEO の生成・検算は **pdf-to-neo スキル**"
+                "（コグニ実機で確かめた判断規則）がそのまま行います\n"
+                "- 検算に通れば NEO と**確認箇所シート（xlsx）**を組でお渡しします。通らなかったときも、"
+                "**印字との違いを添えて「_要確認」の NEO** をお渡しします（直してからお使いください）\n"
+                "- **合計を合わせるための金額調整はしません**（見積書に印字された金額がすべてです）"
+                + (f"\n- スキル: commit `{_nsk_commit}` ／ アプリ側 neo_skill: `{_nsk_code_stamp()}`" if _nsk_commit else ""))
         # 税区分のラジオは下の CSV 取り込みが session_state['tax_override'] を読むので残す。
         # この経路（PDF→NEO）は見積書の合計欄から税込印字を見分ける（reading_schema.md）ので使わない。
         _pdf_tax_options = ['税抜き（外税）', '税込み（内税）']
         _saved_pdf_tax = st.session_state.get('pdf_tax_override',
                                               st.session_state.get('tax_override', '税抜き（外税）'))
         _pdf_tax_idx = 1 if ('内税' in str(_saved_pdf_tax) or '税込' in str(_saved_pdf_tax)) else 0
-        _pdf_tax_sel = st.radio(
-            "💴 見積書の金額表記（CSV 取り込みとベタ打ちで使います。pdf-to-neo スキルの経路は見積書の合計欄から自動判定）",
-            options=_pdf_tax_options,
-            index=_pdf_tax_idx,
-            horizontal=True,
-            key='pdf_tax_radio',
-        )
+        # この経路（見積書 PDF → NEO）では使わない設定なので、主導線から外してたたんでおく（2026-09-20 画面の作り直し）
+        with st.expander(f"💴 金額表記の設定（いまは {_saved_pdf_tax}）— CSV 取り込み・ベタ打ちのときだけ使います", expanded=False):
+            st.caption("見積書 PDF からの生成では、見積書の合計欄から税込・税抜を自動で見分けるので、この設定は使いません。")
+            _pdf_tax_sel = st.radio(
+                "見積書の金額表記",
+                options=_pdf_tax_options,
+                index=_pdf_tax_idx,
+                horizontal=True,
+                key='pdf_tax_radio',
+                label_visibility='collapsed',
+            )
         st.session_state['pdf_tax_override'] = _pdf_tax_sel
         st.session_state['tax_override'] = _pdf_tax_sel
 
@@ -9622,14 +9887,18 @@ def main():
             st.info("🔄 " + str(st.session_state.pop('_p2n_reset_msg')))
         # 添付の書類（車検証・事故/保険の書類）は生成ボタンより前に描く: ボタンの処理が st.rerun() したとき、まだ描いていない
         # uploader の値は Streamlit に捨てられ、車種フォルダ待ちからの再開で添付が消えてしまう（2026-09-14 実ブラウザで発覚）
-        with st.container():
+        # 主役は見積書なので、任意の書類はたたんでおく（添付があるときは開いた状態にして、見出しに名前を出す。2026-09-20 画面の作り直し）
+        _doc_k0, _doc_k1 = _doc_upload_keys()[0], _doc_upload_keys()[1]
+        _doc_on = [bool(st.session_state.get(_doc_k0)), bool(st.session_state.get(_doc_k1))]
+        _doc_title = ('📎 添付ずみ: ' + ' ／ '.join(n for n, on in (('車検証', _doc_on[0]), ('事故・保険の書類', _doc_on[1])) if on)
+                      if any(_doc_on) else
+                      '📎 任意の書類を添える（車検証・事故/保険の書類）— 入れると車両・顧客・保険の情報が NEO に入ります')
+        with st.expander(_doc_title, expanded=any(_doc_on)):
             vehicle_file = st.file_uploader(
                 "📋 車検証（任意）PDF・JPG・PNG 対応",
                 type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
                 key=_doc_upload_keys()[0],
             )
-            if vehicle_file:
-                st.success(f"✅ {vehicle_file.name}")
             insurance_doc_file = st.file_uploader(
                 "🛡️ 事故・保険の書類（任意）速報報告書・受付票などの写真/PDF",
                 type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
@@ -9637,8 +9906,6 @@ def main():
                 help="保険会社・共済からの速報報告書や事故受付票の写真・スクリーンショット。依頼会社名・支店・担当者・事故番号・事故日・"
                      "契約者名・カラーNo・走行距離などを読み取り、サイドバーの事故・保険情報と NEO の車両情報に使います",
             )
-            if insurance_doc_file:
-                st.success(f"✅ {insurance_doc_file.name}")
             # 事故・保険の書類の差し替え／取り外しに合わせて、書類から埋めた欄を消す（API キーの有無・読み取りの成否に関係なく。
             # 前の案件の受付番号や担当者を次の案件に残さない。Codex 54〜58）。消したあと、読めたら下で入れ直す
             _ins_sha = ''
@@ -9688,6 +9955,11 @@ def main():
                 st.caption("書類の読み取りには Gemini API キーが必要です（サイドバーの「APIキー設定」）")
         if st.session_state.pop('_p2n_deferred_rerun', False):
             st.rerun()   # 書類の uploader を描き終えたので、サイドバーの入力欄（form_seq）と案内を描き直す
+        if _p2n_file is None:
+            # 見積書がまだ無いときも「次に押すボタン」を見せる（押せない理由も添える。2026-09-20 画面の作り直し:
+            # 以前はボタンが現れず、何をすればよいか分からなかった）
+            st.button("🚀 見積書からNEOを生成", key='pdf2neo_run_disabled', type="primary", width='stretch', disabled=True)
+            st.caption("↑ 上の「見積書（PDF・写真）」に見積書を入れると押せます。")
         _p2n_beta_ui_shown = False   # この run でベタ打ちの UI を描いたか（locals() で見ない。バグハント H7）
         if _p2n_file is not None:
             _p2n_bytes = _p2n_file.read()
@@ -9695,12 +9967,14 @@ def main():
             # この見積の同一性（車種フォルダ待ちの取り置きが別の見積で再開されないよう照合する）
             _p2n_file_key = f"{_p2n_file.name}|{len(_p2n_bytes)}|{hashlib.sha256(_p2n_bytes).hexdigest()}"
             _p2n_beta_ui_shown = False   # この run でベタ打ちの UI を描いたか（Addata なしの枝で立てる。結果の下の逃げ道と二重に描かない）
-            st.caption(f"📄 {_p2n_file.name}（{len(_p2n_bytes):,} bytes）")
-            st.caption("サイドバーの「事故・保険情報」（証券番号・契約者名・事故日・受付番号・代理店・アジャスター・入出庫日・修理日数）は、"
-                       "見積書に印字が無ければ NEO に補われます。"
-                       "「費用（Expense）」欄はこの経路では使いません — 見積書に印字された費用だけを写します"
-                       "（印字に無い費用を足すと、原本との照合が崩れるため）。Addata なしの「ベタ打ちで生成」だけは、"
-                       "下のチェックを入れたときに限りサイドバーの費用を NEO に入れます。")
+            # ファイル名・大きさは上の入れ物に出ているので、ここでは繰り返さない（2026-09-20 画面の作り直し）
+            with st.expander("サイドバーの入力はどう使われるか", expanded=False):
+                st.markdown(
+                    "- **事故・保険情報**（証券番号・契約者名・事故日・受付番号・代理店・アジャスター・入出庫日・修理日数）は、"
+                    "見積書に印字が無ければ NEO に補われます\n"
+                    "- **費用（Expense）欄はこの経路では使いません** — 見積書に印字された費用だけを写します"
+                    "（印字に無い費用を足すと、原本との照合が崩れるため）\n"
+                    "- Addata なしの「ベタ打ちで生成」だけは、そこに出るチェックを入れたときに限りサイドバーの費用を NEO に入れます")
             if not _nsk_ready:
                 st.error("❌ pdf-to-neo スキル（vendor/pdf_to_neo）が使えません: " + _nsk_why
                          + "  → `python tools/vendor_sync.py --source <files> --commit <ID>` で取り込み、"
@@ -9799,7 +10073,8 @@ def main():
                                                                        addata_id=_p2n_addata_identity(_p2n_addata))
                     st.session_state['pdf2neo_result'] = _p2n_out
                     st.rerun()
-                st.caption(_attached_docs_caption(api_key, selected_model))
+                if (_att_cap := _attached_docs_caption(api_key, selected_model)):
+                    st.caption(_att_cap)
                 if st.button("🚀 見積書からNEOを生成", key='pdf2neo_run', type="primary",
                              width='stretch'):
                     _p2n_skew = sync_app_modules()   # push 後にプロセスが残る本番で古い neo_skill を使わない（ベタ打ちと同じ扱い。バグハント H4）
@@ -9842,6 +10117,8 @@ def main():
                             if not _p2n_state.get('ok') and not _p2n_state.get('force_unverified'):
                                 _p2n_out = _p2n_state
                             else:
+                                # 読み取りが検算に通らなかった案件も、ここから先は同じ道を通る
+                                # （車種フォルダを取り寄せてから NEO を作る。取り寄せる前に作ると部品コードが入らない）
                                 _p2n_progress('車種を決めています（PC の Addata の車種マスタ）')
                                 _p2n_res = _br.resolve_car(_p2n_addata, _p2n_state.get('reading') or {})
                                 _p2n_car = str(_p2n_res.get('car_code') or '')
@@ -9923,7 +10200,7 @@ def main():
                 if not (_p2n_res.get('error') and not (_p2n_rd.get('fails') or _p2n_rd.get('traces'))):
                     # 読み取れた写しが検算に通らなかったときだけ（PDF が開けない・ページ数の上限・キーの誤りなど、
                     # 写す前に止まったときは「検算に通らない」とは言わない。P13）
-                    st.error("❌ 見積書の写しが機械検算に通りませんでした。NEO は作っていません"
+                    st.error("⚠️ 見積書の写しが機械検算に通りませんでした"
                              "（合計を合わせるために行を消したり金額を動かしたりはしません）。"
                              + ("**NEO は下で渡しますが、下の項目が見積書と合っていません。** 必ず突き合わせてください。"
                                 if _p2n_res.get('unverified_neo') else "下の項目を見積書と突き合わせてください。"))
@@ -9992,14 +10269,27 @@ def main():
                 with st.expander("生成ログ（make_neo）", expanded=False):
                     st.code(_p2n_mk.get('tail') or '', language='text')
             elif _p2n_res.get('ok'):
-                st.success(f"✅ 合格 — {_p2n_mk.get('match_line') or '見積書合計との一致: OK'}")
+                _p2n_ok_line = f"✅ 合格 — {_p2n_mk.get('match_line') or '見積書合計との一致: OK'}"
+                if _p2n_res.get('stale'):
+                    # 前の入力の結果が緑の「合格」のまま残ると、今の見積書の結果に見える（実機確認 2026-09-20）
+                    st.info("🕘 前の入力で作った結果 — " + _p2n_ok_line.replace('✅ ', ''))
+                else:
+                    st.success(_p2n_ok_line)
+                _p2n_render_summary(_p2n_res.get('report_md'), stale=bool(_p2n_res.get('stale')))   # 車両・合計・明細の行数をひと目で（2026-09-20 画面の作り直し）
                 if 'コグニ計算' in str(_p2n_mk.get('match_line') or ''):
                     # 工場の単価に円未満の端数がある見積（コグニの円計算では印字の合計を再現できない案件。2026-09-16 フリード）
                     st.info("この見積は**部品の単価に円未満の端数**があります（例: 単価 154.5 円 × 3 個 = 463.5 → 印字 464）。"
                             "工場は端数のまま合計するので、行ごとに円で足すコグニとは数円ずれます。"
                             "**明細の金額は見積書のとおり**で、差の理由は報告文と確認箇所シートの「要確認」に入れてあります。")
-                for _w in (_p2n_rd.get('warn') or []):
-                    st.warning(f"⚠️ 読み取りの注意: {_md_literal(_w)}")
+                # 注意が何件もあるとダウンロードのボタンが下へ追いやられるので、2 件以上はたたんで置く（中身は変えない。2026-09-20）
+                _p2n_warns = list(_p2n_rd.get('warn') or [])
+                if len(_p2n_warns) >= 2:
+                    with st.expander(f"⚠️ 読み取りの注意 {len(_p2n_warns)} 件（金額には影響しません。内容を確かめたいとき）", expanded=False):
+                        for _w in _p2n_warns:
+                            st.warning(_md_literal(_w))
+                else:
+                    for _w in _p2n_warns:
+                        st.warning(f"⚠️ 読み取りの注意: {_md_literal(_w)}")
                 _p2n_name = _p2n_res.get('download_name') or '見積_claude'
                 _p2n_c1, _p2n_c2 = st.columns(2)
                 with _p2n_c1:
@@ -10022,10 +10312,11 @@ def main():
                         key='pdf2neo_dl_review', disabled=bool(_p2n_res.get('stale')),
                         width='stretch',
                     )
-                st.caption("NEO と確認箇所シートは必ず組で保険会社・担当者に渡してください"
-                           "（人が確かめる点は NEO の明細コメントではなくシートにあります）。")
+                st.info("📎 **NEO と確認箇所シートは必ず組で**保険会社・担当者に渡してください"
+                        "（人が確かめる点は NEO の明細コメントではなくシートにあります）。")
                 if _p2n_res.get('report_md'):
-                    with st.expander("📝 報告文（report.md）", expanded=True):
+                    # 合格のときの報告文は「読みたい人だけ」開く（長いので既定は閉じる。2026-09-20 画面の作り直し）
+                    with st.expander("📝 報告文（どう判断したか・確かめてほしい点）", expanded=False):
                         st.markdown(_md_literal(_p2n_res['report_md']))
             else:
                 st.error(f"❌ {_p2n_res.get('error') or '変換できませんでした'}")
@@ -10040,10 +10331,9 @@ def main():
         # ================================================================
         # STEP 1-B: 車検証・テンプレートNEO（任意）
         # ================================================================
-        st.markdown('<div class="section-title">📁 テンプレートNEO（任意）</div>',
-                    unsafe_allow_html=True)
-        st.caption("車検証・事故/保険の書類は上の見積書の下に入れます。テンプレートNEO は任意です。")
-        _up_col2 = st.container()
+        # ふだんは既定のテンプレートで足りるので、たたんでおく（使っているときは開いた状態にする。2026-09-20 画面の作り直し）
+        _up_col2 = st.expander('📁 テンプレートNEO（任意）— 証券番号や工場名が入った .neo を土台にしたいとき',
+                               expanded=bool(st.session_state.get('custom_neo_bytes')))
         with _up_col2:
             custom_neo_file = st.file_uploader(
                 "📁 テンプレートNEOファイル（任意）",
@@ -10116,217 +10406,198 @@ def main():
         # ================================================================
         # STEP 1-C: Gemini で CSV 化（PDF で読み取れないときの代替手段）
         # ================================================================
-        st.markdown("---")
-        st.markdown(
-            '<div style="background:#fffbeb;border:1px solid #fcd34d;border-radius:10px;'
-            'padding:14px 18px;font-size:14px;margin-bottom:12px;">'
-            '🛟 <b>PDF でうまく読み取れないときだけ使う手順</b><br>'
-            '<span style="font-size:12px;color:#555;line-height:1.7;">'
-            '上の「見積書PDF」で明細がきちんと拾えない見積書は、'
-            'こちらで Gemini に読ませて CSV にしてから取り込みます。'
-            'ふだんは使いません。</span></div>', unsafe_allow_html=True)
-        st.markdown(
-            '<div style="background:#f0fdf4;border:1px solid #86efac;border-radius:10px;'
-            'padding:14px 18px;font-size:14px;margin-bottom:12px;">'
-            '🤖 <b>見積書の解析手順</b><br>'
-            '<span style="font-size:12px;color:#555;">'
-            '① 下の「プロンプトをコピー」をクリック → '
-            '② 「Geminiを開く」でGoogle Geminiへ → '
-            '③ プロンプトを貼り付け＋見積書PDFを添付して送信 → '
-            '④ 結果のCSVをコピーして下欄に貼り付け'
-            '</span>'
-            '</div>',
-            unsafe_allow_html=True
-        )
-
-        # ── プロンプト定義 ──
-        _CSV_PROMPT = """添付の自動車修理見積書PDFを、以下のCSV形式で全明細行を転写してください。
-【出力形式（ヘッダー行必須）】 品名,区分,数量,部品金額,工賃,部品コード
-【各列の抽出・加工ルール】
-* 品名：元の記載から「取替」「脱着」「修理」「鈑金」「塗装」などの作業を示す文言（後述の区分ルールに該当する語）を削除した、純粋な部品名・対象名。
-* 区分：元の記載から下記のいずれか1語を割り当てる。上に書いたものほど優先する。 【最優先・空欄】「研磨」「磨き」「写真代」「ショートパーツ」を含む行は空欄にする。**部品金額だけの行でも空欄のまま**（「取替」にしない）。ただし「磨き調整」は区分なので次の行を採る。 【重要】次の語群は**見積書に書かれていた語をそのまま**出すこと（言い換えない）: 「脱着修理」「脱着鈑金」「脱着板金」／「点検調整」「点検清掃」／「分解調整」「分解清掃」／「鈑金」「板金」。この文字列は帳票の「修理方法」欄にそのまま印字されるため。 ・磨き調整：「磨き調整」 ・取替：「取替」「交換」「取換」（※部品金額のみで工賃0の行も「取替」とする。ただし上の空欄ルールに当たる行を除く） ・脱着：「脱着」「取外」「取付」「組付」 ・塗装：「塗装」「ペイント」「ワックス」「加算」「ブース」 ・分解調整：単に「分解」とだけ書かれている場合 ・点検：「点検」「診断」 ・調整：「調整」「光軸」「フィッティング」「コーディング」「設定」「消去」 ・修理：「修理」「補修」「修正」「穴あけ」「シーリング」 ・該当なし：空欄
-* 数量：見積書の数量（半角。整数でなければ 2.5 のようにそのまま。空欄や不明な場合は 1 を補完）
-* 部品金額：「部品、油脂」列の金額。半角整数・カンマなし（記載なしは 0）
-* 工賃：「技術料」列の金額。半角整数・カンマなし（記載なしは 0）
-* 部品コード：品番・部品番号（記載なしは空欄）
-【データ処理の重要ルール（高速化・精度向上）】
-1. 1行1明細：1つの項目に「部品、油脂」「技術料」両方の金額がある場合も、見積書と同じ1行のまま部品金額と工賃の両方を書く（2行に分けない。行数を見積書と同じにする）。
-2. 品名などにカンマ（,）が入るときは、その欄を「"」で囲む。金額にはカンマを入れない。
-3. 列の厳密照合：金額が部品列か技術料列か、PDFの表ヘッダーを厳密に確認する（例：「ショートパーツ」等、技術料列のみの数値を部品列に入れない）。
-4. 対象外：合計行、小計行、消費税行は出力しない。全ページ・全明細行を漏れなく処理する。
-【合計額の自動検算と出力】 明細抽出後、内部で以下の検算を実施すること。
-1. 抽出した全明細の「部品金額」の合計と「工賃」の合計を算出。
-2. 見積書原本の最終的な「部品代合計」「技術料（工賃）合計」と照合。
-3. 不一致の場合のみ、CSVの末尾に改行して以下を出力（一致時は出力しない）。行全体を「"」で囲むこと。 "部品相違〇,〇〇〇円 工賃相違●,●●●円"
-出力はCSVデータおよび相違確認結果のみ。説明文・コメントは一切不要。"""
-
-        # ── ボタン行: プロンプトコピー ＋ Geminiを開く ──
-        # st.components.v1.html は 2026-06-01 で削除予定（起動時に警告が出る）。
-        # 代替の st.iframe は src しか受け取れず HTML を直接描けないため、
-        # Streamlit ネイティブの部品に置き換えてある。
-        # st.code は右上に標準のコピーボタンが付くので、コピー機能は保たれる。
-        _btn_col1, _btn_col2 = st.columns(2)
-        with _btn_col1:
-            with st.popover("📋 プロンプトをコピー", width='stretch'):
-                st.caption("右上のコピーアイコンで全文をコピーできます")
-                st.code(_CSV_PROMPT, language=None)
-        with _btn_col2:
-            st.link_button("🌐 Geminiを開く（別タブ）",
-                           "https://gemini.google.com/",
-                           width='stretch')
-
-        # ── CSV取り込みエリア ──
-        st.markdown("")
-        st.markdown('<div class="section-title">📊 CSV取り込み（代替手段）</div>',
-                    unsafe_allow_html=True)
-
-        # 税区分はいちばん上の「見積書の金額表記」で選んだものを使う。
-        # ここに2つ目のラジオを置いていたため、利用者がどちらを操作すべきか分からず、
-        # 取り違えると NEO の総額が消費税ぶん（10%）ずれていた。
-        _pending_tax = st.session_state.pop('_tax_carry_pending', None)
-        if _pending_tax:
-            st.session_state['tax_override'] = _pending_tax
-        _tax_sel = st.session_state.get('tax_override', '税抜き（外税）')
-        st.caption(f"💴 金額表記: **{_tax_sel}** — 変えるときは、いちばん上の"
-                   "「見積書の金額表記」で切り替えてください")
-
-        _csv_col1, _csv_col2 = st.columns([2, 1])
-        with _csv_col1:
-            _csv_paste = st.text_area(
-                "Geminiの解析結果CSVを貼り付け（ヘッダー行必須）",
-                height=180,
-                placeholder="品名,区分,数量,部品金額,工賃,部品コード\nフロントバンパー,取替,1,45000,0,\nバンパー交換工賃,取替,1,0,12000,",
-                key=f"csv_paste_area_{st.session_state.get('csv_area_seq', 0)}",
-                value=st.session_state.get('_csv_paste_saved', ''),
+        # 車検証だけを入れて（見積書は無し）NEO を作る道は、この下の「開始」ボタンしか入口が無い。
+        # たたんだままだと見つけられないので、そのときは開いておく（Codex 第17周）
+        _fb_open = bool(st.session_state.get("csv_mode") or st.session_state.get("csv_items") or st.session_state.get("_csv_paste_saved")
+                        or (_p2n_file is None and vehicle_file is not None))
+        with st.expander("🛟 PDF でうまく読み取れないとき — Gemini で CSV にして取り込む／車検証だけで作る（ふだんは使いません）", expanded=_fb_open):
+            st.markdown("---")
+            st.markdown(
+                '<div style="background:#fffbeb;border:1px solid #fcd34d;border-radius:10px;'
+                'padding:14px 18px;font-size:14px;margin-bottom:12px;">'
+                '🛟 <b>PDF でうまく読み取れないときだけ使う手順</b><br>'
+                '<span style="font-size:12px;color:#555;line-height:1.7;">'
+                '上の「見積書PDF」で明細がきちんと拾えない見積書は、'
+                'こちらで Gemini に読ませて CSV にしてから取り込みます。'
+                'ふだんは使いません。</span></div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div style="background:#f0fdf4;border:1px solid #86efac;border-radius:10px;'
+                'padding:14px 18px;font-size:14px;margin-bottom:12px;">'
+                '🤖 <b>見積書の解析手順</b><br>'
+                '<span style="font-size:12px;color:#555;">'
+                '① 下の「プロンプトをコピー」をクリック → '
+                '② 「Geminiを開く」でGoogle Geminiへ → '
+                '③ プロンプトを貼り付け＋見積書PDFを添付して送信 → '
+                '④ 結果のCSVをコピーして下欄に貼り付け'
+                '</span>'
+                '</div>',
+                unsafe_allow_html=True
             )
-        with _csv_col2:
-            st.markdown("**CSVファイル（.csv/.txt）**")
-            _csv_file = st.file_uploader(
-                "CSVファイル",
-                type=['csv', 'txt'],
-                # 連番で作り直せるようにする（「取り込みをクリア」でファイルも外す。以前はファイルが残り、クリアが効かなかった。M12）
-                key=f"csv_file_upload_{st.session_state.get('csv_area_seq', 0)}",
-                label_visibility='collapsed',
-            )
-        _csv_text = ''
-        if _csv_file and _csv_paste and _csv_paste.strip():
-            st.info("ℹ️ CSV ファイルと貼り付けの両方があります。ファイルの内容を取り込んでいます（貼り付けは使っていません）。")
-        if _csv_file:
-            try:
-                _raw = _csv_file.read()
-                for _enc in ('utf-8-sig', 'utf-8', 'shift-jis', 'cp932'):
-                    try:
-                        _csv_text = _raw.decode(_enc)
-                        break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-            if not _csv_text:
-                st.error(
-                    "❌ CSVファイルの文字コードを判別できません。"
-                    "UTF-8 または Shift_JIS で保存し直してください"
-                    "（Excelの「Unicodeテキスト」形式は非対応です）。"
+
+            # ── プロンプト定義 ──
+
+            # ── ボタン行: プロンプトコピー ＋ Geminiを開く ──
+            # st.components.v1.html は 2026-06-01 で削除予定（起動時に警告が出る）。
+            # 代替の st.iframe は src しか受け取れず HTML を直接描けないため、
+            # Streamlit ネイティブの部品に置き換えてある。
+            # st.code は右上に標準のコピーボタンが付くので、コピー機能は保たれる。
+            _btn_col1, _btn_col2 = st.columns(2)
+            with _btn_col1:
+                with st.popover("📋 プロンプトをコピー", width='stretch'):
+                    st.caption("右上のコピーアイコンで全文をコピーできます")
+                    st.code(_CSV_PROMPT, language=None)
+            with _btn_col2:
+                st.link_button("🌐 Geminiを開く（別タブ）",
+                               "https://gemini.google.com/",
+                               width='stretch')
+
+            # ── CSV取り込みエリア ──
+            st.markdown("")
+            st.markdown('<div class="section-title">📊 CSV取り込み（代替手段）</div>',
+                        unsafe_allow_html=True)
+
+            # 税区分はいちばん上の「見積書の金額表記」で選んだものを使う。
+            # ここに2つ目のラジオを置いていたため、利用者がどちらを操作すべきか分からず、
+            # 取り違えると NEO の総額が消費税ぶん（10%）ずれていた。
+            _pending_tax = st.session_state.pop('_tax_carry_pending', None)
+            if _pending_tax:
+                st.session_state['tax_override'] = _pending_tax
+            _tax_sel = st.session_state.get('tax_override', '税抜き（外税）')
+            st.caption(f"💴 金額表記: **{_tax_sel}** — 変えるときは、いちばん上の"
+                       "「見積書の金額表記」で切り替えてください")
+
+            _csv_col1, _csv_col2 = st.columns([2, 1])
+            with _csv_col1:
+                _csv_paste = st.text_area(
+                    "Geminiの解析結果CSVを貼り付け（ヘッダー行必須）",
+                    height=180,
+                    placeholder="品名,区分,数量,部品金額,工賃,部品コード\nフロントバンパー,取替,1,45000,0,\nバンパー交換工賃,取替,1,0,12000,",
+                    key=f"csv_paste_area_{st.session_state.get('csv_area_seq', 0)}",
+                    value=st.session_state.get('_csv_paste_saved', ''),
                 )
-            elif not _csv_text.strip():
-                st.error("❌ CSVファイルが空です。")
-                _csv_text = ''
-        elif _csv_paste and _csv_paste.strip():
-            _csv_text = _csv_paste.strip()
+            with _csv_col2:
+                st.markdown("**CSVファイル（.csv/.txt）**")
+                _csv_file = st.file_uploader(
+                    "CSVファイル",
+                    type=['csv', 'txt'],
+                    # 連番で作り直せるようにする（「取り込みをクリア」でファイルも外す。以前はファイルが残り、クリアが効かなかった。M12）
+                    key=f"csv_file_upload_{st.session_state.get('csv_area_seq', 0)}",
+                    label_visibility='collapsed',
+                )
+            _csv_text = ''
+            if _csv_file and _csv_paste and _csv_paste.strip():
+                st.info("ℹ️ CSV ファイルと貼り付けの両方があります。ファイルの内容を取り込んでいます（貼り付けは使っていません）。")
+            if _csv_file:
+                try:
+                    _raw = _csv_file.read()
+                    for _enc in ('utf-8-sig', 'utf-8', 'shift-jis', 'cp932'):
+                        try:
+                            _csv_text = _raw.decode(_enc)
+                            break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+                if not _csv_text:
+                    st.error(
+                        "❌ CSVファイルの文字コードを判別できません。"
+                        "UTF-8 または Shift_JIS で保存し直してください"
+                        "（Excelの「Unicodeテキスト」形式は非対応です）。"
+                    )
+                elif not _csv_text.strip():
+                    st.error("❌ CSVファイルが空です。")
+                    _csv_text = ''
+            elif _csv_paste and _csv_paste.strip():
+                _csv_text = _csv_paste.strip()
 
-        if not _csv_text and not _csv_file and st.session_state.get('csv_mode'):
-            # 貼り付け欄を空にしたのに前回の取込が残っていると、
-            # 消したはずの見積がそのまま生成されてしまう
-            st.session_state.pop('csv_items', None)
-            st.session_state.pop('csv_mode', None)
-            st.session_state.pop('_csv_paste_saved', None)
-
-        if _csv_text:
-            _preview_items, _csv_notes = parse_csv_to_items(_csv_text, return_notes=True)
-            _csv_errs  = [n for n in _csv_notes if str(n).startswith('❌')]
-            _csv_warns = [n for n in _csv_notes if str(n).startswith('⚠️')]
-            _csv_diffs = [n for n in _csv_notes if re.match(r'^(部品|工賃)相違', str(n))]
-            _csv_other = [n for n in _csv_notes if n not in _csv_errs and n not in _csv_warns and n not in _csv_diffs]
-            for _note in _csv_errs:
-                st.error(_note)
-            for _note in _csv_warns:
-                # 金額のある行を読み飛ばした知らせは赤で（注記が多いと 4 件目以降が出ず、行が黙って消えていた。M7）
-                (st.error if '読み飛ばしました' in _note else st.warning)(_note)
-            for _note in _csv_diffs:
-                st.warning(f"⚠️ 見積書との差異が記録されています: {_note}")
-            if _csv_other:
-                with st.expander(f"CSV の後ろの説明文 {len(_csv_other)} 行（明細には取り込んでいません）", expanded=False):
-                    for _note in _csv_other:
-                        st.text(str(_note))
-            if _csv_errs:
-                st.session_state.pop('csv_items', None)
-                st.session_state.pop('csv_mode', None)
-            elif _preview_items:
-                st.success(f"✅ {len(_preview_items)}行 読み込み完了 — 部品: ¥{sum(safe_int(it.get('parts_amount',0)) for it in _preview_items):,} / 工賃: ¥{sum(safe_int(it.get('wage',0)) for it in _preview_items):,}")
-                st.session_state['csv_items'] = _preview_items
-                st.session_state['csv_mode']  = True
-                st.session_state['_csv_paste_saved'] = _csv_text
-            else:
-                st.error("❌ CSVの読み込みに失敗しました。1行目にヘッダー（品名,区分,数量,部品金額,工賃,部品コード）が必要です。")
-                st.session_state.pop('csv_items', None)
-                st.session_state.pop('csv_mode', None)
-
-        # クリアは取り込みの後ろに置く。前に置くと、貼り付けた直後の描画では
-        # まだ csv_items が無いためボタンが1回遅れて出る。
-        if st.session_state.get('csv_mode') and st.session_state.get('csv_items'):
-            if st.button("🗑️ 取り込みをクリア", key='csv_clear_btn'):
+            if not _csv_text and not _csv_file and st.session_state.get('csv_mode'):
+                # 貼り付け欄を空にしたのに前回の取込が残っていると、
+                # 消したはずの見積がそのまま生成されてしまう
                 st.session_state.pop('csv_items', None)
                 st.session_state.pop('csv_mode', None)
                 st.session_state.pop('_csv_paste_saved', None)
-                # 貼り付け欄も空にしないと、ブラウザが直前の値を送り直して
-                # 同じ実行内で再取込され、クリアが効かない。キーを消すだけ
-                # では戻ってくるので、版番号を上げて別ウィジェットにする。
-                _seq = st.session_state.get('csv_area_seq', 0)
-                st.session_state.pop(f'csv_paste_area_{_seq}', None)
-                st.session_state['csv_area_seq'] = _seq + 1
-                st.rerun()
 
-        # ── オプション設定 ──
-        with st.expander("⚙️ オプション設定", expanded=False):
-            opt_col1, opt_col2, opt_col3 = st.columns(3)
-            with opt_col1:
-                # ここで入力された値はどこにも使われておらず、証券番号の欄が
-                # サイドバーと二重に存在していた。サイドバー側に一本化する。
-                st.caption("保険会社・証券番号・契約者名はサイドバーの「🛡️ 保険情報」で入力してください。")
-            with opt_col2:
-                st.write("")
-            with opt_col3:
-                st.write("")
-
-        # ── 開始ボタン ──
-        st.markdown("")
-        estimate_file = None  # PDF見積書アップロード廃止（CSV取り込みに一本化）
-        _csv_mode_active = st.session_state.get('csv_mode') and st.session_state.get('csv_items')
-        _has_input = vehicle_file or _csv_mode_active
-        if _has_input:
-            _btn_label = ("🚀 NEO生成を開始 →" if _csv_mode_active
-                          else "🚗 車検証だけで NEO を作る（明細なし） →")
-            if st.button(_btn_label, type="primary", width='stretch'):
-                if vehicle_file:
-                    st.session_state['vehicle_file_bytes'] = vehicle_file.read()
-                    st.session_state['vehicle_file_name']  = vehicle_file.name
+            if _csv_text:
+                _preview_items, _csv_notes = parse_csv_to_items(_csv_text, return_notes=True)
+                _csv_errs  = [n for n in _csv_notes if str(n).startswith('❌')]
+                _csv_warns = [n for n in _csv_notes if str(n).startswith('⚠️')]
+                _csv_diffs = [n for n in _csv_notes if re.match(r'^(部品|工賃)相違', str(n))]
+                _csv_other = [n for n in _csv_notes if n not in _csv_errs and n not in _csv_warns and n not in _csv_diffs]
+                for _note in _csv_errs:
+                    st.error(_note)
+                for _note in _csv_warns:
+                    # 金額のある行を読み飛ばした知らせは赤で（注記が多いと 4 件目以降が出ず、行が黙って消えていた。M7）
+                    (st.error if '読み飛ばしました' in _note else st.warning)(_note)
+                for _note in _csv_diffs:
+                    st.warning(f"⚠️ 見積書との差異が記録されています: {_note}")
+                if _csv_other:
+                    # たたみ（CSV の節）の中なので、さらにたたまずに枠付きの箱でそのまま見せる（中身は説明文だけ。2026-09-20）
+                    with st.container(border=True):
+                        st.caption(f"CSV の後ろの説明文 {len(_csv_other)} 行（明細には取り込んでいません）")
+                        for _note in _csv_other:
+                            st.text(str(_note))
+                if _csv_errs:
+                    st.session_state.pop('csv_items', None)
+                    st.session_state.pop('csv_mode', None)
+                elif _preview_items:
+                    st.success(f"✅ {len(_preview_items)}行 読み込み完了 — 部品: ¥{sum(safe_int(it.get('parts_amount',0)) for it in _preview_items):,} / 工賃: ¥{sum(safe_int(it.get('wage',0)) for it in _preview_items):,}")
+                    st.session_state['csv_items'] = _preview_items
+                    st.session_state['csv_mode']  = True
+                    st.session_state['_csv_paste_saved'] = _csv_text
                 else:
-                    st.session_state['vehicle_file_bytes'] = None
-                    st.session_state['vehicle_file_name']  = None
-                # PDF見積書は使用しない（CSV取り込みに一本化）
-                st.session_state['estimate_file_bytes'] = None
-                st.session_state['estimate_file_name']  = None
-                st.session_state['use_fax_filter'] = False
-                st.session_state['use_rasterize']  = False
-                st.session_state['use_enhance']    = True
-                st.session_state['selected_model'] = selected_model
-                st.session_state['step'] = 2
-                st.rerun()
-        elif _p2n_file is None:
-            # 見積書が入っているときは、上の生成ボタンが主導線なので出さない。
-            st.info("📄 いちばん上で見積書（PDF・写真）を入れて「見積書からNEOを生成」を押してください。"
-                    "／ CSVを貼り付けた場合や、車検証だけでNEOを作る場合は、"
-                    "この下の「NEO生成を開始」を使います")
+                    st.error("❌ CSVの読み込みに失敗しました。1行目にヘッダー（品名,区分,数量,部品金額,工賃,部品コード）が必要です。")
+                    st.session_state.pop('csv_items', None)
+                    st.session_state.pop('csv_mode', None)
+
+            # クリアは取り込みの後ろに置く。前に置くと、貼り付けた直後の描画では
+            # まだ csv_items が無いためボタンが1回遅れて出る。
+            if st.session_state.get('csv_mode') and st.session_state.get('csv_items'):
+                if st.button("🗑️ 取り込みをクリア", key='csv_clear_btn'):
+                    st.session_state.pop('csv_items', None)
+                    st.session_state.pop('csv_mode', None)
+                    st.session_state.pop('_csv_paste_saved', None)
+                    # 貼り付け欄も空にしないと、ブラウザが直前の値を送り直して
+                    # 同じ実行内で再取込され、クリアが効かない。キーを消すだけ
+                    # では戻ってくるので、版番号を上げて別ウィジェットにする。
+                    _seq = st.session_state.get('csv_area_seq', 0)
+                    st.session_state.pop(f'csv_paste_area_{_seq}', None)
+                    st.session_state['csv_area_seq'] = _seq + 1
+                    st.rerun()
+
+            # ── オプション設定 ──
+            # 「⚙️ オプション設定」のたたみは中身が説明文 1 行だけになっていた（入力欄はサイドバーに一本化済み）。
+            # たたみを開かないと読めない・たたみの入れ子にもなるので、そのまま 1 行で出す（2026-09-20 Codex 第20周）
+            st.caption("保険会社・証券番号・契約者名はサイドバーの「🛡️ 保険情報」で入力してください。")
+
+            # ── 開始ボタン ──
+            st.markdown("")
+            estimate_file = None  # PDF見積書アップロード廃止（CSV取り込みに一本化）
+            _csv_mode_active = st.session_state.get('csv_mode') and st.session_state.get('csv_items')
+            _has_input = vehicle_file or _csv_mode_active
+            if _has_input:
+                _btn_label = ("🚀 NEO生成を開始 →" if _csv_mode_active
+                              else "🚗 車検証だけで NEO を作る（明細なし） →")
+                if st.button(_btn_label, type="primary", width='stretch'):
+                    if vehicle_file:
+                        st.session_state['vehicle_file_bytes'] = vehicle_file.read()
+                        st.session_state['vehicle_file_name']  = vehicle_file.name
+                    else:
+                        st.session_state['vehicle_file_bytes'] = None
+                        st.session_state['vehicle_file_name']  = None
+                    # PDF見積書は使用しない（CSV取り込みに一本化）
+                    st.session_state['estimate_file_bytes'] = None
+                    st.session_state['estimate_file_name']  = None
+                    st.session_state['use_fax_filter'] = False
+                    st.session_state['use_rasterize']  = False
+                    st.session_state['use_enhance']    = True
+                    st.session_state['selected_model'] = selected_model
+                    st.session_state['step'] = 2
+                    st.rerun()
+            elif _p2n_file is None:
+                # 見積書が入っているときは、上の生成ボタンが主導線なので出さない。
+                st.info("📄 いちばん上で見積書（PDF・写真）を入れて「見積書からNEOを生成」を押してください。"
+                        "／ CSVを貼り付けた場合や、車検証だけでNEOを作る場合は、"
+                        "この下の「NEO生成を開始」を使います")
 
     # =========================================
     # STEP 2: AI解析

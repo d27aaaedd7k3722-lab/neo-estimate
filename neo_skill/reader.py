@@ -739,7 +739,8 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
         res.error = str(e)
         return res
     except Exception as e:  # noqa: BLE001
-        res.error = f'PDF を開けない: {type(e).__name__}'
+        # 画面にそのまま出る文なので、何をすればよいかが分かる日本語にする（2026-09-20 実画面のバグハント）
+        res.error = f'PDF を開けません（ファイルが壊れているか、PDF ではないようです。{type(e).__name__}）'
         return res
     _lim = int(getattr(reader, 'max_pdf_bytes', 0) or 0)
     if _lim and len(pdf_bytes) > _lim:   # 上限を超える PDF は必ず失敗するのに、全ページ分をメモリに展開して送っていた（P8）
