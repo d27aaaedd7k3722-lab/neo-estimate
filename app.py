@@ -8360,6 +8360,55 @@ def _fresh_doc_fill(doc):
     return _doc_hints.sidebar_insurance_from_doc(doc)
 
 
+def _p2n_check_count(report_md) -> int:
+    """報告文の「## 要確認（inspect_estimate）」に並ぶ件数（確認箇所シートに載る「要確認」の目安）。
+    「- なし」のときは 0。生成のあと、何件を突き合わせればよいかを画面に出すために使う（2026-09-20）"""
+    body = str(report_md or '').split('## 要確認（inspect_estimate）')
+    if len(body) < 2:
+        return 0
+    n = 0
+    for ln in body[1].splitlines():
+        t = ln.strip()
+        if t.startswith('## '):
+            break
+        if t.startswith('- ') and t[2:].strip() not in ('なし', ''):
+            n += 1
+    return n
+
+
+def _attached_docs_result_line(api_key, model_name) -> str:
+    """生成のあとに「添付の書類から何を読んだか」を 1 行で出す（API は呼ばない。控えから読む）。
+    読み取りは生成の中で行うので、結果と一緒に確かめて直せるようにする（2026-09-20 亮平さん指示）"""
+    if not api_key:
+        return ''
+    vd, doc = _attached_docs_ocr(api_key, model_name, cached_only=True)
+    summary = _doc_hints.summary(vd, doc)
+    if not summary:
+        return ''
+    return ("📎 添付から読み取り → " + summary
+            + "（事故・保険の値はサイドバーの「事故・保険情報」に入れました。違うところはそこで直して、もう一度生成してください）")
+
+
+def _doc_fill_to_sidebar(doc) -> dict:
+    """事故・保険の書類から読めた値を、サイドバーの欄（session_state の素のキー）に入れる。戻り値は入れた {欄: 値}。
+    空欄か、前に書類から入れたままの項目にだけ入れる（利用者が手で入れた・直した値は書き換えない。Codex 62）。
+    2026-09-20 まではファイルを添えた時点で行っていたが、添えるたびに読み取りを待たされるので**生成の中**に移した。
+    入力欄は form_seq で作り直す（ウィジェットは描いたあとに値を変えられないため）"""
+    fill = _doc_hints.sidebar_insurance_from_doc(doc) if doc else {}
+    oid = st.session_state.get('_insdoc_ocr_id') if st.session_state.get(_doc_upload_keys()[1]) is not None else ''
+    if not (fill and oid) or st.session_state.get('_insdoc_applied') == oid:
+        return {}
+    prev_filled = st.session_state.get('_insdoc_filled') or {}
+    updates, now_filled = _doc_fill_plan(fill, prev_filled,
+                                         {k: st.session_state.get(k, '') for k in set(fill) | set(prev_filled)})
+    for k, v in updates.items():
+        st.session_state[k] = v
+    st.session_state['_insdoc_filled'] = now_filled
+    st.session_state['form_seq'] = int(st.session_state.get('form_seq', 0)) + 1
+    st.session_state['_insdoc_applied'] = oid
+    return updates
+
+
 def _insurance_hint_now(doc):
     """スキル経路に渡す保険の hint: サイドバーの値 ＋（この run で初めて読めた書類なら）空の項目だけ書類から。
     読むときも取り置きの再開時も同じ作り方にする（照合の鍵がずれて取り置きを捨てないように。Codex 63）"""
@@ -8524,13 +8573,17 @@ def _attached_docs_caption(api_key, model_name) -> str:
         return ''   # 何も添えていないときは案内を出さない（「任意の書類を添える」のたたみの見出しに同じことが書いてある。2026-09-20）
     if not api_key:
         return "📎 添付の書類はまだ読めていません（Gemini API キーが無いため）。このまま生成すると書類の値は NEO に入りません"
-    vd, doc = _attached_docs_ocr(api_key, model_name)
+    vd, doc = _attached_docs_ocr(api_key, model_name, cached_only=True)   # ここでは読まない（生成を押したときに読む）
+    if not vd and not doc:
+        _names = ' ／ '.join(n for n, on in (('車検証', fv is not None), ('事故・保険の書類', fd is not None)) if on)
+        return (f"📎 添付ずみ: {_names} — **「生成」を押したあとに読み取ります**"
+                "（読み取った値は生成のあとサイドバーの事故・保険情報に入るので、そこで確かめて直せます）")
     parts = []
     if fv is not None:
-        parts.append("車検証: " + ("読み取り済み → 車両・顧客の情報に使います" if vd else "読めていません → 使われません"))
+        parts.append("車検証: " + ("読み取り済み → 車両・顧客の情報に使います" if vd else "まだ読んでいません（生成時に読みます）"))
     if fd is not None:
         parts.append("事故・保険の書類: " + ("読み取り済み → サイドバーの事故・保険情報と車両の情報に使います" if doc
-                                     else "読めていません → 使われません"))
+                                     else "まだ読んでいません（生成時に読みます）"))
     return "📎 " + " ／ ".join(parts)
 
 
@@ -8732,6 +8785,7 @@ def _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_mo
         for _k, _v in _fresh_doc_fill(_p2n_beta_doc).items():
             if not str(_p2n_beta_ins.get(_k) or '').strip():
                 _p2n_beta_ins[_k] = _v
+        _doc_fill_to_sidebar(_p2n_beta_doc)   # 読めた値を画面にも出す（生成後に確かめて直せるように。2026-09-20）
         with st.spinner("見積書を読んでベタ打ちの NEO を作っています…（1〜3 分）"):
             _p2n_beta = run_pdf_to_neo_pipeline(
                 _p2n_bytes, api_key,
@@ -8782,10 +8836,13 @@ def _nsk_code_stamp() -> str:
         return '?'
 
 
-def _attached_docs_ocr(api_key, model_name=None, progress=None):
+def _attached_docs_ocr(api_key, model_name=None, progress=None, cached_only=False):
     """STEP 1-B に添付した車検証（vehicle_upload）と事故・保険の書類（insurance_doc_upload）を Gemini で読み、
     (車検証の dict, 書類の dict) を返す。読めなかったものは {}。同じファイルは内容ハッシュでセッションに控えて二度読まない。
-    書類の内容ハッシュは session_state['_insdoc_sha'] に置く（サイドバーへの一度きりの反映に使う）"""
+    書類の内容ハッシュは session_state['_insdoc_sha'] に置く（サイドバーへの一度きりの反映に使う）。
+
+    cached_only=True のときは**API を呼ばない**（控えにあるものだけ返す）。添付しただけで待たされないよう、
+    読み取りは「生成」を押したあとに行う（2026-09-20 亮平さん指示）。画面を描くたびの呼び出しはこちらを使う"""
     out = []
     cache = st.session_state.setdefault('_doc_ocr_cache', {})
     _k_veh, _k_doc = _doc_upload_keys()
@@ -8809,6 +8866,8 @@ def _attached_docs_ocr(api_key, model_name=None, progress=None):
                 _hit = cache.get(_ck)
                 if isinstance(_hit, dict) and (not _hit.get('_error') or time.time() - float(_hit.get('_t') or 0) < 120):
                     data = _hit   # 成功はずっと、失敗は 2 分だけ控える（rerun のたびに同じファイルを送らない。Codex 57）
+                elif cached_only:
+                    data = {}     # まだ読んでいない（「生成」を押したときに読む）
                 else:
                     if progress:
                         progress(f'{label}を読んでいます（{f.name}）')
@@ -9925,34 +9984,20 @@ def main():
                 st.session_state.pop('_insdoc_filled', None)
                 st.session_state['form_seq'] = int(st.session_state.get('form_seq', 0)) + 1   # 入力欄を作り直して空にする
                 st.rerun()
-            # 添付した書類はその場で読み取る（同じファイルは二度読まない）。書類の事故・保険情報はサイドバーの欄に入れ、
-            # 生成時はサイドバーの値（利用者が直せる）と車検証の車両情報を使う
-            if api_key and (vehicle_file or insurance_doc_file):
-                with st.spinner("添付の書類を読み取っています…"):
-                    _att_vd, _att_doc = _attached_docs_ocr(api_key, selected_model)
-                _att_sum = _doc_hints.summary(_att_vd, _att_doc)
-                if _att_sum:
-                    st.caption("読み取り済み → " + _att_sum + "（生成時に車両・顧客・保険の情報に使います）")
-                if st.session_state.get('_doc_ocr_error'):
-                    st.warning("⚠️ 読み取れませんでした: " + str(st.session_state.pop('_doc_ocr_error')))
-                _att_fill = _doc_hints.sidebar_insurance_from_doc(_att_doc) if _att_doc else {}
-                _att_oid = st.session_state.get('_insdoc_ocr_id') if insurance_doc_file is not None else ''
-                if _att_fill and _att_oid and st.session_state.get('_insdoc_applied') != _att_oid:
-                    # 読めた書類の値をサイドバーに入れる（入れる値が無い・読めなかったときは印を付けない ＝ あとで読めたら入る。Codex 58・60）。
-                    # 印は「ファイル＋モデル＋キー」の同一性（モデルを切り替えて読み直したら入れ直す。Codex 61）
-                    # 空欄か、前に書類から入れたままの項目にだけ入れる（利用者が手で入れた・直した値は書き換えない。Codex 62）
-                    _prev_filled = st.session_state.get('_insdoc_filled') or {}
-                    _updates, _now_filled = _doc_fill_plan(
-                        _att_fill, _prev_filled,
-                        {_k: st.session_state.get(_k, '') for _k in set(_att_fill) | set(_prev_filled)})
-                    for _k, _v in _updates.items():
-                        st.session_state[_k] = _v
-                    st.session_state['_insdoc_filled'] = _now_filled   # どの値を書類から入れたか（差し替え・取り外しで消す範囲。読み直しで無かった項目も追跡を続ける）
-                    st.session_state['form_seq'] = int(st.session_state.get('form_seq', 0)) + 1   # 入力欄を作り直して値を出す
-                    st.session_state['_insdoc_applied'] = _att_oid
-                    st.rerun()
-            elif (vehicle_file or insurance_doc_file) and not api_key:
-                st.caption("書類の読み取りには Gemini API キーが必要です（サイドバーの「APIキー設定」）")
+            # 添付の書類は**ここでは読まない**（入れただけで 30 秒待たされ、生成ボタンもすぐ押せなかった。
+            # 2026-09-20 亮平さん指示: 投げ込む → 生成を押す → 読み取り・生成 → 結果で確かめて直す、の流れにする）。
+            # 読み取りは生成の中（_attached_docs_ocr）で行い、読めた事故・保険情報は生成後にサイドバーへ入る
+            if vehicle_file or insurance_doc_file:
+                if not api_key:
+                    st.caption("書類の読み取りには Gemini API キーが必要です（サイドバーの「APIキー設定」）")
+                else:
+                    _att_vd0, _att_doc0 = _attached_docs_ocr(api_key, selected_model, cached_only=True)
+                    _att_sum0 = _doc_hints.summary(_att_vd0, _att_doc0)
+                    st.caption(("読み取り済み → " + _att_sum0 + "（この内容で生成します。直すときはサイドバーの事故・保険情報で）")
+                               if _att_sum0 else
+                               "この書類は「🚀 見積書からNEOを生成」を押したあとに読み取ります（待たずに次へ進めます）")
+                    if st.session_state.get('_doc_ocr_error'):
+                        st.warning("⚠️ 読み取れませんでした: " + str(st.session_state.pop('_doc_ocr_error')))
         if st.session_state.pop('_p2n_deferred_rerun', False):
             st.rerun()   # 書類の uploader を描き終えたので、サイドバーの入力欄（form_seq）と案内を描き直す
         if _p2n_file is None:
@@ -10029,7 +10074,9 @@ def main():
                     elif _p2n_time.time() - float(_p2n_pending.get('parked_at') or 0) > 2 * 3600:
                         _p2n_stale_why = '車種フォルダを 2 時間待っても届かなかったので'   # 取り置き（顧客情報）を残し続けない
                     elif _p2n_pending.get('doc_key'):
-                        _vd0, _doc0 = _attached_docs_ocr(api_key, selected_model)   # 控え済みなら Gemini は呼ばない
+                        # 画面を描く途中なので**ここでは読まない**（控えにある分だけで照合する。2026-09-20）。
+                        # 書類を差し替えていれば控えに無い ＝ 鍵が変わる ＝ 取り置きを捨てる、で結果も正しい
+                        _vd0, _doc0 = _attached_docs_ocr(api_key, selected_model, cached_only=True)
                         if _p2n_pending['doc_key'] != _doc_key(_doc_hints.vehicle_hint(_vd0, _doc0), _doc_hints.customer_hint(_vd0, _doc0),
                                                               _insurance_hint_now(_doc0)):
                             _p2n_stale_why = '添付の書類や事故・保険情報が変わったので'
@@ -10100,6 +10147,9 @@ def main():
                         # 保険はサイドバーの値だけを使う（書類から読んだ値は添付時にサイドバーへ入れてあり、利用者が消した項目を書類から戻さない。Codex 54）
                         _p2n_ihint = _insurance_hint_now(_p2n_doc)
                         _p2n_doc_key = _doc_key(_p2n_vhint, _p2n_chint, _p2n_ihint)
+                        # 読めた事故・保険情報をサイドバーの欄にも入れる（生成のあと画面で確かめて直せるように。
+                        # 空欄か、前に書類から入れたままの項目だけ。手で入れた・直した値は書き換えない。2026-09-20）
+                        _doc_fill_to_sidebar(_p2n_doc)
                         _p2n_kw = dict(
                             mime_type=get_mime_type(_p2n_file.name),
                             # 車検証（車両・顧客）と サイドバーの「事故・保険情報」。見積書に印字が無い項目にだけ補われる
@@ -10276,6 +10326,11 @@ def main():
                 else:
                     st.success(_p2n_ok_line)
                 _p2n_render_summary(_p2n_res.get('report_md'), stale=bool(_p2n_res.get('stale')))   # 車両・合計・明細の行数をひと目で（2026-09-20 画面の作り直し）
+                if (_att_line := _attached_docs_result_line(api_key, selected_model)):
+                    st.caption(_att_line)
+                if (_chk_n := _p2n_check_count(_p2n_res.get('report_md'))):
+                    # 「生成 → 出来上がりを確かめる」流れ: 何件見ればよいかを先に出す（中身はシートと報告文に）
+                    st.caption(f"🔎 確認箇所シートに**要確認が {_chk_n} 件**あります（下のシートを開いて見積書と突き合わせてください）")
                 if 'コグニ計算' in str(_p2n_mk.get('match_line') or ''):
                     # 工場の単価に円未満の端数がある見積（コグニの円計算では印字の合計を再現できない案件。2026-09-16 フリード）
                     st.info("この見積は**部品の単価に円未満の端数**があります（例: 単価 154.5 円 × 3 個 = 463.5 → 印字 464）。"

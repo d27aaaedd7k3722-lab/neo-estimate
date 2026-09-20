@@ -445,6 +445,19 @@ def _nested_expanders(src):
     return found
 
 
+# 生成のあとに「何を確かめればよいか」を出す（添付から読み取った内容・確認箇所シートの件数。2026-09-20 の流れ）
+chk('_attached_docs_result_line(api_key, selected_model)' in _app_src and '_p2n_check_count(' in _app_src,
+    '9u: 生成後の画面に「添付から読み取り」「要確認の件数」を出していない')
+_u2a = '## 要確認（inspect_estimate）' + chr(10) + '- a' + chr(10) + '- b' + chr(10) + chr(10) + '## 次' + chr(10) + '- c'
+_u2b = '## 要確認（inspect_estimate）' + chr(10) + '- なし' + chr(10)
+chk(app._p2n_check_count(_u2a) == 2 and app._p2n_check_count(_u2b) == 0 and app._p2n_check_count('') == 0,
+    '9u2: 要確認の件数の数え方が違う')
+# 添付の読み取りは画面を描くときには走らせない（添付しただけで待たされない。2026-09-20 亮平さん指示）
+chk('cached_only=True' in _app_src and _app_src.count('cached_only=True') >= 4,
+    '9v2: 画面を描くときの添付の読み取りが API を呼ぶままになっている')
+chk("_doc_fill_to_sidebar(_p2n_doc)" in _app_src and inspect.getsource(app).index("_p2n_ihint = _insurance_hint_now(_p2n_doc)") < inspect.getsource(app).index("_doc_fill_to_sidebar(_p2n_doc)"),
+    '9v3: 生成時の保険 hint を作る前にサイドバーへ入れている（書類の値が hint から落ちる）')
+
 _nest = _nested_expanders(_app_src)
 chk(not _nest, f'9t: たたみの入れ子がある（中の行 → 外の行）: {_nest[:3]}')
 

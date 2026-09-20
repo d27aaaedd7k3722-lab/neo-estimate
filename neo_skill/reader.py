@@ -665,6 +665,52 @@ def _row_code(r) -> str:
     return ''
 
 
+# 塗装の「内訳」（これがあるときはアプリから実額を勧めない）。**lines（塗装行）は入れない** —
+# 塗装行はパネルに当てられれば下書きがパネルを作り（その場合は生成器が実額を無視して指数のままにする）、
+# 当てられなければ一括計上になる。当てられなかった一括計上こそ実額にしたいので、行の有無では決めない（2026-09-20）
+_PAINT_DETAIL_KEYS = ('panels', 'bumper_front', 'bumper_rear', 'bumper_base', 'frame', 'sealing', 'other',
+                      'base', 'booth', 'wax', 'door_sash', 'stripe', 'low_cover', 'two_coat_solid', 'two_tone', 'auto_panels')
+
+
+def _paint_actual_guard(header: dict, pages: list) -> tuple:
+    """塗装が「一式」だけの見積は、コグニの入力方式を**実額**にする（このアプリの方針。2026-09-20 亮平さん指示）。
+    戻り値は (header, 付けた理由の文 or None)。header は直したときだけ複製を返す（読み手の写しは書き換えない）。
+
+    実額は総額を 1 つの金額で入れる方式で、印字どおり 1 行で収まる。付けないと NEO に
+    「塗装費用(工場見積)」という**印字に無い行**が 1 行できる（判断規則 10-15）。
+    下書き（vendor draft_estimate）は材料代の**割合**（material_rate）が付いているだけでも実額を見送るが、
+    割合は金額ではないので、**印字の材料代が 0 円なら実額にして構わない**
+    （本番検証 2026-09-19 のボルボ・シエンタが「材料代 0 円が別に出ている」で実額にならなかった）。
+
+    付けない: 塗装の内訳（パネル・塗装行・バンパ・内板骨格・シーリング・追加項目・加算基礎・ブース 等）があるとき／
+    ページに塗装行があるとき／**材料代の金額が印字されているとき**（実額は材料計の欄を持てず、印字の材料代が消える）／
+    読み取りに input_type・actual の指定があるとき。最後は生成器が判断する（内訳があれば実額は無視される）"""
+    def _int(v) -> int:
+        try:
+            return int(float(str(v if v is not None else 0).replace(',', '') or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    paint = header.get('paint') if isinstance(header.get('paint'), dict) else {}
+    totals = header.get('totals') if isinstance(header.get('totals'), dict) else {}
+    if str(paint.get('input_type') or '').strip() or _is_true(paint.get('actual')):
+        return header, None            # 読み取りの指定が優先
+    if any(paint.get(k) for k in _PAINT_DETAIL_KEYS):
+        return header, None            # 塗装の内訳があるので触らない
+    if _int(paint.get('material')) > 0 or _int(totals.get('material')) > 0:
+        return header, None            # 印字の材料代は消せない（実額は材料計の欄を持てない）
+    n_lines = len(paint.get('lines') or []) + sum(len((p or {}).get('paint_lines') or [])
+                                                  for p in (pages or []) if isinstance(p, dict))
+    total = _int(paint.get('total')) or _int(totals.get('paint'))
+    if total <= 0 and not n_lines:
+        return header, None            # 塗装の金額がどこにも無い
+    hdr = copy.deepcopy(header)
+    hdr['paint'] = dict(hdr.get('paint') or {}, input_type='実額')
+    amt = f'（{total:,} 円）' if total > 0 else ''
+    return hdr, (f'塗装{amt}はコグニの入力方式を**実額**にする（印字どおり 1 つの金額で入る。材料代の印字は無し）。'
+                 'パネル別に組める見積では生成器が指数のままにする')
+
+
 def _manual_rows_guard(header: dict, pages: list) -> tuple:
     """読み手が明細に付けた M（手入力）を外す。戻り値は (pages, 外した理由の文 or None)。
     M を付けてよいのは ADDATA に無い品目だけで（判断規則 10-7）、ADDATA を見られない読み手には決められない。
@@ -829,7 +875,9 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
         # 読み手の M を外すのは書き出す写しだけ（pages は読み手の写しのまま残す。あとで header を読み直して書式 B・輸入車に
         # 変わったら、外した M を戻せるように毎回元から掛け直す。Codex 指摘）
         _pages_w, m_note = _manual_rows_guard(header, pages)
-        maker.write_pages(case_dir, *_pages_for_merge(header, _pages_w))
+        _hdr_w, _pages_m = _pages_for_merge(header, _pages_w)
+        _hdr_w, p_note = _paint_actual_guard(_hdr_w, _pages_m)   # 塗装が一式だけなら実額で入れる（2026-09-20）
+        maker.write_pages(case_dir, _hdr_w, _pages_m)
         # 3) 束ねて合計欄を検算
         m = run('merge', case_dir=case_dir)
         rd, check = m.get('reading'), (m.get('check') or {})
@@ -865,11 +913,13 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
                 if _g not in guard_notes:
                     guard_notes.append(_g)
             _pages_w, m_note = _manual_rows_guard(header, pages)
-            maker.write_pages(case_dir, *_pages_for_merge(header, _pages_w))
+            _hdr_w, _pages_m = _pages_for_merge(header, _pages_w)
+            _hdr_w, p_note = _paint_actual_guard(_hdr_w, _pages_m)
+            maker.write_pages(case_dir, _hdr_w, _pages_m)
             m = run('merge', case_dir=case_dir)
             rd, check = m.get('reading'), (m.get('check') or {})
             res.merge_messages = list(m.get('messages') or [])
-        _extra = list(guard_notes) + ([m_note] if m_note else []) + [m_ for m_ in (res.merge_messages or []) if m_]   # merge の注意（重複行など）も合格時に見える所へ（G11）。M の注意は最後に書き出した写しの分だけ
+        _extra = list(guard_notes) + ([m_note] if m_note else []) + ([p_note] if p_note else []) + [m_ for m_ in (res.merge_messages or []) if m_]   # merge の注意（重複行など）も合格時に見える所へ（G11）。M の注意は最後に書き出した写しの分だけ
         if _extra:   # 戻した理由は合計欄の検算の注意と同じ列に（app は check.warn を「読み取りの注意」に出す）
             check = dict(check or {})
             _w0 = list(check.get('warn') or [])
