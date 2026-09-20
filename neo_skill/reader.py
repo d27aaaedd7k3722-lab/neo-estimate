@@ -730,8 +730,11 @@ def _paint_actual_guard(header: dict, pages: list) -> tuple:
     `auto_panels`（協定でパネル別の内訳を求められる案件）のとき／塗装がどこにも無いとき。
     なお**ベタ打ち（Addata なし）は別の経路**なので、ここは効かない（ベタ打ちは印字どおりそのまま）"""
     def _int(v) -> int:
+        # totals は paint.total のようには正規化されていないので、「104,660円」「¥104,660」「全角」も読む
+        # （読めずに 0 になると、印字の総額があるのに使わない道に落ちる。Codex 第38周）
         try:
-            return int(float(str(v if v is not None else 0).replace(',', '') or 0))
+            s = re.sub(r'[^0-9.\-]', '', unicodedata.normalize('NFKC', str(v if v is not None else 0)))
+            return int(float(s or 0))
         except (TypeError, ValueError):
             return 0
 
@@ -756,6 +759,13 @@ def _paint_actual_guard(header: dict, pages: list) -> tuple:
     _p.pop('auto_panels', None)          # 読み手が書いていても、このアプリでは実額に寄せる
     hdr['paint'] = _p
     mat = _int(paint.get('material')) or _int(totals.get('material'))
+    # 【ここで内訳を畳まない】2026-09-21 に「印字の塗装費用計から実額 1 本を作る」のをここでやってみたが、
+    # **下書きより手前で塗装の内訳を消すと、下書きが明細から塗装パネルを作り直して足す**（明細 → 塗装パネルの
+    # 自動連動）。本番と同じ読み取りで +10,549 円（＝ 明細 4600 の塗装 9,590 × 1.1）ずれた。
+    # 畳むのは内訳を組み立て終えた**下書きの中**（スキルの `_force_actual_paint`）が正しい場所。
+    # このアプリがここで決めるのは**入力方式を必ず実額にすること**までで、総額の決め方は下書きに任せる。
+    # 印字の「塗装費用計」は `totals.paint_total` として読ませ（prompts.py）、下書きがその額から畳む。
+    # NEO に実際に入った塗装計は、報告文の注記（app.py `_paint_note_with_real_total`）で必ず示す
     amt = f'（塗装費用 {total:,} 円' + (f' ＋ 材料代 {mat:,} 円' if mat else '') + '）' if total > 0 else ''
     return hdr, (f'塗装はコグニの入力方式を**実額**にする{amt}。'
                  '塗装費用と材料代をまとめて総額 1 つで入れる（印字に無い「塗装費用(工場見積)」の行を作らない）'

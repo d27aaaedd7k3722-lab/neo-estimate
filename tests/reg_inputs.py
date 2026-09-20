@@ -475,6 +475,18 @@ def test_paint_actual_guard():
     h2b, note2b = reader._paint_actual_guard({'paint': {'total': 66294}, 'totals': {'material': 19226}}, pages)
     chk(h2b['paint'].get('input_type') == '実額', '合計欄の材料代があると実額にしていない')
 
+    # 【畳まない】印字の「塗装費用計」が読めていても、ここでは内訳を消さない。
+    # 下書きより手前で消すと、下書きが明細から塗装パネルを作り直して足す（2026-09-21 実測 +10,549 円）。
+    # 畳むのは下書きの中（スキルの _force_actual_paint）。ここは入力方式を実額にするまで
+    h2c, note2c = reader._paint_actual_guard(
+        {'paint': {'total': 76000, 'material': 21280, 'lines': [{'name': 'A', 'wage': 16970}]},
+         'totals': {'paint_total': 104660}}, pages)
+    chk(h2c['paint'].get('input_type') == '実額', '印字の塗装費用計があると実額にしていない')
+    chk(h2c['paint'].get('lines') and h2c['paint'].get('total') == 76000,
+        f'読み取りの手前で内訳を消している（下書きが明細から塗装パネルを作り直す）: {h2c.get("paint")}')
+    chk((h2c.get('totals') or {}).get('paint_total') == 104660,
+        f'合計欄の塗装費用計を触っている: {h2c.get("totals")}')
+
     # 塗装の内訳（パネル・追加項目・内板骨格 等）があっても実額にする（下書きが畳む）
     for k, v in (('panels', [{'name': 'ﾄﾞｱ'}]), ('other', [{'name': 'ｱﾝﾀﾞｰｺｰﾄ'}]),
                  ('frame', {'engine_room': 1}), ('bumper_front', {'wage': 1000})):
@@ -519,6 +531,91 @@ def test_safe_tail_keeps_no_customer_data():
     _rp = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'neo_skill', 'reader.py')
     chk(chr(8) not in io.open(_rp, encoding='utf-8').read(),
         '正規表現に制御文字（\b のつもりの U+0008）が入っている')
+
+
+def test_parse_json_reply_keeps_no_customer_data():
+    """LLM の返事が JSON でない／壊れているときの例外文に、返事の本文を入れない（2026-09-21 バグハント）。
+    見積書を読んだ返事なので、先頭に顧客名・登録番号・車台番号が来うる"""
+    ng = 'ｹﾝｼｮｳﾀﾛｳ 様 北九州 300 あ 1234 車台 ZZZ-9999999'
+    for bad in (ng, ng + ' {"a": ', '{"a": 1,,}' + ng):
+        try:
+            llm.parse_json_reply(bad)
+            chk(False, f'壊れた返事が通った: {bad[:20]}')
+        except llm.LLMReplyError as e:
+            for w in ('ｹﾝｼｮｳﾀﾛｳ', '北九州', '1234', 'ZZZ-9999999'):
+                chk(w not in str(e), f'例外文に返事の本文が混じっている（{w}）: {e}')
+            chk('JSON' in str(e), f'何が起きたか分からない例外文: {e}')
+    chk(llm.parse_json_reply('```json\n{"a": 1}\n```') == {'a': 1}, 'ふつうの返事が読めない')
+
+
+def test_claude_reply_only_normal_finish():
+    """Claude も Gemini と同じく「正常に終わった返事」だけを通す（途中で止まった返事を検算に回さない。2026-09-21）"""
+    src = io.open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               'neo_skill', 'llm.py'), encoding='utf-8').read()
+    chk("rep.stop_reason not in ('end_turn', 'stop_sequence')" in src,
+        'Claude の stop_reason を白いものだけ通す形にしていない（空・欠落も通さない）')
+    chk("空の返事（stop_reason=" in src, 'Claude の空の返事を弾いていない')
+    chk("finish_reason=" in src and "fin != 'STOP'" in src, 'Gemini 側の判定が変わっている（揃えている前提が崩れる）')
+
+
+def test_make_neo_clears_previous_outputs():
+    """同じ作業フォルダで 2 回目を回すとき、前の回の出来上がりを先に消す（古い NEO・シートを拾わない。2026-09-21）"""
+    import tempfile
+    from neo_skill import maker as mk
+    d = tempfile.mkdtemp(prefix='neo_case_test_')
+    try:
+        keep = os.path.join(d, 'estimate.json')
+        for n in ('estimate.neo', 'estimate.ng.neo', 'estimate_確認箇所.xlsx', 'report.md', 'estimate.json', 'reading.json'):
+            io.open(os.path.join(d, n), 'w', encoding='utf-8').write('x')
+
+        class _Proc:                      # subprocess は動かさない（消す所だけを見る）
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return ('', '')
+        real_popen = mk.subprocess.Popen
+        mk.subprocess.Popen = lambda *a, **kw: _Proc()
+        try:
+            mk.make_neo(d, 'estimate')
+        finally:
+            mk.subprocess.Popen = real_popen
+        for n in ('estimate.neo', 'estimate.ng.neo', 'estimate_確認箇所.xlsx', 'report.md'):
+            chk(not os.path.exists(os.path.join(d, n)), f'前の回の {n} が残っている')
+        chk(os.path.exists(keep) and os.path.exists(os.path.join(d, 'reading.json')),
+            '入力（estimate.json / reading.json）まで消している')
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_make_neo_does_not_adopt_undeletable_leftovers():
+    """消せなかった前の回の出来上がり（Excel で開いている 等）は、今回の出来上がりとして採らない（Codex 指摘 2026-09-21）"""
+    import tempfile
+    from neo_skill import maker as mk
+    d = tempfile.mkdtemp(prefix='neo_case_test_')
+    try:
+        for n in ('estimate.neo', 'estimate_確認箇所.xlsx', 'report.md', 'reading.json'):
+            io.open(os.path.join(d, n), 'w', encoding='utf-8').write('前の回')
+
+        class _Proc:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return ('', '')
+        real_popen, real_remove = mk.subprocess.Popen, mk.os.remove
+        mk.subprocess.Popen = lambda *a, **kw: _Proc()
+        mk.os.remove = lambda p: (_ for _ in ()).throw(OSError('掴まれている'))   # 消せない状況を作る
+        try:
+            res = mk.make_neo(d, 'estimate')
+        finally:
+            mk.subprocess.Popen, mk.os.remove = real_popen, real_remove
+        chk(res.neo_path is None, f'消せなかった前の回の NEO を採っている: {res.neo_path}')
+        chk(res.review_path is None, f'消せなかった前の回の確認箇所シートを採っている: {res.review_path}')
+        chk(res.report_path is None, f'消せなかった前の回の報告文を採っている: {res.report_path}')
+        chk(not res.ok, '出来上がりが無いのに合格にしている')
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == '__main__':

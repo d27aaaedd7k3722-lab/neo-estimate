@@ -270,12 +270,16 @@ def parse_json_reply(text: str) -> dict:
         v = json.loads(t)
     except ValueError:
         i, j = t.find('{'), t.rfind('}')
+        # 返事の本文は例外文に入れない。見積書を読んだ返事なので、先頭に顧客名・登録番号・車台番号が来うる
+        # （それが画面・ログ・報告文に流れる。2026-09-21 バグハント。以前は t[:80] を付けていた）。
+        # 直すのに要るのは「どう壊れているか」だけなので、種別と長さ・壊れた位置だけを残す
         if i < 0 or j <= i:
-            raise LLMReplyError('返事に JSON が無い: ' + t[:80])   # 返事の先頭（顧客名を含み得る）は短く（G14）
+            raise LLMReplyError(f'返事に JSON が無い（{len(t)} 文字）')
         try:
             v = json.loads(t[i:j + 1])
         except ValueError as e:
-            raise LLMReplyError(f'返事の JSON が壊れている（{e}）: ' + t[:80])
+            # json の例外文は「Expecting ',' delimiter: line 1 column 55 (char 54)」の形で、本文は含まない
+            raise LLMReplyError(f'返事の JSON が壊れている（{len(t)} 文字・{e}）')
     if not isinstance(v, dict):
         raise LLMReplyError('返事の JSON がオブジェクトでない')
     return v
@@ -451,6 +455,10 @@ class ClaudeReader:
         if cache_system:
             sys_param[0]['cache_control'] = {'type': 'ephemeral'}
         try:
+            # temperature は渡さない: この呼び方（output_config の effort）では指定が通らないことがあり、
+            # 400 になると読み取りが丸ごと落ちる。読み取りのゆれは**ページごとの機械検算 → 読み直し**と
+            # 生成器の決め打ちで吸収する作り（本番で同じ見積書を 2 回通し、明細 33 行が 1 行違わず一致するのを確認済み。
+            # Gemini 側は temperature=0.0 を渡せるので渡している）。2026-09-21 Codex 指摘への回答
             r = self.client.messages.create(
                 model=self.model, max_tokens=self.max_tokens, system=sys_param,
                 output_config={'effort': self.effort},
@@ -477,6 +485,14 @@ class ClaudeReader:
             raise LLMReplyError(f'返事が max_tokens（{self.max_tokens}）で切れた。ページを分けるか max_tokens を増やす', rep)
         if rep.stop_reason == 'refusal':
             raise LLMReplyError('Claude が読み取りを断った（refusal）', rep, retryable=False)
+        # 正常に終わった理由だけを通す（Gemini 側の finish_reason == 'STOP' と同じ扱い）。
+        # pause_turn・model_context_window_exceeded のように**途中で止まった**返事でも、そこまでの JSON が
+        # 形として通ってしまうと明細が欠けたまま検算に回る（2026-09-21 バグハント）
+        # 空・欠落も通さない（Gemini 側が finish_reason 空を失敗にしているのと揃える。Codex 指摘 2026-09-21）
+        if rep.stop_reason not in ('end_turn', 'stop_sequence'):
+            raise LLMReplyError(f'Claude が正常に終わらなかった（stop_reason={rep.stop_reason or "不明"}）', rep, retryable=True)
+        if not (rep.text or '').strip():
+            raise LLMReplyError(f'Claude から空の返事（stop_reason={rep.stop_reason or "不明"}）', rep)
         return rep
 
 # 読み込んだときのコードの指紋（app.sync_app_modules が「メモリのコードがディスクと同じか」を見る。読み込みの時点で

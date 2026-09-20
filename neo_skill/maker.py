@@ -172,6 +172,23 @@ def make_neo(case_dir: str, name: str, *, no_profile: bool = False, allow_neo_to
         args.append('--force-draft')
     if skip_check:
         args.append('--skip-check')
+    # 前の回の**出来上がり**を消してから走らせる（同じ作業フォルダで 2 回目を回すことがある:
+    # 工賃 0 円での作り直し・検算を外しての作り直し）。残っていると、2 回目が書かなかったファイルを
+    # 1 回目のものと知らずに拾い、NEO と確認箇所シートが食い違う組で渡りうる（2026-09-21 バグハント）。
+    # reading.json / estimate.json（下書き）は入力なので消さない。
+    # 消せなかったもの（Excel で開いている 等）は「前の回のまま」と分かるように印を控え、
+    # **中身が変わっていなければ今回の出来上がりとして採らない**（握りつぶすと古いシートを渡す。Codex 指摘 2026-09-21）
+    stale = {}
+    for _old in (f'{name}.neo', f'{name}.ng.neo', f'{name}_確認箇所.xlsx', f'{name}_確認箇所.csv', 'report.md'):
+        _p = os.path.join(case_dir, _old)
+        try:
+            os.remove(_p)
+        except OSError:
+            try:
+                if os.path.exists(_p):
+                    stale[_p] = (os.path.getmtime(_p), os.path.getsize(_p))
+            except OSError:
+                stale[_p] = None      # 見ることもできない = 触らせない（今回の出来上がりとしては採らない）
     # 子（make_neo.py）は孫（run_case.py 等）を起動する。timeout で子だけ殺すと孫が生き残って作業フォルダを掴む／書き戻すので、
     # プロセスグループごと止める（Windows: taskkill /T、POSIX: killpg。バグハント G6）
     _grp = ({'creationflags': getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)} if os.name == 'nt' else {'start_new_session': True})
@@ -192,17 +209,32 @@ def make_neo(case_dir: str, name: str, *, no_profile: bool = False, allow_neo_to
     rc = proc.returncode
     out = (so or '') + (('\n[stderr]\n' + se) if se and rc != 0 else '')
     res = MakeResult(rc == 0, rc, out, case_dir, name)
+
+    def _made(p: str) -> bool:
+        """この回が書いたファイルか。消せなかった前の回のものは、中身が変わっていなければ採らない"""
+        if not os.path.isfile(p):
+            return False
+        if p not in stale:
+            return True
+        was = stale[p]
+        if was is None:
+            return False          # 触れなかったもの（掴まれている）は採らない
+        try:
+            return (os.path.getmtime(p), os.path.getsize(p)) != was
+        except OSError:
+            return False
+
     neo = os.path.join(case_dir, f'{name}.neo')
     ng = os.path.join(case_dir, f'{name}.ng.neo')
-    res.neo_path = neo if (res.ok and os.path.isfile(neo)) else None
-    res.ng_neo_path = ng if os.path.isfile(ng) else None
+    res.neo_path = neo if (res.ok and _made(neo)) else None
+    res.ng_neo_path = ng if _made(ng) else None
     for ext in ('.xlsx', '.csv'):
         r = os.path.join(case_dir, f'{name}_確認箇所{ext}')
-        if os.path.isfile(r):
+        if _made(r):
             res.review_path = r
             break
     rp = os.path.join(case_dir, 'report.md')
-    res.report_path = rp if os.path.isfile(rp) else None
+    res.report_path = rp if _made(rp) else None
     ep = os.path.join(case_dir, 'estimate.json')
     res.estimate_path = ep if os.path.isfile(ep) else None
     res.match_line = next((l.strip() for l in out.splitlines() if '見積書合計との一致' in l), '')

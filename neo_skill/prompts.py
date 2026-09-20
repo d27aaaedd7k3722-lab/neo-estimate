@@ -95,7 +95,10 @@ HEADER_TEMPLATE = {
     'customer': {'name': '', 'reg_no': '', 'postal': '', 'address': ''}, 'insurance': {'company': ''},
     'labor_rate': None,
     'paint': {},
-    'totals': {'parts': None, 'wage': None, 'paint': None, 'material': None, 'expense': None, 'taxable': None, 'tax': None, 'total': None},
+    # paint_total = 塗装の区画に印字された**材料込の総額**（「塗装費用計」「塗装計」）。このアプリは塗装を必ず
+    # 実額（総額 1 つ）で入れるので、印字されていればその額をそのまま使う（生成器に計算し直させない。2026-09-21 亮平さん指示）
+    'totals': {'parts': None, 'wage': None, 'paint': None, 'material': None, 'paint_total': None,
+               'expense': None, 'taxable': None, 'tax': None, 'total': None},
 }
 
 PAGE_TEMPLATE = {'page': 1, 'rows_printed': None, 'subtotal': {}, 'marks': {}, 'blocks': [{'title': '', 'rows': []}],
@@ -104,6 +107,10 @@ PAGE_TEMPLATE = {'page': 1, 'rows_printed': None, 'subtotal': {}, 'marks': {}, '
 
 # 読み手には書かせないキー（受けたら reader が落とす。指示文のキー一覧から外す。Q14）
 _NOT_FOR_READER = ('wage_round', 'tax_round', 'target_total')
+# 指示文の「書くキー」一覧から外すもの。expenses は下の項目で「ここには書かない」と断っているのに
+# 一覧には載っていて、読み手が header とページの両方に書く揺れを招いていた（2026-09-21 バグハント）。
+# reader は merge のときに**ページ側の費用を header.expenses へ移す**ので、キー自体は残す（落とすのとは違う）
+_NOT_IN_HEADER_LIST = _NOT_FOR_READER + ('expenses',)
 
 
 def header_task(n_pages: int, vehicle_hint: Optional[dict] = None, source_name: str = '',
@@ -119,7 +126,7 @@ def header_task(n_pages: int, vehicle_hint: Optional[dict] = None, source_name: 
                  + json.dumps(customer_hint, ensure_ascii=False))
     return f"""この見積書 PDF は全 {n_pages} ページです。**明細以外**を pages/header.json の形で書いてください（明細の行はここには書かない）。
 
-書くキー（無いものは省く。値が読めないキーは空文字か null）: {', '.join(k for k in HEADER_KEYS if k not in _NOT_FOR_READER)}
+書くキー（無いものは省く。値が読めないキーは空文字か null）: {', '.join(k for k in HEADER_KEYS if k not in _NOT_IN_HEADER_LIST)}
 - source: "{source_name or 'estimate.pdf'} 書式X"（書式は format_catalog.md の A〜G）
 - issuer: **見積書を発行した工場・販売店の名前**（用紙の上端・右上・下端に社判や住所・電話と一緒に印字されている会社名。
   「○○自動車株式会社 △△店」のように店舗名まで印字されていれば続けて写す。宛名（お客様）や保険会社と取り違えない）。
@@ -135,13 +142,20 @@ def header_task(n_pages: int, vehicle_hint: Optional[dict] = None, source_name: 
   paint.total に書くのは**塗装の区画に「塗装工賃計」として印字された額**だけ。
   塗装が明細の表の中に「塗装費用 ○○円」と 1 行で印字されているだけで、**合計欄にも塗装計の印字が無い**見積は、
   その行をページ側の明細に写し、paint には**何も書かない**（両方に書くと塗装計が二重に乗って不合格になる）。
-  合計欄に塗装計が印字されているなら、それは totals.paint に写す（この場合も明細とどちらか一方）
+  合計欄に**塗装工賃計**（材料代を含まない塗装の工賃の計）が印字されているなら、それは totals.paint に写す
+  （この場合も明細とどちらか一方）。材料込みの総額は totals.paint に入れない（下の paint_total に書く）。
+  **塗装の区画に「塗装費用計」「塗装計」のように材料込の総額が印字されていれば、その額を `totals.paint_total` に必ず写す**
+  （内訳の「塗装工賃計」「塗装材料代計」「追加塗装費用計」とは別に印字されている総額のこと。
+   例: 「塗装費用計 104,660円 ＜内訳＞塗装工賃計 76,000円／塗装材料代計 21,280円／追加塗装費用計 7,380円」なら
+   totals.paint_total = 104660、paint.total = 76000、paint.material = 21280）
 - expenses: **ここには書かない**（費用・諸費用は、印字されたページ側の expenses に書く。header とページの両方に書くと「費用の同じ行が 2 回ある」で不合格）
 - frame: 【内板骨格修正】（骨格修正）の区画が印字されているときだけ書く。
   `{{"page": 区画が印字されたページ番号, "basic": true, "basic_wage": 基本修正作業の金額, "items": [{{"code": "1388", "rank": "B", "wage": 12000}}, …]}}`
   （basic は「基本修正作業」の行があれば true。items は区画の各行: code は 4 桁のコード、rank は品番の欄に刷られた A/B/C、wage は金額）。
   この区画の行はページ側の明細（rows）には**写さない**（両方に書くと工賃が二重になる）。区画が無ければ frame は書かない
-- totals: 合計欄そのまま（parts / wage / paint / material / expense / taxable / tax / total。印字されている項目だけ）
+- totals: 合計欄そのまま（parts / wage / paint / material / paint_total / expense / taxable / tax / total。印字されている項目だけ）。
+  **`paint_total` は最優先で見落とさない**: 【塗装明細】の区画に「塗装費用計」「塗装計」と印字された**材料込の総額**があれば
+  必ず totals.paint_total に写す（この 1 つがあると、塗装は総額どおりに入る）
 - **金額は税込・税抜を気にせず印字どおりに写す**。「整備代金お見積金額（税込）」「消費税10％対象(込)」のように
   各行の金額まで税込で刷る書式（ディーラー・二輪）でも、**1.1 で割らない**。
   税込かどうかはプログラムが合計欄と明細の積み上げで見分けて、あとから税抜に直す（勝手に割ると合計が合わなくなる）
@@ -184,6 +198,10 @@ def page_task(page_no: int, n_pages: int, header: dict) -> str:
    **in は、その金額が印字されている列で決める**: 部品価格（部品代）の列なら 部品計、技術料・工賃の列なら 作業計
    （名前が「写真代」「ショートパーツ」でも、工賃の列に刷ってあれば 作業計。合計欄の部品計に入っているかで確かめる）。
    ページ小計 subtotal は印字どおり書く（塗装・費用を含んだ小計でも検算が受ける）。合計欄はここに書かない（header にある）。
+   塗装の区画の行は**印字の並びのまま 1 行につき 1 つ**。同じ行を 2 回書かない。
+   明細の表に同じコードの行（例「4600 Rrﾊﾟﾈﾙ 板金 22,140」）があっても、それは**別の行**で、
+   塗装の区画の行（例「4600 Rrﾊﾟﾈﾙ 修理 20d㎡ (1/2) 9,590」）とは金額が違う。取り違え・二重書きをしない
+   （どちらかが二重になると塗装計が合わずに不合格になる。2026-09-21 実測）。
    費用・塗装行を header に書かない（両方に書くと二重計上で不合格）。
    塗装が「塗装費用 ○○円」の **1 行だけ**で明細の表の中に印字されていて、合計欄にも塗装計の印字が無い見積は、その行を明細（rows）に写す。
    同じ金額を header の paint.total にも書かない（2 か所に書くと塗装計が二重に乗る）

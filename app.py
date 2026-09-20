@@ -9070,6 +9070,11 @@ def main():
             st.session_state['_case_sweep_at'] = time.time()
             from neo_skill import maker as _nsk_sweep
             _nsk_sweep.sweep_case_dirs()
+            # 消しそこねた作業フォルダ（接続解除のときに掴まれていた 等）をもう一度消しに行く。
+            # 2 時間たてば上の sweep でも消えるが、顧客情報を含むので早く消す（2026-09-21 バグハント）
+            _left = list(st.session_state.get('_case_dirs_left') or [])
+            if _left:
+                st.session_state['_case_dirs_left'] = [p for p in _left if _nsk_sweep.remove_case_dir(p, attempts=1)]
     except Exception:  # noqa: BLE001  掃除で画面を止めない
         pass
     if APP_PASSCODE and not st.session_state.get('_passcode_ok'):

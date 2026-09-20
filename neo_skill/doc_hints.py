@@ -409,11 +409,13 @@ def vehicle_info_for_legacy(vd: Optional[dict], doc: Optional[dict] = None) -> d
         out['car_reg_serial'] = _serial_clean(out['car_reg_serial'])
     if out.get('car_reg_business'):
         out['car_reg_business'] = kana_hira(out['car_reg_business'])   # かなはひらがな（Codex hunt B5）
-    # 類別区分番号は 4 桁・型式指定番号は 5 桁（実機 299 本すべて。車検証 OCR が '2' と返しても '0002'。Codex hunt B8）
+    # 類別区分番号は 4 桁・型式指定番号は 5 桁（実機 299 本すべて。車検証 OCR が '2' と返しても '0002'。Codex hunt B8）。
+    # 桁を超えた値（'12345-0002' のように型式指定と類別を続けて読んだ など）は入れない。
+    # 5 桁の欄に 9 桁を入れると、どこで切れるか分からないまま NEO に載る（2026-09-21 バグハント。hint 側と同じ扱いに揃えた）
     for k, w in (('car_category_number', 4), ('car_model_designation', 5)):
         if out.get(k):
             d = re.sub(r'\D', '', _nfkc(out[k]))
-            out[k] = d.zfill(w) if d else ''
+            out[k] = d.zfill(w) if (d and len(d) <= w) else ''
     # 住所は生成器と同じ規則で 都道府県 / 市区郡 / 以降（'北九州市小倉北区' → 市区郡 '北九州市'、以降 '小倉北区…'。Codex hunt B2）
     if any(str(out.get(k) or '').strip() for k in ('prefecture', 'municipality', 'address_other')):
         out['prefecture'], out['municipality'], out['address_other'] = split_address(
@@ -425,6 +427,10 @@ def vehicle_info_for_legacy(vd: Optional[dict], doc: Optional[dict] = None) -> d
     if out and str(out.get('customer_name') or '').strip() in ('', '同上', '***', '＊＊＊') or (out and set(str(out.get('customer_name') or '')) <= set('*＊')):
         if str(out.get('owner_name') or '').strip():
             out['customer_name'] = str(out['owner_name']).strip()
+        else:
+            # 所有者も読めなかった: 「同上」「***」を顧客名（Customer.Name1）に書かない。
+            # 空にして人に入れてもらう（車検証の「同上」は所有者と同じという印で、名前ではない。2026-09-21 バグハント）
+            out['customer_name'] = ''
     if not isinstance(doc, dict) or not doc:
         return _with_user_name(out)
 
@@ -446,10 +452,12 @@ def vehicle_info_for_legacy(vd: Optional[dict], doc: Optional[dict] = None) -> d
     if _get(doc, 'car_name') and (not cur_name or (len(cur_name) <= 5 and not re.search(r'\d', cur_name))):
         out['car_name'] = _get(doc, 'car_name')
     fill('car_model', _nfkc(_get(doc, 'model')).upper())
+    # 型式指定番号は 5 桁・類別区分番号は 4 桁。書類から補うときも、桁を超えた値（'12345-0002' を続けて読んだ 等）は入れない
+    # （車検証側だけ見ていて、書類からの補完で混じり直していた。Codex 指摘 2026-09-21）
     _desig = re.sub(r'\D', '', _nfkc(_get(doc, 'desig')))
-    fill('car_model_designation', _desig.zfill(5) if _desig else '')   # 型式指定番号は 5 桁
+    fill('car_model_designation', _desig.zfill(5) if (_desig and len(_desig) <= 5) else '')
     cat = re.sub(r'\D', '', _nfkc(_get(doc, 'category')))
-    fill('car_category_number', cat.zfill(4) if cat else '')
+    fill('car_category_number', cat.zfill(4) if (cat and len(cat) <= 4) else '')
     fill('engine_model', _get(doc, 'engine_model'))
     fill('color_code', _nfkc(_get(doc, 'color_code')).upper())
     fill('body_color', _get(doc, 'color_name'))

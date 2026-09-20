@@ -242,6 +242,25 @@ def test_hunt_2026_09_15_b():
     chk(bool(v2.get('reg_date')), f'I1: 車検証に無い初度登録を書類から取らない: {v2}')
     lg = dh.vehicle_info_for_legacy({'customer_name': '同上', 'owner_name': ''}, {'owner': 'ケンショウ', 'contractor': 'ケンショウ'})
     chk(bool(lg.get('customer_name')) and lg.get('customer_name') != '同上', f'I6: 使用者「同上」＋書類の所有者で顧客名が同上のまま: {lg}')
+    # I13: 所有者がどこにも無いときは「同上」を顧客名にしない（空にして人に入れてもらう。2026-09-21 バグハント）
+    for _vd in ({'customer_name': '同上', 'owner_name': ''}, {'customer_name': '***'}, {'customer_name': '＊＊＊'}):
+        lg2 = dh.vehicle_info_for_legacy(dict(_vd))
+        chk(not lg2.get('customer_name'), f'I13: 顧客名に置き換えの印（同上・***）が残った: {lg2}')
+        chk(lg2.get('user_name') == '同上', f'I13: 使用者欄が同上になっていない: {lg2}')
+    # I14: 旧経路でも型式指定番号 5 桁・類別区分番号 4 桁を超えた値は入れない（hint 側と揃える。2026-09-21 バグハント）
+    lg3 = dh.vehicle_info_for_legacy({'car_model_designation': '12345-0002', 'car_category_number': '0001'})
+    chk(lg3.get('car_model_designation') == '' and lg3.get('car_category_number') == '0001',
+        f'I14: 旧経路が型式指定の桁あふれを通している: {lg3}')
+    lg4 = dh.vehicle_info_for_legacy({'car_model_designation': '2', 'car_category_number': '2'})
+    chk(lg4.get('car_model_designation') == '00002' and lg4.get('car_category_number') == '0002',
+        f'I14: 桁そろえ（ゼロ詰め）が壊れた: {lg4}')
+    # I15: 書類から補うときも桁あふれを入れない（車検証が無く書類だけの案件。Codex 指摘 2026-09-21）
+    lg5 = dh.vehicle_info_for_legacy({}, {'desig': '12345-0002', 'category': '0001'})
+    chk(not lg5.get('car_model_designation') and lg5.get('car_category_number') == '0001',
+        f'I15: 書類側から型式指定の桁あふれが入った: {lg5}')
+    lg6 = dh.vehicle_info_for_legacy({}, {'desig': '12345', 'category': '12345'})
+    chk(lg6.get('car_model_designation') == '12345' and not lg6.get('car_category_number'),
+        f'I15: 書類側の桁の扱いが違う: {lg6}')
 
 
 if __name__ == '__main__':

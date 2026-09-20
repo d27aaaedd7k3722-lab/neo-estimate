@@ -406,11 +406,17 @@ def disconnect(session_state) -> None:
     以後 find_addata_dir() は他の手段（ZIP・パス・取得URL・環境変数・自動検出）に戻る（Codex 45）"""
     pending = session_state.pop('_bridge_pending', None) or {}
     if pending.get('case_dir'):
+        # 消せなかったフォルダ（別プロセスが掴んでいる等）は黙って忘れない。顧客情報を含むので、
+        # 印を残して画面の定期掃除がもう一度消しに行く（2026-09-21 バグハント。以前は例外ごと握りつぶしていた）
+        left = pending.get('case_dir')
         try:
             from . import maker as _maker
-            _maker.remove_case_dir(pending.get('case_dir'))
+            left = _maker.remove_case_dir(left)
         except Exception:  # noqa: BLE001
             pass
+        if left:
+            _rest = [p for p in (session_state.get('_case_dirs_left') or []) if p != left]
+            session_state['_case_dirs_left'] = (_rest + [left])[-10:]
     bid = session_state.get('_bridge_id')
     if bid:
         _p = os.path.join(tempfile.gettempdir(), PREFIX + str(bid))
