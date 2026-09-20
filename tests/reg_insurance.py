@@ -458,6 +458,18 @@ chk('cached_only=True' in _app_src and _app_src.count('cached_only=True') >= 4,
 chk("_doc_fill_to_sidebar(_p2n_doc)" in _app_src and inspect.getsource(app).index("_p2n_ihint = _insurance_hint_now(_p2n_doc)") < inspect.getsource(app).index("_doc_fill_to_sidebar(_p2n_doc)"),
     '9v3: 生成時の保険 hint を作る前にサイドバーへ入れている（書類の値が hint から落ちる）')
 
+# アプリ側が写しに書いた指定（塗装の実額・M を外した 等）は、画面だけでなく**納品する報告文**にも残す（2026-09-20 本番のバグハント）
+chk(_app_src.count('_with_app_notes(') >= 4 and "out['app_notes']" in _app_src,
+    '9w2: アプリ側の判断を報告文に残していない')
+_w2 = app._with_app_notes('# 報告' + chr(10) + '本文', ['塗装は実額にする'])
+chk('## アプリ側で判断した点' in _w2 and '- 塗装は実額にする' in _w2 and app._with_app_notes('x', []) == 'x',
+    '9w3: 報告文への足し方が違う')
+# 報告文が無いときは注記だけの report.md を作らない／同じ報告文に二度足さない（Codex 第24周）
+chk(app._with_app_notes('', ['x']) == '' and app._with_app_notes(None, ['x']) is None and app._with_app_notes('   ', ['x']) == '   ',
+    '9w4: 報告文が空なのにアプリ側の判断だけの報告文を作っている')
+chk(app._with_app_notes(_w2, ['塗装は実額にする']).count('## アプリ側で判断した点') == 1,
+    '9w5: 同じ報告文に二度足している')
+
 _nest = _nested_expanders(_app_src)
 chk(not _nest, f'9t: たたみの入れ子がある（中の行 → 外の行）: {_nest[:3]}')
 

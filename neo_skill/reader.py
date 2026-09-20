@@ -68,6 +68,7 @@ class ReadResult:
     error: str = ''
     usage: dict = dataclasses.field(default_factory=dict)      # トークン・呼び出し回数
     stats: dict = dataclasses.field(default_factory=dict)      # §5-3 の指標
+    app_notes: list = dataclasses.field(default_factory=list)  # アプリ側が写しに書いた指定（塗装の実額・M を外した 等）。報告文にも残す
 
     def fails(self) -> list:
         out = []
@@ -919,6 +920,7 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
             m = run('merge', case_dir=case_dir)
             rd, check = m.get('reading'), (m.get('check') or {})
             res.merge_messages = list(m.get('messages') or [])
+        res.app_notes = [n for n in (list(guard_notes) + ([m_note] if m_note else []) + ([p_note] if p_note else [])) if n]   # 納品する報告文にも残す（画面だけに出して消えないように。2026-09-20 本番のバグハント）
         _extra = list(guard_notes) + ([m_note] if m_note else []) + ([p_note] if p_note else []) + [m_ for m_ in (res.merge_messages or []) if m_]   # merge の注意（重複行など）も合格時に見える所へ（G11）。M の注意は最後に書き出した写しの分だけ
         if _extra:   # 戻した理由は合計欄の検算の注意と同じ列に（app は check.warn を「読み取りの注意」に出す）
             check = dict(check or {})

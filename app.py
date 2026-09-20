@@ -7874,6 +7874,7 @@ def p2n_read(pdf_bytes, file_name, api_key, mime_type='application/pdf',
                         'fail': list(t.fail), 'warn': list(t.warn)} for t in rd.traces],
             'settings': dict((rd.check or {}).get('settings') or {}),
         }
+        out['app_notes'] = list(getattr(rd, 'app_notes', None) or [])   # アプリ側が写しに書いた指定（報告文にも残す）
         out['stage'] = 'read'
         if rd.error or not rd.ok:
             # 読み取りが検算に通らない。NEO は作らない（人が該当ページと差額を見る）。
@@ -7910,6 +7911,22 @@ def p2n_read(pdf_bytes, file_name, api_key, mime_type='application/pdf',
         raise
 
 
+def _with_app_notes(md, notes) -> str:
+    """報告文の末尾に、アプリ側が読み取りの写しに書いた指定（塗装の実額・読み手の M を外した 等）を残す。
+    画面の「読み取りの注意」にも出るが、**納品する報告文にも残す**（あとから何をしたか追えるように。2026-09-20 本番のバグハント）。
+    報告文が無いときは何も作らない（注記だけの report.md を作らない）。すでに足してあるときは二度足さない（Codex 第24周）"""
+    notes = [str(n).strip() for n in (notes or []) if str(n).strip()]
+    base = str(md or "")
+    if not notes or not base.strip():
+        return md
+    head = '## アプリ側で判断した点（読み取りの写しに書いた指定）'
+    if head in base:
+        return md          # 同じ報告文に二度足さない（要確認の逃げ道で二度通ることがある）
+    nl = chr(10)
+    body = nl.join('- ' + n for n in notes)
+    return base.rstrip(nl) + nl + nl + head + nl + body + nl
+
+
 def p2n_make(state, addata_root=None, record_profile=None, progress=None):
     """p2n_read の state から NEO と確認箇所シートを作る（vendor の make_neo.py）。作業フォルダは終わったら消す。
     戻り値は run_pdf_to_neo_skill と同じ形"""
@@ -7942,7 +7959,7 @@ def p2n_make(state, addata_root=None, record_profile=None, progress=None):
             out['stage'] = 'read'   # 画面は読み取りの不合格のまま（ページごとの検算結果を見せる）
             out['make'] = {'ok': False, 'match_line': mk.match_line, 'reasons': list(mk.reasons),
                            'error': mk.error, 'tail': '\n'.join((mk.stdout or '').splitlines()[-40:])}
-            out['report_md'] = _nsk_maker.read_text(mk.report_path) or out.get('report_md')
+            out['report_md'] = _with_app_notes(_nsk_maker.read_text(mk.report_path) or out.get('report_md'), out.get('app_notes'))
             out['unverified_neo'] = _nsk_maker.read_bytes(mk.ng_neo_path or mk.neo_path)
             out['unverified_review'] = _nsk_maker.read_bytes(mk.review_path)
             out['unverified_review_ext'] = os.path.splitext(mk.review_path or '')[1] or '.xlsx'
@@ -8003,7 +8020,7 @@ def p2n_make(state, addata_root=None, record_profile=None, progress=None):
         out['stage'] = 'make'
         out['make'] = {'ok': mk.ok, 'match_line': mk.match_line, 'reasons': list(mk.reasons),
                        'error': mk.error, 'tail': '\n'.join(mk.stdout.splitlines()[-40:])}
-        out['report_md'] = out.pop('_first_report_md', None) or _nsk_maker.read_text(mk.report_path)
+        out['report_md'] = _with_app_notes(out.pop('_first_report_md', None) or _nsk_maker.read_text(mk.report_path), out.get('app_notes'))
         if not mk.ok:
             out['error'] = mk.error
             out['repair_zip'] = out.pop('_first_repair_zip', None) or _nsk_maker.repair_bundle(case_dir, reading)
@@ -8020,7 +8037,7 @@ def p2n_make(state, addata_root=None, record_profile=None, progress=None):
                 mk_un = _nsk_maker.make_neo(case_dir, 'estimate', no_profile=True, addata_root=addata_root,
                                             skip_check=True, allow_neo_total=True)
                 if mk_un.report_path:
-                    out['report_md'] = _nsk_maker.read_text(mk_un.report_path) or out.get('report_md')
+                    out['report_md'] = _with_app_notes(_nsk_maker.read_text(mk_un.report_path) or out.get('report_md'), out.get('app_notes'))
             out['unverified_neo'] = _un_neo or _nsk_maker.read_bytes(mk_un.ng_neo_path or mk_un.neo_path)
             out['unverified_review'] = _un_review or _nsk_maker.read_bytes(mk_un.review_path)
             out['unverified_review_ext'] = _un_ext or os.path.splitext(mk_un.review_path or '')[1] or '.xlsx'
