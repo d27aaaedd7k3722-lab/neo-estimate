@@ -747,6 +747,21 @@ chk('_p2n_tax_row(_saved_pdf_tax)' in _seg_wait and 'st.columns(2)' in _seg_wait
 chk("'pdf2neo_run_beta_wait'" in _app_src and _app_src.count("key='pdf2neo_run_beta'") == 1,
     '12i2: 待ち用と本物のベタ打ちボタンのキーが同じ')
 
+# 12j: サイドバーを閉じたら二度と開けない、を起こさない（2026-09-21 亮平さん指摘）。
+#      開き直す「≫」は Streamlit のヘッダーの中の stExpandSidebarButton。以前は header ごと
+#      display:none にしていたので、閉じると開き直す手段が画面から完全に消えていた
+_css_seg = _app_src.split('<style>')[1].split('</style>')[0] if '<style>' in _app_src else _app_src
+chk('header[data-testid="stHeader"] { display: none' not in _app_src
+    and 'display: block !important; height: 0 !important' in _app_src,
+    '12j: ヘッダーを丸ごと消している（サイドバーを閉じると二度と開けない）')
+chk('stExpandSidebarButton' in _app_src and 'pointer-events: auto' in _app_src
+    and 'position: fixed !important; top: 12px !important' in _app_src,
+    '12j2: 開き直す「≫」を画面に固定していない（height:0 のヘッダーの中だと上にはみ出す）')
+chk('stToolbarActions' in _app_src and 'stAppDeployButton' in _app_src,
+    '12j3: ヘッダーの中の Deploy・⋮ メニューを隠していない')
+chk('aria-expanded=\"false\"' in _app_src and '.topbar { margin-top' in _app_src,
+    '12j4: 狭い画面で「≫」がトップバーに重なる')
+
 print('REG_INSURANCE:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
     print('  -', f)

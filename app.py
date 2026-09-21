@@ -9268,9 +9268,41 @@ def main():
     .stApp { background: var(--bg); color: var(--ink); }
     p, li, label, .stMarkdown { line-height: 1.75; }
 
-    /* 上の余白を詰める（Streamlit のヘッダは使わない） */
-    header[data-testid="stHeader"] { display: none !important; height: 0 !important; }
-    .stApp > header { display: none !important; }
+    /* 上の余白を詰める（Streamlit のヘッダは使わない）。
+       ただし **header ごと消してはいけない**: サイドバーを閉じたときに出る「≫」（開き直すボタン、
+       data-testid="stExpandSidebarButton"）は、このヘッダーの中のツールバーに描かれる。
+       以前は display:none にしていたので、**一度サイドバーを閉じると二度と開けなかった**
+       （2026-09-21 亮平さん指摘）。場所は取らせず、中身を選んで隠す */
+    header[data-testid="stHeader"] {
+      display: block !important; height: 0 !important; min-height: 0 !important;
+      background: transparent !important; box-shadow: none !important; overflow: visible !important;
+      pointer-events: none !important;          /* 透明な帯で下のものを押せなくしない */
+    }
+    /* ヘッダーの中身は「≫」以外すべて隠す（Deploy・⋮ メニュー・実行中の目印・上の飾り帯） */
+    header[data-testid="stHeader"] [data-testid="stToolbarActions"],
+    header[data-testid="stHeader"] [data-testid="stAppDeployButton"],
+    header[data-testid="stHeader"] [data-testid="stStatusWidget"],
+    header[data-testid="stHeader"] [data-testid="stMainMenu"],
+    header[data-testid="stHeader"] [data-testid="stBaseButton-header"],
+    [data-testid="stDecoration"] { display: none !important; }
+    /* 「≫」は画面の左上に固定して必ず見えるようにする（height:0 のヘッダーの中だと上にはみ出す）。
+       サイドバーが開いている間は Streamlit 側がこのボタンを出さないので、邪魔にならない */
+    header[data-testid="stHeader"] [data-testid="stExpandSidebarButton"] {
+      pointer-events: auto !important;
+      position: fixed !important; top: 12px !important; left: 12px !important; z-index: 1000 !important;
+      width: 34px !important; height: 34px !important;
+      background: #ffffff !important; color: var(--brand) !important;
+      border: 1px solid var(--line) !important; border-radius: 9px !important;
+      box-shadow: 0 2px 8px rgba(15,23,42,.20) !important;
+    }
+    header[data-testid="stHeader"] [data-testid="stExpandSidebarButton"]:hover {
+      background: var(--brand-soft) !important; border-color: var(--brand-2) !important;
+    }
+    /* 画面が狭いと左上の「≫」が濃紺のトップバーに重なるので、サイドバーが閉じている間だけ本文を下げる。
+       広い画面では本文が右にずれているので重ならない（実測 1500px: ボタン x=14〜48／トップバー x=159〜） */
+    @media (max-width: 1000px) {
+      body:has([data-testid="stSidebar"][aria-expanded="false"]) .topbar { margin-top: 44px !important; }
+    }
     .stApp { margin-top: 0 !important; }
     section.main > div { padding-top: 0 !important; }
     /* 本文は中央寄せ・読みやすい行長に（広い画面で間延びしない） */
