@@ -9492,11 +9492,16 @@ def main():
     [class*="st-key-pdf2neo_run"]:not([class*="_beta"]) button[kind="primary"]:not(:disabled):hover {
       box-shadow:0 4px 14px rgba(29,78,216,.36) !important; transform:translateY(-1px);
     }
-    [class*="st-key-pdf2neo_run_beta"] button {
+    /* 押せないときは左右そろえて灰色に（見積書を入れる前の 2 つ。白いままだと押せそうに見える。2026-09-21 亮平さん指摘） */
+    [class*="st-key-pdf2neo_run"] button:disabled {
+      background:#f1f5f9 !important; color:#94a3b8 !important; border:1px solid #e2e8f0 !important;
+      box-shadow:none !important;
+    }
+    [class*="st-key-pdf2neo_run_beta"] button:not(:disabled) {
       background:var(--surface) !important; border:1.5px solid var(--brand-line) !important;
       color:var(--brand) !important; font-weight:700 !important;
     }
-    [class*="st-key-pdf2neo_run_beta"] button:hover {
+    [class*="st-key-pdf2neo_run_beta"] button:not(:disabled):hover {
       background:var(--brand-soft) !important; border-color:var(--brand-2) !important;
     }
     /* 押せないボタンは「使えない理由がある」と分かる見た目に（薄いだけだと故障に見える） */
@@ -10378,9 +10383,20 @@ def main():
             st.rerun()   # 書類の uploader を描き終えたので、サイドバーの入力欄（form_seq）と案内を描き直す
         if _p2n_file is None:
             # 見積書がまだ無いときも「次に押すボタン」を見せる（押せない理由も添える。2026-09-20 画面の作り直し:
-            # 以前はボタンが現れず、何をすればよいか分からなかった）
-            st.button("🚀 見積書からNEOを生成", key='pdf2neo_run_disabled', type="primary", width='stretch', disabled=True)
-            st.caption("↑ 上の「見積書（PDF・写真）」に見積書を入れると押せます。")
+            # 以前はボタンが現れず、何をすればよいか分からなかった）。
+            # 2026-09-21 亮平さん指摘: ここだけ**ボタンが 1 つ・金額表記が無し**で、見積書を入れるまで
+            # 「2 つのモードがある」ことも「金額表記を直せる」ことも分からなかった（金額表記は遥か下の
+            # 「うまくいかないとき」の中に出ていた）。入れる前・入れた後で同じ形にする
+            _pdf_tax_sel = _p2n_tax_row(_saved_pdf_tax)
+            _p2n_c0, _p2n_c0b = st.columns(2)
+            _p2n_wait = "↑ 上の「見積書（PDF・写真）」に見積書を入れると押せます"
+            with _p2n_c0:
+                st.button("🚀 NEOを生成（部品コードつき）", key='pdf2neo_run_disabled', type="primary",
+                          width='stretch', disabled=True, help=_p2n_wait)
+            with _p2n_c0b:
+                st.button("✏️ ベタ打ちで生成", key='pdf2neo_run_beta_wait', width='stretch',
+                          disabled=True, help=_p2n_wait)
+            st.caption(_p2n_wait + "。左は部品コード・標準指数つき（Addata が要ります）、右は見積書の明細・金額をそのまま写します。")
         _p2n_beta_ui_shown = False   # この run でベタ打ちの UI を描いたか（locals() で見ない。バグハント H7）
         if _p2n_file is not None:
             _p2n_bytes = _p2n_file.getvalue()   # read()+seek より位置に依存しない（run をまたいで同じ物が残る）

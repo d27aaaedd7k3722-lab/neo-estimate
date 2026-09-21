@@ -523,7 +523,7 @@ chk(app._yen('１０４，６６０ 円') == 104660 and app._yen('') is None and
 # 9z3〜9z7: 画面の作り直しで Codex が挙げた 5 件（2026-09-21 第40周）
 # (1) CSV だけの経路でも税区分を変えられる（描いていない run にだけ出す。キーは重複させない）
 # 定義 + vendor/キーが無い枝 + Addata なしの横並び + Addata ありの横並び + CSV だけの経路（2026-09-21: 行き止まりの枝にも足した）
-chk("if not st.session_state.get('_pdf_tax_row_shown'):" in _app_src and _app_src.count('_p2n_tax_row(') == 5,
+chk("if not st.session_state.get('_pdf_tax_row_shown'):" in _app_src and _app_src.count('_p2n_tax_row(') == 6,
     f"9z3: CSV だけの経路に税区分の切り替えが無い／二重に描いている: {_app_src.count('_p2n_tax_row(')}")
 chk("st.session_state.pop('_pdf_tax_row_shown', None)" in _app_src.split('def _main_and_reset')[1][:400],
     '9z4: 税区分を描いた印を run の終わりで落としていない（次の run で描けなくなる）')
@@ -735,6 +735,17 @@ chk('_skipped' in _ocr_src and "st.session_state['_doc_ocr_error'] = (f'添付 {
 chk(_app_src.count("out['error'] = _safe_pipeline_err(e)") == 2
     and "f'{type(e).__name__}: {e}'" not in _app_src,
     '12h: パイプラインの例外の本文がそのまま画面に出る')
+
+# 12i: 見積書を入れる前も、入れた後と同じ形にする（ボタン 2 つ横並び ＋ 金額表記はそのすぐ上）。
+#      以前はここだけ無効ボタン 1 つで、金額表記は遥か下の「うまくいかないとき」の中にしか出なかった
+#      （2026-09-21 亮平さん指摘「税込・税抜のボタンがありません」「NEO生成と、ベタ打ちNEO生成のボタンもできていません」）
+_seg_wait = _app_src.split('if _p2n_file is None:')[1].split('_p2n_beta_ui_shown = False')[0]
+chk('_p2n_tax_row(_saved_pdf_tax)' in _seg_wait and 'st.columns(2)' in _seg_wait
+    and "key='pdf2neo_run_disabled'" in _seg_wait and "key='pdf2neo_run_beta_wait'" in _seg_wait,
+    '12i: 見積書が無いときにボタン 2 つ・金額表記が出ていない')
+# 待ち用のベタ打ちボタンは押せる方とキーが別（同じだと Addata 無しの枝と重複して落ちる）
+chk("'pdf2neo_run_beta_wait'" in _app_src and _app_src.count("key='pdf2neo_run_beta'") == 1,
+    '12i2: 待ち用と本物のベタ打ちボタンのキーが同じ')
 
 print('REG_INSURANCE:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
