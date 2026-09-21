@@ -86,6 +86,25 @@ chk(not cur.execute('select WageEnabled from Expense where LineNo=8').fetchone()
     '2e: 固定費目「その他控除」（LineNo 8）に金額を入れている')
 chk(t[9] == 112200, f'2b: PDF経路の Total={t[9]:,}（期待 112,200）')
 
+# ── 2026-09-21: コグニセブン**実機**で確かめた費用行の消費税 ─────────────────────
+# トヨタ アイシス 5ドアワゴン ZNM10 L 1800 の新規見積に「レッカー代1」= 105 円（部品代の列）を入れ、
+# 消費税設定の計算単位だけを変えて 2 本保存し、NEO の中身を読んだ実測値:
+#   四捨五入(tx_ArrangeFlag=1): Expense.PartsPriceTax=11 / PartsPriceInTax=116 / Total.hy_Wrecker1Tax=11
+#   切り捨て(tx_ArrangeFlag=2): Expense.PartsPriceTax=10 / PartsPriceInTax=115 / Total.hy_Wrecker1Tax=10
+# → **費用行の税も請求書単位と同じ端数処理に従う**。以前アプリは常に四捨五入していて、
+#   切り捨て・切り上げのテンプレートでコグニと 1 円ずれていた（Codex 深掘りの指摘を実機で裏取り）
+_COGNI_REAL = [('四捨五入', 105, 11, 116), ('切り捨て', 105, 10, 115)]
+for _mode, _amt, _want_tax, _want_in in _COGNI_REAL:
+    _got = app._round_tax10(_amt, _mode)
+    chk(_got == _want_tax and _amt + _got == _want_in,
+        f'実機一致: {_mode} の {_amt} 円 → 税 {_got}（コグニ実機は {_want_tax}・税込 {_want_in}）')
+# _calc_tax が tax_round を見ていること（常に四捨五入に戻っていないか）
+_src_upd = __import__('re').sub(r'[ 	]+', ' ', __import__('inspect').getsource(app._update_ansmb_body))
+chk('tax = _round_tax10(amount, tax_round)' in _src_upd,
+    '費用行の税が端数処理の設定を見ていない（常に四捨五入に戻っている）')
+chk('tax = jpy_round(amount * TAX_RATE)' not in _src_upd,
+    '費用行の税に四捨五入の決め打ちが残っている')
+
 print('REG_EXPENSE:', 'ALL PASS' if not FAIL else f'FAIL {len(FAIL)}件')
 for f in FAIL[:10]: print('  -', f)
 sys.exit(1 if FAIL else 0)

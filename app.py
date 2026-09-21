@@ -1767,7 +1767,14 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
                             'parts_no': parts_no})
     # ── 税込/税抜に応じた費用計算ヘルパー ──
     def _calc_tax(amount, inclusive=False):
-        """金額から OutTax, InTax, Tax を計算"""
+        """費用行の金額から OutTax, InTax, Tax を計算。
+
+        端数処理は**テンプレートの設定どおり**（Setting.tx_ArrangeFlag）。以前は常に四捨五入していたので、
+        切り捨て・切り上げのテンプレートでコグニと 1 円ずれていた。
+        2026-09-21 にコグニセブン実機で確かめた（トヨタ アイシス・レッカー代1 に 105 円）:
+          四捨五入(1): Expense.PartsPriceTax=11 / InTax=116 / Total.hy_Wrecker1Tax=11
+          切り捨て(2): Expense.PartsPriceTax=10 / InTax=115 / Total.hy_Wrecker1Tax=10
+        費用行の税も請求書単位と同じ端数処理に従う（Codex 深掘りの指摘。実機で裏取り）"""
         if amount == 0:
             return 0, 0, 0
         if inclusive:
@@ -1776,7 +1783,7 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
             tax    = amount - outtax
         else:
             outtax = amount
-            tax    = jpy_round(amount * TAX_RATE)
+            tax    = _round_tax10(amount, tax_round)
             intax  = amount + tax
         return outtax, intax, tax
 
