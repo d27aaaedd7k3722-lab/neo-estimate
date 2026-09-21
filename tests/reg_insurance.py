@@ -730,6 +730,12 @@ chk(_llm_src and 'msg[:200]' not in _llm_src and "str(getattr(e, 'message', e))"
 chk('_skipped' in _ocr_src and "st.session_state['_doc_ocr_error'] = (f'添付 {_skipped} 件" in _ocr_src,
     '12g: 読めない添付が黙って無視される')
 
+# 12h: 画面に出る文に、顧客名の入ったファイル名・見積書の文字が例外の本文として混ざらない
+#      （自分で書いている例外＝LLMError/RunnerError/PageShapeError だけ本文を残す）
+chk(_app_src.count("out['error'] = _safe_pipeline_err(e)") == 2
+    and "f'{type(e).__name__}: {e}'" not in _app_src,
+    '12h: パイプラインの例外の本文がそのまま画面に出る')
+
 print('REG_INSURANCE:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
     print('  -', f)

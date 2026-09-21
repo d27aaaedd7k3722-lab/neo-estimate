@@ -7900,7 +7900,7 @@ def p2n_read(pdf_bytes, file_name, api_key, mime_type='application/pdf',
         out['record_profile'] = bool(record_profile)
         return out
     except Exception as e:
-        out['error'] = f'{type(e).__name__}: {e}'
+        out['error'] = _safe_pipeline_err(e)
         if case_dir:
             _left = _nsk_maker.remove_case_dir(case_dir)
             if _left:
@@ -8115,7 +8115,7 @@ def p2n_make(state, addata_root=None, record_profile=None, progress=None):
             out['error'] = 'NEO と確認箇所シートが組で作られなかった'
         return out
     except Exception as e:
-        out['error'] = f'{type(e).__name__}: {e}'
+        out['error'] = _safe_pipeline_err(e)
         return out
     finally:
         _left = _nsk_maker.remove_case_dir(case_dir)
@@ -8653,6 +8653,19 @@ def _docs_sig(state=None) -> str:
         except Exception:  # noqa: BLE001
             parts.append('?')
     return '|'.join(sorted(parts))
+
+
+def _safe_pipeline_err(e) -> str:
+    """パイプラインの例外を画面に出す文にする。**自分で書いている例外だけ本文を残す**（何を直せばよいかが入っている）。
+    よその例外は型だけ: 読み込んだ見積書の文字や、顧客名の入ったファイル名（「〇〇様_品川300あ1234.pdf」）が
+    そのまま画面に出ることがある（2026-09-21 監査）"""
+    try:
+        from neo_skill import llm as _l, reader as _r
+        if isinstance(e, (_l.LLMError, _r.RunnerError, _r.PageShapeError)):
+            return str(e)
+    except Exception:  # noqa: BLE001
+        pass
+    return f'想定外のことが起きました（{type(e).__name__}）'
 
 
 def _attached_docs_caption(api_key, model_name) -> str:
