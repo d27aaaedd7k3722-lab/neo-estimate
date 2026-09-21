@@ -724,6 +724,161 @@ def test_manual_flags_and_unit_price():
     chk(rows[1][3:6] == (155, 15, 170) and rows[1][6] == 160, f'L11: 数量行の単価欄（155・税 15 切り捨て・行の税 160）: {rows[1]}')
 
 
+def _erparts(neo, cols):
+    ck = app.find_real_cks(neo)
+    f = app.extract_files(app.decompress_neo(neo, ck), app.parse_entries(neo, ck[0])[1])
+    c = sqlite3.connect(':memory:')
+    c.deserialize(f['AnSMB.txt'])
+    try:
+        return c.execute(f'SELECT {cols} FROM ERParts ORDER BY LineNo').fetchall()
+    finally:
+        c.close()
+
+
+def test_csv_blank_method_as_printed():
+    """CSV の区分が空欄の行は、原本どおり区分なし（DisposalCode -1）で NEO に入れる（2026-09-21 §2-3 ②）。
+    工場ソフトの CSV で区分が本当に空の行を「取替」にしていた。ベタ打ち・プレビュー取り込み（既定）は今までどおり推し量る。
+    両方向: CSV は推し量らない／既定は推し量る／区分の書いてある行は変わらない"""
+    tpl = open(os.path.join(ROOT, 'template_toyota.neo'), 'rb').read()
+    h = '品名,区分,数量,部品金額,工賃,部品コード\n'
+    it, notes = app.parse_csv_to_items(h + 'ｸﾘｯﾌﾟ,,1,300,0,\nﾌﾛﾝﾄﾊﾞﾝﾊﾟ,取替,1,45000,0,\nﾎﾞﾃﾞｰ研磨,,1,0,3000,\n'
+                                       'ｺｰﾃｨﾝｸﾞ,,1,0,5000,\n', return_notes=True)
+    chk([x['method'] for x in it] == ['', '取替', '', ''], f'CSV の区分を取り込みで変えている: {[x["method"] for x in it]}')
+    _bn = [n for n in notes if '区分が空欄の行' in str(n)]
+    chk(len(_bn) == 1 and str(_bn[0]).startswith('⚠️') and '「ｸﾘｯﾌﾟ」' in _bn[0] and '「取替」' in _bn[0],
+        f'推し量れば区分が付く空欄の行を知らせていない: {notes}')
+    # 推し量っても区分なしの行（研磨・区分の語の無い工賃行）と、区分の書いてある行は知らせない（知らせが増えて埋もれる）
+    chk(_bn and 'ﾎﾞﾃﾞｰ研磨' not in _bn[0] and 'ｺｰﾃｨﾝｸﾞ' not in _bn[0] and 'ﾌﾛﾝﾄﾊﾞﾝﾊﾟ' not in _bn[0],
+        f'区分が変わらない行まで知らせている: {_bn}')
+    _it2, notes2 = app.parse_csv_to_items(h + 'ﾌﾛﾝﾄﾊﾞﾝﾊﾟ,取替,1,45000,0,\nﾎﾞﾃﾞｰ研磨,,1,0,3000,\n', return_notes=True)
+    chk(not any('区分が空欄の行' in str(n) for n in notes2), f'区分の変わらない CSV に空欄の知らせが出る: {notes2}')
+    # NEO: CSV（infer_method=False）は空欄のまま -1、既定（ベタ打ち・プレビュー取り込み）は今までどおり取替 0
+    rows = [{k: v for k, v in x.items()} for x in it]
+    neo_csv, *_ = app.generate_neo_file(tpl, {}, rows, 0, {}, infer_method=False)
+    got = _erparts(neo_csv, 'PartsName, DisposalCode, DisposalName')
+    chk([(r[1], r[2]) for r in got] == [(-1, ''), (0, '取替'), (-1, ''), (-1, '')],
+        f'CSV の区分が空欄の行を推し量っている（原本どおり区分なしにする）: {got}')
+    neo_def, *_ = app.generate_neo_file(tpl, {}, rows, 0, {})
+    got2 = _erparts(neo_def, 'PartsName, DisposalCode, DisposalName')
+    chk([(r[1], r[2]) for r in got2][:2] == [(0, '取替'), (0, '取替')],
+        f'ベタ打ち・プレビュー取り込み（既定）の推し量りが変わった: {got2}')
+    # 推し量りの中身は元のまま（関数に切り出しただけ）
+    for nm, pa, wg, want in (('ｸﾘｯﾌﾟ', 300, 0, '取替'), ('ﾌﾛﾝﾄﾄﾞｱ脱着修理', 0, 9000, '脱着修理'), ('ｼｮｰﾄﾊﾟｰﾂ', 800, 0, ''),
+                             ('ﾎﾞﾃﾞｰ磨き調整', 0, 5000, '磨き調整'), ('光軸調整', 0, 3000, '調整'), ('※金額調整', 500, 0, ''),
+                             ('ﾍﾟｲﾝﾄ', 0, 9000, '塗装'), ('ﾄﾞｱ脱着板金', 0, 12000, '脱着板金'), ('ﾙｰﾌ', 0, 12000, ''),
+                             ('写真代', 3000, 0, ''), ('ﾊﾞﾝﾊﾟ分解', 0, 2000, '分解調整'), ('ﾌﾛﾝﾄﾊﾟﾈﾙ 鈑金', 0, 20000, '鈑金')):
+        g = app._infer_method_from_name({'name': nm, 'parts_amount': pa, 'wage': wg})
+        chk(g == want, f'推し量りが変わった: {nm} 部品 {pa} 工賃 {wg} → {g!r}（元は {want!r}）')
+    # ステップ④が CSV 取り込みのときだけ推し量りを止める（プレビュー取り込みは _csv_import が False）
+    src = open(os.path.join(ROOT, 'app.py'), encoding='utf-8').read()
+    chk("infer_method=not bool((estimate_data or {}).get('_csv_import'))" in src,
+        'ステップ④が CSV 取り込みで推し量りを止めていない')
+
+
+def test_csv_ai_diff_marks():
+    """CSV の後ろに AI が書いた「部品相違○円 工賃相違●円」は、ステップ③の確認とファイル名の印になる（2026-09-21 §2-3 ③）。
+    両方向: 相違のある申告・額の読めない申告は印にする／0 円・「なし」は印にしない"""
+    m = app._csv_ai_diff_marks
+    chk(m(['部品相違1,200円 工賃相違0円']) == ['部品相違'], f'部品だけの相違: {m(["部品相違1,200円 工賃相違0円"])}')
+    chk(m(['部品相違0円 工賃相違３，５００円']) == ['工賃相違'], '全角の額の工賃相違を読めていない')
+    chk(m(['部品相違-1,200円', '工賃相違▲500円']) == ['部品相違', '工賃相違'], 'マイナスの相違を印にしていない')
+    chk(m(['部品相違〇,〇〇〇円 工賃相違●,●●●円']) == ['部品相違', '工賃相違'], '額の読めない申告を相違なしにしている')
+    chk(m(['部品相違0円 工賃相違0円']) == [] and m(['部品相違なし 工賃相違無し']) == [] and m([]) == [],
+        '相違 0 円・なしを印にしている')
+    chk(m(['部品相違']) == ['部品相違'], '額の無い「部品相違」を印にしていない')
+    # 区切りごとに見る（Codex 2 周目 P1）: 「なし」と「額の読めない相違」が混ざっても、読めない側は印にする
+    chk(m(['部品相違なし 工賃相違〇,〇〇〇円']) == ['工賃相違'], f'「なし」混じりの読めない相違を見逃す: {m(["部品相違なし 工賃相違〇,〇〇〇円"])}')
+    chk(m(['部品相違1,200円 工賃相違なし']) == ['部品相違'], '「なし」混じりの相違の額を読めていない')
+    # つなぎの語だけの区切りは次の区切りと同じ判定（「A・B はありません」「A、B ともに 0 円」「A・B 各 1,000 円」）
+    chk(m(['部品相違・工賃相違はありません（一致）']) == [], '「部品相違・工賃相違はありません」を相違にしている')
+    chk(m(['部品相違、工賃相違ともに0円']) == [], '「ともに 0 円」を相違にしている')
+    chk(m(['部品相違・工賃相違 各1,000円']) == ['部品相違', '工賃相違'], '「各 1,000 円」の片方を見逃す')
+    chk(m(['部品相違あり']) == ['部品相違'] and m(['部品相違（1,200円）']) == ['部品相違'], '「あり」・括弧書きの額を相違にしていない')
+    # 区切りの残りが丸ごと言い切りの相違なし（なし・ありません・一致・0 円。「です」・数字の無い括弧書きは付いてよい）なら印なし
+    for clean in ('部品相違: 一致です', '部品相違は ありません', '部品相違（0円）', '部品相違なし、工賃相違なし', '部品相違なし（一致）',
+                  '部品相違 0円 / 工賃相違 0円（照合済み）', '部品相違：なし。工賃相違：なし．', '部品相違ありませんでした'):
+        chk(m([clean]) == [], f'言い切りの相違なしを相違にしている: {clean} → {m([clean])}')
+    # 逆向き（Codex 4・5 周目 P1）: 否定の言い回し・0 円のあとに続く額・言い切りでない文は、相違ありとして確認を求める
+    for neg, want in (('工賃相違: 一致していません', ['工賃相違']), ('部品相違なしではありません', ['部品相違']),
+                      ('工賃相違は一致しておりません', ['工賃相違']), ('部品相違: 一致しません', ['部品相違']),
+                      ('部品相違: 不一致', ['部品相違']), ('部品相違（1200）', ['部品相違']),
+                      ('工賃相違（見積書 0円 / CSV 8,000円）', ['工賃相違']), ('部品相違0円ではなく1,200円', ['部品相違']),
+                      ('部品相違0円ではありません', ['部品相違']),
+                      # 括弧書きの打ち消し・片側だけの言い切り（Codex 6 周目 P1）
+                      ('部品相違なし（ではありません）', ['部品相違']), ('部品相違0円（不一致）', ['部品相違']),
+                      ('部品相違、工賃相違0円', ['部品相違']), ('部品相違 工賃相違なし', ['部品相違']),
+                      ('工賃相違0円（見積書と照合）', ['工賃相違']),
+                      # 言い切りでない文は、数字が説明でも相違ありに倒す（確認を 1 回求めるだけ。見逃すよりよい。
+                      # 3 周目に「説明の数字を額と読むな」の指摘があったが、それを受けて部分的に読むと 4・5 周目の見逃しが開いた）
+                      ('部品相違・工賃相違（2項目とも一致）', ['部品相違', '工賃相違']), ('部品相違: 2項目とも一致', ['部品相違']),
+                      ('部品相違（1円単位で一致）', ['部品相違']), ('部品相違なし 工賃相違なし（1円単位で一致）', ['工賃相違']),
+                      ('工賃相違（見積書 12,000円 / CSV 10,800円）部品は一致', ['工賃相違'])):
+        chk(m([neg]) == want, f'言い切りでない申告・否定の言い回しを相違なしにしている: {neg} → {m([neg])}（{want} のはず）')
+    # 取り込み: 相違のメモは明細にせず注記に回り、画面（③の確認・ファイル名）へ運ぶ
+    it, notes = app.parse_csv_to_items('品名,区分,数量,部品金額,工賃,部品コード\nﾊﾞﾝﾊﾟ,取替,1,45000,0,\n"部品相違1,200円 工賃相違0円"\n',
+                                       return_notes=True)
+    chk(len(it) == 1 and any(str(n).startswith('部品相違') for n in notes), f'相違のメモの扱い: {it} / {notes}')
+    # 前置き付きの申告も拾う（「⚠️」「※」・長い前置き・短い前置き）。先頭を「部品相違」にそろえて③の確認につなぐ（Codex 1 周目 P2）
+    _h = '品名,区分,数量,部品金額,工賃,部品コード\nﾊﾞﾝﾊﾟ,取替,1,45000,0,\n'
+    for tail in ('"⚠️ 部品相違1,200円 工賃相違0円"\n', '"※部品相違1,200円"\n', '"相違確認結果: 部品相違1,200円 工賃相違0円（照合済み）"\n',
+                 '"相違: 部品相違1,200円"\n', '相違確認,部品相違1,200円\n'):
+        it_p, notes_p = app.parse_csv_to_items(_h + tail, return_notes=True)
+        _d = [n for n in notes_p if str(n).startswith(('部品相違', '工賃相違'))]
+        chk(len(it_p) == 1 and _d and m(_d) == ['部品相違'],
+            f'前置き付きの相違申告（{tail.strip()}）を③の確認につないでいない: 明細 {len(it_p)} 行 / {notes_p}')
+    # 逆向き: 相違の無い申告は確認にしない／相違の語を含む正しい明細（金額あり）は明細のまま
+    it_n, notes_n = app.parse_csv_to_items(_h + '"※部品相違・工賃相違はありません（一致）"\n', return_notes=True)
+    chk(len(it_n) == 1 and m([n for n in notes_n if str(n).startswith(('部品相違', '工賃相違'))]) == [],
+        f'「相違はありません」を相違として確認にしている: {notes_n}')
+    it_i, notes_i = app.parse_csv_to_items(_h + 'ﾊﾟﾈﾙ部品相違調整,調整,1,0,3000,\n', return_notes=True)
+    chk(len(it_i) == 2 and not any(str(n).startswith('部品相違') for n in notes_i),
+        f'金額のある明細を相違のメモとして捨てている: {it_i} / {notes_i}')
+    # 品名に「相違」の無い 0 円の行は、ほかの欄に「部品相違」の語があっても明細のまま（備考などの語を申告と取り違えない）
+    it_k, notes_k = app.parse_csv_to_items(_h + 'ﾄﾞｱﾐﾗｰ,部品相違なし,1,0,0,\n', return_notes=True)
+    chk(len(it_k) == 2, f'品名に「相違」の無い明細を相違のメモとして捨てている: {it_k} / {notes_k}')
+    # ファイル名の印（CSV は pdf_parts が 0 なので照合の印が付かない。AI の申告を確かめて作ったものに付ける）
+    n1 = app.generate_filename({'car_name': 'ﾃｽﾄ車'}, 45000, 0, 0, 0, True, extra_marks=['部品相違'])
+    chk(n1.endswith('_見積（部品相違）.neo'), f'AI の申告の印がファイル名に無い: {n1}')
+    n2 = app.generate_filename({'car_name': 'ﾃｽﾄ車'}, 45000, 0, 0, 0, True)
+    chk('相違' not in n2, f'印の無い CSV に相違が付いた: {n2}')
+    n3 = app.generate_filename({'car_name': 'ﾃｽﾄ車'}, 45000, 0, 0, 0, True, grand_ok=False, extra_marks=['総額相違', '工賃相違'])
+    chk(n3.count('総額相違') == 1 and '工賃相違' in n3, f'印が重なる／落ちる: {n3}')
+    chk('/' not in app.generate_filename({}, 0, 0, 0, 0, True, extra_marks=['部品/相違']), 'ファイル名に使えない文字を入れている')
+    # 画面の配線: ②で明細の指紋と組にして運び、③で確認を求め、④でファイル名に付ける
+    src = open(os.path.join(ROOT, 'app.py'), encoding='utf-8').read()
+    for frag, why in (("st.session_state['_csv_ai_diffs'] = {'sig': _items_sig(_preview_items)", '①で明細と組にしていない'),
+                      ("estimate_data['_csv_ai_diffs'] = [str(n) for n in _cad['notes']]", '②で運んでいない'),
+                      ("key='csv_ai_diff_confirmed'", '③に確認のチェックが無い'),
+                      # 確認を外す鍵に取り込みごとの番号を入れる（同じ文面の申告の別の CSV で前の確認を持ち越さない。Codex 1 周目 P1）
+                      ("estimate_data['_csv_import_seq'] = _cseq", '②で取り込みごとの番号を振っていない'),
+                      ("_ai_sig = (f\"{estimate_data.get('_csv_import_seq', '')}\\n{_items_sig(edited_items)}\\n\" + '\\n'.join(_ai_notes))",
+                       '③の確認を外す鍵に取り込みの番号・いまの明細が無い（確認のあとに直した明細で生成できる。Codex 7 周目 P1）'),
+                      ("amount_confirmed = bool(amount_confirmed) and bool(_ai_ok)", '③の確認が生成を止めていない'),
+                      ("extra_marks=(_s3v.get('csv_ai_marks') or ())", '④でファイル名に印を付けていない')):
+        chk(frag in src, f'AI の申告の配線: {why}')
+
+
+def test_qty_unit_in_classification():
+    """数量 × 単価 ≠ 部品金額（validate_row_consistency の判定）を、CSV 取り込み・プレビュー取り込みのステップ③の点検にも出す
+    （2026-09-21 §2-3 ①。PDF 経路にしか無く、CSV では 1 つも出なかった）。行は画面の表の No（_ed_no）で呼ぶ"""
+    alerts = app.check_parts_labor_classification([
+        {'name': 'ｸﾘｯﾌﾟ', 'method': '取替', 'quantity': 3, 'parts_amount': 5000, 'wage': 0, '_ed_no': 4},
+        {'name': 'ﾎﾞﾙﾄ', 'method': '取替', 'quantity': 14, 'parts_amount': 1960, 'wage': 0, '_ed_no': 5},
+        {'name': 'ﾅｯﾄ', 'method': '取替', 'quantity': 1, 'parts_amount': 333, 'wage': 0}])
+    qa = [a for a in alerts if a['flag'] == 'qty_unit']
+    chk(len(qa) == 1 and qa[0]['row_no'] == 4 and qa[0]['severity'] == 'warning' and '行4「ｸﾘｯﾌﾟ」' in qa[0]['message']
+        and '1666.7' in qa[0]['message'], f'数量 3 × 単価 ≠ 5,000 円を表の No で知らせていない: {qa}')
+    # ほかのパターンとは別の話なので両方出る（脱着の行の部品代 ＋ 割り切れない部品代）
+    a2 = app.check_parts_labor_classification([{'name': 'ﾐﾗｰ', 'method': '脱着', 'quantity': 3, 'parts_amount': 1000, 'wage': 2000}])
+    chk(sorted(a['flag'] for a in a2) == ['parts_in_labor', 'qty_unit'], f'脱着の部品代と数量の点検が両方出ない: {a2}')
+    # PDF 経路の文言は元のまま（同じ判定を関数に切り出しただけ）
+    _, w = app.validate_row_consistency([{'name': 'ｸﾘｯﾌﾟ', 'quantity': 3, 'parts_amount': 5000, 'wage': 0}])
+    chk(w == ['行1「ｸﾘｯﾌﾟ」: 数量3 × 単価1666.7 ≠ 部品金額¥5,000（端数あり）'], f'validate_row_consistency の文言が変わった: {w}')
+    # ③の控え（キャッシュ）の鍵に数量が入っている（数量を直しても古い点検が残らない）
+    src = open(os.path.join(ROOT, 'app.py'), encoding='utf-8').read()
+    chk("it.get('quantity', 1), it.get('_ed_no')) for it in edited_items]))" in src, '③の点検の控えの鍵に数量・No が無い')
+
+
 if __name__ == '__main__':
     sys.stdout.reconfigure(encoding='utf-8')
     for name, fn in sorted(globals().items()):

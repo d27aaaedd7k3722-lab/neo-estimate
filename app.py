@@ -1089,7 +1089,7 @@ def extract_files(full_raw, entries):
 # ============================================================
 
 def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclusive=False, is_beta_mode=False,
-                 tax_round='四捨五入'):
+                 tax_round='四捨五入', infer_method=True):
     """ERParts/Expense/Total を更新（値引き行の負工賃も対応）
     expenses: {
         'towing': レッカー費用,              # LineNo=5「レッカー代１」（固定費目名）
@@ -1102,6 +1102,8 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
     is_tax_inclusive: True の場合、items の金額は税込値として扱い、
                      OutTax/InTax/Tax を正しく逆算する。
     is_beta_mode: True の場合、ベタ打ちモード（未マッチ部品に※を付与しない）
+    infer_method: False の場合、区分が空欄の行を品名から推し量らない（区分なしのまま書く。CSV 取り込み。
+                  _infer_method_from_name）
     """
     if expenses is None:
         expenses = {}
@@ -1113,7 +1115,8 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
     # 途中で例外が出ても一時ファイル（顧客情報を含む）を残さない
     try:
         return _update_ansmb_impl(tf.name, items, short_parts_wage, expenses,
-                                  is_tax_inclusive, is_beta_mode, tax_round=tax_round)
+                                  is_tax_inclusive, is_beta_mode, tax_round=tax_round,
+                                  infer_method=infer_method)
     finally:
         try:
             os.unlink(tf.name)
@@ -1122,14 +1125,15 @@ def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclus
 
 
 def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
-                       is_tax_inclusive, is_beta_mode, tax_round='四捨五入'):
+                       is_tax_inclusive, is_beta_mode, tax_round='四捨五入', infer_method=True):
     # 途中で落ちても必ず閉じる。閉じないまま抜けると、Windows では
     # SQLite がファイルを掴んだままで呼び出し元の unlink が失敗し、
     # **顧客情報の入った一時DBが消えずに残る**。
     conn = sqlite3.connect(_tmp_db_path)
     try:
         return _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage,
-                                  expenses, is_tax_inclusive, is_beta_mode, tax_round=tax_round)
+                                  expenses, is_tax_inclusive, is_beta_mode, tax_round=tax_round,
+                                  infer_method=infer_method)
     finally:
         try:
             conn.close()
@@ -1137,8 +1141,69 @@ def _update_ansmb_impl(_tmp_db_path, items, short_parts_wage, expenses,
             pass
 
 
+def _infer_method_from_name(item) -> str:
+    """区分が空欄の行の区分を、品名と金額から推し量る（推し量れなければ ''）。
+
+    ベタ打ち・プレビュー取り込みの NEO 書き出し（_update_ansmb_body）で使う。**CSV 取り込みでは使わない**:
+    CSV の区分の欄は原本の写しで、工場のソフトから出した CSV で区分が本当に空の行は、実機なら区分なし
+    （DisposalCode -1）になる。部品金額だけの行を「取替」にすると修理方法の欄に原本に無い語が刷られる（2026-09-21）。
+    CSV の取り込み（parse_csv_to_items）は、ここで区分が付いてしまう行だけを「区分なしで入れる」と知らせる。
+
+    「※金額調整」は自動で足した差額の行で、作業ではない。推定に掛けると「調整」の 2 文字が修理系の語に当たって
+    「修理」区分の部品行になり、コグニセブン上で説明できない行になる。"""
+    if str(item.get('name', '')).startswith('※金額調整'):
+        return ''
+    # 見積書の品名は半角カナで書かれることが多い（「ｼｮｰﾄﾊﾟｰﾂ」「ﾍﾟｲﾝﾄ」）。
+    # 生の文字列で照合すると、全角で書いたキーワードに当たらず、
+    # 区分なしの行になってしまう。区分の文字列と同じく NFKC で
+    # 揃えてから探す（半角カナ→全角カナ、全角英数→半角英数）。
+    _name_for_detect = unicodedata.normalize('NFKC', str(item.get('name', '')))
+    _parts_amt = safe_int(item.get('parts_amount', 0))
+    _wage_amt  = safe_int(item.get('wage', 0))
+    # 上から順に見て、最初に当たった語を区分にする。
+    # (探す語, 区分として書く文字列)。書く文字列が None なら、
+    # 当たった語そのものを使う。DisposalName は帳票の「修理方法」に
+    # そのまま印字されるので、見積書に「脱着板金」と書いてあった行を
+    # 「脱着修理」に書き換えない（区分コードはどちらも 3 で同じ）。
+    #
+    # 並び順に意味がある。複合語（2語以上）を単独の語より先に置く。
+    # 「脱着修理」を「脱着」より後ろに置くと脱着（コード1）に取られ、
+    # 実機の 3 にならない。
+    _INFER = (
+        # 複合区分
+        (('脱着修理', '脱着鈑金', '脱着板金'), None),
+        (('点検調整', '点検清掃'), None),
+        (('磨き調整',), None),
+        (('分解調整', '分解清掃'), None),
+        # 研磨・磨き・写真代・ショートパーツは区分なしのまま。
+        # 原本に区分が書かれていないものを勝手に決めない。
+        # （「磨き調整」は上で拾うのでここには来ない）
+        (('研磨', '磨き', '写真代', 'ショートパーツ'), ''),
+        # 単独区分
+        (('取替', '交換', '取換', '取り替え'), '取替'),
+        (('脱着', '取外', '取付', '組付', '脱外'), '脱着'),
+        (('鈑金', '板金'), None),
+        (('塗装', 'ペイント', 'ワックス', '加算', 'ブース'), '塗装'),
+        (('分解',), '分解調整'),
+        (('点検', '診断'), '点検'),
+        (('調整', '光軸', 'フィッティング', 'コーディング', '設定', '消去'), '調整'),
+        (('修理', '補修', '修正', '穴あけ', 'シーリング'), '修理'),
+    )
+    # 部品金額があって工賃が無い行は取替。ただし「研磨」等の
+    # 区分なし語が入っている行はそちらを優先する（上の並びの前に置く）。
+    _no_method = (any(kw in _name_for_detect for kw in ('研磨', '磨き', '写真代', 'ショートパーツ'))
+                  and '磨き調整' not in _name_for_detect)
+    if not _no_method and _parts_amt > 0 and _wage_amt == 0:
+        return '取替'
+    for _kws, _label in _INFER:
+        _hit = next((k for k in _kws if k in _name_for_detect), None)
+        if _hit is not None:
+            return _hit if _label is None else _label
+    return ''
+
+
 def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
-                       is_tax_inclusive, is_beta_mode, tax_round='四捨五入'):
+                       is_tax_inclusive, is_beta_mode, tax_round='四捨五入', infer_method=True):
     # 消した明細（前の案件の品名・品番・金額）がファイルの空き領域に残らないよう 0 で消す（レビュー: 顧客 DB だけだった）
     conn.execute('PRAGMA secure_delete=ON')
     cur  = conn.cursor()
@@ -1432,60 +1497,10 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
         name     = cp932_trim(name, _ERPARTS_WIDTH['PartsName'])
         parts_no = cp932_trim(parts_no, _ERPARTS_WIDTH['PartsNo'])
 
-        # 品名から作業種別を自動推定（区分が空白の場合）
-        # ただし「※金額調整」は自動で足した差額の行で、作業ではない。
-        # 推定に掛けると「調整」の2文字が修理系の語に当たって
-        # 「修理」区分の部品行になり、コグニセブン上で説明できない行になる。
-        if not method and not str(item.get('name', '')).startswith('※金額調整'):
-            # 見積書の品名は半角カナで書かれることが多い（「ｼｮｰﾄﾊﾟｰﾂ」「ﾍﾟｲﾝﾄ」）。
-            # 生の文字列で照合すると、全角で書いたキーワードに当たらず、
-            # 区分なしの行になってしまう。区分の文字列と同じく NFKC で
-            # 揃えてから探す（半角カナ→全角カナ、全角英数→半角英数）。
-            _name_for_detect = unicodedata.normalize(
-                'NFKC', str(item.get('name', '')))
-            _parts_amt = safe_int(item.get('parts_amount', 0))
-            _wage_amt  = safe_int(item.get('wage', 0))
-            # 上から順に見て、最初に当たった語を区分にする。
-            # (探す語, 区分として書く文字列)。書く文字列が None なら、
-            # 当たった語そのものを使う。DisposalName は帳票の「修理方法」に
-            # そのまま印字されるので、見積書に「脱着板金」と書いてあった行を
-            # 「脱着修理」に書き換えない（区分コードはどちらも 3 で同じ）。
-            #
-            # 並び順に意味がある。複合語（2語以上）を単独の語より先に置く。
-            # 「脱着修理」を「脱着」より後ろに置くと脱着（コード1）に取られ、
-            # 実機の 3 にならない。
-            _INFER = (
-                # 複合区分
-                (('脱着修理', '脱着鈑金', '脱着板金'), None),
-                (('点検調整', '点検清掃'), None),
-                (('磨き調整',), None),
-                (('分解調整', '分解清掃'), None),
-                # 研磨・磨き・写真代・ショートパーツは区分なしのまま。
-                # 原本に区分が書かれていないものを勝手に決めない。
-                # （「磨き調整」は上で拾うのでここには来ない）
-                (('研磨', '磨き', '写真代', 'ショートパーツ'), ''),
-                # 単独区分
-                (('取替', '交換', '取換', '取り替え'), '取替'),
-                (('脱着', '取外', '取付', '組付', '脱外'), '脱着'),
-                (('鈑金', '板金'), None),
-                (('塗装', 'ペイント', 'ワックス', '加算', 'ブース'), '塗装'),
-                (('分解',), '分解調整'),
-                (('点検', '診断'), '点検'),
-                (('調整', '光軸', 'フィッティング', 'コーディング', '設定', '消去'), '調整'),
-                (('修理', '補修', '修正', '穴あけ', 'シーリング'), '修理'),
-            )
-            # 部品金額があって工賃が無い行は取替。ただし「研磨」等の
-            # 区分なし語が入っている行はそちらを優先する（上の並びの前に置く）。
-            _no_method = any(kw in _name_for_detect
-                             for kw in ('研磨', '磨き', '写真代', 'ショートパーツ'))                 and '磨き調整' not in _name_for_detect
-            if not _no_method and _parts_amt > 0 and _wage_amt == 0:
-                method = '取替'
-            else:
-                for _kws, _label in _INFER:
-                    _hit = next((k for k in _kws if k in _name_for_detect), None)
-                    if _hit is not None:
-                        method = _hit if _label is None else _label
-                        break
+        # 品名から作業種別を自動推定（区分が空白の場合）。中身は _infer_method_from_name。
+        # CSV 取り込みでは推し量らない（infer_method=False。区分が空欄の行は原本どおり区分なし。2026-09-21）
+        if not method and infer_method:
+            method = _infer_method_from_name(item)
 
         qty    = safe_int(item.get('quantity', 1), 1)
         # 整数でない数量（'2.5' L など）はコグニの数量欄（整数）に書けない。丸めた数量で「単価の税×数量」の規則を当てると
@@ -3003,11 +3018,13 @@ def repack_neo(orig_data, files, mgmt, entries):
     return header + bytes(new_mgmt) + table_bytes + ck_data
 
 
-def generate_neo_file(template_data, customer_info, items, short_parts_wage, insurance_info, expenses=None, is_tax_inclusive=False, is_beta_mode=False, merge_mode=False):
+def generate_neo_file(template_data, customer_info, items, short_parts_wage, insurance_info, expenses=None, is_tax_inclusive=False, is_beta_mode=False, merge_mode=False,
+                      infer_method=True):
     """テンプレートNEOから更新済みNEOを生成
     merge_mode=True の場合、ユーザーアップロードのテンプレートNEOをベースとし、
     車検証OCRで取得した値（非空のみ）でヘッダ情報を訂正し、明細欄はPDF解析結果で上書きする。
     テンプレートにのみ存在する情報（工場名・証券番号等）は保持される。
+    infer_method=False の場合、区分が空欄の行を品名から推し量らない（CSV 取り込み。update_ansmb）。
     """
     real_ck  = find_real_cks(template_data)
     if not real_ck:
@@ -3023,7 +3040,7 @@ def generate_neo_file(template_data, customer_info, items, short_parts_wage, ins
     files['AnSMB.txt'], total_parts, total_wages, grand_total, _annote_rows = update_ansmb(
         files['AnSMB.txt'], normalized_items, short_parts_wage,
         expenses=expenses, is_tax_inclusive=is_tax_inclusive, is_beta_mode=is_beta_mode,
-        tax_round=_tax_round,
+        tax_round=_tax_round, infer_method=infer_method,
     )
     files['AnNote.ini']       = generate_annote(_annote_rows)
     files['AnSvEm0001Ex.db']  = update_em_db(
@@ -6357,17 +6374,27 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
                               or len(name) > 24)))):
             # 注意書きの中のカンマでセルが割れていてもつなげる（列ずれで取り込みが止まる・0 円の明細になっていた。レビュー 3 周目）
             _tn = ','.join(str(c).strip() for c in row if str(c or '').strip()) if _marker_note else name.strip()
+            _ad = _ai_diff_note(_tn)
+            if _ad:
+                # 前置き（「⚠️」「※」「相違確認結果:」など）付きの「部品相違○円 工賃相違●円」も AI の相違申告として拾う
+                # （先頭をそろえると、画面が③の確認につなぐ。前置きがあると注意書き扱いで素通りしていた。Codex 1 周目 P2）
+                _trailer_notes.append(_ad)
+                continue
             # AI が CSV の後ろに書いた「❌」「⚠️」の注意（「3 行読み取れませんでした」など）は、閉じた欄に隠さず警告として出す。
             # 取り込みは止めない（先頭が「⚠️ CSV の中の注意」なので、取り込みを止める ❌ とは区別される。レビュー 2 周目）
             _trailer_notes.append(('⚠️ CSV の中の注意: ' + _tn.lstrip('❌⚠\ufe0f ').strip())
                                   if _tn.startswith(('❌', '⚠', '※')) else _tn)
             continue
-        # アプリ自身のプロンプトが末尾に付ける差異メモは明細ではない
+        # アプリ自身のプロンプトが末尾に付ける差異メモは明細ではない。前置き（「相違:」など）が付いても、
+        # 金額・品番の無い行なら差異メモ（先頭を「部品相違／工賃相違」にそろえて③の確認につなぐ。Codex 1 周目 P2）
         _nm_s = name.strip()
+        # 品名の欄に「相違」があり、行のどこかに「部品相違／工賃相違」がある（「相違確認,部品相違1,200円」のように
+        # 引用符なしで欄が割れた形も）。品名に「相違」の無い正しい明細（備考欄の語など）は巻き込まない
+        _dn = ','.join(c.strip() for c in row if c.strip())
         if (re.fullmatch(r'(部品|工賃)相違[\s\u3000\d,，円]*', _nm_s)
-                or (re.match(r'^(部品|工賃)相違', _nm_s)
-                    and parts_amt == 0 and wage_amt == 0)):
-            _trailer_notes.append(','.join(c.strip() for c in row if c.strip()))
+                or ('相違' in _nm_s and re.search(r'(部品|工賃)相違', _dn)
+                    and parts_amt == 0 and wage_amt == 0 and (not part_no or re.match(r'^(部品|工賃)相違', _nm_s)))):
+            _trailer_notes.append(_ai_diff_note(_dn) or _dn)
             continue
         # 集計行の除外。
         # 「合計」「小計(税抜)」「税込合計」「合計金額」「【合計】」「小計①」など、
@@ -6500,6 +6527,15 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
         _trailer_notes.append('⚠️ 次の行は、桁区切りのカンマで割れた行と同じ形です（この CSV はほかの行で桁区切りを使っていないので'
                              'そのまま読みました）: ' + _few_rows(_split_like)
                              + '。金額が違っていたら、金額をカンマ無しで書き直してください。')
+    # 区分が空欄の行は、原本どおり区分なし（コグニでは空欄 ＝ DisposalCode -1）で NEO に入れる。品名・金額から「取替」などを
+    # 推し量らない（工場ソフトの CSV で区分が本当に空の行を「取替」にして、修理方法の欄に原本に無い語が刷られていた。2026-09-21）。
+    # 以前の推し量りなら区分が付いた行だけ、推し量った語と一緒に知らせる（黙って変えない。原本に区分があれば人が書き足せる）
+    _blank_method = [f'「{it["name"]}」（品名・金額からは「{_im}」に見えます）' for it in items
+                     if not str(it.get('method') or '').strip() and (_im := _infer_method_from_name(it))]
+    if _blank_method:
+        _trailer_notes.append('⚠️ 区分が空欄の行を、区分なし（コグニでは空欄）のまま取り込みました: ' + _few_rows(_blank_method)
+                              + '。原本にこの行の区分（取替・脱着 など）が印字されていれば、CSV の区分の欄か、'
+                              'ステップ③の表の「区分」に書いてください。')
     if _dropped_amount:
         # 金額のある行を落とした知らせは先頭に置く（注記が多いと隠れていた。M7）
         _trailer_notes.insert(0,
@@ -6846,6 +6882,8 @@ def check_parts_labor_classification(items):
     AI抽出結果の parts_amount / wage の割り当てが不自然な行をフラグ付きで返す。
 
     検出パターン:
+    0. 数量 2 以上で、部品金額が数量で割り切れない・単価が 1 円未満（数量か金額の写し間違いの疑い。
+       ほかのパターンとは別の話なので、当たっても続けて見る。validate_row_consistency と同じ判定）
     1. 「脱着」「取外」系の行に parts_amount > 0 がある（脱着に部品代は不要）
     2. 「材料」「ウレタン」「シーリング」等の材料系名称なのに wage > 0, parts_amount = 0
        （材料費は部品・油脂列に入るべき）
@@ -6853,12 +6891,16 @@ def check_parts_labor_classification(items):
     4. 「修理」「板金」「塗装」等の作業系なのに parts_amount > 0, wage = 0
        （作業費は技術料列に入るべき）
 
+    ステップ③（CSV 取り込み・プレビュー取り込み）の明細に毎回かける。CSV 経路は見積書と照合できないので、
+    PDF 経路（analyze_estimate）の validate_row_consistency の「数量 × 単価 ≠ 部品金額」もここで見る（2026-09-21。
+    以前は CSV では 1 つも出なかった）。
+
     Returns: list of dicts {
-        'row_no': int,      # 1始まりの行番号
+        'row_no': int,      # 画面の表の No（_ed_no。無ければ 1 始まりの位置）
         'name': str,        # 品名
         'parts_amount': int,
         'wage': int,
-        'flag': str,        # 'parts_in_labor' / 'labor_in_parts' / 'both_zero' / 'ambiguous'
+        'flag': str,        # 'parts_in_labor' / 'labor_in_parts' / 'both_zero' / 'qty_unit'
         'message': str,     # 日本語の警告メッセージ
         'severity': str,    # 'error' / 'warning'
     }
@@ -6877,9 +6919,19 @@ def check_parts_labor_classification(items):
         method    = str(item.get('method', '')).strip()
         parts_amt = safe_int(item.get('parts_amount', 0))
         wage      = safe_int(item.get('wage', 0))
-        row_no    = i + 1
+        # 画面の表の No で呼ぶ（行を消すと位置と No がずれ、別の行を指していた。_ed_no はステップ③の表が付ける）
+        row_no    = safe_int(item.get('_ed_no'), 0) or (i + 1)
 
         base = {'row_no': row_no, 'name': name, 'parts_amount': parts_amt, 'wage': wage}
+
+        # パターン0: 数量と部品金額が合わない（続けてほかのパターンも見る）
+        _qw = _qty_unit_warning(item)
+        if _qw:
+            alerts.append({**base,
+                'flag': 'qty_unit',
+                'message': f'行{row_no}「{name}」: {_qw}。数量か部品金額の写し間違いの疑いがあります（金額はそのまま）。',
+                'severity': 'warning'
+            })
 
         # パターン1: 脱着系で parts_amount > 0
         if any(kw in name or kw in method for kw in REMOVAL_KW) and parts_amt > 0:
@@ -7000,6 +7052,26 @@ def global_dedup_items(items):
     return pass2
 
 
+def _qty_unit_warning(item):
+    """数量 2 以上の行で、部品金額が数量で割り切れない・単価が 1 円未満になるときの文（無ければ None）。
+    数量か部品金額の写し間違いの疑い。金額は動かさない（validate_row_consistency と
+    check_parts_labor_classification が同じ判定を使う）。
+      例: parts_amount=1960, qty=14 → 140円/個 → 整合（None）
+      例: parts_amount=5000, qty=3 → 1666.67円/個 → 不整合"""
+    qty   = safe_int(item.get('quantity', 1), 1)
+    parts = safe_int(item.get('parts_amount', 0))
+    if parts > 0 and qty > 1:
+        # 単価を逆算して整合性チェック
+        unit_price = parts / qty
+        # 単価が整数でなければ不整合の可能性
+        if abs(unit_price - round(unit_price)) > 0.01:
+            return f"数量{qty} × 単価{unit_price:.1f} ≠ 部品金額¥{parts:,}（端数あり）"
+        # 単価が極端に小さい場合（1円未満）も警告
+        if round(unit_price) < 1:
+            return f"単価が極端に小さい（¥{unit_price:.0f}/個）、数量{qty}を確認してください"
+    return None
+
+
 def validate_row_consistency(items):
     """
     明細行ごとの整合性チェック。
@@ -7010,27 +7082,13 @@ def validate_row_consistency(items):
     warnings = []
     for i, item in enumerate(items):
         item = dict(item)
-        qty   = safe_int(item.get('quantity', 1), 1)
         parts = safe_int(item.get('parts_amount', 0))
         wage  = safe_int(item.get('wage', 0))
         name  = str(item.get('name', ''))
 
-        if parts > 0 and qty > 1:
-            # 単価を逆算して整合性チェック
-            unit_price = parts / qty
-            # 単価が整数でなければ不整合の可能性
-            if abs(unit_price - round(unit_price)) > 0.01:
-                # 数量=1として全額を部品金額とみなす方が正しいか判定
-                # 例: parts_amount=1960, qty=14 → 140円/個 → 整合（OK）
-                # 例: parts_amount=5000, qty=3 → 1666.67円/個 → 不整合
-                warnings.append(
-                    f"行{i+1}「{name}」: 数量{qty} × 単価{unit_price:.1f} ≠ 部品金額¥{parts:,}（端数あり）"
-                )
-            # 単価が極端に小さい場合（1円未満）も警告
-            elif round(unit_price) < 1:
-                warnings.append(
-                    f"行{i+1}「{name}」: 単価が極端に小さい（¥{unit_price:.0f}/個）、数量{qty}を確認してください"
-                )
+        _qw = _qty_unit_warning(item)
+        if _qw:
+            warnings.append(f"行{i+1}「{name}」: {_qw}")
 
         # 部品金額も工賃もゼロの行は警告（0円行が意図的でない可能性）
         if parts == 0 and wage == 0 and name and name != '値引き':
@@ -7837,13 +7895,15 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
 
 def generate_filename(cust, calc_parts, calc_wages, pdf_parts, pdf_wages,
                       has_estimate, reverse_match=False, short_parts_wage=0,
-                      parts_ok=False, wage_ok=False, grand_ok=True):
+                      parts_ok=False, wage_ok=False, grand_ok=True, extra_marks=()):
     """
     登録番号から出力ファイル名を生成。
     reverse_match=True の場合は部品・工賃相違を抑制する。
     ショートパーツがPDF側の部品合計に含まれているケースも考慮して比較する。
     parts_ok / wage_ok はステップ③の照合で一致とした（値引き前の小計・総額の一致を含む）もの。grand_ok=False は
     見積書の総額と合わないまま確認して生成したもの（「総額相違」を付ける。レビュー 3 周目）
+    extra_marks: 照合のほかに付ける印（CSV を作った AI が申告した「部品相違」「工賃相違」を確認して生成したもの。
+    CSV は見積書と照合できず pdf_parts が 0 なので、上の判定では印が付かない。2026-09-21）
     """
     dept   = safe_str(cust.get('car_reg_department', ''))
     div    = safe_str(cust.get('car_reg_division', ''))
@@ -7873,6 +7933,10 @@ def generate_filename(cust, calc_parts, calc_wages, pdf_parts, pdf_wages,
     # 逆算一致の見積ではファイル名に出ていなかった（レビュー 6 周目）
     if not grand_ok:
         discrepancies.append('総額相違')
+    for _mk in (extra_marks or ()):
+        _mk = re.sub(r'[\\/:*?"<>|\s\x00-\x1f]', '', str(_mk or ''))[:8]   # ファイル名に使えない文字は落とす
+        if _mk and _mk not in discrepancies:
+            discrepancies.append(_mk)
     if discrepancies:
         suffix = '（' + '・'.join(discrepancies) + '）'
     else:
@@ -8331,6 +8395,7 @@ def _render_beta_result(_p2n_res, selected_model):
                  disabled=bool(_p2n_res.get('stale'))):   # 入力が変わった結果は取り込ませない（Codex 70）
         st.session_state['csv_items'] = _p2n_items
         st.session_state['csv_mode'] = True
+        st.session_state.pop('_csv_ai_diffs', None)   # 前に貼った CSV の AI の申告（部品相違など）をこの明細に持ち込まない
         _carry = '税込み（内税）' if st.session_state.get('pdf2neo_tax_inclusive') else '税抜き（外税）'
         st.session_state['tax_override'] = _carry
         st.session_state['_tax_carry_pending'] = _carry
@@ -8419,6 +8484,66 @@ _CSV_PROMPT = """添付の自動車修理見積書PDFを、以下のCSV形式で
 2. 見積書原本の最終的な「部品代合計」「技術料（工賃）合計」と照合。
 3. 不一致の場合のみ、CSVの末尾に改行して以下を出力（一致時は出力しない）。行全体を「"」で囲むこと。 "部品相違〇,〇〇〇円 工賃相違●,●●●円"
 出力はCSVデータおよび相違確認結果のみ。説明文・コメントは一切不要。"""
+
+
+def _ai_diff_note(text):
+    """CSV の後ろに AI が書いた「部品相違○円 工賃相違●円」を、前置き（「⚠️」「※」「相違確認結果:」など）が付いていても
+    申告として拾う。先頭を「部品相違／工賃相違」にそろえた文を返す（画面は先頭で見分けて③の確認につなぐ）。無ければ None。
+    前置き付きだと注意書き・説明文として扱われ、③の確認を素通りしていた（Codex 1 周目 P2。AI の書き方は毎回揺れる）"""
+    t = str(text or '')
+    m = re.search(r'(部品|工賃)相違', t)
+    return t[m.start():].strip() if m else None
+
+
+def _csv_ai_diff_marks(notes) -> list:
+    """CSV の後ろに AI が書いた「部品相違○円 工賃相違●円」（上の指示文の検算の結果。parse_csv_to_items が注記として返す）から、
+    確認を求める印（'部品相違' / '工賃相違'）を返す。相違が無ければ []。
+
+    指示文は**合計が合わないときだけ**この行を書かせるので、申告があればまず相違ありとみる。申告を「部品相違…」「工賃相違…」の
+    **区切りごと**に見て、区切りの残りが**丸ごと**言い切りの相違なし（「なし・無し・ありません・一致」＋「です／でした」、または 0 円）の
+    ときだけ印なしにする。落として見てよいのは前後の区切り記号と、**中身が決まった語だけの括弧書き**（「（一致）」「（照合済み）」）。
+    ほかの語・数字・括弧書き（「（不一致）」「（ではありません）」）が 1 つでも混ざれば印（決められなければ止める）。
+    つなぎの語だけの区切り（「部品相違・工賃相違はありません」の「部品相違・」）は、次の区切りが**両方に掛かる言い切り**
+    （「ともに 0 円」「はありません」）で「・」「、」「と」などでつないだときだけ、その判定を引き継ぐ（「部品相違、工賃相違0円」の部品側は印）。
+
+    自然文を部分的に読んで「相違なし」とすると、直すたびに逆の穴が開いた（Codex 2〜6 周目: 「なし」と読めない額の混在・
+    否定の言い回し「一致していません」・「見積書 0円 / CSV 8,000円」・括弧書きの打ち消し・片側だけの言い切りの引き継ぎ）。
+    いまの形では「なし（1円単位で一致）」のような説明の付いた相違なしも印になるが、確認を 1 回求めるだけで、見逃すよりよい。
+    CSV 経路は見積書と照合できないので、この申告が「CSV が見積書の合計と合っていない」唯一の手がかり（2026-09-21）"""
+    _clean_word = r'(?:は\s*)?(?:なし|無し|ありません|一致)(?:です|でした)?'
+    _clean_zero = r'(?:ともに|共に|とも|いずれも)?\s*[-−+△▲]?\s*¥?\s*0[0,]*\s*円?(?:です|でした)?'
+    _benign = r'(?:一致|照合済み?|確認済み?|相違なし|差異なし|差額なし|なし)'      # 落としてよい括弧書きの中身
+    _both = r'(?:ともに|共に|とも|いずれも|両方|どちらも|双方|は\s*(?:ありません|なし|無し))'   # 両方に掛かる言い切りの頭
+    marks, unknown = [], False
+    for n in notes or []:
+        t = unicodedata.normalize('NFKC', str(n or ''))
+        hits = list(re.finditer(r'(部品|工賃)相違', t))
+        if not hits:
+            unknown = unknown or bool(t.strip())
+            continue
+        verdicts, nxt, nxt_body = [], None, ''     # 後ろの区切りから見る（つなぎの語だけの区切りは次の区切りを見て決める）
+        for k in range(len(hits) - 1, -1, -1):
+            seg = t[hits[k].end():(hits[k + 1].start() if k + 1 < len(hits) else len(t))]
+            body = re.sub(r'[（(]\s*' + _benign + r'\s*[）)]', '', seg)
+            body = re.sub(r'^[\s:：、,。．.・/／]+|[\s、,。．.・/／]+$', '', body)
+            _par = re.fullmatch(r'[（(]([^（）()]*)[）)]', body)                # 全体が 1 つの括弧書き（「（0円）」）なら中を見る
+            if _par:
+                body = _par.group(1).strip()
+            _coord = re.fullmatch(r'\s*(?:[・、,/／と]|及び|および|並びに|ならびに)\s*', seg)
+            if _coord or not body:
+                v = not (_coord and nxt is False and re.match(_both, nxt_body))
+            elif re.fullmatch(_clean_word, body) or re.fullmatch(_clean_zero, body):
+                v = False
+            else:
+                v = True
+            verdicts.append((hits[k].group(1) + '相違', v))
+            nxt, nxt_body = v, body
+        for mk, v in reversed(verdicts):
+            if v and mk not in marks:
+                marks.append(mk)
+    if unknown and not marks:
+        marks.append('合計相違')
+    return marks
 
 
 def _md_literal(text) -> str:
@@ -11266,6 +11391,7 @@ def main():
                 st.session_state.pop('csv_items', None)
                 st.session_state.pop('csv_mode', None)
                 st.session_state.pop('_csv_paste_saved', None)
+                st.session_state.pop('_csv_ai_diffs', None)
                 if _csv_file:
                     st.warning("前に取り込んでいた明細は消しました（この CSV を読めなかったため、"
                                "前の内容がそのまま生成されないようにしています）。")
@@ -11282,7 +11408,10 @@ def main():
                     # 金額のある行を読み飛ばした知らせは赤で（注記が多いと 4 件目以降が出ず、行が黙って消えていた。M7）
                     (st.error if '読み飛ばしました' in _note else st.warning)(_note)
                 for _note in _csv_diffs:
-                    st.warning(f"⚠️ 見積書との差異が記録されています: {_note}")
+                    # 相違のある申告は、ステップ③で原本と突き合わせて確認のチェックを入れるまで生成できない（先に知らせる）
+                    st.warning(f"⚠️ 見積書との差異が記録されています: {_md_literal(_note)}"
+                               + ("（ステップ③で原本と突き合わせ、確認のチェックを入れてから生成します）"
+                                  if _csv_ai_diff_marks([_note]) else ""))
                 if _csv_other:
                     # たたみ（CSV の節）の中なので、さらにたたまずに枠付きの箱でそのまま見せる（中身は説明文だけ。2026-09-20）
                     with st.container(border=True):
@@ -11292,15 +11421,22 @@ def main():
                 if _csv_errs:
                     st.session_state.pop('csv_items', None)
                     st.session_state.pop('csv_mode', None)
+                    st.session_state.pop('_csv_ai_diffs', None)
                 elif _preview_items:
                     st.success(f"✅ {len(_preview_items)}行 読み込み完了 — 部品: ¥{sum(safe_int(it.get('parts_amount',0)) for it in _preview_items):,} / 工賃: ¥{sum(safe_int(it.get('wage',0)) for it in _preview_items):,}")
                     st.session_state['csv_items'] = _preview_items
                     st.session_state['csv_mode']  = True
                     st.session_state['_csv_paste_saved'] = _csv_text
+                    # AI が CSV の後ろに書いた「部品相違／工賃相違」（指示文の検算で合計が合わなかった印）を、この明細と組で持つ。
+                    # ステップ③で確かめるまで生成させない（ここで警告を出すだけで、③では消えていた。2026-09-21）。
+                    # 明細の指紋で組にするので、あとで別の CSV やプレビュー取り込みに替わったら使われない。
+                    # 相違の無い CSV でも毎回書き直す（前の CSV の申告を残さない）
+                    st.session_state['_csv_ai_diffs'] = {'sig': _items_sig(_preview_items), 'notes': [str(n) for n in _csv_diffs]}
                 else:
                     st.error("❌ CSVの読み込みに失敗しました。1行目にヘッダー（品名,区分,数量,部品金額,工賃,部品コード）が必要です。")
                     st.session_state.pop('csv_items', None)
                     st.session_state.pop('csv_mode', None)
+                    st.session_state.pop('_csv_ai_diffs', None)
 
             # クリアは取り込みの後ろに置く。前に置くと、貼り付けた直後の描画では
             # まだ csv_items が無いためボタンが1回遅れて出る。
@@ -11309,6 +11445,7 @@ def main():
                     st.session_state.pop('csv_items', None)
                     st.session_state.pop('csv_mode', None)
                     st.session_state.pop('_csv_paste_saved', None)
+                    st.session_state.pop('_csv_ai_diffs', None)
                     # 貼り付け欄も空にしないと、ブラウザが直前の値を送り直して
                     # 同じ実行内で再取込され、クリアが効かない。キーを消すだけ
                     # では戻ってくるので、版番号を上げて別ウィジェットにする。
@@ -11447,6 +11584,18 @@ def main():
                 estimate_data['_neg_at_import'] = [
                     sum(min(0, safe_int(_it.get('parts_amount', 0))) for _it in _csv_items_s2),
                     sum(min(0, safe_int(_it.get('wage', 0))) for _it in _csv_items_s2)]
+            else:
+                # CSV を作った AI の「部品相違／工賃相違」の申告（ステップ①で取り込んだ明細と組のときだけ）。③で確認を求める
+                _cad = st.session_state.get('_csv_ai_diffs') or {}
+                _cad_sig = str(_cad.get('sig') or '')
+                if _cad_sig and _cad_sig == _items_sig(_csv_items_s2) and _cad.get('notes'):
+                    estimate_data['_csv_ai_diffs'] = [str(n) for n in _cad['notes']]
+                # 取り込みごとの番号。③の確認チェックは「申告の文面＋この番号」が変わったら外す（同じ文面の申告の別の CSV に
+                # 替えたときに、前の CSV で入れた確認を持ち越さない。Codex 1 周目 P1。実機では①に戻ると Streamlit がチェックを
+                # 捨てるので起きなかったが、その振る舞いに頼らない）
+                _cseq = int(st.session_state.get('_csv_import_seq', 0) or 0) + 1
+                st.session_state['_csv_import_seq'] = _cseq
+                estimate_data['_csv_import_seq'] = _cseq
             if _is_tax_incl_csv:
                 st.info("💴 税込モード: CSVの金額は税込みとして処理されます")
             else:
@@ -12548,8 +12697,10 @@ def main():
             _error_alerts = []
             if _step3_mode == 'beta':
                 # アイテムが変わった時だけ再計算（session_stateでキャッシュ）
+                # 数量と表の No も鍵に入れる（数量と部品金額の点検・No での呼び方が、数量を直しても古いまま残らないように）
                 _items_hash = hash(str([(it.get('name',''), it.get('parts_amount',0), it.get('wage',0),
-                                         it.get('work_code', '') or it.get('method', '')) for it in edited_items]))
+                                         it.get('work_code', '') or it.get('method', ''),
+                                         it.get('quantity', 1), it.get('_ed_no')) for it in edited_items]))
                 if st.session_state.get('_cls_hash') != _items_hash:
                     st.session_state['_cls_cache'] = check_parts_labor_classification(edited_items)
                     st.session_state['_cls_hash']  = _items_hash
@@ -12773,6 +12924,27 @@ def main():
                            "原本にはありません。原本の明細を確かめて直すか、行を削除してください。")
                 _adj_ok = st.checkbox("「※金額調整」の行を確認しました（このまま NEO に入れる）", value=False, key='adj_rows_confirmed')
                 amount_confirmed = bool(amount_confirmed) and bool(_adj_ok)
+            # CSV を作った AI が「見積書の合計と明細の合算が合わない」と書き残していた（指示文 _CSV_PROMPT の検算の結果）。
+            # CSV 経路は見積書と照合できない（③は「照合なし」）ので、この申告が唯一の手がかり。確かめるまで生成させない
+            # （以前はステップ①で警告を出すだけで、③では何も出ずに生成できた。2026-09-21）。印はファイル名にも付ける（④）
+            _ai_notes = ([str(_x) for _x in (estimate_data.get('_csv_ai_diffs') or [])]
+                         if estimate_data.get('_csv_import') else [])
+            _ai_marks = _csv_ai_diff_marks(_ai_notes)
+            _s3_verdict_now['csv_ai_marks'] = list(_ai_marks)
+            if _ai_marks:
+                st.warning("⚠️ この CSV を作った AI が、見積書の合計と明細の合算が合わないと書き残していました（"
+                           + ' ／ '.join(_md_literal(_x) for _x in _ai_notes[:3]) + "）。CSV は見積書と照合できないので、"
+                           "行の抜け・金額の写し間違いがないか、明細を原本と突き合わせてください"
+                           "（合わせるために行を足したり金額を動かしたりはしません）。")
+                # 申告の中身・取り込み（別の CSV に替えた）・**いまの明細**（③で直した・消した・足した）のどれかが変わったら確認を外す。
+                # ウィジェットを作る前に代入で外す（amount_confirmed と同じ）。文面だけを鍵にすると同じ文面の申告の別の CSV で、明細を入れないと確認後に直した明細で、前の確認が残る（Codex 1・7 周目 P1）
+                _ai_sig = (f"{estimate_data.get('_csv_import_seq', '')}\n{_items_sig(edited_items)}\n" + '\n'.join(_ai_notes))
+                if st.session_state.get('_csv_ai_diff_sig') != _ai_sig:
+                    st.session_state['_csv_ai_diff_sig'] = _ai_sig
+                    st.session_state['csv_ai_diff_confirmed'] = False
+                _ai_ok = st.checkbox("見積書の合計と突き合わせました（このまま NEO に進む）", value=False,
+                                     key='csv_ai_diff_confirmed')
+                amount_confirmed = bool(amount_confirmed) and bool(_ai_ok)
 
             # ── Total strip ──
             # sp はここでも同じ値を読み直すだけ（③の頭で読んでいる）
@@ -12980,7 +13152,11 @@ def main():
             neo_data, total_parts, total_wages, grand_total = generate_neo_file(
                 _active_template, updated_vehicle, items, short_parts_wage, insurance_info,
                 expenses=expense_info, is_tax_inclusive=is_tax_inclusive, is_beta_mode=_step4_beta,
-                merge_mode=_use_custom_neo
+                merge_mode=_use_custom_neo,
+                # CSV 取り込みは区分の欄が原本の写し。空欄の行は区分なしのまま書く（品名から「取替」などを推し量らない。
+                # 工場ソフトの CSV で区分が本当に空の行は、実機なら区分なし。2026-09-21）。プレビュー取り込み（ベタ打ちの
+                # 結果）はベタ打ちと同じく推し量る（_csv_import が False）
+                infer_method=not bool((estimate_data or {}).get('_csv_import')),
             )
             progress.progress(85, text="📝 ファイル名を生成中...")
             _s3v = st.session_state.get('_s3_verdict') or {}
@@ -12989,6 +13165,8 @@ def main():
                 has_estimate, reverse_match, short_parts_wage,
                 parts_ok=bool(_s3v.get('parts_ok')), wage_ok=bool(_s3v.get('wage_ok')),
                 grand_ok=_s3v.get('grand_ok', True) is not False,
+                # CSV を作った AI が申告した相違を③で確かめて生成したもの（合格品と取り違えないよう印を付ける）
+                extra_marks=(_s3v.get('csv_ai_marks') or ()) if (estimate_data or {}).get('_csv_import') else (),
             )
             # step4 は再描画のたびにこのブロックを通る。登録番号が無い案件は
             # ファイル名に日時が入るため、そのままだと同じ見積なのに秒が変わって
@@ -13105,7 +13283,10 @@ def main():
                     ("合計金額", f"¥{grand_total:,}（税込）"),
                 ]
                 if (estimate_data or {}).get('_csv_import'):
-                    summary_items.append(("金額検証", "照合なし（CSV の金額のまま）"))
+                    _ai_mk4 = _s3v.get('csv_ai_marks') or []
+                    summary_items.append(("金額検証", "照合なし（CSV の金額のまま）"
+                                          + (f"。CSV を作った AI が申告した「{'・'.join(_ai_mk4)}」を確かめて生成"
+                                             if _ai_mk4 else "")))
                 elif reverse_match:
                     summary_items.append(("金額検証", "✅ 逆算一致"))
             else:

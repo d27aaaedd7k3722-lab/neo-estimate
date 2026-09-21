@@ -8,7 +8,7 @@ lines = src.split('\n')
 want_fn = {'_normalize_number_text','safe_int','parse_csv_to_items','_is_total_row_name',
            '_build_column_map','cp932_trim','jpy_round','_normalize_date8','to_halfwidth_katakana','normalize_name','_strip_control_chars',
            'is_fractional_qty', '_looks_like_part_no', '_resolve_columns_by_data', '_norm_col_header',
-           '_csv_row_parts'}
+           '_csv_row_parts', '_infer_method_from_name', '_ai_diff_note'}
 pieces = ["import re, csv, io, unicodedata, math\nfrom decimal import Decimal, ROUND_HALF_UP\n"]
 for node in tree.body:
     if isinstance(node, ast.FunctionDef) and node.name in want_fn:

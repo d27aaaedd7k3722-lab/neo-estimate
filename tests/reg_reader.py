@@ -162,6 +162,36 @@ def main() -> int:
             fails.append('make_neo が pages/ から reading.json を作っていない')
     shutil.rmtree(case, ignore_errors=True)
 
+    # ── 塗装材料代の点検（2026-09-21 §2-4）: 最後に読んだ header で見て、画面の注意（check.warn）と報告文（app_notes）の
+    #    両方に出す。読み取りの合否は変えない（金額を動かさない点検）。判定そのものは reg_inputs の test_paint_material_note
+    case = tempfile.mkdtemp(prefix='reg_reader_')
+    _orig_mn = reader._paint_material_note
+    _seen_hdr = []
+
+    def _fake_mn(h):
+        _seen_hdr.append(copy.deepcopy(h))
+        return '塗装の材料代 2,128 円が、塗装工賃計 76,000 円の 2.8% です（試験）'
+    reader._paint_material_note = _fake_mn
+    try:
+        res = reader.read_estimate(pdf, reader=FakeReader([HEADER, PAGE_OK]), case_dir=case, source_name='test.pdf')
+    finally:
+        reader._paint_material_note = _orig_mn
+    if not res.ok:
+        fails.append(f'材料代の点検で読み取りの合否が変わった: {res.error} {res.fails()}')
+    if not any('材料代 2,128 円' in w for w in (res.check.get('warn') or [])):
+        fails.append(f'材料代の点検が画面の注意（check.warn）に出ていない: {res.check.get("warn")}')
+    if not any('材料代 2,128 円' in n for n in (res.app_notes or [])):
+        fails.append(f'材料代の点検が報告文（app_notes）に残っていない: {res.app_notes}')
+    if not _seen_hdr or (_seen_hdr[-1].get('totals') or {}).get('total') != HEADER['totals']['total']:
+        fails.append(f'材料代の点検に読んだ header を渡していない: {_seen_hdr[-1:] }')
+    shutil.rmtree(case, ignore_errors=True)
+    # 点検に当たらなければ何も足さない（ふつうの見積の注意を増やさない）
+    case = tempfile.mkdtemp(prefix='reg_reader_')
+    res = reader.read_estimate(pdf, reader=FakeReader([HEADER, PAGE_OK]), case_dir=case, source_name='test.pdf')
+    if any('材料代' in str(x) for x in list(res.check.get('warn') or []) + list(res.app_notes or [])):
+        fails.append(f'塗装の無い見積に材料代の注意が出た: {res.check.get("warn")} / {res.app_notes}')
+    shutil.rmtree(case, ignore_errors=True)
+
     # ── 13: 読み手が index_policy=manual と書いても、区分がコグニ語彙（取替/脱着 …）か区分の印字が無ければ auto に戻し、注意に出す。
     #        書式 C の目印「部品」があれば読み手の判断を残す（2026-09-15 スペーシア FAX 見積）
     case = tempfile.mkdtemp(prefix='reg_reader_')

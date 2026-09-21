@@ -772,6 +772,46 @@ def _paint_actual_guard(header: dict, pages: list) -> tuple:
                  + (f'。{_over}は使わない（このアプリは常に実額）' if _over else ''))
 
 
+# 塗装材料代 ÷ 塗装工賃計（％）の「ふつう」の幅。コグニの材料代は **塗装工賃計 × 材料代割合**（整数 %）で、
+# 割合の既定はコグニの AudaData/AnUsrTblPnt.sld MaterialRate（塗料 × 塗膜 × 高機能塗装の 48 行・12〜25%）、
+# 工場が変えることが多い（実案件は 28% / 23% / 26% / 21% …）。実案件 NEO 2,500 本（Z:\ドキュメント、指数入力で
+# 材料代のある 1,564 本、2026-09-21 集計）の比は 最小 3.0% ／ 1% 点 19.0% ／ 中央 26% ／ 99% 点 47.8% ／ 最大 74.1% で、
+# **99.8% がこの幅に入る**。10 倍・1/10 の読み違い（0 の数・工賃計と塗装費用計の取り違え）はこの幅から外れる
+_MATERIAL_RATIO_BAND = (5.0, 60.0)
+
+
+def _paint_material_note(header: dict) -> Optional[str]:
+    """印字の塗装材料代が塗装工賃計と桁違いでないかを見る（読み取りの点検。金額は動かさない）。
+    戻り値は注意の文（幅に入っていれば None）。
+
+    比べるのは header の **paint.total（塗装工賃計）と paint.material（材料代）**（無ければ totals.paint / totals.material）。
+    どちらかが無い・0 円（材料代なしの見積は実案件の 1 割強）なら何もしない。このアプリは塗装を実額 1 つで入れるので
+    （_paint_actual_guard）、材料代の読み違いはそのまま NEO の塗装計に入る。合計欄の検算で捕まることが多いが、
+    総額の印字が無い見積・読み直しでも直らなかった見積の手がかりとして出す（2026-09-21）"""
+    paint = header.get('paint') if isinstance(header.get('paint'), dict) else {}
+    totals = header.get('totals') if isinstance(header.get('totals'), dict) else {}
+
+    def _yen(v) -> int:
+        # totals は paint.total のようには正規化されていない（「76,000円」「¥76,000」「全角」）。読めなければ 0
+        try:
+            s = re.sub(r'[^0-9.\-]', '', unicodedata.normalize('NFKC', str(v if v is not None else 0)))
+            return int(float(s or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    w = _yen(paint.get('total')) or _yen(totals.get('paint'))
+    m = _yen(paint.get('material')) or _yen(totals.get('material'))
+    if w <= 0 or m <= 0:
+        return None
+    r = 100.0 * m / w
+    lo, hi = _MATERIAL_RATIO_BAND
+    if lo <= r <= hi:
+        return None
+    return (f'塗装の材料代 {m:,} 円が、塗装工賃計 {w:,} 円の {r:.1f}% です（コグニの材料代は「塗装工賃計 × 材料代割合」で、'
+            f'実案件は {lo:g}〜{hi:g}% にほぼ収まります）。桁の読み違い（0 の数・工賃計と塗装費用計の取り違え）がないか、'
+            '原本の塗装の欄と突き合わせてください（金額は読み取りのままで、直していません）')
+
+
 def _manual_rows_guard(header: dict, pages: list) -> tuple:
     """読み手が明細に付けた M（手入力）を外す。戻り値は (pages, 外した理由の文 or None)。
     M を付けてよいのは ADDATA に無い品目だけで（判断規則 10-7）、ADDATA を見られない読み手には決められない。
@@ -980,8 +1020,12 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
             m = run('merge', case_dir=case_dir)
             rd, check = m.get('reading'), (m.get('check') or {})
             res.merge_messages = list(m.get('messages') or [])
-        res.app_notes = [n for n in (list(guard_notes) + ([m_note] if m_note else []) + ([p_note] if p_note else [])) if n]   # 納品する報告文にも残す（画面だけに出して消えないように。2026-09-20 本番のバグハント）
-        _extra = list(guard_notes) + ([m_note] if m_note else []) + ([p_note] if p_note else []) + [m_ for m_ in (res.merge_messages or []) if m_]   # merge の注意（重複行など）も合格時に見える所へ（G11）。M の注意は最後に書き出した写しの分だけ
+        # 塗装材料代が塗装工賃計と桁違いでないか（最後に読んだ header で見る。金額は動かさない。2026-09-21）
+        mat_note = _paint_material_note(header)
+        res.app_notes = [n for n in (list(guard_notes) + ([m_note] if m_note else []) + ([p_note] if p_note else [])
+                                     + ([mat_note] if mat_note else [])) if n]   # 納品する報告文にも残す（画面だけに出して消えないように。2026-09-20 本番のバグハント）
+        _extra = (list(guard_notes) + ([m_note] if m_note else []) + ([p_note] if p_note else []) + ([mat_note] if mat_note else [])
+                  + [m_ for m_ in (res.merge_messages or []) if m_])   # merge の注意（重複行など）も合格時に見える所へ（G11）。M の注意は最後に書き出した写しの分だけ
         if _extra:   # 戻した理由は合計欄の検算の注意と同じ列に（app は check.warn を「読み取りの注意」に出す）
             check = dict(check or {})
             _w0 = list(check.get('warn') or [])

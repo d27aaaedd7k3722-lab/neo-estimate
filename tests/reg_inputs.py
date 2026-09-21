@@ -516,6 +516,34 @@ def test_paint_actual_guard():
 
 
 
+def test_paint_material_note():
+    """塗装材料代が塗装工賃計と桁違いでないか（2026-09-21 §2-4）。コグニの材料代は「塗装工賃計 × 材料代割合」で、
+    実案件 1,564 本の 99.8% が 5〜60%。両方向: 幅の中は黙る／外（0 の数の読み違い）は数字つきで知らせる。金額は動かさない"""
+    import re
+    # ふつうの割合（実案件の形: 22.5% / 28% / 合計欄の材料代 29%）と、境目（5% / 60%）は何も出さない
+    for p in ({'paint': {'total': 85520, 'material': 19226}}, {'paint': {'total': 76000, 'material': 21280}},
+              {'paint': {'total': 66294}, 'totals': {'material': 19226}},
+              {'paint': {'total': 76000, 'material': 3800}}, {'paint': {'total': 76000, 'material': 45600}}):
+        chk(reader._paint_material_note(p) is None, f'ふつうの材料代で知らせている: {p}')
+    # 0 の数の読み違い（材料代 1/10・工賃計 1/10）は知らせる
+    n1 = reader._paint_material_note({'paint': {'total': 76000, 'material': 2128}})
+    chk(bool(n1) and '2.8%' in n1 and '2,128' in n1 and '76,000' in n1, f'材料代 1/10 を知らせていない: {n1}')
+    n2 = reader._paint_material_note({'paint': {'total': 7600, 'material': 21280}})
+    chk(bool(n2) and '280.0%' in n2, f'工賃計 1/10（材料代が工賃計の 2.8 倍）を知らせていない: {n2}')
+    # 合計欄は正規化されていない（「76,000円」「¥２，１２８」）。それでも読む
+    n3 = reader._paint_material_note({'paint': {}, 'totals': {'paint': '76,000円', 'material': '¥２，１２８'}})
+    chk(bool(n3) and '2.8%' in n3, f'合計欄の文字の金額を読めていない: {n3}')
+    # paint 側の値を先に見る（合計欄の値で上書きしない）
+    chk(reader._paint_material_note({'paint': {'total': 76000, 'material': 21280}, 'totals': {'material': 2128}}) is None,
+        'paint.material より合計欄の材料代を優先している')
+    # 材料代・工賃計のどちらかが無ければ何もしない（材料代なしの見積は実案件の 1 割強）
+    for p in ({}, {'paint': {}}, {'paint': {'total': 76000}}, {'paint': {'material': 21280}},
+              {'paint': {'total': 0, 'material': 21280}}, {'paint': {'total': 'x', 'material': 'y'}}, {'paint': 'x'}):
+        chk(reader._paint_material_note(p) is None, f'材料代か工賃計が無いのに知らせている: {p}')
+    # 報告文の「塗装の実額」の注記（_paint_note_with_real_total が拾う「塗装費用 N 円」）と取り違えられない
+    chk(not re.search(r'塗装費用\s*[\d,]+\s*円', n1 or ''), f'塗装の実額の注記と取り違えられる文: {n1}')
+
+
 def test_safe_tail_keeps_no_customer_data():
     """検算（別プロセス）の出力から画面に出すのは、例外の名前とファイル:行だけ（顧客情報を出さない。2026-09-20）"""
     got = reader._safe_tail(['Traceback (most recent call last):',
