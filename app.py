@@ -63,6 +63,7 @@ import unicodedata
 import traceback
 import pandas as pd
 import hashlib
+import threading
 import hmac
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
@@ -216,24 +217,52 @@ def _persist_store() -> dict:
     return _FALLBACK_STORE
 
 
-def _quota_exhausted_set() -> set:
+_MODEL_SET_LOCK = threading.RLock()
+
+
+def _api_key_tag(api_key=None) -> str:
+    """どの API キーの話かを表す短い印。使えないモデルの記録を**キーごと**に分けるために使う"""
+    if not api_key:
+        try:
+            api_key = st.session_state.get('gemini_api_key') or st.session_state.get('api_key') or ''
+        except Exception:  # noqa: BLE001  worker スレッドでは session_state を触れない
+            api_key = ''
+    return hashlib.sha256(str(api_key or '').encode('utf-8')).hexdigest()[:12]
+
+
+def _model_set(kind: str, api_key=None) -> set:
+    """使えないと分かったモデルの集合。**API キーごと**に分ける。
+
+    以前は 1 つの集合をプロセス全体で共有していた。worker スレッドでは `_persist_store()` が
+    プロセス共通の `_FALLBACK_STORE` を返すので、**別の利用者の 429 / 404 で自分のモデルが
+    途中から切り替わっていた**（本番は全員で 1 プロセス・同じ Secrets のキー。
+    キーが同じなら共有してよいが、自分でキーを入れた人は巻き込まれない。2026-09-21 Codex 深掘り）"""
+    store = _persist_store()
+    name = f'{kind}:{_api_key_tag(api_key)}'
+    with _MODEL_SET_LOCK:
+        val = store.get(name)
+        if not isinstance(val, set):
+            val = set()
+            store[name] = val
+        if store is not _FALLBACK_STORE:
+            # worker スレッドは session_state を使えず `_FALLBACK_STORE` に書く。画面側は session_state を
+            # 読むので、**読むときに合わせないと worker の 429 / 404 が画面に届かず、同じ死んだモデルを
+            # 選び直し続ける**（元のコメントは「読むときに合わせる」と言っていたが実装が無かった。
+            # 2026-09-21 Codex 深掘り 2 周目）。キーごとに分けてあるので他人のぶんは入らない
+            _fb = _FALLBACK_STORE.get(name)
+            if isinstance(_fb, set) and _fb:
+                val |= _fb
+        return val
+
+
+def _quota_exhausted_set(api_key=None) -> set:
     """クォータ超過で利用不可になったモデルの集合（worker スレッドで記録したぶんも合わせる。N6）"""
-    store = _persist_store()
-    val = store.get('quota_exhausted')
-    if not isinstance(val, set):
-        val = set()
-        store['quota_exhausted'] = val
-    return val
+    return _model_set('quota_exhausted', api_key)
 
 
-def _unavailable_set() -> set:
+def _unavailable_set(api_key=None) -> set:
     """提供終了（404 NOT_FOUND / no longer available）と判明したモデルの集合"""
-    store = _persist_store()
-    val = store.get('unavailable')
-    if not isinstance(val, set):
-        val = set()
-        store['unavailable'] = val
-    return val
+    return _model_set('unavailable', api_key)
 
 
 def _availability_cache() -> dict:
@@ -248,6 +277,8 @@ def _availability_cache() -> dict:
 # 解析結果キャッシュ: 同一ファイル（md5）の再解析を防ぐ（セッション中に有効）
 # key: md5_hex + "_" + model_name + "_" + str(use_rasterize) → value: 解析結果dict
 _analyze_result_cache: dict = {}
+_analyze_result_lock = threading.RLock()   # 本番は全員で 1 プロセス。ロック無しだと出し入れの間に
+                                           # 別の人が消して KeyError（2026-09-21 Codex 深掘り）
 
 
 def _model_cache_key(api_key: str) -> str:
@@ -274,7 +305,10 @@ def _is_quota_error(err_msg: str) -> bool:
 def _mark_model_unavailable(api_key: str, model_name: str):
     """提供終了モデルを記録し、モデル一覧キャッシュを破棄する"""
     if model_name:
-        _unavailable_set().add(model_name)
+        # api_key を必ず渡す。worker スレッドでは session_state を読めないので、渡さないと
+        # **空のキーの集合**に書かれ、画面側は自分のキーの集合を読むため記録が届かない
+        # （同じ死んだモデルを選び直し続ける。2026-09-21 Codex P1）
+        _unavailable_set(api_key).add(model_name)
     _availability_cache().pop(_model_cache_key(api_key), None)
 
 
@@ -329,9 +363,9 @@ def get_available_gemini_models(api_key: str) -> list:
     else:
         candidates = list(_PREFERRED_MODELS)
     result = [m for m in candidates
-              if m not in _quota_exhausted_set() and m not in _unavailable_set()]
+              if m not in _quota_exhausted_set(api_key) and m not in _unavailable_set(api_key)]
     if not result:
-        result = [m for m in candidates if m not in _unavailable_set()] or [_FALLBACK_MODEL]
+        result = [m for m in candidates if m not in _unavailable_set(api_key)] or [_FALLBACK_MODEL]
     _availability_cache()[cache_key] = result
     return result
 
@@ -340,7 +374,7 @@ def get_default_gemini_model(api_key: str) -> str:
     """利用可能なモデルの中から最優先モデルを返す。クォータ超過・提供終了モデルは除外。"""
     models = get_available_gemini_models(api_key)
     for m in models:
-        if m not in _quota_exhausted_set() and m not in _unavailable_set():
+        if m not in _quota_exhausted_set(api_key) and m not in _unavailable_set(api_key):
             return m
     # 全モデルがクォータ超過の場合はフォールバック
     return models[0] if models else _FALLBACK_MODEL
@@ -349,7 +383,7 @@ def get_default_gemini_model(api_key: str) -> str:
 def get_alternative_gemini_model(api_key: str, failed_model: str) -> str:
     """failed_model 以外で利用可能な代替モデルを返す（無ければ空文字）"""
     for m in get_available_gemini_models(api_key):
-        if m != failed_model and m not in _quota_exhausted_set() and m not in _unavailable_set():
+        if m != failed_model and m not in _quota_exhausted_set(api_key) and m not in _unavailable_set(api_key):
             return m
     return ''
 SELF_CORRECTION_THRESHOLD = 1000  # 差額が1000円以上の場合のみ自己修復を試行（高速化）
@@ -707,10 +741,30 @@ def _template_tax_round(em_db_bytes) -> tuple:
 import functools as _functools
 
 
-@_functools.lru_cache(maxsize=8)
+_NEO_TAX_ROUND_CACHE: dict = {}     # sha256 → (端数処理, 旗)。**NEO の中身は持たない**
+_NEO_TAX_ROUND_LOCK = threading.RLock()
+
+
 def _neo_tax_round(neo_bytes: bytes) -> tuple:
     """NEO（テンプレート）の消費税の端数処理 → (端数処理, 旗)。ステップ③の合計・照合を、生成（generate_neo_file）と同じ
-    端数処理で出すため（生成だけテンプレートに従い、画面と照合は四捨五入のままだった。レビュー 2 周目）。読めなければ ('四捨五入', 1)"""
+    端数処理で出すため（生成だけテンプレートに従い、画面と照合は四捨五入のままだった。レビュー 2 周目）。読めなければ ('四捨五入', 1)
+
+    以前は `lru_cache(maxsize=8)` を付けていたが、**引数が NEO の生バイトなので、利用者が入れた
+    顧客情報入りのテンプレートが最大 8 本、共有プロセスの記憶に残り続けていた**（本番は全員で 1 プロセス。
+    2026-09-21 Codex 深掘り）。指紋だけを鍵にして、中身は持たないようにした"""
+    _k = hashlib.sha256(neo_bytes or b'').hexdigest()
+    with _NEO_TAX_ROUND_LOCK:
+        if _k in _NEO_TAX_ROUND_CACHE:
+            return _NEO_TAX_ROUND_CACHE[_k]
+    _r = _neo_tax_round_read(neo_bytes)
+    with _NEO_TAX_ROUND_LOCK:
+        if len(_NEO_TAX_ROUND_CACHE) > 64:
+            _NEO_TAX_ROUND_CACHE.clear()
+        _NEO_TAX_ROUND_CACHE[_k] = _r
+    return _r
+
+
+def _neo_tax_round_read(neo_bytes: bytes) -> tuple:
     try:
         ck = find_real_cks(neo_bytes)
         full = decompress_neo(neo_bytes, ck)
@@ -5427,7 +5481,7 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
             _msg = f'モデル「{_model_used}」は利用できません（提供終了の可能性があります）'
             _switch = True
         elif _is_quota_error(_msg):
-            _quota_exhausted_set().add(_model_used)
+            _quota_exhausted_set(api_key).add(_model_used)
             try:
                 _availability_cache().pop(_model_cache_key(api_key), None)
             except Exception:
@@ -6123,6 +6177,7 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
                 idx = pos if (pos is not None and pos not in _claimed) else None
         return row[idx].strip() if idx is not None and 0 <= idx < len(row) else ''
 
+    _printed_totals: dict = {}   # CSV に印字された部品計・工賃計（最後に明細の合算と突き合わせる）
     row_idx = 0
     # 明細の行のセル数。どの行も見出しより同じだけ多い（全行の末尾に余分なカンマがある書き出し）ときは、部品 1〜3 桁・工賃 3 桁の
     # 行を「割れた金額」とみなさない（クリップ 300 円・工賃 500 円の正しい行を止めていた。レビュー 3 周目）
@@ -6221,6 +6276,19 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
 
         name      = _cell(row, 'name', 0)
         category  = _cell(row, 'work_code', 1)
+        if category and _colmap and _colmap.get('work_code') is None:
+            # 見出しに区分の列が無く、**位置で 2 列目を区分として拾った**とき: その中身が区分の語彙に
+            # 当たらなければ使わない。工場のソフトが 2 列目に「位置」「メーカー」を出す書式で、
+            # 「右前」がそのまま NEO の修理方法の欄に印字されていた（区分コードは -1 になり、
+            # コグニ側の再計算も取替として動かない。2026-09-21 Claude 深掘り）。
+            # 決められないなら区分なしにする（「決められなければ止める」の方針）
+            # 「〃」も残さない: 区分の列が無いのだから「上と同じ区分」を指しようがなく、
+            # 位置やメーカーの列の「〃」がそのまま修理方法として NEO に入る（2026-09-21 Codex P2）
+            from neo_rules import disposal_code as _dc
+            if _dc(category) < 0:
+                _trailer_notes.append(f'⚠️ 2 列目の「{str(category)[:12]}」は作業区分として読めないので、'
+                                      '区分なしで取り込みました（見出しに区分の列がありません）')
+                category = ''
         _qty_raw  = _cell(row, 'quantity', 2)
         _frac_row = False
         _pa_raw   = _cell(row, 'parts_amount', 3)
@@ -6300,6 +6368,28 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
         # 一方「合計表示灯」「総額メーター」「温度計」のような正当な品名は
         # 集計語で終わらないので残る。
         if _is_total_row_name(name):
+            # 捨てる前に、印字された「部品計」「工賃計」だけ控える。CSV が自分で持っている唯一の正解なので、
+            # 最後に明細の合算と突き合わせる（合わなければ取り込まない ＝「決められなければ止める」）。
+            # 以前はここで黙って捨てていたので、**明細が 1 行丸ごと抜けても無警告で NEO が出ていた**
+            # （工賃 12,000 円が落ちた CSV で「✅ 読み込み完了」とだけ出る。2026-09-21 Claude 深掘り）。
+            # 「合計」「小計」「消費税」は税の入り方が書式で違うので控えない（誤検知で止めない）
+            _tn = re.sub(r'[\s　【】\[\]「」『』¥￥:：･・*＊_~]', '', str(name or ''))
+            _tn = re.sub(r'[（(].*?[）)]', '', _tn)
+            # 「小計」は**使わない**: ページごと・節ごとの小計が並ぶ書式で、最初の小計を全明細の合算と
+            # 比べて正しい CSV を止めてしまう（2026-09-21 Codex P2）。総計を表す呼び方だけを見る
+            _tkey = ('parts' if _tn in ('部品計', '部品合計', '部品金額計')
+                     else 'wage' if _tn in ('工賃計', '工賃合計', '作業計', '技術料計', '技術料合計')
+                     else '')
+            if _tkey:
+                # **0 と空欄を区別する**。「工賃計,,,,0,」は印字 0 円（明細に工賃があれば食い違い ＝ 止める）、
+                # 「工賃計,,,,,」は印字なし（突き合わせない）。以前は両方 0 として無視していた（Codex 深掘り 2 周目）
+                _own = _pa_raw if _tkey == 'parts' else _wg_raw
+                if str(_own or '').strip():
+                    _printed_totals[_tkey] = safe_int(_own)
+                else:
+                    _v = max([safe_int(c) for c in row if str(c or '').strip()] or [0])
+                    if _v:
+                        _printed_totals[_tkey] = _v   # 同じ名前が何度も出たら**最後**を採る（総計は末尾にある）
             continue
         # 「値引」単独で金額が無い行だけ落とす（金額のある値引きは明細として残す）
         _nm = re.sub(r'[\s\u3000]', '', name)
@@ -6414,6 +6504,23 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
         _errors.insert(0, '❌ 見出しに金額の列（部品金額・工賃・技術料・単価）が見つかりません。'
                           '1行目を「品名,区分,数量,部品金額,工賃,部品コード」にしてください。'
                           '（AI の返事に説明文が多いときは、表の部分だけを貼ってください）')
+    # ── 印字の部品計・工賃計と、明細の合算を突き合わせる ─────────────────────
+    # CSV 経路は見積書の PDF と照合できない（ステップ③は「照合なし」）。印字の小計が唯一の正解なので、
+    # 合わなければ取り込まない。以前は明細が 1 行落ちても「✅ 読み込み完了」とだけ出ていた
+    # （2026-09-21 Claude 深掘り）。印字が無い CSV は今までどおり素通り
+    if items and _printed_totals:
+        _sum = {'parts': sum(safe_int(it.get('parts_amount', 0)) for it in items),
+                'wage': sum(safe_int(it.get('wage', 0)) for it in items)}
+        _label = {'parts': '部品計', 'wage': '工賃計'}
+        for _k, _printed in _printed_totals.items():
+            _got = _sum.get(_k, 0)
+            if _got != _printed:
+                _errors.append(
+                    f'❌ CSV に印字の{_label[_k]} {_printed:,}円と、明細の合算 {_got:,}円が '
+                    f'{abs(_printed - _got):,}円ちがいます。行の抜け・金額の写し間違いの疑いがあるので取り込みません。'
+                    'CSV を見直して入れ直してください（合わせるために行を足したり金額を動かしたりはしません）')
+            else:
+                _trailer_notes.append(f'✅ 印字の{_label[_k]} {_printed:,}円と明細の合算が一致しました')
     if _errors:
         # 誤りのある CSV は取り込まない（1 行でも列がずれていると、ほかの行も同じずれ方をしている疑いがある）
         return ([], _errors + _trailer_notes) if return_notes else []
@@ -6660,7 +6767,7 @@ def analyze_estimate_single(api_key, file_bytes, mime_type, model_name, page_num
                 ) from e
             # クォータ超過エラー
             if _is_quota_error(err_msg):
-                _quota_exhausted_set().add(model_name)
+                _quota_exhausted_set(api_key).add(model_name)
                 cache_key = api_key[-8:] if api_key else ''
                 if cache_key in _availability_cache():
                     del _availability_cache()[cache_key]
@@ -7197,14 +7304,17 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
             except Exception:
                 pass
 
-    if _cache_key in _analyze_result_cache:
-        print("[INFO] キャッシュヒット: 再解析をスキップします", file=sys.stderr)
+    # 存在確認と取り出しの間に別の人が消すと KeyError になるので、ロックの中で一度に済ませる
+    with _analyze_result_lock:
         # 参照のまま返すと、呼び出し側の書き換えがキャッシュに残る。
         # このキャッシュはプロセス全体で共有（セッション跨ぎ・利用者跨ぎ）
         # なので、1回目の生成が書いた値を2回目が入力として読み、
         # 同じPDFから内訳の違う .neo が出ていた。
         # items の dict も共有されており、照合結果の書き戻しでも同じ事故が起きる。
-        return copy.deepcopy(_analyze_result_cache[_cache_key])
+        _hit = copy.deepcopy(_analyze_result_cache[_cache_key]) if _cache_key in _analyze_result_cache else None
+    if _hit is not None:
+        print("[INFO] キャッシュヒット: 再解析をスキップします", file=sys.stderr)
+        return _hit
     # ──────────────────────────────────────────────────────────────────────────
 
     # クォータ超過・提供終了のモデルを避けて使用モデルを決定する。
@@ -7213,7 +7323,7 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     # 提供終了と分かっているモデルを除外していなかったため、
     # 同じ死んだモデルを毎回選び直して復旧しなかった。
     # APIが実際に返したモデルから選ぶ。
-    if used_model in _quota_exhausted_set() or used_model in _unavailable_set():
+    if used_model in _quota_exhausted_set(api_key) or used_model in _unavailable_set(api_key):
         _alt = get_alternative_gemini_model(api_key, used_model)
         if _alt and _alt != used_model:
             print(f"[INFO] モデル '{used_model}' は利用できないため "
@@ -7703,11 +7813,12 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
     _cache_ok = (bool(result.get('items')) and not result.get('_incomplete')
                  and any(safe_int(result.get(_k, 0)) > 0 for _k in ('pdf_grand_total', 'pdf_parts_total', 'pdf_wage_total')))
     if _cache_ok:
-        _analyze_result_cache[_cache_key] = copy.deepcopy(result)
-    # キャッシュが大きくなりすぎないよう古いエントリを削除（最大20件）
-    while len(_analyze_result_cache) > 20:
-        oldest_key = next(iter(_analyze_result_cache))
-        del _analyze_result_cache[oldest_key]
+        # 出し入れはロックで守る（本番は全員で 1 プロセス。同時に終わると、片方が選んだ「いちばん古い鍵」を
+        # もう片方が先に消して KeyError になり、**関係のない人の変換が落ちる**。2026-09-21 Codex 深掘り）
+        with _analyze_result_lock:
+            _analyze_result_cache[_cache_key] = copy.deepcopy(result)
+            while len(_analyze_result_cache) > 20:
+                _analyze_result_cache.pop(next(iter(_analyze_result_cache)), None)
     # ──────────────────────────────────────────────────────────────────────────
 
     return result
@@ -8198,8 +8309,15 @@ def _render_beta_result(_p2n_res, selected_model):
         _p2n_name = st.session_state.get('_pdf2neo_filename')
         if not _p2n_name:
             _p2n_name = generate_filename(_p2n_res.get('vehicle_info') or {}, 0, 0, 0, 0, False, reverse_match=True)
+            if _p2n_needs_ack:
+                # スキル経路は「_要確認」を付けるのに、ベタ打ちだけ合格品と名前で見分けが付かなかった。
+                # 保存先のフォルダで取り違えるので、同じ印を付ける（2026-09-21 Claude 深掘り）
+                _stem, _dot, _ext = str(_p2n_name).rpartition('.')
+                _p2n_name = (f'{_stem}_要確認{_dot}{_ext}' if _dot else f'{_p2n_name}_要確認')
             st.session_state['_pdf2neo_filename'] = _p2n_name
-        st.download_button("📥 NEOファイルをダウンロード（ベタ打ち）", data=_p2n_neo, file_name=_p2n_name,
+        st.download_button("📥 NEOファイルをダウンロード（ベタ打ち）",
+                           # disabled は rerun が返るまで効かない。押し抜けても古い NEO が出ないよう中身も空にする
+                           data=(b'' if _p2n_res.get('stale') else _p2n_neo), file_name=_p2n_name,
                            mime="application/octet-stream", key='pdf2neo_dl_beta', width='stretch',
                            disabled=bool(_p2n_res.get('stale')) or not _p2n_ack)   # 入力が変わった／未確認の結果は落とさせない（Codex hunt A1/E1）
     if st.button("📝 プレビューに取り込んで修正する", key='pdf2neo_to_preview_beta', width='stretch',
@@ -8611,6 +8729,11 @@ def _p2n_inputs_signature(file_key, state=None, api_key='', model_name='', beta=
     parts = [str(file_key or '')]
     _files = _docs_files(state)
     parts.append(_docs_ocr_state(s, api_key, model_name, _files))   # 読めたか・何が読めたか（Codex 72）
+    # 読み手（Gemini / Claude）と AI モデルを**無条件で**入れる。以前は上の _docs_ocr_state 経由でしか
+    # 入っておらず、**添付が 0 件だと戻り値が空**になってモデルも読み手も指紋に残らなかった。
+    # 見積書だけの案件（いちばん多い使い方）で、生成後にモデルを変えても前の結果が落とせていた
+    # （2026-09-21 Claude 深掘り）。読み手は画面の選択（_p2n_reader_label）から復元する
+    parts.append('reader=' + str(s.get('_p2n_reader_label') or '') + '|' + str(model_name or ''))
     parts.append(str(addata_id or ''))   # スキル経路が使った Addata（場所＋データ版。ベタ打ちは ''。Codex hunt F1）
     parts.append(_docs_sig(state))   # 中身＋役割（名前）。入れる順番では変わらない（入れ物は 1 つ）
     def _sv(k):
@@ -8653,6 +8776,45 @@ def _docs_sig(state=None) -> str:
         except Exception:  # noqa: BLE001
             parts.append('?')
     return '|'.join(sorted(parts))
+
+
+# 中身の先頭の目印（マジックナンバー）。16 進で書く: 生のバイトをソースに置くと編集のたびに壊れる
+_IMG_MAGICS = tuple(bytes.fromhex(h) for h in (
+    'ffd8ff',              # JPEG
+    '89504e470d0a1a0a',    # PNG
+    '474946383761', '474946383961',   # GIF87a / GIF89a
+    '424d',                # BMP
+    '49492a00', '4d4d002a',           # TIFF (little / big endian)
+))
+
+
+def _upload_kind_problem(data: bytes, name: str = '') -> str:
+    """入れたファイルの**中身**を見て、読めないと分かるものをここで断る。戻り値は画面に出す理由（空なら問題なし）。
+
+    以前は拡張子しか見ていなかった（get_mime_type）ので、0 バイト・中身が PDF でないもの・途中で切れた PDF が
+    警告ひとつ無く生成ボタンまで進み、押してから 1〜3 分待たされて失敗していた。添付があるときは
+    その前に添付の読み取り（課金）まで走っていた（2026-09-21 実機バグハント）"""
+    if not data:
+        return 'ファイルの中身が空です（0 バイト）。保存し直して入れ直してください'
+    head = bytes(data[:32])
+    if head.startswith(b'%PDF-'):
+        try:
+            from neo_skill import llm as _l
+            if _l.pdf_page_count(data) < 1:
+                return 'PDF にページがありません。保存し直して入れ直してください'
+        except Exception:  # noqa: BLE001  例外の本文は出さない（中身の文字が混ざる）
+            return 'PDF が壊れているようで開けません。保存し直すか、別の形で書き出して入れ直してください'
+        return ''
+    if any(head.startswith(m) for m in _IMG_MAGICS):
+        return ''
+    if head[:4] == b'RIFF' and bytes(data[8:12]) == b'WEBP':
+        return ''
+    if bytes(data[4:8]) == b'ftyp':          # HEIC / HEIF
+        return ''
+    _ext = str(name or '').lower().rsplit('.', 1)[-1]
+    return (f'中身が PDF でも写真でもありません（拡張子は .{_ext}）。'
+            'ファイルの種類を確かめて入れ直してください' if _ext else
+            '中身が PDF でも写真でもありません。ファイルの種類を確かめて入れ直してください')
 
 
 def _safe_pipeline_err(e) -> str:
@@ -9049,14 +9211,15 @@ def _attached_docs_ocr(api_key, model_name=None, progress=None, cached_only=Fals
             _b = _f.getvalue()
         except Exception:  # noqa: BLE001
             _b = b''
-        if _b:
+        # 中身が PDF でも写真でもないものは AI に投げない（投げても読めず、課金だけ増える。2026-09-21 実機バグハント）
+        if _b and not _upload_kind_problem(_b, str(_f.name or '')):
             _fh.append((hashlib.sha256(_b).hexdigest(), _f, _b))
         else:
-            _skipped += 1   # 0 バイト・読み出せない添付。黙って捨てない（下で知らせる。Codex hunt X 2026-09-21）
+            _skipped += 1   # 0 バイト・読み出せない・中身が別物の添付。黙って捨てない（Codex hunt X 2026-09-21）
     _fh.sort(key=lambda x: x[0])
     if _skipped and not cached_only:
-        # 添えたのに 1 枚も中身が取れないと、書類の情報が入っていない NEO が**警告なしで**出ていた
-        st.session_state['_doc_ocr_error'] = (f'添付 {_skipped} 件は中身が空か読み出せませんでした'
+        # 添えたのに中身が取れないと、書類の情報が入っていない NEO が**警告なしで**出ていた
+        st.session_state['_doc_ocr_error'] = (f'添付 {_skipped} 件は中身が空か、PDF でも写真でもありませんでした'
                                               '（保存し直して入れ直してください）')
     for _idx, (h, f, b) in enumerate(_fh, 1):
         if vd and doc:
@@ -9300,7 +9463,10 @@ def main():
     }
     /* 画面が狭いと左上の「≫」が濃紺のトップバーに重なるので、サイドバーが閉じている間だけ本文を下げる。
        広い画面では本文が右にずれているので重ならない（実測 1500px: ボタン x=14〜48／トップバー x=159〜） */
-    @media (max-width: 1000px) {
+    @media (max-width: 1279px) {
+      /* 1001〜1279px では本文が画面いっぱいに広がり、トップバーの左上角（x=17〜47）が
+         ≫ の箱（x=14〜48・y=12〜46）に重なる。閉じている間だけ本文を下げる
+         （実機で 1px 刻みに測って境界を確定。2026-09-21 Claude 実機点検 ①） */
       body:has([data-testid="stSidebar"][aria-expanded="false"]) .topbar { margin-top: 44px !important; }
     }
     .stApp { margin-top: 0 !important; }
@@ -9332,8 +9498,17 @@ def main():
     [data-testid="stSidebar"] [data-testid="stExpander"] { margin-bottom: 2px; }
 
     /* ══ 上のバー ════════════════════════════════════════════════ */
+    /* 生成ボタン 2 つ: 高さをそろえ（primary と secondary で 2〜4px ずれていた）、
+       狭い画面でラベルを「…」で切らずに折り返す（幅 768〜810px で
+       「🚀 NEOを生成（部品コー…」になっていた。2026-09-21 Claude 実機点検 ②③） */
+    [class*="st-key-pdf2neo_run"] button {
+      min-height: 44px !important; height: auto !important;
+      white-space: normal !important; line-height: 1.25 !important;
+    }
+    [class*="st-key-pdf2neo_run"] button p { white-space: normal !important; overflow: visible !important;
+                                             text-overflow: clip !important; }
     .topbar { background: linear-gradient(135deg,#17203a 0%,#1e3358 100%); color:#fff;
-              padding: 0 22px; height: 56px; display:flex; align-items:center; justify-content:space-between;
+              padding: 0 22px; min-height: 56px; height: auto; display:flex; align-items:center; justify-content:space-between;
               border-radius: var(--r); margin-bottom: 16px; box-shadow: var(--shadow); }
     .topbar-title { font-size: 15.5px; font-weight: 700; letter-spacing:.03em; display:flex; align-items:center; gap:10px; }
     .topbar-badge { background: var(--brand-2); font-size: 10px; padding: 2px 8px; border-radius: 999px; font-weight: 700; }
@@ -10027,22 +10202,12 @@ def main():
                 help="Gemini APIで実際に利用可能なモデルを自動検出（提供終了モデルは除外）。Flash=高速・コスパ良好、Pro=高精度"
             )
         st.markdown("---")
-        with st.expander("🔬 精度オプション（ふだんは既定のまま）", expanded=False):
-            use_fax_filter = st.checkbox(
-                "FAXページ自動除外",
-                value=True,
-                help="FAX送付状が混在するPDFの1ページ目を自動検出・除外します。APIコールが1回増えます。"
-            )
-            use_rasterize = st.checkbox(
-                "PDF→画像変換（行ズレ防止）",
-                value=False,
-                help="PDFをJPEG画像に変換してからAIに送ります。通常はOFFのままで精度が高くなります。"
-            )
-            use_enhance = st.checkbox(
-                "画像前処理（FAX品質改善）",
-                value=True,
-                help="コントラスト・シャープネスを強化してFAX品質の画像を読みやすくします。ラスタライズ有効時のみ機能します。"
-            )
+        # 「🔬 精度オプション」の 3 つのチェックは**どこにも効いていなかった**（key が無く、戻り値の変数は
+        # 一度も読まれず、session_state 側は 11205 行付近で決め打ち。しかも見積書 → NEO の 2 つの経路は
+        # この 3 つを使う analyze_estimate を通らない）。押しても何も変わらないのに、行ズレしたとき
+        # 「画像変換 ON で作り直す」→ 同じ結果、を繰り返させていたので画面から外した（2026-09-21 Claude 深掘り）。
+        # 行ズレへの手当ては「🤖 見積書を読む AI」でモデルを替えるか、CSV 取り込みの道を使う
+        use_fax_filter, use_rasterize, use_enhance = True, False, True
         st.markdown("---")
         st.header("🛡️ 事故・保険情報")
         st.caption("コグニセブンの受付／保険欄に書き込まれます。空欄はテンプレートの値を維持します。")
@@ -10396,7 +10561,11 @@ def main():
                         vehicle_file = _f
                         break
             if vehicle_file is None:
-                vehicle_file = next((f for f in _doc_files_now if _SHAKEN_NAME_RE.search(str(f.name or ''))), None)
+                # 中身が PDF でも写真でもないものは渡さない（渡すと「車検証だけで作る」が API を呼んでから失敗する。
+                # 名前だけで選んでいたので、拡張子が .pdf の別物が通っていた。2026-09-21 実機バグハント）
+                vehicle_file = next((f for f in _doc_files_now
+                                     if _SHAKEN_NAME_RE.search(str(f.name or ''))
+                                     and not _upload_kind_problem(f.getvalue(), str(f.name or ''))), None)
         if _doc_files_now:
             if not api_key:
                 st.caption("書類の読み取りには Gemini API キーが必要です（サイドバーの「APIキー設定」）")
@@ -10437,7 +10606,18 @@ def main():
             _p2n_beta_ui_shown = False   # この run でベタ打ちの UI を描いたか（Addata なしの枝で立てる。結果の下の逃げ道と二重に描かない）
             # ファイル名・大きさは上の入れ物に出ているので、ここでは繰り返さない（2026-09-20 画面の作り直し）
             # 「サイドバーの入力はどう使われるか」は結果より下に置いた（主導線を短くする。2026-09-20 使い勝手の点検）
-            if not _nsk_ready or not (claude_api_key or api_key):
+            if (_p2n_bad := _upload_kind_problem(_p2n_bytes, _p2n_file.name)):
+                # 押してから 1〜3 分待たせて失敗させない（添付があると読み取りの課金まで走っていた）
+                st.error(f"❌ この見積書は読めません: {_p2n_bad}")
+                _pdf_tax_sel = _p2n_tax_row(_saved_pdf_tax)
+                _p2n_c0e, _p2n_c0f = st.columns(2)
+                with _p2n_c0e:
+                    st.button("🚀 NEOを生成（部品コードつき）", key='pdf2neo_run_disabled', type="primary",
+                              width='stretch', disabled=True, help=_p2n_bad)
+                with _p2n_c0f:
+                    st.button("✏️ ベタ打ちで生成", key='pdf2neo_run_beta_wait', width='stretch',
+                              disabled=True, help=_p2n_bad)
+            elif not _nsk_ready or not (claude_api_key or api_key):
                 # 以前はここで赤い字を出すだけで**ボタンが 1 つも出ず行き止まり**だった（金額表記の行も出ないので、
                 # ラジオが遥か下の「うまくいかないとき」の中に現れた）。ベタ打ちは vendor を使わないので、
                 # Gemini のキーさえあれば作れる（2026-09-21 Claude 並行バグハント ③）
@@ -10824,7 +11004,7 @@ def main():
                 with _p2n_c1:
                     st.download_button(
                         "📥 NEOファイルをダウンロード",
-                        data=_p2n_res.get('neo_bytes') or b'',
+                        data=(b'' if _p2n_res.get('stale') else (_p2n_res.get('neo_bytes') or b'')),
                         file_name=f"{_p2n_name}.neo",
                         mime="application/octet-stream",
                         key='pdf2neo_dl', disabled=bool(_p2n_res.get('stale')),   # 入力が変わった結果は落とさせない（Codex hunt A1）
@@ -10834,7 +11014,7 @@ def main():
                     _p2n_ext = _p2n_res.get('review_ext') or '.xlsx'
                     st.download_button(
                         "📥 確認箇所シートをダウンロード",
-                        data=_p2n_res.get('review_bytes') or b'',
+                        data=(b'' if _p2n_res.get('stale') else (_p2n_res.get('review_bytes') or b'')),
                         file_name=f"{_p2n_name}_確認箇所{_p2n_ext}",
                         mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                               if _p2n_ext == '.xlsx' else "text/csv"),
@@ -11070,12 +11250,18 @@ def main():
             elif _csv_paste and _csv_paste.strip():
                 _csv_text = _csv_paste.strip()
 
-            if not _csv_text and not _csv_file and st.session_state.get('csv_mode'):
+            if not _csv_text and st.session_state.get('csv_mode'):
                 # 貼り付け欄を空にしたのに前回の取込が残っていると、
-                # 消したはずの見積がそのまま生成されてしまう
+                # 消したはずの見積がそのまま生成されてしまう。
+                # **ファイルがあっても**（文字コードを判別できない・中身が空）落とす。以前は `not _csv_file` を
+                # 付けていたので、判別に失敗した CSV を入れると「読めません」と言いながら**前の案件の明細**が
+                # 残り、そのまま生成できた（次の案件の車検証に前の案件の金額が乗る。2026-09-21 Claude 深掘り）
                 st.session_state.pop('csv_items', None)
                 st.session_state.pop('csv_mode', None)
                 st.session_state.pop('_csv_paste_saved', None)
+                if _csv_file:
+                    st.warning("前に取り込んでいた明細は消しました（この CSV を読めなかったため、"
+                               "前の内容がそのまま生成されないようにしています）。")
 
             if _csv_text:
                 _preview_items, _csv_notes = parse_csv_to_items(_csv_text, return_notes=True)
@@ -11526,7 +11712,7 @@ def main():
                     )
             # クォータ超過エラーの場合、分かりやすいメッセージとリトライを促す
             elif _is_quota_error(err_str):
-                _quota_exhausted_set().add(_cur_model)
+                _quota_exhausted_set(api_key).add(_cur_model)
                 # キャッシュクリア
                 _api_key_for_err = api_key
                 if _api_key_for_err:

@@ -523,7 +523,7 @@ chk(app._yen('１０４，６６０ 円') == 104660 and app._yen('') is None and
 # 9z3〜9z7: 画面の作り直しで Codex が挙げた 5 件（2026-09-21 第40周）
 # (1) CSV だけの経路でも税区分を変えられる（描いていない run にだけ出す。キーは重複させない）
 # 定義 + vendor/キーが無い枝 + Addata なしの横並び + Addata ありの横並び + CSV だけの経路（2026-09-21: 行き止まりの枝にも足した）
-chk("if not st.session_state.get('_pdf_tax_row_shown'):" in _app_src and _app_src.count('_p2n_tax_row(') == 6,
+chk("if not st.session_state.get('_pdf_tax_row_shown'):" in _app_src and _app_src.count('_p2n_tax_row(') == 7,   # ＋読めないファイルの枝（2026-09-21）
     f"9z3: CSV だけの経路に税区分の切り替えが無い／二重に描いている: {_app_src.count('_p2n_tax_row(')}")
 chk("st.session_state.pop('_pdf_tax_row_shown', None)" in _app_src.split('def _main_and_reset')[1][:400],
     '9z4: 税区分を描いた印を run の終わりで落としていない（次の run で描けなくなる）')
@@ -761,6 +761,128 @@ chk('stToolbarActions' in _app_src and 'stAppDeployButton' in _app_src,
     '12j3: ヘッダーの中の Deploy・⋮ メニューを隠していない')
 chk('aria-expanded=\"false\"' in _app_src and '.topbar { margin-top' in _app_src,
     '12j4: 狭い画面で「≫」がトップバーに重なる')
+
+# 12k: 入れたファイルの**中身**を見て断る（以前は拡張子しか見ておらず、0 バイト・中身が PDF でないもの・
+#      途中で切れた PDF が警告なしに生成ボタンまで進み、押してから 1〜3 分待たされて失敗していた。
+#      添付があるときはその前に読み取りの課金まで走っていた。2026-09-21 実機バグハント）
+_bad = [('空', b''), ('別物', b'This is not a PDF at all.' * 5),
+        ('壊れたPDF', b'%PDF-1.4' + bytes([10]) + b'1 0 obj' + bytes([10]) + b'<< >>' + bytes([10]))]
+for _nm, _dat in _bad:
+    chk(bool(app._upload_kind_problem(_dat, 'x.pdf')), f'12k: {_nm} を通してしまう')
+_ok = [('JPEG', bytes.fromhex('ffd8ffe0')), ('PNG', bytes.fromhex('89504e470d0a1a0a')),
+       ('TIFF', bytes.fromhex('49492a00')), ('BMP', bytes.fromhex('424d')),
+       ('WEBP', b'RIFF' + bytes(4) + b'WEBP'), ('HEIC', bytes(4) + b'ftypheic')]
+for _nm, _hd in _ok:
+    chk(not app._upload_kind_problem(_hd + b'x' * 64, 'x.jpg'), f'12k2: 正しい {_nm} を断ってしまう')
+# 本物の PDF は素通り（サンプルがある PC だけ）
+_smp = os.path.join(os.path.dirname(R), 'サンプル見積PDF', '見積書.pdf')
+if os.path.exists(_smp):
+    chk(not app._upload_kind_problem(open(_smp, 'rb').read(), '見積書.pdf'), '12k3: 本物の見積書 PDF を断ってしまう')
+# 画面側: 読めないファイルでは生成ボタンを押させない
+chk('_upload_kind_problem(_p2n_bytes, _p2n_file.name)' in _app_src
+    and 'この見積書は読めません' in _app_src,
+    '12k4: 読めない見積書でも生成ボタンが押せる')
+chk('_upload_kind_problem(_b, str(_f.name' in _ocr_src,
+    '12k5: 中身が別物の添付を AI に投げている（読めず課金だけ増える）')
+
+# 12m: CSV 取り込みは印字の部品計・工賃計と明細の合算を突き合わせる（合わなければ取り込まない）。
+#      以前は集計行を黙って捨てていたので、明細が 1 行落ちても「✅ 読み込み完了」とだけ出ていた。
+#      **両方向**を試す（「直すたびに逆の穴が開く」ため。2026-09-21 Claude 深掘り）
+def _csvchk(csv_text):
+    it, no = app.parse_csv_to_items(csv_text, return_notes=True)
+    return len(it), [n for n in no if str(n).startswith('❌')]
+_H = '品名,区分,数量,部品金額,工賃,部品コード' + chr(10)
+_n, _e = _csvchk(_H + 'A,取替,1,45000,0,' + chr(10) + 'B,取替,1,0,12000,' + chr(10)
+                 + '部品計,,,45000,,' + chr(10) + '工賃計,,,,12000,' + chr(10))
+chk(_n == 2 and not _e, '12m: 小計が一致する CSV を取り込めない')
+_n, _e = _csvchk(_H + 'A,取替,1,45000,0,' + chr(10) + '部品計,,,45000,,' + chr(10) + '工賃計,,,,12000,' + chr(10))
+chk(_n == 0 and _e, '12m2: 明細が 1 行落ちた CSV を止めない（金額の違う NEO が黙って出る）')
+_n, _e = _csvchk(_H + 'A,取替,1,45000,0,' + chr(10) + 'B,取替,1,0,12000,' + chr(10))
+chk(_n == 2 and not _e, '12m3: 小計の印字が無い CSV まで止めてしまう')
+_n, _e = _csvchk(_H + 'A,取替,1,45000,0,' + chr(10) + '小計,,,45000,0,' + chr(10)
+                 + '消費税,,,,4500,' + chr(10) + '合計,,,,49500,' + chr(10))
+chk(_n == 1 and not _e, '12m4: 合計・消費税の行を小計として誤って突き合わせている')
+
+# 12n: 見出しに区分の列が無いとき、2 列目の中身が作業区分の語彙に当たらなければ区分にしない
+#      （工場のソフトが出す「位置」列の「右前」が NEO の修理方法の欄に印字されていた）
+_it, _no = app.parse_csv_to_items('品名,位置,数量,部品金額,工賃,部品コード' + chr(10) + 'ﾄﾞｱ,右前,1,58000,0,67001' + chr(10),
+                                  return_notes=True)
+chk(_it and not str(_it[0].get('work_code') or '').strip()
+    and any('作業区分として読めない' in str(n) for n in _no),
+    '12n: 区分でない列の中身をそのまま作業区分にしている')
+_it2 = app.parse_csv_to_items('品名,区分,数量,部品金額,工賃,部品コード' + chr(10) + 'ﾄﾞｱ,取替,1,58000,0,67001' + chr(10))
+chk(_it2 and str(_it2[0].get('work_code') or '') == '取替', '12n2: 正しい区分まで落としている')
+
+# 12p: CSV を読めなかったときは、前に取り込んだ明細を残さない（次の案件に前の金額が乗る）
+chk("if not _csv_text and st.session_state.get('csv_mode'):" in _app_src
+    and 'not _csv_file and st.session_state' not in _app_src,
+    '12p: 読めない CSV を入れても前の取り込みが残る')
+
+# 12q: 指紋に読み手と AI モデルが**無条件で**入る（添付 0 件の案件で素通りしていた）
+_sig_src = inspect.getsource(app._p2n_inputs_signature)
+chk("parts.append('reader='" in _sig_src, '12q: 読み手・モデルが指紋に入らない（添付なしの案件で古い結果が落とせる）')
+_st_q = {'_p2n_reader_label': 'Gemini（a）'}
+chk(app._p2n_inputs_signature('f', _st_q, model_name='m1') != app._p2n_inputs_signature('f', _st_q, model_name='m2'),
+    '12q2: モデルを変えても指紋が変わらない')
+chk(app._p2n_inputs_signature('f', {'_p2n_reader_label': 'Gemini（a）'}, model_name='m')
+    != app._p2n_inputs_signature('f', {'_p2n_reader_label': 'Claude（b）'}, model_name='m'),
+    '12q3: 読み手を変えても指紋が変わらない')
+
+# 12r: 使えないモデルの記録は API キーごと（他の人の 429 で自分のモデルが変わらない）
+chk('_model_set(' in _app_src and "f'{kind}:{_api_key_tag(api_key)}'" in _app_src,
+    '12r: 使えないモデルの記録がプロセス全体で共有されている')
+
+# 12s: テンプレート NEO の生バイトを共有プロセスに溜めない
+chk('_NEO_TAX_ROUND_CACHE' in _app_src and '@_functools.lru_cache(maxsize=8)' not in _app_src,
+    '12s: 顧客情報入りのテンプレート NEO が lru_cache でプロセスに残る')
+
+# 12t: ベタ打ちで差異のある NEO は名前でも分かるように
+chk("_p2n_name = (f'{_stem}_要確認{_dot}{_ext}'" in _app_src,
+    '12t: 差異ありのベタ打ち NEO が合格品と名前で見分けられない')
+
+# 12u: 直したことで開いた**逆向きの穴**（Codex 深掘りレビュー 2026-09-21）
+# (a) 節ごとの小計が並ぶ CSV を誤って止めない（「小計」は総計として扱わない・同じ名前は最後を採る）
+_n, _e = _csvchk(_H + 'A,取替,1,20000,0,' + chr(10) + '部品小計,,,20000,,' + chr(10)
+                 + 'B,取替,1,25000,0,' + chr(10) + '部品小計,,,25000,,' + chr(10) + '部品計,,,45000,,' + chr(10))
+chk(_n == 2 and not _e, '12u: 節ごとの小計がある正しい CSV を止めてしまう')
+# (b) 区分の列が無いときは「〃」も区分にしない（位置の列の〃が修理方法として NEO に入る）
+_it3, _ = app.parse_csv_to_items('品名,位置,数量,部品金額,工賃,部品コード' + chr(10)
+                                 + 'ﾄﾞｱ,右前,1,58000,0,67001' + chr(10) + 'ﾄﾞｱ,〃,1,58000,0,67002' + chr(10),
+                                 return_notes=True)
+chk(len(_it3) == 2 and not any(str(i.get('work_code') or '').strip() for i in _it3),
+    '12u2: 区分の列が無いのに「〃」を区分として残している')
+# 本物の区分列の「〃」は今までどおり残す
+_it4 = app.parse_csv_to_items(_H + 'A,取替,1,1000,0,' + chr(10) + 'B,〃,1,2000,0,' + chr(10))
+chk(len(_it4) == 2 and str(_it4[1].get('work_code') or '') == '〃', '12u3: 本物の区分列の「〃」まで落としている')
+# (c) 使えないモデルの記録は、読み書きのすべてで api_key を渡す
+#     （worker は session_state を読めず、渡さないと空のキーの集合に書かれて画面に届かない）
+chk('_quota_exhausted_set()' not in _app_src and '_unavailable_set()' not in _app_src,
+    '12u4: api_key を渡さずに使えないモデルの集合を読み書きしている箇所が残っている')
+
+# 12v: Codex 深掘り 2 周目の 3 件（逆向きの穴）
+# (a) 印字 0 の総計は「印字なし」ではなく「印字 0」として突き合わせる。空欄とは区別する
+_n, _e = _csvchk(_H + 'A,取替,1,0,20000,' + chr(10) + '工賃計,,,,0,' + chr(10))
+chk(_n == 0 and _e, '12v: 印字 0 の工賃計と明細の工賃が食い違うのに通してしまう')
+_n, _e = _csvchk(_H + 'A,取替,1,45000,0,' + chr(10) + '工賃計,,,,0,' + chr(10) + '部品計,,,45000,,' + chr(10))
+chk(_n == 1 and not _e, '12v2: 印字 0 と明細 0（正しい CSV）まで止めてしまう')
+_n, _e = _csvchk(_H + 'A,取替,1,45000,0,' + chr(10) + '部品計,,,,,' + chr(10))
+chk(_n == 1 and not _e, '12v3: 総計の欄が空欄の行を 0 円の印字として突き合わせている')
+# (b) 「技術料合計」も工賃の総計として拾う
+_n, _e = _csvchk(_H + 'A,取替,1,0,5000,' + chr(10) + '技術料合計,,,,12000,' + chr(10))
+chk(_n == 0 and _e, '12v4: 「技術料合計」を総計として拾っていない')
+# (c) worker（_FALLBACK_STORE）の記録が画面側の読み出しに合流する
+_src_ms = inspect.getsource(app._model_set)
+chk('_FALLBACK_STORE.get(name)' in _src_ms and 'val |= _fb' in _src_ms,
+    '12v5: worker が記録した使えないモデルが画面側に届かない（同じ死んだモデルを選び続ける）')
+
+# 12w: 実機点検で出た見た目の 4 点（2026-09-21・幅 1600〜430px の 13 幅で確認）
+chk('@media (max-width: 1279px)' in _app_src,
+    '12w: 「≫」とトップバーの重なりの境界が違う（1001〜1279px で重なる）')
+chk('min-height: 44px !important; height: auto !important;' in _app_src
+    and 'white-space: normal !important' in _app_src,
+    '12w2: 生成ボタンの高さがそろっていない／狭い画面でラベルが「…」で切れる')
+chk('.topbar { background' in _app_src and 'min-height: 56px; height: auto;' in _app_src,
+    '12w3: トップバーが縦に 1px 欠ける')
 
 print('REG_INSURANCE:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
