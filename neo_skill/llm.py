@@ -57,6 +57,23 @@ class LLMReplyError(LLMError):
         self.retryable = retryable
 
 
+_ERR_KEYS = (('APIキー', ('api key', 'api_key', 'unauthenticated', 'permission', '401', '403')),
+             ('利用上限（クォータ）', ('quota', 'rate limit', 'resource_exhausted', '429')),
+             ('モデルが使えない', ('not found', 'is not supported', '404')),
+             ('安全性で止まった', ('safety', 'blocked', 'prohibited')),
+             ('通信', ('timeout', 'connection', 'unavailable', '503')))
+
+
+def _err_kind(msg) -> str:
+    """API の返事から**分類だけ**を作る。本文は返さない（送った見積書・車検証の中身が映ることがある。
+    2026-09-21 監査）。分からなければ「原因不明」"""
+    low = str(msg or '').lower()
+    for label, keys in _ERR_KEYS:
+        if any(k in low for k in keys):
+            return label
+    return '原因不明'
+
+
 def clean_api_key(key) -> str:
     """API キーの前後の空白・改行と、コピーで紛れ込む見えない文字（ゼロ幅空白・BOM など）を落とす。以前はゼロ幅空白の
     入ったキーが「接続できない」と誤って案内されていた（P14）"""
@@ -380,10 +397,10 @@ class GeminiReader:
                 busy = code == 429 or 'RESOURCE_EXHAUSTED' in msg.upper()
                 if busy:
                     if attempt >= len(waits):
-                        raise LLMError(f'Gemini API の利用上限（429）が続いています（{self.model}）。しばらく待ってからやり直してください: {msg[:200]}')
+                        raise LLMError(f'Gemini API の利用上限（429）が続いています（{self.model}）。しばらく待ってからやり直してください')
                 elif (isinstance(code, int) and 400 <= code < 500 and code != 408) or (code is None and self._fatal(msg)):
                     # 4xx（不正な要求・大きすぎる・キー・モデル無し）は待っても通らない。6 回・30 秒待っていた（P14）
-                    raise LLMError(f'Gemini API エラー（{self.model}）: {msg[:300]}')
+                    raise LLMError(f'Gemini API エラー（{self.model}／{_err_kind(msg)}）')   # 返事の本文は入れない（2026-09-21 監査）
                 elif is_timeout_error(e):
                     # 締め切り切れは送り直さない（締め切り 10 分を最大 6 回・60 分待たせていた。レビュー 3 周目）
                     raise LLMError(f'Gemini の応答が時間内に返りませんでした（{self.model}）。ページ数を減らすか、'
@@ -392,7 +409,7 @@ class GeminiReader:
                 if attempt < len(waits):
                     time.sleep(waits[attempt] * (2 if busy else 1))
         if r is None:
-            raise LLMError(f'Gemini API に失敗（{self.model}）: {last}')
+            raise LLMError(f'Gemini API に失敗（{self.model}／{_err_kind(last)}）')
         self.calls += 1
         try:
             text = r.text or ''
@@ -464,14 +481,14 @@ class ClaudeReader:
                 output_config={'effort': self.effort},
                 messages=[{'role': 'user', 'content': blocks}],
             )
-        except a.AuthenticationError as e:
-            raise LLMError('Claude API キーが無効: ' + str(getattr(e, 'message', e)))
-        except a.RateLimitError as e:
-            raise LLMError('Claude API の利用上限（429）。しばらく待って再実行: ' + str(getattr(e, 'message', e)))
+        except a.AuthenticationError:
+            raise LLMError('Claude API キーが無効')
+        except a.RateLimitError:
+            raise LLMError('Claude API の利用上限（429）。しばらく待って再実行してください')
         except a.APIStatusError as e:
-            raise LLMError(f'Claude API エラー {getattr(e, "status_code", "?")}: ' + str(getattr(e, "message", e)))
-        except a.APIConnectionError as e:
-            raise LLMError('Claude API に接続できない: ' + str(e))
+            raise LLMError(f'Claude API エラー {getattr(e, "status_code", "?")}（{_err_kind(getattr(e, "message", ""))}）')
+        except a.APIConnectionError:
+            raise LLMError('Claude API に接続できない（通信）')
         self.calls += 1
         text = ''.join(b.text for b in r.content if getattr(b, 'type', '') == 'text')
         u = r.usage

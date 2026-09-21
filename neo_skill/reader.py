@@ -125,7 +125,7 @@ def _runner(op: str, timeout: float = 300.0, addata_root: Optional[str] = None, 
     except subprocess.TimeoutExpired:
         raise RunnerError(f'検算（{op}）が {int(timeout)} 秒で終わらなかった')
     except OSError as e:
-        raise RunnerError(f'検算（{op}）を起動できない: {e}')
+        raise RunnerError(f'検算（{op}）を起動できない（{type(e).__name__}）')
     line = next((l for l in reversed((p.stdout or '').splitlines()) if l.startswith(RUNNER_MARK)), '')
     if p.returncode != 0 or not line:
         # 別プロセスの出力には見積書の中身（顧客名・登録番号・車台番号）が混じりうるので、
@@ -135,7 +135,7 @@ def _runner(op: str, timeout: float = 300.0, addata_root: Optional[str] = None, 
     try:
         return json.loads(line[len(RUNNER_MARK):])
     except ValueError as e:
-        raise RunnerError(f'検算（{op}）の結果を読めない: {e}')
+        raise RunnerError(f'検算（{op}）の結果を読めない（{type(e).__name__}）')
 
 
 def _progress(cb: Optional[Callable], msg: str) -> None:
@@ -989,10 +989,12 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
         res.check = check or {}
         res.reading = rd
         res.ok = bool(rd) and not (check or {}).get('fail') and all(t.ok for t in res.traces)
-    except (llm_mod.LLMError, RunnerError) as e:
+    except (llm_mod.LLMError, RunnerError, PageShapeError) as e:
+        # この 3 つは**自分で書いている文**（何を直せばよいかが入っている。llm 側も分類だけに直した）
         res.error = str(e)
-    except Exception as e:  # noqa: BLE001  理由を残して返す（握り潰さない）。顧客情報は含めない（型と文言だけ）
-        res.error = f'{type(e).__name__}: {e}'
+    except Exception as e:  # noqa: BLE001  理由を残して返す（握り潰さない）。よそから来た例外の**本文は入れない**
+        # （読んだ見積書の文字・ファイルの中身がそのまま混ざることがある。2026-09-21 監査）
+        res.error = f'読み取りの途中で想定外のことが起きました（{type(e).__name__}）'
     res.usage = usage.as_dict()
     first = sum(1 for t in res.traces if t.first_try_ok)
     res.stats = {

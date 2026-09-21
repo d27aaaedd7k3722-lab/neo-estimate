@@ -4713,7 +4713,7 @@ def complement_vehicle_info_with_gemini(api_key, model_code, current_car_name, c
         info = json.loads(text.strip())
         return info
     except Exception as e:
-        print("Gemini Fallback Error:", e)
+        print("Gemini Fallback Error:", _safe_err(e))
         return {}
 
 def generate_discrepancy_report_pdf(discrepancies, total_diff, vehicle_info):
@@ -5415,7 +5415,8 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
     # 「読み取れたが全項目が空」と区別できず、車両情報なしのNEOが
     # 黙って作られてしまう。
     if not _shaken_has_data(result):
-        _msg = str(_last_error) if _last_error else '車検証のページを判別できませんでした'
+        # 例外の本文は入れない（画面に出る。API の返事に送った中身が混じりうる。2026-09-21 監査）
+        _msg = (_safe_err(_last_error) if _last_error else '車検証のページを判別できませんでした')
         # 失敗の理由を記録しないと、提供終了やクォータ超過のモデルを
         # 毎回選び直して4回ずつ無駄に叩き続ける（明細側には同じ記録が
         # あるのに、車検証側だけ抜けていた）。
@@ -7063,7 +7064,7 @@ def _self_correction_retry(api_key, file_bytes, mime_type, model_name,
         return new_result  # 改善された → 採用
     except Exception as e:
         import sys
-        print(f"[WARN] _self_correction_retry 例外: {e}", file=sys.stderr)
+        print("[WARN] _self_correction_retry 例外:", _safe_err(e), file=sys.stderr)
         return None
 
 
@@ -7275,7 +7276,7 @@ def analyze_estimate(api_key, file_bytes, mime_type, model_name=None,
             analyze_estimate_single, api_key, file_bytes, mime_type,
             used_model, 1, 1, bool(tax_inclusive))
     except Exception as _e_sub:
-        _logw(f"③ 明細解析の先行実行に失敗（直列で続行）: {_e_sub}")
+        _logw("③ 明細解析の先行実行に失敗（直列で続行）: " + _safe_err(_e_sub))
         _detail_ex.shutdown(wait=False)
         _detail_ex = None
 
@@ -8331,9 +8332,11 @@ def _p2n_summary(report_md) -> dict:
             out['rows'], out['manual'] = m.group(1), (m.group(2) or '')
             continue
         cells = [c.strip() for c in (s.strip('|').split('|') if s.startswith('|') else s.split('\t'))]
-        if len(cells) >= 3 and cells[0].startswith('合計') and not out['total']:
+        if len(cells) >= 3 and cells[0].startswith('合計'):
             # 報告文の表は「項目 | 見積書 | 生成」。帯に大きく出すのは**印字（見積書）の額**。
-            # コグニの円計算で数円ずれる案件があるので、違うときだけ生成側も小さく添える（Codex 第17周）
+            # コグニの円計算で数円ずれる案件があるので、違うときだけ生成側も小さく添える（Codex 第17周）。
+            # 表がいくつもある報告文では**最後の合計行**＝納品した NEO の表を採る（先頭で止めると、
+            # 作り直しの記録などが先にある報告文で古い額を帯に出す。Codex hunt Z 2026-09-21）
             out['total'] = cells[1] or cells[2]
             out['total_made'] = cells[2] if (cells[2] and cells[2] != cells[1]) else ''
             out['total_is_printed'] = bool(cells[1])   # 印字の欄が空なら「見積書の印字」とは言わない
@@ -8409,11 +8412,25 @@ def _sidebar_insurance_hint():
     return {k: v for k, v in _h.items() if v and v != '0'}
 
 
-def _doc_upload_keys():
-    """STEP 1-B の uploader のキー（車検証, 事故・保険の書類）。連番 upload_seq を付け、「新しい見積を作成する」で作り直して確実に空にする
-    （Streamlit の uploader は値をプログラムから消せない。前の案件の車検証・書類が次の案件に付いたままにならないように。Codex 56）"""
-    n = int(st.session_state.get('upload_seq', 0))
-    return f'vehicle_upload_{n}', f'insurance_doc_upload_{n}'
+# ファイル名で「車検証らしさ」に当たりを付ける（外れても、もう一方の読み方で読み直すので実害は無い。2026-09-21）
+_SHAKEN_NAME_RE = re.compile(r'車検|検査証|shaken|syaken|syakennsyo|vehicle|inspect', re.I)
+
+
+def _docs_upload_key() -> str:
+    """添付（車検証・事故/保険の書類）の uploader のキー。**入れ物は 1 つ**にして、何の書類かは読み取りで見分ける
+    （2026-09-21 亮平さん指示。以前は車検証と書類で 2 つに分かれていた）。
+    連番 upload_seq を付け、「新しい見積を作成する」で作り直して確実に空にする
+    （Streamlit の uploader は値をプログラムから消せない。前の案件の書類が次の案件に付いたままにならないように。Codex 56）"""
+    return f'docs_upload_{int(st.session_state.get("upload_seq", 0))}'
+
+
+def _docs_files(state=None) -> list:
+    """添付されたファイルの一覧（0〜数枚）。uploader は accept_multiple_files=True なので list で返る"""
+    s = st.session_state if state is None else state
+    v = s.get(_docs_upload_key() if state is None else 'docs_upload')
+    if v is None:
+        return []
+    return list(v) if isinstance(v, (list, tuple)) else [v]
 
 
 def _sidebar_insurance_values():
@@ -8470,7 +8487,7 @@ def _doc_fill_to_sidebar(doc) -> dict:
     2026-09-20 まではファイルを添えた時点で行っていたが、添えるたびに読み取りを待たされるので**生成の中**に移した。
     入力欄は form_seq で作り直す（ウィジェットは描いたあとに値を変えられないため）"""
     fill = _doc_hints.sidebar_insurance_from_doc(doc) if doc else {}
-    oid = st.session_state.get('_insdoc_ocr_id') if st.session_state.get(_doc_upload_keys()[1]) is not None else ''
+    oid = st.session_state.get('_insdoc_ocr_id') if _docs_files() else ''
     if not (fill and oid) or st.session_state.get('_insdoc_applied') == oid:
         return {}
     prev_filled = st.session_state.get('_insdoc_filled') or {}
@@ -8563,27 +8580,27 @@ def _reset_case_inputs(keep_docs: bool = False):
         st.session_state['upload_seq'] = int(st.session_state.get('upload_seq', 0)) + 1  # 車検証・書類の uploader を作り直して空に
 
 
-def _docs_ocr_state(s, api_key, model_name, keys) -> str:
+def _docs_ocr_state(s, api_key, model_name, files) -> str:
     """添付の書類の OCR の状態（控え _doc_ocr_cache の中身のハッシュ。無い／失敗は ''）。API は呼ばない。
-    同じファイルでも、キーを直して読めるようになれば状態が変わる ＝ 前の（書類なしで作った）結果を落とさせない（Codex 72）"""
+    同じファイルでも、キーを直して読めるようになれば状態が変わる ＝ 前の（書類なしで作った）結果を落とさせない（Codex 72）。
+    入れ物を 1 つにしたので、**ファイルごと**に「車検証として読めたか／書類として読めたか」を見る（2026-09-21）"""
     cache = s.get('_doc_ocr_cache') or {}
+    kb = hashlib.sha256((api_key or '').encode('utf-8')).hexdigest()[:12]
     out = []
-    for kind, key in (('shaken', keys[0]), ('insdoc', keys[1])):
-        f = s.get(key)
-        if f is None:
-            out.append('')
-            continue
+    for f in (files or []):
         try:
             h = hashlib.sha256(f.getvalue()).hexdigest()
         except Exception:  # noqa: BLE001
             out.append('?')
             continue
-        hit = cache.get((kind, h, str(model_name or ''), hashlib.sha256((api_key or '').encode('utf-8')).hexdigest()[:12]))
-        if isinstance(hit, dict) and not hit.get('_error'):
-            out.append(hashlib.sha256(repr(sorted((str(k), str(v)) for k, v in hit.items())).encode('utf-8')).hexdigest())
-        else:
-            out.append('')
-    return '|'.join(out)
+        got = ''
+        for kind in ('shaken', 'insdoc'):
+            hit = cache.get((kind, h, str(model_name or ''), kb))
+            if isinstance(hit, dict) and not hit.get('_error'):
+                got = hashlib.sha256(repr(sorted((str(k), str(v)) for k, v in hit.items())).encode('utf-8')).hexdigest()
+                break
+        out.append(got)
+    return '|'.join(sorted(out))
 
 
 def _p2n_inputs_signature(file_key, state=None, api_key='', model_name='', beta=False, addata_id='') -> str:
@@ -8592,15 +8609,10 @@ def _p2n_inputs_signature(file_key, state=None, api_key='', model_name='', beta=
     保険欄で作った NEO を落とせてしまう。Codex hunt A1 2026-09-15）"""
     s = st.session_state if state is None else state
     parts = [str(file_key or '')]
-    _keys = _doc_upload_keys() if state is None else ('vehicle_upload', 'insurance_doc_upload')
-    parts.append(_docs_ocr_state(s, api_key, model_name, _keys))   # 読めたか・何が読めたか（Codex 72）
+    _files = _docs_files(state)
+    parts.append(_docs_ocr_state(s, api_key, model_name, _files))   # 読めたか・何が読めたか（Codex 72）
     parts.append(str(addata_id or ''))   # スキル経路が使った Addata（場所＋データ版。ベタ打ちは ''。Codex hunt F1）
-    for _k in _keys:
-        _f = s.get(_k)
-        try:
-            parts.append(hashlib.sha256(_f.getvalue()).hexdigest() if _f is not None else '')
-        except Exception:  # noqa: BLE001
-            parts.append('?')
+    parts.append(_docs_sig(state))   # 中身＋役割（名前）。入れる順番では変わらない（入れ物は 1 つ）
     def _sv(k):
         v = str(s.get(k, 0 if k == 'repair_days' else '') or '')
         if k in ('accident_date', 'garage_in_date', 'garage_out_date'):
@@ -8626,39 +8638,44 @@ def _p2n_inputs_signature(file_key, state=None, api_key='', model_name='', beta=
     return hashlib.sha256('|'.join(parts).encode('utf-8')).hexdigest()
 
 
-def _docs_sig() -> str:
-    """添付の書類（車検証・事故/保険の書類）の同一性（内容ハッシュの組）。見積書を変えたときに、添付が前の見積書のときと
-    同じなら前の案件の書類 ＝ 消す、変わっていれば新しい案件のために入れ替えたもの ＝ 残す（Codex 71）"""
+def _docs_sig(state=None) -> str:
+    """添付の書類の同一性。見積書を変えたときに、添付が前の見積書のときと同じなら前の案件の書類 ＝ 消す、
+    変わっていれば新しい案件のために入れ替えたもの ＝ 残す（Codex 71）。
+    入れる順番で変わらないように**並べ替えてから**つなぐ（入れ物を 1 つにしたので順番は意味を持たない）。
+    中身だけでなく**どちらの書類として読むか**（名前が車検証らしいか）も入れる ——
+    同じ中身でも名前を変えると役割が変わるので、保険欄の入れ直し・結果の陳腐化をここで拾う（Codex 第41/42周）"""
     parts = []
-    for _k in _doc_upload_keys():
-        _f = st.session_state.get(_k)
+    for _f in _docs_files(state):
+        _nm = str(getattr(_f, 'name', '') or '')
         try:
-            parts.append(hashlib.sha256(_f.getvalue()).hexdigest() if _f is not None else '')
+            parts.append(hashlib.sha256(_f.getvalue()).hexdigest()
+                         + '#' + ('S' if _SHAKEN_NAME_RE.search(_nm) else 'D'))
         except Exception:  # noqa: BLE001
             parts.append('?')
-    return '|'.join(parts)
+    return '|'.join(sorted(parts))
 
 
 def _attached_docs_caption(api_key, model_name) -> str:
     """生成ボタンの上の案内。添付したファイル名ではなく「実際に読めたか」で文を変える（読めていない書類は NEO に入らない。
     Codex hunt A3 2026-09-15）。読み取りは控え（_doc_ocr_cache）から返るので、ここで API を余分に呼ぶことはない"""
-    _kv, _kd = _doc_upload_keys()
-    fv, fd = st.session_state.get(_kv), st.session_state.get(_kd)
-    if fv is None and fd is None:
-        return ''   # 何も添えていないときは案内を出さない（「任意の書類を添える」のたたみの見出しに同じことが書いてある。2026-09-20）
+    _files = _docs_files()
+    if not _files:
+        return ''   # 何も添えていないときは案内を出さない
     if not api_key:
         return "📎 添付の書類はまだ読めていません（Gemini API キーが無いため）。このまま生成すると書類の値は NEO に入りません"
     vd, doc = _attached_docs_ocr(api_key, model_name, cached_only=True)   # ここでは読まない（生成を押したときに読む）
     if not vd and not doc:
-        _names = ' ／ '.join(n for n, on in (('車検証', fv is not None), ('事故・保険の書類', fd is not None)) if on)
-        return (f"📎 添付ずみ: {_names} — **「生成」を押したあとに読み取ります**"
-                "（読み取った値は生成のあとサイドバーの事故・保険情報に入るので、そこで確かめて直せます）")
+        return (f"📎 添付ずみ: {len(_files)} 件 — **「生成」を押したあとに読み取ります**"
+                "（何の書類かは読み取りで見分けます。読み取った値は生成のあとサイドバーの事故・保険情報に入るので、"
+                "そこで確かめて直せます）")
+    # ここに来るのは vd か doc のどちらかが読めているときだけ（上の早期 return で振り分けずみ）
     parts = []
-    if fv is not None:
-        parts.append("車検証: " + ("読み取り済み → 車両・顧客の情報に使います" if vd else "まだ読んでいません（生成時に読みます）"))
-    if fd is not None:
-        parts.append("事故・保険の書類: " + ("読み取り済み → サイドバーの事故・保険情報と車両の情報に使います" if doc
-                                     else "まだ読んでいません（生成時に読みます）"))
+    if vd:
+        parts.append("車検証: 読み取り済み → 車両・顧客の情報に使います")
+    if doc:
+        parts.append("事故・保険の書類: 読み取り済み → サイドバーの事故・保険情報と車両の情報に使います")
+    if len(parts) < len(_files):
+        parts.append(f"残り {len(_files) - len(parts)} 件は生成のときに読みます")
     return "📎 " + " ／ ".join(parts)
 
 
@@ -8820,36 +8837,113 @@ def _blank_wage_rows(reading) -> list:
             if not _has(r.get('wage')) and not _has(r.get('index')) and not r.get('manual') and _std_fill(r)]
 
 
-def _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_model, _pdf_tax_sel, fallback=False):
-    """ベタ打ち（旧経路 run_pdf_to_neo_pipeline）の生成ボタンとその処理。Addata が決まらないとき（本来の置き場）と、
-    スキル経路が不合格・車種未収録で NEO が出なかったときの逃げ道（fallback=True。2026-09-15 実機テスト: ボルボ V40 は
-    車種マスタに無く汎用車種の生成で例外、精算見積 4 本は検算差で不合格 → 以前は行き止まりだった）の 2 か所から呼ぶ"""
-    _p2n_beta_exp = {'towing': safe_int(st.session_state.get('exp_towing', 0)),
-                     'rental_car': safe_int(st.session_state.get('exp_rental', 0)),
-                     'tax_exempt': safe_int(st.session_state.get('exp_exempt', 0))}
-    if (_att_cap := _attached_docs_caption(api_key, selected_model)):
-        st.caption(_att_cap)
-    _p2n_beta_use_exp = False
+def _p2n_tax_row(saved) -> str:
+    """見積書の金額表記（税抜／税込）の切り替え。**生成ボタンのすぐ上**に常に出す（2026-09-21 亮平さん指示:
+    サイドバー・たたみの中だと使いにくい）。戻り値は選ばれた表記。
+    この設定を使うのは**ベタ打ちと CSV 取り込み**だけ。「NEOを生成」は見積書の合計欄から自動で見分ける"""
+    if st.session_state.get('custom_neo_bytes'):
+        # テンプレート NEO を使うと、空欄の項目にはテンプレートの値（前の案件の立会工場・使用者名・車台番号など）が残る。
+        # ステップ④のプレビューには前からこの注意が出ていたが、**ベタ打ちの側には出ていなかった**ので、
+        # 立会工場を空のまま押すと前の案件の工場名が黙って入った（2026-09-21 Claude 並行バグハント ②）
+        st.warning("⚠️ テンプレートNEO を使用中です。**空欄のままの項目はテンプレートに入っている値がそのまま .neo に残ります**"
+                   "（立会工場・使用者名・車台番号・事故受付番号など）。別の案件として出す項目はサイドバーで入力し直してください。"
+                   "使わないときはサイドバー「📁 テンプレートNEO」の 🗑️ リセットで外せます。")
+    opts = ['税抜き（外税）', '税込み（内税）']
+    idx = 1 if ('内税' in str(saved) or '税込' in str(saved)) else 0
+    _c1, _c2 = st.columns([1, 2])
+    with _c1:
+        st.markdown('<div style="padding-top:6px;font-size:0.9rem">💴 <b>この見積書の金額表記</b></div>',
+                    unsafe_allow_html=True)
+    with _c2:
+        pick = st.radio('見積書の金額表記', options=opts, index=idx, horizontal=True,
+                        key='pdf_tax_radio', label_visibility='collapsed')
+    st.caption('この設定を使うのは「✏️ ベタ打ちで生成」と CSV 取り込みのときだけです。'
+               '「🚀 NEOを生成」は見積書の合計欄から税込・税抜を**自動で見分ける**ので、ここは見ません。')
+    st.session_state['pdf_tax_override'] = pick
+    st.session_state['tax_override'] = pick
+    st.session_state['_pdf_tax_row_shown'] = True
+    return pick
+
+
+_ERR_KINDS = (('APIキー', ('api key', 'api_key', 'unauthenticated', 'permission', '401', '403')),
+              ('利用上限（クォータ）', ('quota', 'rate limit', 'resource_exhausted', '429')),
+              ('モデルが使えない', ('not found', 'model', '404')),
+              ('通信', ('timeout', 'connection', 'network', 'unavailable', '503')))
+
+
+def _safe_err(e, kind: str = '') -> str:
+    """画面・ログに出してよい理由文だけを作る。**例外の本文は出さない**（API の返事や見積書の中身が
+    混じりうる ＝ 顧客情報が漏れる。2026-09-21 監査）。型名と、分かっている分類だけを返す"""
+    name = kind or (type(e).__name__ if isinstance(e, BaseException) else 'Error')
+    low = str(e).lower() if e is not None else ''
+    for label, keys in _ERR_KINDS:
+        if any(k in low for k in keys):
+            return f'{name}／{label}'
+    return name
+
+
+def _show_doc_ocr_error() -> None:
+    """添えた書類を読めなかったことを**結果のところ**で知らせる（読み取りは生成ボタンの後に走るので、
+    画面の上の添付欄はこの run ではもう描き終わっている）。合格・ベタ打ち・要確認の**どの結果でも**同じ文を出す
+    （以前は合格の枝にしか無く、ベタ打ちと要確認では黙っていた。Codex 第43周）。出したら必ず消す"""
+    err = st.session_state.pop('_doc_ocr_error', '')
+    if err:
+        st.warning(f"⚠️ 添えた書類を読み取れませんでした（{_md_literal(str(err))}）。"
+                   "**この NEO には書類の情報が入っていません**（見積書の印字と、サイドバーに入っている値だけで作っています）。"
+                   "書類を入れ直すか、サイドバーの事故・保険情報を手で入れて、もう一度作り直してください。")
+
+
+def _beta_exp_values() -> dict:
+    """ベタ打ちで NEO に足せる費用（サイドバーの入力）。**チェックを描く側と生成する側が同じ値を見る**ように
+    1 か所にまとめる（2026-09-21: チェックを関数に切り出したとき生成側の参照が消え、チェックを入れて押すと
+    NameError で落ちていた。費用が 0 でない案件では 100% 再現。Claude 並行バグハント ①）"""
+    return {'towing': safe_int(st.session_state.get('exp_towing', 0)),
+            'rental_car': safe_int(st.session_state.get('exp_rental', 0)),
+            'tax_exempt': safe_int(st.session_state.get('exp_exempt', 0))}
+
+
+def _beta_expense_gate(_p2n_file_key) -> bool:
+    """ベタ打ちで「サイドバーの費用を NEO に入れる」チェック。見積が変わったら外す（Codex 52）。
+    ボタンを横並びにしたときは、狭い列に長い文が入らないので**ボタンの行より前**に置く（2026-09-21）"""
+    exp = _beta_exp_values()
+    use = False
     if st.session_state.get('_beta_exp_file_key') != _p2n_file_key:
-        # 見積が変わったらチェックは外す（前の見積で入れた同意を次の見積に持ち越さない。Codex 52）
         st.session_state['pdf2neo_beta_use_exp'] = False
         st.session_state['_beta_use_exp_val'] = False
         st.session_state['_beta_exp_file_key'] = _p2n_file_key
-    if any(_p2n_beta_exp.values()):
+    if any(exp.values()):
         # 前の案件の入力が残っていても黙って足さない（合計が原本と食い違う）。チェックしたときだけ入れる（Codex 51）
-        _p2n_beta_use_exp = st.checkbox(
-            f"サイドバーの費用を NEO に入れる（レッカー ¥{_p2n_beta_exp['towing']:,}・代車 ¥{_p2n_beta_exp['rental_car']:,}・"
-            f"非課税 ¥{_p2n_beta_exp['tax_exempt']:,}）。見積書に印字の無い費用なので、入れると原本の合計とは一致しません",
+        use = st.checkbox(
+            f"✏️ ベタ打ちのとき、サイドバーの費用を NEO に入れる（レッカー ¥{exp['towing']:,}・代車 ¥{exp['rental_car']:,}・"
+            f"非課税 ¥{exp['tax_exempt']:,}）。見積書に印字の無い費用なので、入れると原本の合計とは一致しません",
             value=False, key='pdf2neo_beta_use_exp')
     # チェックの値はウィジェットとは別のキーに控える（このブロックを描かない run ではウィジェットの値が消え、指紋が食い違って
     # 結果が陳腐化・行き止まりになる。バグハント H1）
-    st.session_state['_beta_use_exp_val'] = bool(_p2n_beta_use_exp)
+    st.session_state['_beta_use_exp_val'] = bool(use)
+    return bool(use)
+
+
+def _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_model, _pdf_tax_sel,
+                      fallback=False, inline=False):
+    """ベタ打ち（旧経路 run_pdf_to_neo_pipeline）の生成ボタンとその処理。Addata が決まらないとき（本来の置き場）と、
+    スキル経路が不合格・車種未収録で NEO が出なかったときの逃げ道（fallback=True。2026-09-15 実機テスト: ボルボ V40 は
+    車種マスタに無く汎用車種の生成で例外、精算見積 4 本は検算差で不合格 → 以前は行き止まりだった）の 2 か所から呼ぶ。
+    inline=True は「NEO を生成」と**横並び**に置くとき（説明とチェックは呼ぶ側が先に描く。2026-09-21 亮平さん指示）"""
+    if not inline:
+        if (_att_cap := _attached_docs_caption(api_key, selected_model)):
+            st.caption(_att_cap)
+        _p2n_beta_use_exp = _beta_expense_gate(_p2n_file_key)
+    else:
+        _p2n_beta_use_exp = bool(st.session_state.get('_beta_use_exp_val'))
     if not api_key:
         st.caption("ベタ打ちの読み取りは Gemini を使います。サイドバーの「APIキー設定」に Gemini API キーを入れてください。")
         return
-    _label = ("✏️ ベタ打ちで作る（部品コード・標準指数なし。明細・金額は見積書のとおり、合計に合わせる金額調整の行が入ることがあります）"
-              if fallback else "✏️ ベタ打ちで生成（Addata なし・部品コード/標準指数は入りません）")
-    if st.button(_label, key='pdf2neo_run_beta', width='stretch'):
+    _label = ("✏️ ベタ打ちで生成" if inline else
+              ("✏️ ベタ打ちで作る（部品コード・標準指数なし。明細・金額は見積書のとおり、合計に合わせる金額調整の行が入ることがあります）"
+               if fallback else "✏️ ベタ打ちで生成（Addata なし・部品コード/標準指数は入りません）"))
+    if st.button(_label, key='pdf2neo_run_beta', width='stretch',
+                 help=("部品コード・標準指数を引かず、見積書の明細・金額をそのまま写します（Addata が無くても作れます）。"
+                       "合計に合わせる金額調整の行が入ることがあります" if inline else None)):
         st.session_state.pop('pdf2neo_result', None)
         st.session_state.pop('_pdf2neo_filename', None)
         st.session_state.pop('pdf2neo_beta_ack', None)   # 前の結果の「差異を確認した」チェックを次の結果に持ち越さない
@@ -8871,7 +8965,7 @@ def _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_mo
                 template_bytes=st.session_state.get('custom_neo_bytes'),
                 is_tax_inclusive=_p2n_beta_tax,
                 # 費用はチェックしたときだけ（上）。事故・保険欄は旧経路と同じ扱い（b15bd06 で外す前の呼び方）
-                expenses=(_p2n_beta_exp if _p2n_beta_use_exp else None),
+                expenses=(_beta_exp_values() if _p2n_beta_use_exp else None),
                 insurance_info=_p2n_beta_ins,
                 force_beta=True,
             )
@@ -8912,54 +9006,100 @@ def _nsk_code_stamp() -> str:
 
 
 def _attached_docs_ocr(api_key, model_name=None, progress=None, cached_only=False):
-    """STEP 1-B に添付した車検証（vehicle_upload）と事故・保険の書類（insurance_doc_upload）を Gemini で読み、
-    (車検証の dict, 書類の dict) を返す。読めなかったものは {}。同じファイルは内容ハッシュでセッションに控えて二度読まない。
-    書類の内容ハッシュは session_state['_insdoc_sha'] に置く（サイドバーへの一度きりの反映に使う）。
+    """添付（入れ物は 1 つ）を読み、(車検証の dict, 事故・保険の書類の dict) を返す。読めなかったものは {}。
+
+    **何の書類かは読み取りで見分ける**（2026-09-21 亮平さん指示で入れ物を 1 つにした）。ファイル名で当たりを付け、
+    外れたらもう一方として読み直す（車検証として読めなかった画像は、速報報告書などとして読む）。
+    同じファイル・同じモデル・同じキーなら内容ハッシュで控えて二度読まない。
 
     cached_only=True のときは**API を呼ばない**（控えにあるものだけ返す）。添付しただけで待たされないよう、
     読み取りは「生成」を押したあとに行う（2026-09-20 亮平さん指示）。画面を描くたびの呼び出しはこちらを使う"""
-    out = []
+    vd, doc = {}, {}
+    files = _docs_files()
+    if not files:
+        return {}, {}
     cache = st.session_state.setdefault('_doc_ocr_cache', {})
-    _k_veh, _k_doc = _doc_upload_keys()
-    for kind, key, fn, label in (('shaken', _k_veh, analyze_vehicle_registration, '車検証'),
-                                 ('insdoc', _k_doc, analyze_insurance_document, '事故・保険の書類')):
-        f = st.session_state.get(key)
-        data = {}
-        if f is not None and api_key:
-            try:
-                b = f.getvalue()
-            except Exception:  # noqa: BLE001
-                b = None
-            if b:
-                h = hashlib.sha256(b).hexdigest()
-                if kind == 'insdoc':
-                    st.session_state['_insdoc_sha'] = h
-                # 控えはモデルと API キーごと（モデルを切り替えた・キーを直したら読み直す。Codex 59）
-                _ck = (kind, h, str(model_name or ''), hashlib.sha256((api_key or '').encode('utf-8')).hexdigest()[:12])
-                if kind == 'insdoc':
-                    st.session_state['_insdoc_ocr_id'] = '|'.join(_ck[1:])   # 同じファイルでもモデル・キーが変われば別の読み取り（Codex 61）
-                _hit = cache.get(_ck)
-                if isinstance(_hit, dict) and (not _hit.get('_error') or time.time() - float(_hit.get('_t') or 0) < 120):
-                    data = _hit   # 成功はずっと、失敗は 2 分だけ控える（rerun のたびに同じファイルを送らない。Codex 57）
-                elif cached_only:
-                    data = {}     # まだ読んでいない（「生成」を押したときに読む）
+    kb = hashlib.sha256((api_key or '').encode('utf-8')).hexdigest()[:12]
+    # サイドバーへの一度きりの反映は「添付の組」で見る（どのファイルが書類かは読むまで決まらないため。2026-09-21）
+    _sig = _docs_sig()
+    st.session_state['_insdoc_sha'] = _sig
+    st.session_state['_insdoc_ocr_id'] = f'{_sig}|{model_name or ""}|{kb}'
+    if not api_key:
+        return {}, {}
+    _FN = {'shaken': (analyze_vehicle_registration, '車検証'),
+           'insdoc': (analyze_insurance_document, '事故・保険の書類')}
+    # 読む順番は**内容のハッシュ順**に固定する。入れた順番で採用される書類が変わると、指紋（inputs_sig）は
+    # 並べ替えて見ているため「中身が変わったのに古い結果のまま」になる（Codex 指摘 2026-09-21）
+    _fh, _skipped = [], 0
+    for _f in files:
+        try:
+            _b = _f.getvalue()
+        except Exception:  # noqa: BLE001
+            _b = b''
+        if _b:
+            _fh.append((hashlib.sha256(_b).hexdigest(), _f, _b))
+        else:
+            _skipped += 1   # 0 バイト・読み出せない添付。黙って捨てない（下で知らせる。Codex hunt X 2026-09-21）
+    _fh.sort(key=lambda x: x[0])
+    if _skipped and not cached_only:
+        # 添えたのに 1 枚も中身が取れないと、書類の情報が入っていない NEO が**警告なしで**出ていた
+        st.session_state['_doc_ocr_error'] = (f'添付 {_skipped} 件は中身が空か読み出せませんでした'
+                                              '（保存し直して入れ直してください）')
+    for _idx, (h, f, b) in enumerate(_fh, 1):
+        if vd and doc:
+            break
+        # 同じファイルが**すでにどちらかの役割で読めている**なら、その役割を先に試す（控えに当たって即決まる）。
+        # これが無いと、失敗の控えの 120 秒が切れたあとの 2 回目で失敗した側を先に試し、読み取りの揺れで
+        # 今度は成功して役割が入れ替わる ＝ 同じ見積書・同じ添付で違う NEO になる（Claude 並行バグハント ④）
+        _ok_kind = next((k for k in ('shaken', 'insdoc')
+                         if isinstance(_c0 := cache.get((k, h, str(model_name or ''), kb)), dict)
+                         and not _c0.get('_error')), '')
+        # 名前に「車検」などがあれば車検証から試す。すでに埋まっている枠は試さない
+        first = _ok_kind or ('shaken' if _SHAKEN_NAME_RE.search(str(f.name or '')) else 'insdoc')
+        order = [k for k in (first, 'insdoc' if first == 'shaken' else 'shaken')
+                 if not (vd if k == 'shaken' else doc)]
+        for kind in order:
+            fn, label = _FN[kind]
+            ck = (kind, h, str(model_name or ''), kb)   # 控えはモデルと API キーごと（Codex 59）
+            hit = cache.get(ck)
+            if isinstance(hit, dict) and not hit.get('_error'):
+                data = hit          # 成功はずっと控える（rerun のたびに同じファイルを送らない。Codex 57）
+            elif isinstance(hit, dict) and hit.get('_error') and time.time() - float(hit.get('_t') or 0) < 120:
+                continue            # 直前に失敗した読み方は 2 分だけ飛ばす（もう一方の読み方は試す）
+            elif cached_only:
+                continue            # まだ読んでいない（「生成」を押したときに読む）
+            else:
+                if progress:
+                    progress(f'添付 {_idx} 件目を読んでいます（{label}として）')   # ファイル名は出さない（顧客情報が入りやすい）
+                try:
+                    data = fn(api_key, b, get_mime_type(f.name), model_name) or {}
+                except Exception as e:  # noqa: BLE001
+                    data = {'_error': _safe_err(e)}   # 例外の本文は入れない（画面に出る。2026-09-21 監査）
+                if kind == 'shaken' and isinstance(data, dict) and not data.get('_error') and not _shaken_has_data(data):
+                    # confidence だけの返事を「読めた」として控えない（Codex 66。書類側は analyze_insurance_document が同じ判定を持つ）
+                    data = {'_error': '車検証のページを判別できませんでした'}
+                if isinstance(data, dict) and not data.get('_error'):
+                    cache[ck] = data
+                elif isinstance(data, dict) and data.get('_error'):
+                    cache[ck] = dict(data, _t=time.time())
+            if isinstance(data, dict) and not data.get('_error'):
+                if kind == 'shaken':
+                    vd = data
                 else:
-                    if progress:
-                        progress(f'{label}を読んでいます（{f.name}）')
-                    try:
-                        data = fn(api_key, b, get_mime_type(f.name), model_name) or {}
-                    except Exception as e:  # noqa: BLE001
-                        data = {'_error': f'{type(e).__name__}: {e}'}
-                    if kind == 'shaken' and isinstance(data, dict) and not data.get('_error') and not _shaken_has_data(data):
-                        # confidence だけの返事を「読めた」として控えない（Codex 66。書類側は analyze_insurance_document が同じ判定を持つ）
-                        data = {'_error': '車検証のページを判別できませんでした'}
-                    if isinstance(data, dict) and not data.get('_error'):
-                        cache[_ck] = data
-                    elif isinstance(data, dict) and data.get('_error'):
-                        cache[_ck] = dict(data, _t=time.time())
-                        st.session_state['_doc_ocr_error'] = f"{label}: {data['_error']}"
-        out.append(data if isinstance(data, dict) and not data.get('_error') else {})
-    return out[0], out[1]
+                    doc = data
+                break
+        else:
+            # どちらの読み方でも読めなかった（両方 error／控えの失敗が新しい）。結果のところで知らせる
+            if not cached_only:
+                _e = ''
+                for kind in ('shaken', 'insdoc'):
+                    _h = cache.get((kind, h, str(model_name or ''), kb))
+                    if isinstance(_h, dict) and _h.get('_error'):
+                        _e = str(_h['_error'])
+                # ファイル名は出さない（「山田太郎_品川300あ1234.pdf」のように顧客情報が入りやすい。Codex 指摘 2026-09-21）
+                st.session_state['_doc_ocr_error'] = (f'添付 {_idx} 件目: '
+                                                      + (_e or '車検証・事故/保険の書類のどちらとしても読めませんでした'))
+    return vd, doc
 
 
 def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=None,
@@ -9044,7 +9184,8 @@ def run_pdf_to_neo_pipeline(pdf_bytes, api_key, model_name=None, template_bytes=
             return {'ok': False, 'error': 'PDF→NEO変換が想定外の値を返しました'}
         return result
     except Exception as e:
-        return {'ok': False, 'error': f'PDF→NEO変換に失敗しました: {e}'}
+        # 例外の本文は入れない（画面に出る。見積書の中身が混じりうる。2026-09-21 監査）
+        return {'ok': False, 'error': 'PDF→NEO変換に失敗しました（種類: ' + _safe_err(e) + '）'}
     finally:
         for _path in (tmp_pdf, tmp_tpl):
             if _path:
@@ -9311,6 +9452,101 @@ def main():
       .step-bar { padding:10px 12px; }
       .total-strip, .vehicle-strip { padding:12px 14px; }
     }
+    /* ══ 2026-09-21 見た目の詰め: 主役と脇役をはっきり分ける ══════════════ */
+    .chip { font-size:10.5px; font-weight:700; padding:3px 9px; border-radius:999px; letter-spacing:.02em;
+            display:inline-flex; align-items:center; gap:4px; }
+    .chip-ok   { background:rgba(34,197,94,.18); color:#bbf7d0; border:1px solid rgba(34,197,94,.45); }
+    .chip-warn { background:rgba(251,191,36,.18); color:#fde68a; border:1px solid rgba(251,191,36,.5); }
+    /* 主役の入れ物（見積書）= 濃い枠・淡い色地。脇役（添付）= 破線で控えめ */
+    [class*="st-key-pdf2neo_upload"] [data-testid="stFileUploader"] {
+      border:2px solid var(--brand-line) !important; background:var(--brand-soft) !important;
+      box-shadow:0 1px 2px rgba(29,78,216,.06) !important;
+    }
+    [class*="st-key-pdf2neo_upload"] [data-testid="stFileUploader"]:hover { border-color:var(--brand-2) !important; }
+    [class*="st-key-docs_upload"] [data-testid="stFileUploader"] {
+      border:1.5px dashed #cbd5e1 !important; background:#fcfdff !important;
+    }
+    [class*="st-key-docs_upload"] [data-testid="stFileUploader"]:hover {
+      border-color:var(--brand-2) !important; background:var(--brand-soft) !important;
+    }
+    [class*="st-key-pdf2neo_upload"] label p { font-weight:800 !important; font-size:13.5px !important; color:var(--ink) !important; }
+    [class*="st-key-docs_upload"] label p { font-weight:600 !important; font-size:12.5px !important; color:var(--ink-3) !important; }
+    /* 生成のボタン: 主役は濃いグラデ、ベタ打ちは輪郭だけ（押し間違えない） */
+    [class*="st-key-pdf2neo_run"]:not([class*="_beta"]) button[kind="primary"]:not(:disabled) {
+      background:linear-gradient(135deg,#2563eb 0%,#1d4ed8 100%) !important; border:none !important;
+      box-shadow:0 2px 8px rgba(29,78,216,.28) !important; font-weight:800 !important; letter-spacing:.02em;
+    }
+    [class*="st-key-pdf2neo_run"]:not([class*="_beta"]) button[kind="primary"]:not(:disabled):hover {
+      box-shadow:0 4px 14px rgba(29,78,216,.36) !important; transform:translateY(-1px);
+    }
+    [class*="st-key-pdf2neo_run_beta"] button {
+      background:var(--surface) !important; border:1.5px solid var(--brand-line) !important;
+      color:var(--brand) !important; font-weight:700 !important;
+    }
+    [class*="st-key-pdf2neo_run_beta"] button:hover {
+      background:var(--brand-soft) !important; border-color:var(--brand-2) !important;
+    }
+    /* 押せないボタンは「使えない理由がある」と分かる見た目に（薄いだけだと故障に見える） */
+    [data-testid="stBaseButton-primary"]:disabled {
+      background:#e2e8f0 !important; color:#94a3b8 !important; box-shadow:none !important; opacity:1 !important;
+    }
+    /* 金額表記の行は主導線の一部なので、余白を詰めて 1 行に見せる */
+    [class*="st-key-pdf_tax_radio"] { margin-top:-6px; }
+    [class*="st-key-pdf_tax_radio"] [role="radiogroup"] { gap:14px !important; }
+    /* ══ 2026-09-21(2) 使う人の目線でもう一段 ═══════════════════════════ */
+    /* 金額は等幅の数字で（桁が揃い、読み違えない） */
+    .total-value, .total-value-highlight, .stMarkdown table td, .stMarkdown table th,
+    [data-testid="stMetricValue"] { font-variant-numeric: tabular-nums; font-feature-settings:"tnum" 1; }
+    /* 受け取りの見出し（成果物が 2 つで 1 組だと分かるように） */
+    .deliver-head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;
+                    font-size:13px; font-weight:800; color:var(--ink); margin:14px 0 6px; }
+    .deliver-head span { font-size:11px; font-weight:600; color:var(--ink-3); }
+    /* 受け取りのボタン: NEO は緑の面、シートは緑の輪郭（どちらも成果物だと分かる並び） */
+    [class*="st-key-pdf2neo_dl"] button:not(:disabled) {
+      background:linear-gradient(135deg,#16a34a 0%,#15803d 100%) !important; border:none !important;
+      color:#fff !important; font-weight:800 !important; box-shadow:0 2px 8px rgba(21,128,61,.25) !important;
+    }
+    [class*="st-key-pdf2neo_dl"] button:not(:disabled):hover {
+      box-shadow:0 4px 14px rgba(21,128,61,.34) !important; transform:translateY(-1px);
+    }
+    [class*="st-key-pdf2neo_dl_review"] button:not(:disabled) {
+      background:var(--surface) !important; border:1.5px solid #86efac !important;
+      color:#15803d !important; box-shadow:none !important;
+    }
+    [class*="st-key-pdf2neo_dl_review"] button:not(:disabled):hover {
+      background:var(--ok-soft) !important; border-color:#22c55e !important;
+    }
+    /* 進み具合の帯を薄くして、主導線の高さを稼ぐ */
+    .step-bar { padding:8px 14px !important; }
+    .step-circle { width:26px !important; height:26px !important; font-size:12px !important; }
+    /* 入れ物にカーソルを乗せたときの手応え（押せる所だと分かる） */
+    [data-testid="stFileUploader"] { transition:border-color .12s ease, background .12s ease, transform .12s ease; }
+    [data-testid="stFileUploader"]:hover { transform:translateY(-1px); }
+    /* ══ 2026-09-21(3) 入れる所を「見ただけで分かる」形に ════════════════ */
+    /* 入れ物のラベルに小さな印（必須／あれば）を付ける。字を読まなくても主従が分かる */
+    [class*="st-key-pdf2neo_upload"] label p::after {
+      content:"必須"; margin-left:8px; font-size:10px; font-weight:800; letter-spacing:.06em;
+      color:#1d4ed8; background:#dbeafe; border:1px solid #bfdbfe; border-radius:999px; padding:1px 7px;
+      vertical-align:2px;
+    }
+    [class*="st-key-docs_upload"] label p::after {
+      content:"あれば"; margin-left:8px; font-size:10px; font-weight:700; letter-spacing:.06em;
+      color:#64748b; background:#f1f5f9; border:1px solid #e2e8f0; border-radius:999px; padding:1px 7px;
+      vertical-align:2px;
+    }
+    /* 入れ物どうしの間を詰める（2 つで 1 かたまりに見せる） */
+    [class*="st-key-pdf2neo_upload"] { margin-bottom:-4px; }
+    /* ファイルが入っている入れ物は「済んだ」色に（緑の細い縁取り） */
+    [data-testid="stFileUploader"]:has([data-testid="stFileChip"]),
+    [data-testid="stFileUploader"]:has([data-testid="stFileUploaderFile"]) {
+      border-color:#86efac !important; background:#f6fefa !important;
+    }
+    /* 上のバーに軽い光沢（のっぺりさせない） */
+    .topbar { position:relative; overflow:hidden; }
+    .topbar::after {
+      content:""; position:absolute; inset:0; pointer-events:none;
+      background:radial-gradient(120% 140% at 88% -30%, rgba(96,165,250,.28) 0%, rgba(96,165,250,0) 58%);
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -9341,58 +9577,28 @@ def main():
 
         # ── 設定 ──
         st.markdown('<div style="font-size:10px;font-weight:700;color:#94a3b8;letter-spacing:.08em;text-transform:uppercase;padding:4px 0">設定</div>', unsafe_allow_html=True)
-        # APIキーは .env / Secrets に入れてあれば触らない。サイドバーの上に居座らせず、たたんでおく
-        with st.expander("🔑 APIキー・AIモデル", expanded=not (ANTHROPIC_API_KEY and GEMINI_API_KEY)):
-            # 見積書 PDF → NEO（pdf-to-neo スキル経路）は Claude か Gemini で読む（両方あれば画面で選ぶ）。
-            # Gemini は CSV 取り込み・車検証 OCR・旧経路でも使う。
-            if ANTHROPIC_API_KEY:
-                claude_api_key = ANTHROPIC_API_KEY
-                st.success("Claude APIキー: 設定済み (.env)")
-            else:
-                claude_api_key = (st.text_input(
-                    "Claude APIキー（見積書の読み取り）",
-                    type="password",
-                    key='claude_api_key_input',
-                    help=".envファイルの ANTHROPIC_API_KEY にキーを設定すれば毎回入力不要"
-                ) or '').strip()   # 空白だけの入力を「キーあり」にしない
-            if GEMINI_API_KEY:
-                api_key = GEMINI_API_KEY
-                st.success("Gemini APIキー: 設定済み (.env)")
-            else:
-                api_key = (st.text_input(
-                    "Gemini APIキー（見積書の読み取り・CSV取り込み・車検証OCR）",
-                    type="password",
-                    help=".envファイルの GEMINI_API_KEY にキーを設定すれば毎回入力不要"
-                ) or '').strip()
-            # 利用可能なモデルをAPIで動的取得（APIキーがある場合のみ）
-            if api_key:
-                _ck = _model_cache_key(api_key)
-                if _ck in _availability_cache():
-                    _avail_models = _availability_cache()[_ck]
-                else:
-                    with st.spinner("利用可能なモデルを確認中..."):
-                        _avail_models = get_available_gemini_models(api_key)
-            else:
-                _avail_models = [_FALLBACK_MODEL]
-            # 自動切り替え済みのモデルがあればそれを初期選択にする
-            _pref_model = st.session_state.get('selected_model')
-            _model_index = _avail_models.index(_pref_model) if _pref_model in _avail_models else 0
-            selected_model = st.selectbox(
-                "🤖 AIモデル",
-                options=_avail_models,
-                index=_model_index,
-                key="model_selector_v2",
-                help="Gemini APIで実際に利用可能なモデルを自動検出（提供終了モデルは除外）。Flash=高速・コスパ良好、Pro=高精度"
-            )
-        st.markdown("---")
-        st.markdown("**🗂 Addata（車種データベース）**")
+        # Addata は**最初に 1 回だけ**やること。サイドバーの先頭に置き、状態がひと目で分かる形にする（2026-09-21 亮平さん指示）
+        _ad_now = find_addata_dir()
+        st.markdown(
+            '<div style="background:%s;border:1.5px solid %s;border-radius:10px;padding:8px 10px;margin:2px 0 6px">'
+            '<div style="font-size:13px;font-weight:800;color:%s">%s</div>'
+            '<div style="font-size:11px;color:#475569;margin-top:2px">%s</div></div>' % (
+                ('#f0fdf4', '#86efac', '#15803d', '🗂 ① Addata：つながっています',
+                 'このブラウザに覚えました。次に開いたときは自動でつなぎ直します')
+                if _ad_now else
+                ('#fffbeb', '#fcd34d', '#b45309', '🗂 ① Addata：まず、ここをつなぎます',
+                 '下の「PC の Addata をこの画面から使う」で C:\Addata を選んでください（最初の 1 回だけ）')),
+            unsafe_allow_html=True)
         # ── PC の Addata をブラウザ経由で使う（クラウド向け。neo_skill.bridge / addata_bridge/index.html）──
         # サーバは利用者の PC を読めないので、ブラウザ側で PC のフォルダを選んでもらい、
         # 車種マスタ（COM）と見積の車種フォルダだけをこの画面のアプリに送ってもらう
-        with st.expander("🖥️ PC の Addata をこの画面から使う（クラウド向け・おすすめ）",
-                         expanded=bool(st.session_state.get('_bridge_path') or not find_addata_dir())):
+        with st.expander("🖥️ PC の Addata をこの画面から使う（おすすめ）",
+                         expanded=bool(st.session_state.get('_bridge_path') or not _ad_now)):
             st.caption("PC の Addata フォルダ（C:\\Addata）を一度選ぶと、車種マスタ（約 9MB）と見積の車種フォルダ（数 MB）だけを"
-                       "この画面に送って照合に使います。5GB を上げる必要はありません。Chrome / Edge で使えます。")
+                       "この画面に送って照合に使います。5GB を上げる必要はありません。Chrome / Edge で使えます。  \n"
+                       "**選んだフォルダはこのブラウザが覚えます**。画面を読み直しても（F5）つながったままです。"
+                       "ブラウザを閉じて開き直したときだけ、🔓 のボタンを **1 回**押してください"
+                       "（フォルダを読む許可はブラウザを閉じると切れる決まりのため）。")
             try:
                 from neo_skill import bridge as _br
                 _bpath = _br.root(st.session_state)
@@ -9727,6 +9933,50 @@ def main():
                     st.session_state['_addata_zip_id'] = _zip_id
                     st.error(f"❌ {_why}")
         st.markdown("---")
+        # APIキーは .env / Secrets に入れてあれば触らない。サイドバーの上に居座らせず、たたんでおく
+        with st.expander("🔑 APIキー・AIモデル", expanded=not (ANTHROPIC_API_KEY and GEMINI_API_KEY)):
+            # 見積書 PDF → NEO（pdf-to-neo スキル経路）は Claude か Gemini で読む（両方あれば画面で選ぶ）。
+            # Gemini は CSV 取り込み・車検証 OCR・旧経路でも使う。
+            if ANTHROPIC_API_KEY:
+                claude_api_key = ANTHROPIC_API_KEY
+                st.success("Claude APIキー: 設定済み (.env)")
+            else:
+                claude_api_key = (st.text_input(
+                    "Claude APIキー（見積書の読み取り）",
+                    type="password",
+                    key='claude_api_key_input',
+                    help=".envファイルの ANTHROPIC_API_KEY にキーを設定すれば毎回入力不要"
+                ) or '').strip()   # 空白だけの入力を「キーあり」にしない
+            if GEMINI_API_KEY:
+                api_key = GEMINI_API_KEY
+                st.success("Gemini APIキー: 設定済み (.env)")
+            else:
+                api_key = (st.text_input(
+                    "Gemini APIキー（見積書の読み取り・CSV取り込み・車検証OCR）",
+                    type="password",
+                    help=".envファイルの GEMINI_API_KEY にキーを設定すれば毎回入力不要"
+                ) or '').strip()
+            # 利用可能なモデルをAPIで動的取得（APIキーがある場合のみ）
+            if api_key:
+                _ck = _model_cache_key(api_key)
+                if _ck in _availability_cache():
+                    _avail_models = _availability_cache()[_ck]
+                else:
+                    with st.spinner("利用可能なモデルを確認中..."):
+                        _avail_models = get_available_gemini_models(api_key)
+            else:
+                _avail_models = [_FALLBACK_MODEL]
+            # 自動切り替え済みのモデルがあればそれを初期選択にする
+            _pref_model = st.session_state.get('selected_model')
+            _model_index = _avail_models.index(_pref_model) if _pref_model in _avail_models else 0
+            selected_model = st.selectbox(
+                "🤖 AIモデル",
+                options=_avail_models,
+                index=_model_index,
+                key="model_selector_v2",
+                help="Gemini APIで実際に利用可能なモデルを自動検出（提供終了モデルは除外）。Flash=高速・コスパ良好、Pro=高精度"
+            )
+        st.markdown("---")
         with st.expander("🔬 精度オプション（ふだんは既定のまま）", expanded=False):
             use_fax_filter = st.checkbox(
                 "FAXページ自動除外",
@@ -9850,6 +10100,15 @@ def main():
     # ── Topbar ──
     api_dot_color = "#22c55e" if api_key else "#ef4444"
     api_status_text = "接続中" if api_key else "未設定"
+    # Addata の状態は上のバーの右にチップで出す（つながっているときは下の帯を出さず、1 行ぶん詰める。2026-09-21）
+    _ad_top = find_addata_dir()
+    try:
+        from addata_locator import addata_version as _ad_ver_top
+        _ad_top_ver = (_ad_ver_top(_ad_top) or '') if _ad_top else ''
+    except Exception:  # noqa: BLE001
+        _ad_top_ver = ''
+    _ad_chip = ('<span class="chip chip-ok">🗂 Addata ' + (_ad_top_ver or '接続') + '</span>'
+                if _ad_top else '<span class="chip chip-warn">🗂 Addata 未接続</span>')
     st.markdown(f"""
     <div class="topbar">
         <div class="topbar-title">
@@ -9860,9 +10119,23 @@ def main():
             <span><span class="api-dot" style="background:{api_dot_color}"></span>Gemini API {api_status_text}</span>
             <span>|</span>
             <span>モデル: {selected_model}</span>
+            {_ad_chip}
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # ── Addata の状態（主画面の先頭に常に出す。サイドバーを開かなくても分かるように。2026-09-21 亮平さん指示）──
+    _ad_main = _ad_top
+    if not _ad_main:
+        st.markdown(
+            '<div style="background:#fffbeb;border:1.5px solid #fcd34d;border-radius:10px;'
+            'padding:10px 14px;margin:2px 0 10px">'
+            '<div style="font-size:14px;font-weight:800;color:#b45309">🗂 まず Addata をつなぎます（最初の 1 回だけ）</div>'
+            '<div style="font-size:12px;color:#475569;margin-top:3px;line-height:1.7">'
+            '左のサイドバーの先頭「🗂 ① Addata」→「🖥️ PC の Addata をこの画面から使う」で '
+            '<b>C:\\Addata</b> を選んでください。一度選べばこのブラウザに覚えるので、次からは自動でつながります。<br>'
+            'つながないままでも「✏️ ベタ打ちで生成」は使えます（部品コード・標準指数は入りません）。</div></div>',
+            unsafe_allow_html=True)
 
     # ── Step progress bar ──
     # 進み具合は**実際の状態**で出す（以前は常に「①」のままで、どこまで進んだか分からなかった。2026-09-20 画面の作り直し）。
@@ -9962,17 +10235,19 @@ def main():
                 '<div style="font-size:13px;color:#334155;margin-top:6px;line-height:1.7;">'
                 '次の見積書を作るときは、下の「見積書（PDF・写真）」を入れ替えます（前の案件の添付・保険欄・結果は自動で消えます）。</div>'
                 '</div>', unsafe_allow_html=True)
-        else:
+        elif not st.session_state.get('pdf2neo_upload'):
+            # **まだ見積書を入れていないときだけ**、大きな案内を出す。入れた後は同じ文言が 3 か所
+            # （帯・この案内・入れ物のラベル）で重なるので引っ込める（2026-09-21 使う人の目線で整理）
             st.markdown(
                 '<div style="background:#eff6ff;border:1.5px dashed #60a5fa;'
                 'border-radius:14px;padding:16px 20px;margin-bottom:10px;">'
                 '<div style="font-size:18px;font-weight:800;color:#1d4ed8;letter-spacing:.02em;">'
-                '📄 見積書（PDF・写真）を入れて、下の「見積書からNEOを生成」を押すだけ</div>'
-                '<div style="font-size:13px;color:#334155;margin-top:6px;line-height:1.7;">'
-                'AI が<b>印字どおり</b>に写し、機械検算に通れば <b>NEO と確認箇所シート（xlsx）</b>を組でお渡しします。'
-                '<b>合計を合わせるための金額調整はしません</b>。</div>'
+                '📄 見積書を入れて、下の「NEOを生成」を押すだけ</div>'
+                '<div style="font-size:12px;color:#64748b;margin-top:4px;line-height:1.6;">'
+                '印字どおりに写し、機械検算に通れば <b>NEO ＋ 確認箇所シート</b>を組でお渡しします'
+                '<span style="color:#94a3b8"> ／ 合計合わせの金額調整はしません</span></div>'
                 '</div>', unsafe_allow_html=True)
-        # 説明のたたみ（このアプリが何をするか・金額表記の設定）は**結果より下**に置く。
+        # 説明のたたみ（このアプリが何をするか）は**結果より下**に置く（金額表記は生成ボタンのすぐ上に出す）。
         # 主導線（見積書を入れる → 生成 → 受け取る）の上に置くと、生成後のダウンロードが画面の外に出ていた
         # （2026-09-20 実測: ダウンロードが y=1013 で画面 950px の外）。ここでは値だけ読む
         _pdf_tax_options = ['税抜き（外税）', '税込み（内税）']
@@ -9981,7 +10256,7 @@ def main():
         _pdf_tax_sel = _saved_pdf_tax
 
         _p2n_file = st.file_uploader(
-            "📄 見積書（PDF・写真）をここにドロップ、またはクリックして選択",
+            "📄 **見積書**（PDF・写真）— ここにドロップ、またはクリックして選択",
             type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
             key='pdf2neo_upload',
         )
@@ -9999,9 +10274,11 @@ def main():
                 st.session_state['_p2n_last_file_key'] = _p2n_early_key
                 _docs_now = _docs_sig()
                 _docs_prev = str(st.session_state.get('_p2n_last_docs_sig') or '')
-                # 片方の書類だけ前の見積書のときのまま（もう片方だけ入れ替えた）なら、残った方は前の案件の書類 ＝ 全部消す（Codex 76）
-                _slot_same = any(p and p == n for p, n in zip(_docs_prev.split('|'), _docs_now.split('|')))
-                if not any(_docs_now.split('|')) or _docs_now == _docs_prev or _slot_same:
+                # 1 枚でも前の見積書のときの書類がそのまま残っていたら、それは前の案件の書類 ＝ 全部消す（Codex 76。
+                # 入れ物を 1 つにしたので「枠」ではなく**中身の重なり**で見る。2026-09-21）
+                _docs_now_set = {x for x in _docs_now.split('|') if x}
+                _slot_same = bool(_docs_now_set & {x for x in _docs_prev.split('|') if x})
+                if not _docs_now_set or _docs_now == _docs_prev or _slot_same:
                     # 添付が無い、前の見積書のときのまま、または片方が前のまま ＝ 前の案件の書類・保険欄。消して案内する（Codex 73/76）
                     _reset_case_inputs()
                     st.session_state['_p2n_reset_msg'] = (
@@ -10024,58 +10301,66 @@ def main():
             st.info("🔄 " + str(st.session_state.pop('_p2n_reset_msg')))
         # 添付の書類（車検証・事故/保険の書類）は生成ボタンより前に描く: ボタンの処理が st.rerun() したとき、まだ描いていない
         # uploader の値は Streamlit に捨てられ、車種フォルダ待ちからの再開で添付が消えてしまう（2026-09-14 実ブラウザで発覚）
-        # 主役は見積書なので、任意の書類はたたんでおく（添付があるときは開いた状態にして、見出しに名前を出す。2026-09-20 画面の作り直し）
-        _doc_k0, _doc_k1 = _doc_upload_keys()[0], _doc_upload_keys()[1]
-        _doc_on = [bool(st.session_state.get(_doc_k0)), bool(st.session_state.get(_doc_k1))]
-        _doc_title = ('📎 添付ずみ: ' + ' ／ '.join(n for n, on in (('車検証', _doc_on[0]), ('事故・保険の書類', _doc_on[1])) if on)
-                      if any(_doc_on) else
-                      '📎 任意の書類を添える（車検証・事故/保険の書類）— 入れると車両・顧客・保険の情報が NEO に入ります')
-        with st.expander(_doc_title, expanded=any(_doc_on)):
-            vehicle_file = st.file_uploader(
-                "📋 車検証（任意）PDF・JPG・PNG 対応",
-                type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
-                key=_doc_upload_keys()[0],
-            )
-            insurance_doc_file = st.file_uploader(
-                "🛡️ 事故・保険の書類（任意）速報報告書・受付票などの写真/PDF",
-                type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
-                key=_doc_upload_keys()[1],
-                help="保険会社・共済からの速報報告書や事故受付票の写真・スクリーンショット。依頼会社名・支店・担当者・事故番号・事故日・"
-                     "契約者名・カラーNo・走行距離などを読み取り、サイドバーの事故・保険情報と NEO の車両情報に使います",
-            )
-            # 事故・保険の書類の差し替え／取り外しに合わせて、書類から埋めた欄を消す（API キーの有無・読み取りの成否に関係なく。
-            # 前の案件の受付番号や担当者を次の案件に残さない。Codex 54〜58）。消したあと、読めたら下で入れ直す
-            _ins_sha = ''
-            if insurance_doc_file is not None:
-                try:
-                    _ins_sha = hashlib.sha256(insurance_doc_file.getvalue()).hexdigest()
-                except Exception:  # noqa: BLE001
-                    _ins_sha = ''
-            if _ins_sha != st.session_state.get('_insdoc_cleared_sha', ''):
-                # 前の書類から入れた値のまま（利用者が直していない）項目だけ消す。手で入れた・直した値は残す（Codex 61）
-                _filled_before = st.session_state.get('_insdoc_filled') or {}
-                for _k in _DOC_INSURANCE_KEYS:
-                    if _k in _filled_before and str(st.session_state.get(_k, '') or '') == str(_filled_before.get(_k) or ''):
-                        st.session_state[_k] = ''
-                st.session_state['_insdoc_cleared_sha'] = _ins_sha
-                st.session_state.pop('_insdoc_applied', None)
-                st.session_state.pop('_insdoc_filled', None)
-                st.session_state['form_seq'] = int(st.session_state.get('form_seq', 0)) + 1   # 入力欄を作り直して空にする
-                st.rerun()
-            # 添付の書類は**ここでは読まない**（入れただけで 30 秒待たされ、生成ボタンもすぐ押せなかった。
-            # 2026-09-20 亮平さん指示: 投げ込む → 生成を押す → 読み取り・生成 → 結果で確かめて直す、の流れにする）。
-            # 読み取りは生成の中（_attached_docs_ocr）で行い、読めた事故・保険情報は生成後にサイドバーへ入る
-            if vehicle_file or insurance_doc_file:
-                if not api_key:
-                    st.caption("書類の読み取りには Gemini API キーが必要です（サイドバーの「APIキー設定」）")
-                else:
-                    _att_vd0, _att_doc0 = _attached_docs_ocr(api_key, selected_model, cached_only=True)
-                    _att_sum0 = _doc_hints.summary(_att_vd0, _att_doc0)
-                    st.caption(("読み取り済み → " + _att_sum0 + "（この内容で生成します。直すときはサイドバーの事故・保険情報で）")
-                               if _att_sum0 else
-                               "この書類は「🚀 見積書からNEOを生成」を押したあとに読み取ります（待たずに次へ進めます）")
-                    if st.session_state.get('_doc_ocr_error'):
-                        st.warning("⚠️ 読み取れませんでした: " + str(st.session_state.pop('_doc_ocr_error')))
+        # 入れ物は**1 つ**にして常に開いておく（車検証も速報報告書も、まとめて放り込めるように。2026-09-21 亮平さん指示）。
+        # 何の書類かは読み取りで見分ける（_attached_docs_ocr）
+        _doc_files_now = st.file_uploader(
+            "📎 添付（あれば）— 車検証・事故/保険の書類。**まとめて何枚でも**入れられます",
+            type=['pdf', 'jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif'],
+            accept_multiple_files=True, key=_docs_upload_key(),
+            help="車検証の写真・PDF と、保険会社/共済の速報報告書・事故受付票の写真やスクリーンショット。"
+                 "何の書類かは読み取りで見分けます。読み取った値は車両・顧客の情報と、"
+                 "サイドバーの事故・保険情報に入ります（生成のあとに画面で確かめて直せます）")
+        # 添付の差し替え／取り外しに合わせて、書類から埋めた欄を消す（API キーの有無・読み取りの成否に関係なく。
+        # 前の案件の受付番号や担当者を次の案件に残さない。Codex 54〜58）。消したあと、読めたら下で入れ直す
+        _ins_sha = _docs_sig() if _doc_files_now else ''
+        if _ins_sha != st.session_state.get('_insdoc_cleared_sha', ''):
+            # 前の書類から入れた値のまま（利用者が直していない）項目だけ消す。手で入れた・直した値は残す（Codex 61）
+            _filled_before = st.session_state.get('_insdoc_filled') or {}
+            for _k in _DOC_INSURANCE_KEYS:
+                if _k in _filled_before and str(st.session_state.get(_k, '') or '') == str(_filled_before.get(_k) or ''):
+                    st.session_state[_k] = ''
+            st.session_state['_insdoc_cleared_sha'] = _ins_sha
+            st.session_state.pop('_insdoc_applied', None)
+            st.session_state.pop('_insdoc_filled', None)
+            st.session_state['form_seq'] = int(st.session_state.get('form_seq', 0)) + 1   # 入力欄を作り直して空にする
+            st.rerun()
+        # 添付は**ここでは読まない**（入れただけで 30 秒待たされ、生成ボタンもすぐ押せなかった。
+        # 2026-09-20 亮平さん指示: 投げ込む → 生成を押す → 読み取り・生成 → 結果で確かめて直す、の流れにする）。
+        # 読み取りは生成の中（_attached_docs_ocr）で行い、読めた事故・保険情報は生成後にサイドバーへ入る
+        # 車検証だけで作る道（下の「🛟 …」）は 1 ファイルを受け取る作りなので、添付から**車検証と分かるもの**だけ渡す。
+        # 分からないもの（受付票など）を渡すと、その経路はそれを車検証として読もうとする（Codex 第41周）。
+        # 優先: ① 読み取りで車検証として読めたファイル ② 名前に「車検」等があるファイル ③ 渡さない
+        vehicle_file = None
+        if _doc_files_now:
+            _vd_seen = (_attached_docs_ocr(api_key, selected_model, cached_only=True)[0] if api_key else {})
+            if _vd_seen:
+                _cache = st.session_state.get('_doc_ocr_cache') or {}
+                _kb = hashlib.sha256((api_key or '').encode('utf-8')).hexdigest()[:12]
+                for _f in _doc_files_now:
+                    try:
+                        _h = hashlib.sha256(_f.getvalue()).hexdigest()
+                    except Exception:  # noqa: BLE001
+                        continue
+                    _hit = _cache.get(('shaken', _h, str(selected_model or ''), _kb))
+                    if isinstance(_hit, dict) and not _hit.get('_error'):
+                        vehicle_file = _f
+                        break
+            if vehicle_file is None:
+                vehicle_file = next((f for f in _doc_files_now if _SHAKEN_NAME_RE.search(str(f.name or ''))), None)
+        if _doc_files_now:
+            if not api_key:
+                st.caption("書類の読み取りには Gemini API キーが必要です（サイドバーの「APIキー設定」）")
+            else:
+                _att_vd0, _att_doc0 = _attached_docs_ocr(api_key, selected_model, cached_only=True)
+                _att_sum0 = _doc_hints.summary(_att_vd0, _att_doc0)
+                st.caption(("読み取り済み → " + _att_sum0 + "（この内容で生成します。直すときはサイドバーの事故・保険情報で）")
+                           if _att_sum0 else
+                           f"添付 {len(_doc_files_now)} 件は生成のボタンを押したあとに読み取ります（待たずに次へ進めます）")
+                # ここで pop すると、生成後の run では**結果より先に**消えてしまい、ダウンロードの近くで
+                # 「書類の情報が入っていない」ことに気づけない（Codex 指摘 2026-09-21）。
+                # 結果を出す run では触らず、結果のところに任せる
+                if st.session_state.get('_doc_ocr_error') and not st.session_state.get('pdf2neo_result'):
+                    st.warning("⚠️ 読み取れませんでした: " + str(st.session_state.pop('_doc_ocr_error')))
         if st.session_state.pop('_p2n_deferred_rerun', False):
             st.rerun()   # 書類の uploader を描き終えたので、サイドバーの入力欄（form_seq）と案内を描き直す
         if _p2n_file is None:
@@ -10085,32 +10370,63 @@ def main():
             st.caption("↑ 上の「見積書（PDF・写真）」に見積書を入れると押せます。")
         _p2n_beta_ui_shown = False   # この run でベタ打ちの UI を描いたか（locals() で見ない。バグハント H7）
         if _p2n_file is not None:
-            _p2n_bytes = _p2n_file.read()
-            _p2n_file.seek(0)
+            _p2n_bytes = _p2n_file.getvalue()   # read()+seek より位置に依存しない（run をまたいで同じ物が残る）
             # この見積の同一性（車種フォルダ待ちの取り置きが別の見積で再開されないよう照合する）
             _p2n_file_key = f"{_p2n_file.name}|{len(_p2n_bytes)}|{hashlib.sha256(_p2n_bytes).hexdigest()}"
             _p2n_beta_ui_shown = False   # この run でベタ打ちの UI を描いたか（Addata なしの枝で立てる。結果の下の逃げ道と二重に描かない）
             # ファイル名・大きさは上の入れ物に出ているので、ここでは繰り返さない（2026-09-20 画面の作り直し）
             # 「サイドバーの入力はどう使われるか」は結果より下に置いた（主導線を短くする。2026-09-20 使い勝手の点検）
-            if not _nsk_ready:
-                st.error("❌ pdf-to-neo スキル（vendor/pdf_to_neo）が使えません: " + _nsk_why
-                         + "  → `python tools/vendor_sync.py --source <files> --commit <ID>` で取り込み、"
-                         "アプリを再起動してください。")
-            elif not (claude_api_key or api_key):
-                st.warning("⚠️ 見積書の読み取りには Claude または Gemini の APIキーが必要です。"
-                           "サイドバーの「APIキー設定」で入力するか、.env の ANTHROPIC_API_KEY / GEMINI_API_KEY に設定してください。")
+            if not _nsk_ready or not (claude_api_key or api_key):
+                # 以前はここで赤い字を出すだけで**ボタンが 1 つも出ず行き止まり**だった（金額表記の行も出ないので、
+                # ラジオが遥か下の「うまくいかないとき」の中に現れた）。ベタ打ちは vendor を使わないので、
+                # Gemini のキーさえあれば作れる（2026-09-21 Claude 並行バグハント ③）
+                if not _nsk_ready:
+                    st.error("❌ pdf-to-neo スキル（vendor/pdf_to_neo）が使えません: " + _nsk_why
+                             + "  → `python tools/vendor_sync.py --source <files> --commit <ID>` で取り込み、"
+                             "アプリを再起動してください。")
+                    _p2n_stop_help = ("pdf-to-neo スキル（vendor/pdf_to_neo）が取り込めていないので押せません。"
+                                      "ベタ打ちはスキルを使わないので、Gemini のキーがあれば右のボタンで作れます")
+                else:
+                    st.warning("⚠️ 見積書の読み取りには Claude または Gemini の APIキーが必要です。"
+                               "サイドバーの「APIキー設定」で入力するか、.env の ANTHROPIC_API_KEY / GEMINI_API_KEY に設定してください。")
+                    _p2n_stop_help = "APIキーが無いので押せません。サイドバーの「APIキー設定」で入れてください"
+                if (_att_cap := _attached_docs_caption(api_key, selected_model)):
+                    st.caption(_att_cap)
+                _pdf_tax_sel = _p2n_tax_row(_saved_pdf_tax)
+                _beta_expense_gate(_p2n_file_key)
+                _p2n_beta_ui_shown = True
+                _c1, _c2 = st.columns(2)
+                with _c1:
+                    st.button("🚀 NEOを生成（部品コードつき）", key='pdf2neo_run_disabled', type="primary",
+                              width='stretch', disabled=True, help=_p2n_stop_help)
+                with _c2:
+                    _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_model, _pdf_tax_sel,
+                                      inline=True)
             elif not (_p2n_addata := find_addata_dir()):
                 # Addata が決まらないとき: pdf-to-neo スキルの経路（部品コード・標準指数を引く）は vendor の自動検出に
                 # 落とさず止める（別の版で作らない）。代わりに、以前からある「ベタ打ち（モードA）」で作れるようにする
                 # （2026-09-14 亮平さん指示: Addata が特定できない状態ではベタ打ちも使えなくなっていた）。
                 # ベタ打ち = 見積書の明細・金額・品名をそのまま写す。部品コード・標準品番・標準指数は入らない
                 _p2n_url_err = st.session_state.get('_addata_url_error')
-                st.warning("⚠️ Addata（コグニの車種データ）が決まっていないので、部品コード・標準指数を引く生成（pdf-to-neo スキル）はできません。"
+                st.caption("⚠️ Addata（コグニの車種データ）が決まっていないので、**部品コードつきの生成は押せません**。"
                            + (f" 取得URLの失敗: {_p2n_url_err}" if _p2n_url_err else "")
-                           + " サイドバー「🖥️ PC の Addata をこの画面から使う」で PC の C:\\Addata を選ぶか、"
-                           "下の「ベタ打ちで生成」で部品コード無しの NEO を作れます（明細・金額・品名は見積書のとおり）。")
+                           + " サイドバー「🖥️ PC の Addata をこの画面から使う」で PC の C:\\Addata を選ぶと押せるようになります。"
+                           "いまは右の「ベタ打ちで生成」で部品コード無しの NEO を作れます（明細・金額・品名は見積書のとおり）。")
+                if (_att_cap := _attached_docs_caption(api_key, selected_model)):
+                    st.caption(_att_cap)
+                _pdf_tax_sel = _p2n_tax_row(_saved_pdf_tax)   # 金額表記はボタンのすぐ上（2026-09-21 亮平さん指示）
+                _beta_expense_gate(_p2n_file_key)
                 _p2n_beta_ui_shown = True
-                _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_model, _pdf_tax_sel)
+                # 2 つのモードを**いつでも横並びで見せる**（押せる／押せないで、いまどちらが使えるか分かる。2026-09-21 亮平さん指示）
+                _c1, _c2 = st.columns(2)
+                with _c1:
+                    st.button("🚀 NEOを生成（部品コードつき）", key='pdf2neo_run_disabled', type="primary",
+                              width='stretch', disabled=True,
+                              help="Addata（コグニの車種データ）が決まっていないので押せません。"
+                                   "サイドバーの「🖥️ PC の Addata をこの画面から使う」で C:\\Addata を選ぶと押せます")
+                with _c2:
+                    _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_model, _pdf_tax_sel,
+                                      inline=True)
             else:
                 # 読み手: 両方のキーがあれば選べる。**既定は Gemini**（2026-09-16 亮平さん指示: API は Gemini をメインで使う。
                 # 本番の Secrets も Gemini だけ）。片方だけならそれを使う。指示文・検算・読み直し・生成は同じなので、
@@ -10197,10 +10513,23 @@ def main():
                 # すでにこの見積書の NEO ができているなら、ボタンは「作り直す」と分かる形にする。
                 # 押すと AI の読み取りからやり直すので、結果が前と変わることがある（バグハント 2026-09-20）
                 _p2n_again = bool(_p2n_give_now)
-                if st.button(("🔄 もう一度作り直す（AI で読み直します）" if _p2n_again else "🚀 見積書からNEOを生成"),
-                             key='pdf2neo_run', type="primary", width='stretch',
-                             help=("できあがった NEO は下にあります。作り直すと読み取りからやり直すので、"
-                                   "読み取りのゆれで結果が変わることがあります" if _p2n_again else None)):
+                # 2 つのモードを**横並び**にして、どちらでも選べるようにする（2026-09-21 亮平さん指示）。
+                # 長い文が入る「費用を入れる」チェックは、狭い列に収まらないのでボタンの行より前に置く
+                _pdf_tax_sel = _p2n_tax_row(_saved_pdf_tax)   # 金額表記はボタンのすぐ上（2026-09-21 亮平さん指示）
+                _beta_expense_gate(_p2n_file_key)
+                _p2n_beta_ui_shown = True      # 下の逃げ道でベタ打ちのボタンを二度描かない（キーの重複で落ちる）
+                _p2n_c1, _p2n_c2 = st.columns(2)
+                with _p2n_c1:
+                    _p2n_clicked = st.button(
+                        ("🔄 もう一度作り直す（AI で読み直します）" if _p2n_again else "🚀 NEOを生成（部品コードつき）"),
+                        key='pdf2neo_run', type="primary", width='stretch',
+                        help=("できあがった NEO は下にあります。作り直すと読み取りからやり直すので、"
+                              "読み取りのゆれで結果が変わることがあります" if _p2n_again else
+                              "Addata と突き合わせて部品コード・標準品番・標準指数を入れます（コグニの判断規則どおり）"))
+                with _p2n_c2:
+                    _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_model, _pdf_tax_sel,
+                                      inline=True)
+                if _p2n_clicked:
                     _p2n_skew = sync_app_modules()   # push 後にプロセスが残る本番で古い neo_skill を使わない（ベタ打ちと同じ扱い。バグハント H4）
                     if _p2n_skew:
                         st.error(_version_skew_message(_p2n_skew))
@@ -10298,6 +10627,9 @@ def main():
                 _p2n_res = dict(_p2n_res, stale=True)
                 st.warning("⚠️ 生成したあとに 見積書・添付の書類・事故/保険情報・費用 のどれかが変わりました。下の結果は前の入力で作ったもので、"
                            "ダウンロードは止めています。生成ボタンを押して作り直してください。")
+        # 添付を読めなかったことは、**どの結果でも**ここで 1 回だけ知らせる（合格・ベタ打ち・要確認。Codex 第43周）
+        if _p2n_res:
+            _show_doc_ocr_error()
         if _p2n_res and _p2n_res.get('legacy_beta'):
             _render_beta_result(_p2n_res, selected_model)
             if _p2n_offer_beta:
@@ -10425,6 +10757,8 @@ def main():
                     for _w in _p2n_warns:
                         st.warning(f"⚠️ 読み取りの注意: {_md_literal(_w)}")
                 _p2n_name = _p2n_res.get('download_name') or '見積_claude'
+                st.markdown('<div class="deliver-head">📦 受け取る — <b>2 つで 1 組</b>'
+                            '<span>NEO はコグニで開く／シートは人が確かめる</span></div>', unsafe_allow_html=True)
                 _p2n_c1, _p2n_c2 = st.columns(2)
                 with _p2n_c1:
                     st.download_button(
@@ -10446,8 +10780,8 @@ def main():
                         key='pdf2neo_dl_review', disabled=bool(_p2n_res.get('stale')),
                         width='stretch',
                     )
-                st.info("📎 **NEO と確認箇所シートは必ず組で**保険会社・担当者に渡してください"
-                        "（人が確かめる点は NEO の明細コメントではなくシートにあります）。")
+                st.caption("📎 **NEO と確認箇所シートは必ず組で**保険会社・担当者に渡してください"
+                           "（人が確かめる点は NEO の明細コメントではなくシートにあります）。")
                 if _p2n_res.get('report_md'):
                     # 合格のときの報告文は「読みたい人だけ」開く（長いので既定は閉じる。2026-09-20 画面の作り直し）
                     with st.expander("📝 報告文（どう判断したか・確かめてほしい点）", expanded=False):
@@ -10480,14 +10814,13 @@ def main():
                 "- **費用（Expense）欄はこの経路では使いません** — 見積書に印字された費用だけを写します"
                 "（印字に無い費用を足すと、原本との照合が崩れるため）\n"
                 "- Addata なしの「ベタ打ちで生成」だけは、そこに出るチェックを入れたときに限りサイドバーの費用を NEO に入れます")
-        _pdf_tax_idx = 1 if ("内税" in str(_saved_pdf_tax) or "税込" in str(_saved_pdf_tax)) else 0
-        with st.expander(f"💴 金額表記の設定（いまは {_saved_pdf_tax}）— CSV 取り込み・ベタ打ちのときだけ使います", expanded=False):
-            st.caption("見積書 PDF からの生成では、見積書の合計欄から税込・税抜を自動で見分けるので、この設定は使いません。")
-            _pdf_tax_pick = st.radio(
-                "見積書の金額表記", options=_pdf_tax_options, index=_pdf_tax_idx, horizontal=True,
-                key="pdf_tax_radio", label_visibility="collapsed")
-        st.session_state["pdf_tax_override"] = _pdf_tax_pick
-        st.session_state["tax_override"] = _pdf_tax_pick
+        # 金額表記の切り替えは**生成ボタンのすぐ上**に出す（_p2n_tax_row）。ここでは、まだ見積書を入れていない等で
+        # その行を描かなかった run のために、控えてある値をそのまま保つだけにする（2026-09-21 亮平さん指示）。
+        # 印（_pdf_tax_row_shown）は**この run の最後**で落とす。ここで落とすと、下の CSV 取り込みが
+        # 「まだ描いていない」と見て 2 つ目のラジオを描き、キーが重複して落ちる（Codex 指摘 2026-09-21）
+        if not st.session_state.get('_pdf_tax_row_shown'):
+            st.session_state["pdf_tax_override"] = _saved_pdf_tax
+            st.session_state["tax_override"] = _saved_pdf_tax
 
         # ================================================================
         # STEP 1-B: 車検証・テンプレートNEO（任意）
@@ -10503,8 +10836,7 @@ def main():
                 help="コグニセブンで作成した.neoファイル。証券番号・工場名・車両情報等が入力済みのものを使用してください。"
             )
             if custom_neo_file:
-                _neo_bytes_read = custom_neo_file.read()
-                custom_neo_file.seek(0)
+                _neo_bytes_read = custom_neo_file.getvalue()
                 # 解析にかける前にサイズで弾く。巨大なファイルは
                 # 解析そのものがメモリを食い、共有プロセスを落としうる。
                 if len(_neo_bytes_read) > MAX_NEO_UPLOAD_BYTES:
@@ -10617,15 +10949,21 @@ def main():
             st.markdown('<div class="section-title">📊 CSV取り込み（代替手段）</div>',
                         unsafe_allow_html=True)
 
-            # 税区分はいちばん上の「見積書の金額表記」で選んだものを使う。
+            # 税区分は**生成ボタンのすぐ上**の「この見積書の金額表記」で選んだものを使う。
             # ここに2つ目のラジオを置いていたため、利用者がどちらを操作すべきか分からず、
             # 取り違えると NEO の総額が消費税ぶん（10%）ずれていた。
             _pending_tax = st.session_state.pop('_tax_carry_pending', None)
             if _pending_tax:
                 st.session_state['tax_override'] = _pending_tax
-            _tax_sel = st.session_state.get('tax_override', '税抜き（外税）')
-            st.caption(f"💴 金額表記: **{_tax_sel}** — 変えるときは、いちばん上の"
-                       "「見積書の金額表記」で切り替えてください")
+            # 見積書 PDF を入れていない（CSV だけで作る）run では、上の切り替えを描いていない。
+            # そのままだと**税区分を変えられないまま**生成でき、税込の CSV が税抜扱いで 10% ずれる
+            # （Codex 指摘 2026-09-21）。描いていないときだけ、ここに 1 つだけ出す（キーは重複させない）
+            if not st.session_state.get('_pdf_tax_row_shown'):
+                _tax_sel = _p2n_tax_row(st.session_state.get('tax_override', '税抜き（外税）'))
+            else:
+                _tax_sel = st.session_state.get('tax_override', '税抜き（外税）')
+                st.caption(f"💴 金額表記: **{_tax_sel}** — 変えるときは、生成ボタンのすぐ上の"
+                           "「この見積書の金額表記」で切り替えてください")
 
             _csv_col1, _csv_col2 = st.columns([2, 1])
             with _csv_col1:
@@ -10650,7 +10988,7 @@ def main():
                 st.info("ℹ️ CSV ファイルと貼り付けの両方があります。ファイルの内容を取り込んでいます（貼り付けは使っていません）。")
             if _csv_file:
                 try:
-                    _raw = _csv_file.read()
+                    _raw = _csv_file.getvalue()   # read() だと同じ run をまたいだ 2 回目で b'' になる（Claude 並行バグハント ②）
                     for _enc in ('utf-8-sig', 'utf-8', 'shift-jis', 'cp932'):
                         try:
                             _csv_text = _raw.decode(_enc)
@@ -10740,7 +11078,7 @@ def main():
                               else "🚗 車検証だけで NEO を作る（明細なし） →")
                 if st.button(_btn_label, type="primary", width='stretch'):
                     if vehicle_file:
-                        st.session_state['vehicle_file_bytes'] = vehicle_file.read()
+                        st.session_state['vehicle_file_bytes'] = vehicle_file.getvalue()   # 2 回目の押下で空にならない
                         st.session_state['vehicle_file_name']  = vehicle_file.name
                     else:
                         st.session_state['vehicle_file_bytes'] = None
@@ -10796,7 +11134,7 @@ def main():
                         vehicle_mime = get_mime_type(vehicle_name) if vehicle_bytes else None
                         vehicle_data = analyze_vehicle_registration(api_key, vehicle_bytes, vehicle_mime) or {}
                     except Exception as _veh_err:
-                        vehicle_data = {'_error': str(_veh_err)[:120]}
+                        vehicle_data = {'_error': _safe_err(_veh_err)}
                     if vehicle_data.get('_error'):
                         _queue_step2_msg(
                             'warning',
@@ -10908,7 +11246,7 @@ def main():
                     try:
                         vehicle_data = fut_vehicle.result() or {}
                     except Exception as _veh_err:
-                        vehicle_data = {'_error': str(_veh_err)[:120]}
+                        vehicle_data = {'_error': _safe_err(_veh_err)}
                     if vehicle_data.get('_error'):
                         _queue_step2_msg(
                             'warning',
@@ -10920,7 +11258,7 @@ def main():
                     try:
                         estimate_data = fut_estimate.result() or {}
                     except Exception as _est_err:
-                        st.error(f"⚠️ 見積書解析に失敗しました: {str(_est_err)[:100]}")
+                        st.error("⚠️ 見積書解析に失敗しました（種類: " + _safe_err(_est_err) + "）")
                         st.warning("ネットワークが不安定な可能性があります。もう一度お試しください。")
                         estimate_data = None
             elif vehicle_bytes:
@@ -11122,7 +11460,8 @@ def main():
                     st.error(
                         "⚠️ 利用可能なGeminiモデルが見つかりません。\n\n"
                         "APIキーが有効か、Google AI Studio で利用できるモデルを確認してください。\n\n"
-                        f"詳細: {err_str}"
+                        # 例外の本文は出さない（API の返事に要求の中身が混じりうる。2026-09-21 監査）
+                        "（種類: " + _safe_err(None, 'ModelListError') + "）"
                     )
             # クォータ超過エラーの場合、分かりやすいメッセージとリトライを促す
             elif _is_quota_error(err_str):
@@ -11149,8 +11488,11 @@ def main():
                         "翌日（リセット後）か、Google AI StudioでAPIキーの課金を有効化してください。"
                     )
             else:
-                st.error(f"⚠️ AI解析中にエラーが発生しました:\n\n{err_str}")
-                st.code(traceback.format_exc())
+                # 例外の本文・トレースバックは画面に出さない（AI へ送った見積書・車検証の中身が
+                # 返事に混じりうる ＝ 顧客情報が漏れる。2026-09-21 監査）。詳しくはサーバのログへ
+                st.error("⚠️ AI解析中にエラーが発生しました（種類: " + _safe_err(e) + "）。"
+                         "もう一度お試しください。続くときは、別のモデル・別の API キーをお試しください。")
+                print("[AI解析エラー]", traceback.format_exc(), file=sys.stderr)
             if st.button("← ステップ①に戻る"):
                 st.session_state['step'] = 1
                 st.rerun()
@@ -12374,13 +12716,12 @@ def main():
                 # フォールバック: file_uploaderが同一セッション内でまだ生きている場合
                 _fallback_neo = st.session_state.get('custom_neo_upload')
                 if _fallback_neo:
-                    _custom_neo_bytes = _fallback_neo.read()
-                    _fallback_neo.seek(0)
+                    _custom_neo_bytes = _fallback_neo.getvalue()
             _use_custom_neo   = _custom_neo_bytes is not None
             _active_template  = _custom_neo_bytes if _use_custom_neo else template_data
             if _use_custom_neo:
                 _custom_name = st.session_state.get('custom_neo_name', 'カスタムNEO')
-                progress.progress(35, text=f"📁 テンプレートNEO ({_custom_name}) を読み込み中...")
+                progress.progress(35, text="📁 テンプレートNEO を読み込み中...")
             progress.progress(50, text="⚙️ 明細データをNEOに書き込み中...")
             neo_data, total_parts, total_wages, grand_total = generate_neo_file(
                 _active_template, updated_vehicle, items, short_parts_wage, insurance_info,
@@ -12601,15 +12942,25 @@ def main():
                 _neo_wait.empty()  # 待機メッセージが残り続けるのを防ぐ
             except Exception:
                 pass
-            st.error(f"⚠️ NEO生成中にエラーが発生しました:\n\n{str(e)}")
-            print("[NEO生成エラー]", traceback.format_exc())
+            # 例外の本文は画面に出さない（見積書・車検証の中身が混じりうる。2026-09-21 監査）
+            st.error("⚠️ NEO生成中にエラーが発生しました（種類: " + _safe_err(e) + "）")
+            print("[NEO生成エラー]", traceback.format_exc(), file=sys.stderr)
             if st.button("← ステップ③に戻る"):
                 st.session_state['step'] = 3
                 st.rerun()
 
 
+def _main_and_reset():
+    """main() を回したあと、この run 限りの印を落とす（次の run で「まだ描いていない」から始める）"""
+    try:
+        main()
+    finally:
+        # 金額表記の行を描いたかの印。run をまたいで残すと、次の run で 2 つ目のラジオを描けなくなる
+        st.session_state.pop('_pdf_tax_row_shown', None)
+
+
 if __name__ == '__main__':
-    main()
+    _main_and_reset()
     _consume_sidebar_rerun()   # サイドバーで頼まれた描き直し（本文の uploader を描き終えてから）
 
 # 読み込んだときのコードの指紋（app.sync_app_modules が「メモリのコードがディスクと同じか」を見る。読み込みの時点で

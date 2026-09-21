@@ -346,9 +346,9 @@ chk('"user_name"' in inspect.getsource(P._merge_vehicle_into_customer), '9q: 旧
 _mv = P._merge_vehicle_into_customer({'customer_name': '顧客 太郎', 'user_name': '同上'}, {})
 chk(_mv.get('user_name') == '同上', f'9r: user_name が旧経路の merge を通らない: {_mv!r}')
 _app_src = inspect.getsource(app)
-chk("_p2n_prev_key and _p2n_prev_key != _p2n_early_key" in _app_src and '_reset_case_inputs()' in _app_src.split('_p2n_prev_key and _p2n_prev_key != _p2n_early_key')[1][:700],
+chk("_p2n_prev_key and _p2n_prev_key != _p2n_early_key" in _app_src and '_reset_case_inputs()' in _app_src.split('_p2n_prev_key and _p2n_prev_key != _p2n_early_key')[1][:1000],
     '9c: 見積書が別のファイルに変わったときに _reset_case_inputs を呼んでいない')
-_st9 = {'vehicle_upload': None, 'insurance_doc_upload': None, 'contractor_name': 'A', 'repair_days': 0, 'pdf_tax_radio': '税抜き（外税）'}
+_st9 = {'docs_upload': None, 'contractor_name': 'A', 'repair_days': 0, 'pdf_tax_radio': '税抜き（外税）'}
 _sig1 = app._p2n_inputs_signature('f1', _st9)
 chk(_sig1 == app._p2n_inputs_signature('f1', dict(_st9)), '9d: 同じ入力なら同じ指紋')
 chk(_sig1 != app._p2n_inputs_signature('f2', _st9), '9e: 見積書が違えば指紋が違う')
@@ -362,11 +362,11 @@ chk(app._p2n_inputs_signature('f1', dict(_st9, accident_date='2026/09/01')) == a
 class _FakeUp:
     def __init__(self, b): self._b = b
     def getvalue(self): return self._b
-chk(_sig1 != app._p2n_inputs_signature('f1', dict(_st9, vehicle_upload=_FakeUp(b'x'))), '9h: 車検証の添付が違えば指紋が違う')
+chk(_sig1 != app._p2n_inputs_signature('f1', dict(_st9, docs_upload=[_FakeUp(b'x')])), '9h: 車検証の添付が違えば指紋が違う')
 # Codex 72 [1]: 同じ添付でも OCR の控え（読めた中身）が変われば指紋が変わる（キーを直して読めるようになった等）
 import hashlib as _hl
 _ck = ('shaken', _hl.sha256(b'x').hexdigest(), 'm', _hl.sha256(b'k').hexdigest()[:12])
-_s_no = dict(_st9, vehicle_upload=_FakeUp(b'x'))
+_s_no = dict(_st9, docs_upload=[_FakeUp(b'x')])
 _s_ok = dict(_s_no, _doc_ocr_cache={_ck: {'car_name': 'トヨタ'}})
 _s_err = dict(_s_no, _doc_ocr_cache={_ck: {'_error': 'x'}})
 chk(app._p2n_inputs_signature('f1', _s_no, api_key='k', model_name='m') != app._p2n_inputs_signature('f1', _s_ok, api_key='k', model_name='m'),
@@ -377,10 +377,18 @@ _src_rc = inspect.getsource(app._reset_case_inputs)
 chk('keep_docs' in _src_rc and '_DOC_STATE_KEYS' in _src_rc and '_insdoc_filled' in _src_rc, '9v: _reset_case_inputs(keep_docs) が書類と書類から入れた欄を残す形になっていない（Codex 72）')
 chk('_reset_case_inputs(keep_docs=True)' in inspect.getsource(app).split('_p2n_prev_key and _p2n_prev_key != _p2n_early_key')[1][:1800],
     '9w: 書類を入れ替えて別の見積書を入れたとき、手入力の保険欄を消していない（Codex 72）')
-chk("not any(_docs_now.split('|'))" in inspect.getsource(app).split('_p2n_prev_key and _p2n_prev_key != _p2n_early_key')[1][:1800],
+chk("not _docs_now_set" in inspect.getsource(app).split('_p2n_prev_key and _p2n_prev_key != _p2n_early_key')[1][:1800],
     '9y: 添付が無いときに keep_docs の枝に入る（Codex 73）')
 chk('_slot_same' in inspect.getsource(app).split('_p2n_prev_key and _p2n_prev_key != _p2n_early_key')[1][:1800],
-    '9y2: 片方の書類だけ前のままのときに keep_docs の枝に入る（Codex 76）')
+    '9y2: 前の案件の書類が 1 枚でも残っているときに keep_docs の枝に入る（Codex 76）')
+# 9y3: 添付の入れ物は 1 つ。何の書類かは読み取りで見分ける（2026-09-21 亮平さん指示）
+chk('accept_multiple_files=True, key=_docs_upload_key()' in _app_src and '_doc_upload_keys' not in _app_src,
+    '9y3: 添付の入れ物が 1 つになっていない')
+chk('_SHAKEN_NAME_RE' in _app_src and "for kind in order:" in _app_src,
+    '9y4: 添付の種類を見分ける処理が無い（名前で当たりを付け、外れたらもう一方で読み直す）')
+_att_src = inspect.getsource(app._attached_docs_ocr)
+chk('st.expander' not in inspect.getsource(app).split('📎 添付（任意）')[0][-400:],
+    '9y5: 添付の入れ物がたたみの中にある（常に開いておく）')
 _kd = inspect.getsource(app).split('_reset_case_inputs(keep_docs=True)')[1][:900]
 chk("_p2n_deferred_rerun'] = True" in _kd and 'st.rerun()' not in _kd.split("_p2n_deferred_rerun'] = True")[0],
     '9z: 書類を残す枝で uploader を描く前に st.rerun() している（書類が消える）')
@@ -399,9 +407,10 @@ chk(app._p2n_inputs_signature('f1', _st9) == app._p2n_inputs_signature('f1', dic
     '9o2: スキル経路はテンプレート・税区分の選択を見ない（Codex 78）')
 chk(app._p2n_inputs_signature('f1', _st9, beta=True) != app._p2n_inputs_signature('f1', dict(_st9, pdf_tax_radio='税込み（内税）'), beta=True), '9o3: ベタ打ちは税区分が違えば指紋が違う')
 _n9k = _app_src.count('(_att_cap := _attached_docs_caption(api_key, selected_model))')
-chk(_n9k == 2 and _app_src.count('st.caption(_att_cap)') == 2, f'9k: 添付の案内が読めたかで出ていない（2 か所）: {_n9k}')
-chk("return ''" in inspect.getsource(app._attached_docs_caption).split('if fv is None and fd is None:')[1][:160],
-    '9k2: 何も添えていないときに添付の案内を出している（画面作り直し 2026-09-20。案内は「任意の書類を添える」の見出しに出る）')
+# 3 か所（ベタ打ちの単独 UI ／ Addata なしの横並び ／ Addata ありの横並び）。2026-09-21 にボタンを 2 つに分けて 1 か所増えた
+chk(_n9k == 4 and _app_src.count('st.caption(_att_cap)') == 4, f'9k: 添付の案内が読めたかで出ていない（4 か所）: {_n9k}')
+chk("return ''" in inspect.getsource(app._attached_docs_caption).split('if not _files:')[1][:160],
+    '9k2: 何も添えていないときに添付の案内を出している（画面作り直し 2026-09-20）')
 # 上の案内カードは 3 通り（要確認の NEO・合格・まだ）。要確認を「まだ生成していない」扱いにすると、帯（3 段目）と食い違う（Codex 第17周）
 _9m_card = _app_src.split("_p2n_card_res = st.session_state.get('pdf2neo_result') or {}")[1][:1800]
 chk("_p2n_card_res.get('unverified_neo')" in _9m_card and '_要確認' in _9m_card and "elif _p2n_give_now and _p2n_card_res.get('ok')" in _9m_card,
@@ -470,6 +479,13 @@ chk(app._with_app_notes('', ['x']) == '' and app._with_app_notes(None, ['x']) is
 chk(app._with_app_notes(_w2, ['塗装は実額にする']).count('## アプリ側で判断した点') == 1,
     '9w5: 同じ報告文に二度足している')
 
+# 9y: 添えた書類を読めなかったときは、**結果のところで**知らせる（読み取りは「生成」を押した後に走るので、
+#     上の添付欄の知らせはこの run ではもう描き終わっていて出ない。2026-09-21 バグハント）
+chk("st.session_state.pop('_doc_ocr_error', '')" in _app_src and '添えた書類を読み取れませんでした' in _app_src,
+    '9y: 添付の読み取り失敗を結果のところで知らせていない')
+# 知らせは共通の関数（_show_doc_ocr_error）に移した。結果を描き始める前に 1 回だけ呼ぶ（9zc で位置を固定）
+chk('_show_doc_ocr_error()' in _app_src, '9y2: 読み取り失敗の知らせを共通の関数から出していない')
+
 # 9x: 塗装の実額の注記は、**NEO に実際に入る塗装計**を添える（印字の塗装費用＋材料代と食い違う案件がある。
 #     2026-09-20 本番のバグハント: 印字 76,000＋21,280 = 97,280 に対し NEO の塗装計は 104,660 だった）
 _tbl = (chr(10).join(['# 報告', '', '| 項目 | 見積書 | 生成 |', '|---|---|---|',
@@ -504,6 +520,58 @@ chk('104,660 円' in app._with_app_notes(_tbl.replace('104,660', '104,660'.trans
     '9x7: 全角の金額で注記が出ない')
 chk(app._yen('１０４，６６０ 円') == 104660 and app._yen('') is None and app._yen('—') is None,
     '9x8: 金額の読み取りが違う')
+# 9z3〜9z7: 画面の作り直しで Codex が挙げた 5 件（2026-09-21 第40周）
+# (1) CSV だけの経路でも税区分を変えられる（描いていない run にだけ出す。キーは重複させない）
+# 定義 + vendor/キーが無い枝 + Addata なしの横並び + Addata ありの横並び + CSV だけの経路（2026-09-21: 行き止まりの枝にも足した）
+chk("if not st.session_state.get('_pdf_tax_row_shown'):" in _app_src and _app_src.count('_p2n_tax_row(') == 5,
+    f"9z3: CSV だけの経路に税区分の切り替えが無い／二重に描いている: {_app_src.count('_p2n_tax_row(')}")
+chk("st.session_state.pop('_pdf_tax_row_shown', None)" in _app_src.split('def _main_and_reset')[1][:400],
+    '9z4: 税区分を描いた印を run の終わりで落としていない（次の run で描けなくなる）')
+# (2) 添付を読む順番は内容のハッシュ順（入れた順番で採用される書類が変わらない＝指紋と食い違わない）
+_ocr_src = inspect.getsource(app._attached_docs_ocr)
+chk('_fh.sort(key=lambda x: x[0])' in _ocr_src, '9z5: 添付を読む順番を内容のハッシュ順に固定していない')
+# (3) 読み取り失敗の文・進み具合の文にファイル名を出さない（顧客情報が入りやすい）
+chk('f.name' not in _ocr_src.split('_doc_ocr_error')[1][:200] and '添付 {_idx} 件目' in _ocr_src,
+    '9z6: 読み取り失敗の文にファイル名を出している')
+chk('件目を読んでいます' in _ocr_src and 'f.name}）' not in _ocr_src,
+    '9z7: 進み具合の文にファイル名を出している')
+# (4) 生成後の run では、結果より先に読み取り失敗の知らせを消さない
+chk("if st.session_state.get('_doc_ocr_error') and not st.session_state.get('pdf2neo_result'):" in _app_src,
+    '9z8: 添付欄が結果より先に読み取り失敗の知らせを消している')
+# 9zc: 読み取り失敗の知らせは**どの結果でも**出す（合格・ベタ打ち・要確認）。共通の関数 1 か所にまとめる
+chk('def _show_doc_ocr_error' in _app_src and _app_src.count('            _show_doc_ocr_error()') == 1
+    and _app_src.index('            _show_doc_ocr_error()') < _app_src.index("if _p2n_res and _p2n_res.get('legacy_beta'):"),
+    '9zc: 読み取り失敗の知らせが合格の枝にしか無い（ベタ打ち・要確認で黙る）')
+chk("err = st.session_state.pop('_doc_ocr_error', '')" in inspect.getsource(app._show_doc_ocr_error),
+    '9zc2: 知らせを出したあとに消していない（次の案件まで残る）')
+
+# 9z9 / 9za: Codex 第41周
+# (1) 同じ中身でも**名前で読み方が変わる**ので、名前も指紋に入れる（名前を変えたのに古い結果を落とせない道を塞ぐ）
+class _NUp:
+    def __init__(self, b, name):
+        self._b, self.name = b, name
+
+    def getvalue(self):
+        return self._b
+
+
+_sd = {'docs_upload': None, 'contractor_name': 'A', 'repair_days': 0, 'pdf_tax_radio': '税抜き（外税）'}
+chk(app._p2n_inputs_signature('f1', dict(_sd, docs_upload=[_NUp(b'x', 'report.pdf')]))
+    != app._p2n_inputs_signature('f1', dict(_sd, docs_upload=[_NUp(b'x', '車検証_report.pdf')])),
+    '9z9: 同じ中身でも名前で読み方が変わるのに指紋が同じ（古い結果を落とせる）')
+chk(app._p2n_inputs_signature('f1', dict(_sd, docs_upload=[_NUp(b'x', 'a.pdf')]))
+    == app._p2n_inputs_signature('f1', dict(_sd, docs_upload=[_NUp(b'x', 'b.pdf')])),
+    '9z9b: どちらも車検証らしくない名前なのに指紋が違う（毎回作り直しになる）')
+# (2) 事故・保険の書類を「車検証だけで作る」経路に渡さない（読み取りで車検証と分かったものか、名前が車検証らしいものだけ）
+chk('vehicle_file = None' in _app_src and "_hit = _cache.get(('shaken'" in _app_src,
+    '9za: 車検証と分からない添付を「車検証だけで作る」経路に渡している')
+# 9zb: 添付の同一性は 1 か所（_docs_sig）で決める。保険欄の入れ直し・持ち越し判定・指紋が同じ見方をする
+chk('_docs_sig(state)' in _app_src and _app_src.count("'#' + ('S' if _SHAKEN_NAME_RE.search") == 1,
+    '9zb: 添付の同一性の決め方が 2 か所にある（片方だけ直すと食い違う）')
+chk(app._docs_sig({'docs_upload': [_NUp(b'x', 'a.pdf')]}) != app._docs_sig({'docs_upload': [_NUp(b'x', '車検証.pdf')]}),
+    '9zb2: 同じ中身でも役割（名前）が変われば別の添付として扱えていない（前の保険欄が残る）')
+chk(app._docs_sig({'docs_upload': None}) == '', '9zb3: 添付が無いときの同一性が空でない')
+
 # 9xa: 検算表の見出しは「3 列目が 生成」の表だけ。ほかの 3 列の表を取り違えない（Codex 第31周 P1）
 _other = _tbl + chr(10) * 2 + chr(10).join(['| 項目 | 説明 | 金額 |', '|---|---|---|',
                                             '| 塗装計（材料込） | メモ | 97,280 |'])
@@ -573,8 +641,16 @@ _src_mk = inspect.getsource(app.p2n_make)
 chk('_blank_wage_rows(reading)' in _src_mk and 'force_draft=True' in _src_mk and "write_reading(case_dir, reading)" in _src_mk,
     '10d: p2n_make が工賃欄空欄の行を 0 円にして force_draft で作り直していない／失敗時に元へ戻していない')
 # R2: ベタ打ちの逃げ道
-chk(_app_src.count('_beta_generate_ui(') == 4 and 'fallback=True' in _app_src and '_p2n_offer_beta' in _app_src,   # 定義 + Addata なし + 不合格の下 + 逃げ道の結果の下
-    f"10e: ベタ打ちの UI が共通化されて 3 か所（Addata なし／スキル経路の不合格／逃げ道の結果の下）から呼ばれていない: {_app_src.count('_beta_generate_ui(')}")
+# 定義 + Addata なしの横並び + Addata ありの横並び + 不合格の下 + 逃げ道の結果の下（2026-09-21 にボタンを 2 つに分けた）
+chk(_app_src.count('_beta_generate_ui(') == 6 and 'fallback=True' in _app_src and '_p2n_offer_beta' in _app_src,
+    f"10e: ベタ打ちの UI が共通化されて 5 か所から呼ばれていない: {_app_src.count('_beta_generate_ui(')}")
+# 10e3: 2 つのモードを横並びで出す。Addata が無いときは部品コードつきが押せない（押せる／押せないで分かる）
+chk("_p2n_c1, _p2n_c2 = st.columns(2)" in _app_src and "inline=True" in _app_src,
+    '10e3: 生成ボタンを横並びにしていない')
+chk("key='pdf2neo_run_disabled'" in _app_src and 'disabled=True' in _app_src,
+    '10e4: Addata が無いときに「部品コードつき」を押せない形で見せていない')
+# 同じ run でベタ打ちのボタンを 2 回描くとキーが重複して落ちるので、横並びを出したら印を立てる
+chk(_app_src.count('_p2n_beta_ui_shown = True') == 3, '10e5: 横並びを描いたのに「描いた印」を立てていない')
 # E1/E4: 差がある結果のダウンロードは確認してから
 _src_rb = inspect.getsource(app._render_beta_result)
 chk("key='pdf2neo_beta_ack'" in _src_rb and 'or not _p2n_ack' in _src_rb and 'amount_changes' in _src_rb, '10f: ベタ打ちの結果に確認チェックのゲートが無い')
@@ -613,6 +689,46 @@ _nh = hashlib.sha256()
 for _nn in sorted(x for x in os.listdir(_nd) if x.endswith('.py')):
     _nh.update(_nn.encode('utf-8') + b'\0' + app._file_digest(os.path.join(_nd, _nn)).encode('ascii'))
 chk(len(app._nsk_code_stamp()) == 8 and app._nsk_code_stamp() == _nh.hexdigest()[:8], '11d: 画面に出す neo_skill の印が neo_skill 全モジュールの指紋と違う（2026-09-15: reader.py だけ → 全モジュール）')
+
+# ── 12a〜12e: 2026-09-21 の並行バグハント（Codex ×2・Claude ×2）で出た穴をここで留める
+# 12a: 未定義の名前を残さない。費用のチェックを関数に切り出したとき `_p2n_beta_exp` の参照だけが残り、
+#      チェックを入れてベタ打ちを押すと必ず NameError で落ちていた（条件式の中なので既存のテストでは踏めない）
+import glob as _glob            # noqa: E402
+import subprocess as _sp        # noqa: E402
+_pf = _sp.run([sys.executable, '-m', 'pyflakes', 'app.py'] + sorted(_glob.glob('neo_skill/*.py')),
+              cwd=R, capture_output=True, text=True, encoding='utf-8', errors='replace')
+_undef = [ln for ln in ((_pf.stdout or '') + (_pf.stderr or '')).splitlines() if 'undefined name' in ln]
+chk(not _undef, '12a: 未定義の名前が残っている（実行時に NameError で落ちる）: ' + ' / '.join(_undef[:5]))
+chk('_beta_exp_values()' in inspect.getsource(app._beta_generate_ui)
+    and '_beta_exp_values()' in inspect.getsource(app._beta_expense_gate),
+    '12a2: チェックを描く側と生成する側が同じ費用の値を見ていない')
+
+# 12b: vendor が壊れている・APIキーが無いときも行き止まりにしない（ベタ打ちは vendor を使わない）
+chk('if not _nsk_ready or not (claude_api_key or api_key):' in _app_src,
+    '12b: vendor 不調とキー無しの枝でボタンも金額表記も出ず行き止まりになる')
+
+# 12c: 添付は一度読めた役割を覚える（失敗の控えの 120 秒が切れた 2 回目で役割が入れ替わらない＝同じ見積書なら同じ NEO）
+chk('_ok_kind' in _ocr_src and 'first = _ok_kind or (' in _ocr_src,
+    '12c: 同じ添付の役割が run ごとに入れ替わりうる')
+
+# 12d: テンプレート NEO を使っているときは、ベタ打ちの側にも「空欄は前の値が残る」注意を出す
+#      （前は CSV プレビューの側にしか無く、立会工場が前の案件のまま黙って入った）
+chk('テンプレートNEO を使用中です' in inspect.getsource(app._p2n_tax_row),
+    '12d: ベタ打ちの側にテンプレート NEO の注意が無い')
+
+# 12e: 入れたファイルは getvalue() で読む（read() は同じ run をまたいだ 2 回目で b'' になる）
+chk('_csv_file.getvalue()' in _app_src and 'vehicle_file.getvalue()' in _app_src
+    and '_p2n_file.getvalue()' in _app_src and 'custom_neo_file.getvalue()' in _app_src,
+    '12e: 入れたファイルを read() で読んでいる（2 回目で空になる）')
+
+# 12f: 画面に出る例外の文に、よそから来た本文（＝読んだ見積書・車検証の文字）を入れない
+_llm_src = inspect.getsource(_llm_mod) if (_llm_mod := sys.modules.get('neo_skill.llm')) else ''
+chk(_llm_src and 'msg[:200]' not in _llm_src and "str(getattr(e, 'message', e))" not in _llm_src,
+    '12f: API の返事の本文が例外の文に入っている')
+
+# 12g: 0 バイト・読み出せない添付を黙って捨てない（書類の情報が入っていない NEO が警告なしで出ていた。Codex hunt X）
+chk('_skipped' in _ocr_src and "st.session_state['_doc_ocr_error'] = (f'添付 {_skipped} 件" in _ocr_src,
+    '12g: 読めない添付が黙って無視される')
 
 print('REG_INSURANCE:', 'ALL PASS' if not FAIL else 'FAIL')
 for f in FAIL:
