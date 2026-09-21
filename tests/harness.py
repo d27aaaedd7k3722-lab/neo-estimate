@@ -8,7 +8,7 @@ lines = src.split('\n')
 want_fn = {'_normalize_number_text','safe_int','parse_csv_to_items','_is_total_row_name',
            '_build_column_map','cp932_trim','jpy_round','_normalize_date8','to_halfwidth_katakana','normalize_name','_strip_control_chars',
            'is_fractional_qty', '_looks_like_part_no', '_resolve_columns_by_data', '_norm_col_header',
-           '_csv_row_parts', '_infer_method_from_name', '_ai_diff_note'}
+           '_csv_row_parts', '_infer_method_from_name', '_ai_diff_note', '_ai_diff_mark_of', '_is_ai_diff_text'}
 pieces = ["import re, csv, io, unicodedata, math\nfrom decimal import Decimal, ROUND_HALF_UP\n"]
 for node in tree.body:
     if isinstance(node, ast.FunctionDef) and node.name in want_fn:
@@ -16,7 +16,7 @@ for node in tree.body:
     elif isinstance(node, ast.Assign):
         tgt = node.targets[0]
         nm = getattr(tgt,'id',None)
-        if nm and (nm.startswith('_TOTAL') or nm.startswith('_COLUMN') or nm in ('TAX_RATE','FULL_TO_HALF_KANA','HALF_TO_FULL_KANA')):
+        if nm and (nm.startswith('_TOTAL') or nm.startswith('_COLUMN') or nm in ('TAX_RATE','FULL_TO_HALF_KANA','HALF_TO_FULL_KANA','_AI_DIFF_LABEL_RE')):
             pieces.append('\n'.join(lines[node.lineno-1:node.end_lineno]))
 mod = types.ModuleType('h')
 code = '\n\n'.join(pieces)

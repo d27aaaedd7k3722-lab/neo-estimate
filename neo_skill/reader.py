@@ -463,6 +463,11 @@ def _normalise_values(out: dict, notes: Optional[list]) -> None:
                 note(f'読み手が書いた totals.{k} は使わない（合計の許容は人が reading に書くもの）')
 
 
+# 工賃の単価（レバーレート。1 時間 ＝ 指数 1.0 あたりの円）として受ける範囲。外れた値は読み違い（「1時間」の 1 など）とみなして
+# 使わず、生成器に工賃と指数から逆算させる（バグハント第 3 弾 C3）
+_LABOR_RATE_BAND = (1000, 30000)
+
+
 def _normalise_header(h: dict, vehicle_hint: Optional[dict], insurance_hint: Optional[dict],
                       customer_hint: Optional[dict] = None, notes: Optional[list] = None) -> dict:
     """header.json の形に揃える。値には触らない（null・空の項目は「書かなかった」として落とすだけ）。
@@ -508,7 +513,8 @@ def _normalise_header(h: dict, vehicle_hint: Optional[dict], insurance_hint: Opt
             out[k] = str(v)
     # est_date は YYYYMMDD の 8 桁（生成器は est_date[:4] を年として使うので、数値や '2026/9/13'・和暦のままだと落ちる。バグハント G1）
     if out.get('est_date') not in (None, ''):
-        d8 = _dh.date8_full(str(out['est_date']))   # 年月だけ（日 00）は '' → 形の FAIL（レビュー 2026-09-15）
+        # 曜日付き（'2026/09/13(日)'）はほかの日付欄と同じく曜日を落とす（落とさず読み取り全体が止まっていた。バグハント第 3 弾 C7）
+        d8 = _dh.date8_full(_strip_weekday(str(out['est_date'])))   # 年月だけ（日 00）は '' → 形の FAIL（レビュー 2026-09-15）
         if len(d8) == 8:
             out['est_date'] = d8
         else:
@@ -517,11 +523,20 @@ def _normalise_header(h: dict, vehicle_hint: Optional[dict], insurance_hint: Opt
     if out.get('labor_rate') not in (None, ''):
         lr = _as_int(out['labor_rate'])
         if lr is None:
-            m_ = re.search(r'\d[\d,]*', unicodedata.normalize('NFKC', str(out['labor_rate'])))
-            lr = int(m_.group(0).replace(',', '')) if m_ else None
-        if lr and lr > 0:
+            # 「1時間 8,000円」のように単位の数字が先に来る形がある。最初の数字を拾うとレバーレート 1 円の NEO
+            # （標準工賃が全部 0）が合格になった（バグハント第 3 弾 C3）。「円」の直前の数が 1 つだけならそれ、
+            # 「円」が無く数字が 1 つだけならそれ。どちらでもなければ決めない（生成器が工賃と指数から逆算）
+            s_ = unicodedata.normalize('NFKC', str(out['labor_rate']))
+            yen_ = re.findall(r'(\d[\d,]*)\s*円', s_)
+            nums_ = re.findall(r'\d[\d,]*', s_)
+            pick_ = yen_[0] if len(yen_) == 1 else (nums_[0] if not yen_ and len(nums_) == 1 else '')
+            lr = int(pick_.replace(',', '')) if pick_.replace(',', '').isdigit() else None
+        if lr is not None and _LABOR_RATE_BAND[0] <= lr <= _LABOR_RATE_BAND[1]:
             out['labor_rate'] = lr
         else:
+            if notes is not None:
+                notes.append(f'labor_rate「{str(out["labor_rate"])[:24]}」は工賃の単価（1 時間あたり '
+                             f'{_LABOR_RATE_BAND[0]:,}〜{_LABOR_RATE_BAND[1]:,} 円）として読めないので使わず、工賃と指数から逆算する')
             out.pop('labor_rate', None)
     # wage_round / tax_round は読み手が推測で書いても使わない（印字の工賃と合計欄から vendor が判定する。index_policy と同じ歯止め。G5）
     for k in ('wage_round', 'tax_round'):
@@ -541,6 +556,13 @@ def _normalise_header(h: dict, vehicle_hint: Optional[dict], insurance_hint: Opt
     tt = out.get('totals')
     if isinstance(tt, dict):
         out['totals'] = {k: v for k, v in tt.items() if v not in (None, '')}
+        # 「67,100-」「¥67,100-」（金額の後ろの「-」は印字の飾り）は数に直す。数にならない値は vendor の検算で注意になるだけで
+        # 合格扱いのまま進み、下書き生成で理由の分からない失敗になっていた（バグハント第 3 弾 C8）
+        for k, v in list(out['totals'].items()):
+            if isinstance(v, str):
+                m_ = re.fullmatch(r'[¥]?\s*(\d[\d,]*)\s*円?\s*[-ー―‐]\s*', unicodedata.normalize('NFKC', v).strip())
+                if m_:
+                    out['totals'][k] = int(m_.group(1).replace(',', ''))
     for k in ('vehicle', 'customer', 'insurance'):
         if isinstance(out.get(k), dict):
             out[k] = {kk: vv for kk, vv in out[k].items() if vv not in (None, '')}
@@ -877,6 +899,9 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
 
     usage = _Usage()
     guard_notes: list = []   # index_policy を戻した理由（check.warn に載せて画面の「読み取りの注意」に出す）
+    # header を写したときの注意（labor_rate を使わなかった 等）。**いま使っている header の分だけ**持つ（形の読み直し・合計欄の
+    # 読み直しで捨てた header の注意が、採った header に当てはまらないのに残っていた。バグハント第 3 弾 C13）
+    hdr_notes_now: list = []
     res = ReadResult(False, case_dir)
     t0 = time.time()
     try:
@@ -916,9 +941,11 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
         黙って値を落として合計欄の検算なしで進まない。Codex 指摘 2026-09-14）。
         JSON オブジェクトでない返事（配列・文字列）は _ask_json が 1 回言い直させる"""
         def normalise(raw):
-            h = _normalise_header(raw, vehicle_hint, insurance_hint, customer_hint, notes=guard_notes)
+            _hn: list = []
+            h = _normalise_header(raw, vehicle_hint, insurance_hint, customer_hint, notes=_hn)
             if not isinstance(h.get('totals'), dict) or not h['totals']:
                 raise PageShapeError('totals（見積書の合計欄）が無い。合計欄は必ず写す（検算の拠り所）')
+            hdr_notes_now[:] = _hn   # 採った header の注意だけにする（C13）
             return h
         raw = _ask_json(reader, system, [whole, {'type': 'text', 'text': task_text}], usage, 'header.json')
         for attempt in range(max_retries):
@@ -990,7 +1017,15 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
             rounds += 1
             if rounds == 1:
                 _progress(progress, '合計欄と合わないので、合計欄・費用・塗装の写しを読み直しています')
+                _hdr_prev = header
                 header = ask_header(prompts.header_retry_task(check['fail'], check.get('warn') or [], header, (rd or {}).get('tax_included')), system, whole)
+                # 読み直させたのは合計欄・塗装・レバーレート（と header に書いた費用を消すこと。prompts.header_retry_task）。
+                # 車両・顧客・保険などの欄は、最初に写したものを使う。丸ごと差し替えていたので、返事が車両欄を落とすと車両が消えて
+                # 下書き生成で止まり（バグハント第 3 弾 C6）、欄の一部だけ返すと型式指定・類別などが黙って消えた（Codex 講評 2 周目 P1）。
+                # 合計欄の読み直しで車や顧客が変わることは無いはずなので、中身が違っても最初の写しを採る
+                for _k in ('vehicle', 'customer', 'insurance', 'hints', 'source', 'issuer', 'est_date', 'note'):
+                    if _hdr_prev.get(_k) not in (None, '', [], {}):
+                        header[_k] = copy.deepcopy(_hdr_prev[_k])
                 res.header = header
             else:
                 _progress(progress, '合計欄と合わないので、各ページの写し漏れ・二重写しを確かめています')
@@ -999,11 +1034,19 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
                     pg = i + 1
                     blocks = [llm_mod.document_block(page_pdfs[i]),
                               {'type': 'text', 'text': prompts.page_totals_retry_task(pg, check['fail'], page, (rd or {}).get('tax_included'))}]
-                    p2, shape_err = normalise_or_fail(_ask_json(reader, system, blocks, usage, f'page_{pg}.json'), pg)
+                    try:
+                        p2, shape_err = normalise_or_fail(_ask_json(reader, system, blocks, usage, f'page_{pg}.json'), pg)
+                    except (llm_mod.LLMError, PageShapeError):
+                        # 壊れた返事が続いた・断られた: このページは前回の写しのまま続ける（読み取り全体を捨てていた。C6）
+                        p2 = None
                     v = run('validate', header=header, page=p2) if p2 else {'ok': False}
                     if v.get('ok'):
                         new_pages.append(p2)
                         res.traces[i].attempts += 1
+                        # 読み直しで検算に通ったページは合格に戻す（最初に上限まで落ちたページが、正しく読めても不合格のまま
+                        # 残り、合計まで合っているのに「要確認」になっていた。バグハント第 3 弾 C5）
+                        res.traces[i].ok, res.traces[i].rows = True, int(v.get('rows') or 0)
+                        res.traces[i].fail, res.traces[i].warn = [], list(v.get('warn') or [])
                     else:  # 読み直しで検算が落ちるなら前回の（合格していた）写しを残す
                         new_pages.append(page)
                 pages = new_pages
@@ -1022,9 +1065,9 @@ def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str =
             res.merge_messages = list(m.get('messages') or [])
         # 塗装材料代が塗装工賃計と桁違いでないか（最後に読んだ header で見る。金額は動かさない。2026-09-21）
         mat_note = _paint_material_note(header)
-        res.app_notes = [n for n in (list(guard_notes) + ([m_note] if m_note else []) + ([p_note] if p_note else [])
+        res.app_notes = [n for n in (list(hdr_notes_now) + list(guard_notes) + ([m_note] if m_note else []) + ([p_note] if p_note else [])
                                      + ([mat_note] if mat_note else [])) if n]   # 納品する報告文にも残す（画面だけに出して消えないように。2026-09-20 本番のバグハント）
-        _extra = (list(guard_notes) + ([m_note] if m_note else []) + ([p_note] if p_note else []) + ([mat_note] if mat_note else [])
+        _extra = (list(hdr_notes_now) + list(guard_notes) + ([m_note] if m_note else []) + ([p_note] if p_note else []) + ([mat_note] if mat_note else [])
                   + [m_ for m_ in (res.merge_messages or []) if m_])   # merge の注意（重複行など）も合格時に見える所へ（G11）。M の注意は最後に書き出した写しの分だけ
         if _extra:   # 戻した理由は合計欄の検算の注意と同じ列に（app は check.warn を「読み取りの注意」に出す）
             check = dict(check or {})

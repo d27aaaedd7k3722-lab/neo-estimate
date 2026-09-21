@@ -323,7 +323,10 @@ def addata_version(path: Optional[str]) -> str:
         return ''
     for line in text.splitlines():
         if line.lower().startswith('number='):
-            return line.split('=', 1)[1].strip()
+            v = line.split('=', 1)[1].strip()
+            # 版は「2026/08」の形だけ受ける。?addata_url= の ZIP などで外から入る値なので、
+            # 形の違うもの（HTML を仕込んだもの等）は「不明」にする（バグハント第 3 弾 D1）
+            return v if re.fullmatch(r'\d{4}/\d{1,2}', v) else ''
     return ''
 
 

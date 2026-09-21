@@ -236,6 +236,9 @@
   }
 
   window.addEventListener('message', async function (ev) {
+    // 描画の知らせは親（Streamlit の画面）からだけ受ける。ほかの窓（このアプリを開いた別のページなど）から
+    // 「streamlit:render」を送られると、Addata の取得 URL（keep）を覚えさせられ・接続を解除させられた（バグハント第 3 弾 D3）
+    if (ev.source !== window.parent) return;
     const d = ev.data || {};
     if (d.type !== 'streamlit:render') return;
     lastArgs = d.args || lastArgs;

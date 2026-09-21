@@ -464,8 +464,16 @@ chk(app._p2n_check_count(_u2a) == 2 and app._p2n_check_count(_u2b) == 0 and app.
 # 添付の読み取りは画面を描くときには走らせない（添付しただけで待たされない。2026-09-20 亮平さん指示）
 chk('cached_only=True' in _app_src and _app_src.count('cached_only=True') >= 4,
     '9v2: 画面を描くときの添付の読み取りが API を呼ぶままになっている')
-chk("_doc_fill_to_sidebar(_p2n_doc)" in _app_src and inspect.getsource(app).index("_p2n_ihint = _insurance_hint_now(_p2n_doc)") < inspect.getsource(app).index("_doc_fill_to_sidebar(_p2n_doc)"),
-    '9v3: 生成時の保険 hint を作る前にサイドバーへ入れている（書類の値が hint から落ちる）')
+# 生成時は、書類の値を**先に**サイドバーへ入れてから、サイドバーの値そのものを hint にする（NEO・画面・入力の指紋を同じ値に。
+# 前は hint を先に作ってからサイドバーを書き換えていたので、同じ書類を別のモデルで読み直すと NEO だけ前の読みのまま、画面と指紋は
+# 新しい読み、になっていた。バグハント第 3 弾 C1）。ベタ打ちも同じ形
+_src_all = inspect.getsource(app)
+chk("_doc_fill_to_sidebar(_p2n_doc)" in _app_src and "_p2n_ihint = _sidebar_insurance_hint()" in _app_src
+    and _src_all.index("_doc_fill_to_sidebar(_p2n_doc)") < _src_all.index("_p2n_ihint = _sidebar_insurance_hint()"),
+    '9v3: 生成時の保険 hint を、書類の値をサイドバーへ入れる前に作っている（NEO と画面・指紋が食い違う）')
+chk("_insurance_hint_now" not in _src_all and "_fresh_doc_fill" not in _src_all
+    and _src_all.index("_doc_fill_to_sidebar(_p2n_beta_doc)") < _src_all.index("_p2n_beta_ins = _sidebar_insurance_values()"),
+    '9v3b: ベタ打ち・取り置きの再開で、サイドバーと別の作り方の保険 hint が残っている')
 
 # アプリ側が写しに書いた指定（塗装の実額・M を外した 等）は、画面だけでなく**納品する報告文**にも残す（2026-09-20 本番のバグハント）
 chk(_app_src.count('_with_app_notes(') >= 4 and "out['app_notes']" in _app_src,
@@ -779,7 +787,8 @@ _smp = os.path.join(os.path.dirname(R), 'サンプル見積PDF', '見積書.pdf'
 if os.path.exists(_smp):
     chk(not app._upload_kind_problem(open(_smp, 'rb').read(), '見積書.pdf'), '12k3: 本物の見積書 PDF を断ってしまう')
 # 画面側: 読めないファイルでは生成ボタンを押させない
-chk('_upload_kind_problem(_p2n_bytes, _p2n_file.name)' in _app_src
+# 見積書の入口では読み取りのページ数の上限も渡す（上限を超える PDF で添付の読み取りの課金が先に走っていた。バグハント第 3 弾 C10）
+chk('_upload_kind_problem(_p2n_bytes, _p2n_file.name, max_pages=_nsk_reader_gate.MAX_PAGES)' in _app_src
     and 'この見積書は読めません' in _app_src,
     '12k4: 読めない見積書でも生成ボタンが押せる')
 chk('_upload_kind_problem(_b, str(_f.name' in _ocr_src,

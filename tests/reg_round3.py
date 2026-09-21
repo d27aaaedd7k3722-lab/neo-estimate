@@ -769,10 +769,22 @@ def test_csv_blank_method_as_printed():
                              ('写真代', 3000, 0, ''), ('ﾊﾞﾝﾊﾟ分解', 0, 2000, '分解調整'), ('ﾌﾛﾝﾄﾊﾟﾈﾙ 鈑金', 0, 20000, '鈑金')):
         g = app._infer_method_from_name({'name': nm, 'parts_amount': pa, 'wage': wg})
         chk(g == want, f'推し量りが変わった: {nm} 部品 {pa} 工賃 {wg} → {g!r}（元は {want!r}）')
-    # ステップ④が CSV 取り込みのときだけ推し量りを止める（プレビュー取り込みは _csv_import が False）
+    # ステップ④は推し量らない（区分は③の表のとおり）。プレビュー取り込みは取り込むときに推し量った区分を表に入れる
+    # （④で推し量ると③で区分を消した行に区分が入った。バグハント第 3 弾 B3）
     src = open(os.path.join(ROOT, 'app.py'), encoding='utf-8').read()
-    chk("infer_method=not bool((estimate_data or {}).get('_csv_import'))" in src,
-        'ステップ④が CSV 取り込みで推し量りを止めていない')
+    # ④の生成の呼び出し（`neo_data, …, grand_total = generate_neo_file(...)`）そのものを構文木で見る
+    # （文字列がどこかにあるだけで通る検査にしない。Codex 講評 第 3 弾 1 周目）
+    import ast as _ast
+    _calls = [n.value for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.Assign) and isinstance(n.value, _ast.Call)
+              and getattr(n.value.func, 'id', '') == 'generate_neo_file'
+              and any(isinstance(t, _ast.Tuple) and any(getattr(e, 'id', '') == 'grand_total' for e in t.elts) for t in n.targets)]
+    _kw = [k for c in _calls for k in c.keywords if k.arg == 'infer_method']
+    chk(len(_calls) == 1 and len(_kw) == 1 and isinstance(_kw[0].value, _ast.Constant) and _kw[0].value.value is False,
+        f'ステップ④が推し量りを止めていない（③で消した区分が NEO に入る）: 呼び出し {len(_calls)} 件 / infer_method '
+        f'{[_ast.unparse(k.value) for k in _kw]}')
+    chk("_pv_m = _infer_method_from_name(_pv_it)" in src and "st.session_state['csv_items'] = _p2n_items_pv" in src,
+        'プレビュー取り込みで、推し量った区分を③の表に入れていない（ベタ打ちの NEO と区分が変わる）')
 
 
 def test_csv_ai_diff_marks():
@@ -817,21 +829,22 @@ def test_csv_ai_diff_marks():
     # 取り込み: 相違のメモは明細にせず注記に回り、画面（③の確認・ファイル名）へ運ぶ
     it, notes = app.parse_csv_to_items('品名,区分,数量,部品金額,工賃,部品コード\nﾊﾞﾝﾊﾟ,取替,1,45000,0,\n"部品相違1,200円 工賃相違0円"\n',
                                        return_notes=True)
-    chk(len(it) == 1 and any(str(n).startswith('部品相違') for n in notes), f'相違のメモの扱い: {it} / {notes}')
-    # 前置き付きの申告も拾う（「⚠️」「※」・長い前置き・短い前置き）。先頭を「部品相違」にそろえて③の確認につなぐ（Codex 1 周目 P2）
+    chk(len(it) == 1 and any(app._is_ai_diff_text(n) for n in notes), f'相違のメモの扱い: {it} / {notes}')
+    # 前置き付きの申告も拾う（「⚠️」「※」・長い前置き・短い前置き）。申告は**全文のまま**③の確認につなぐ（Codex 1 周目 P2。
+    # 先頭を「部品相違」にそろえて前を切り捨てると「部品代相違1,200円 工賃相違0円」の部品側が消えた。バグハント第 3 弾 B1）
     _h = '品名,区分,数量,部品金額,工賃,部品コード\nﾊﾞﾝﾊﾟ,取替,1,45000,0,\n'
     for tail in ('"⚠️ 部品相違1,200円 工賃相違0円"\n', '"※部品相違1,200円"\n', '"相違確認結果: 部品相違1,200円 工賃相違0円（照合済み）"\n',
                  '"相違: 部品相違1,200円"\n', '相違確認,部品相違1,200円\n'):
         it_p, notes_p = app.parse_csv_to_items(_h + tail, return_notes=True)
-        _d = [n for n in notes_p if str(n).startswith(('部品相違', '工賃相違'))]
+        _d = [n for n in notes_p if app._is_ai_diff_text(n)]
         chk(len(it_p) == 1 and _d and m(_d) == ['部品相違'],
             f'前置き付きの相違申告（{tail.strip()}）を③の確認につないでいない: 明細 {len(it_p)} 行 / {notes_p}')
     # 逆向き: 相違の無い申告は確認にしない／相違の語を含む正しい明細（金額あり）は明細のまま
     it_n, notes_n = app.parse_csv_to_items(_h + '"※部品相違・工賃相違はありません（一致）"\n', return_notes=True)
-    chk(len(it_n) == 1 and m([n for n in notes_n if str(n).startswith(('部品相違', '工賃相違'))]) == [],
+    chk(len(it_n) == 1 and m([n for n in notes_n if app._is_ai_diff_text(n)]) == [],
         f'「相違はありません」を相違として確認にしている: {notes_n}')
     it_i, notes_i = app.parse_csv_to_items(_h + 'ﾊﾟﾈﾙ部品相違調整,調整,1,0,3000,\n', return_notes=True)
-    chk(len(it_i) == 2 and not any(str(n).startswith('部品相違') for n in notes_i),
+    chk(len(it_i) == 2 and not any(app._is_ai_diff_text(n) for n in notes_i),
         f'金額のある明細を相違のメモとして捨てている: {it_i} / {notes_i}')
     # 品名に「相違」の無い 0 円の行は、ほかの欄に「部品相違」の語があっても明細のまま（備考などの語を申告と取り違えない）
     it_k, notes_k = app.parse_csv_to_items(_h + 'ﾄﾞｱﾐﾗｰ,部品相違なし,1,0,0,\n', return_notes=True)
@@ -848,11 +861,14 @@ def test_csv_ai_diff_marks():
     src = open(os.path.join(ROOT, 'app.py'), encoding='utf-8').read()
     for frag, why in (("st.session_state['_csv_ai_diffs'] = {'sig': _items_sig(_preview_items)", '①で明細と組にしていない'),
                       ("estimate_data['_csv_ai_diffs'] = [str(n) for n in _cad['notes']]", '②で運んでいない'),
-                      ("key='csv_ai_diff_confirmed'", '③に確認のチェックが無い'),
+                      ("key=_ack_key('csv_ai_diff_confirmed', _ack_base, _ai_notes)", '③に確認のチェックが無い'),
                       # 確認を外す鍵に取り込みごとの番号を入れる（同じ文面の申告の別の CSV で前の確認を持ち越さない。Codex 1 周目 P1）
                       ("estimate_data['_csv_import_seq'] = _cseq", '②で取り込みごとの番号を振っていない'),
-                      ("_ai_sig = (f\"{estimate_data.get('_csv_import_seq', '')}\\n{_items_sig(edited_items)}\\n\" + '\\n'.join(_ai_notes))",
+                      # 確認のチェックの鍵は、取り込み（中身・番号）といまの明細から作る（バグハント第 3 弾 B4）
+                      ("_ack_base = (str(st.session_state.get('_estimate_token') or ''), str((estimate_data or {}).get('_csv_import_seq', '')),",
                        '③の確認を外す鍵に取り込みの番号・いまの明細が無い（確認のあとに直した明細で生成できる。Codex 7 周目 P1）'),
+                      ("                         _items_sig(edited_items))",
+                       '③の確認を外す鍵にいまの明細が無い（確認のあとに直した明細で生成できる。Codex 7 周目 P1）'),
                       ("amount_confirmed = bool(amount_confirmed) and bool(_ai_ok)", '③の確認が生成を止めていない'),
                       ("extra_marks=(_s3v.get('csv_ai_marks') or ())", '④でファイル名に印を付けていない')):
         chk(frag in src, f'AI の申告の配線: {why}')

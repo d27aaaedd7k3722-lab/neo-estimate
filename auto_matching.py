@@ -1404,6 +1404,11 @@ def _clear_master_codes(it):
 def match_pdf_items_to_addata(items, vehicle_info, addata_root=ADDATA_ROOT):
     """app.py の items 形式を Addata DB と照合して L1-L4 マッチ情報を付与する薄いラッパ。
 
+    ⚠️ 2026-09-21 からアプリ（CSV・プレビュー取り込み）はこれを呼ばない。右の参照番号（12.DB の mirror）を読まない、
+    ﾌﾛﾝﾄ/ﾘﾔ を前後として読まない、品番を金額の合わない先頭レコードから取る、13.DB を 1 バイトずれて読む、
+    という欠陥で別の部品の部品コード・品番を返す（バグハント第 3 弾 E1/E2/E5。車種の決め方の欠陥 E3 は
+    identify_vehicle 側）。使い直すなら先にこれらを直すか、正本 vendor の find_ref に置き換えること。
+
     入力:
       items: list[dict] — app.py 形式（parts_name / parts_no / quantity / unit_price / amount / category / wage 等）
       vehicle_info: dict — 車両情報（model_designation, category_number, model_code, color_code 等）
