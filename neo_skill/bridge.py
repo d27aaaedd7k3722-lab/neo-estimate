@@ -42,8 +42,10 @@ _SAFE_PART = re.compile(r'^[A-Za-z0-9_.\-]+$')
 # 部品から受け取る内容の上限（Addata の実測: COM 69 ファイル・最大 3.4MB、車種フォルダ 30 ファイル前後・最大 7MB）。
 # 画面の ZIP アップロード（200MB）や取得URL（300MB）の上限をこの経路で素通りさせない
 MAX_FILES_PER_MESSAGE = 400
-MAX_FILE_BYTES = 32 * 1024 * 1024
-MAX_MESSAGE_BYTES = 128 * 1024 * 1024
+# 1 回の知らせの上限は**元の大きさで 24MB**（送る知らせは base64 で 4/3 倍の約 32MB。実需の最大は車種フォルダ 11.1MB・COM 8.8MB）。
+# 以前の 128MB は共有プロセスの記憶を跳ねさせた（第 4 弾 Q4）。元の大きさで 32MB にしていたときは、知らせが 42MB 余りになりえた（Codex）
+MAX_FILE_BYTES = 24 * 1024 * 1024
+MAX_MESSAGE_BYTES = 24 * 1024 * 1024   # 部品と同じ値
 ALLOWED_EXT = frozenset({'.db', '.cab', '.chm', '.txt', ''})   # '' は COM/AdVer（拡張子なし）
 MARKER_DIR = '.bridge'   # フォルダ単位の完了印（COM.ok / W69.ok）。vendor は A〜Z と COM しか見ない
 

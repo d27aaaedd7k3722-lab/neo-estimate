@@ -120,7 +120,9 @@ def test_legacy_vehicle_info():
     v = dh.vehicle_info_for_legacy(SHAKEN, DOC)
     chk(v['customer_name'] == 'テスト自動車販売株式会社' and v['owner_name'] == 'テスト自動車販売株式会社', f'使用者が同上なら所有者を顧客名に（旧経路は customer_name をそのまま Name1 に書く）: {v.get("customer_name")!r}')
     chk(v['color_code'] == '3T3' and v['body_color'] == 'センシュアルレッドマイカ', f'書類から色を補う: {v.get("color_code")!r} {v.get("body_color")!r}')
-    chk(v['car_model'] == '５ＢＡ－ＫＳＰ２１０', '車検証の型式は書き換えない')
+    # 型式は**中身を書き換えない**（排ガス記号 5BA- を外さない）。幅と区切りだけ実機と同じ半角にそろえる
+    # （実機 7,178 本中 7,169 本が半角英数字と「-」だけ。以前は全角のまま NEO に入っていた。第 4 弾 C3）
+    chk(v['car_model'] == '5BA-KSP210', f"車検証の型式は書き換えない（排ガス記号を残し、半角にそろえる）: {v['car_model']!r}")
     # 登録番号は実機 NEO と同じ半角数字・ハイフン無し（車検証 OCR は全角 '５００' '１２３４' で返す）
     chk(v['car_reg_division'] == '500' and v['car_reg_serial'] == '1234' and v['car_reg_business'] == 'あ' and v['car_reg_department'] == '北九州',
         f'登録番号を半角に: {[v.get(k) for k in ("car_reg_department", "car_reg_division", "car_reg_business", "car_reg_serial")]!r}')

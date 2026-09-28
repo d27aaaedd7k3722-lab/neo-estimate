@@ -221,7 +221,8 @@ chk(row == ('', 500), f'13: 品名空の行 {row} (期待 ("",500))')
 # 品名がある未マッチ行には引き続き ※ が付く
 cur = gen([{'name': '未マッチ品', 'method': '取替', 'parts_amount': 500, 'wage': 0,
             'quantity': 1, 'match_level': 'L4', '_match_level': 0}])
-chk(cur.execute('select PartsName from ERParts').fetchone()[0] == '※未マッチ品',
+# 品名のカタカナは NEO に書くとき半角にそろえる（§12.26。第 4 弾 A3）ので「※未ﾏｯﾁ品」
+chk(cur.execute('select PartsName from ERParts').fetchone()[0] == '※未ﾏｯﾁ品',
     '13b: 名前のある未マッチ行に ※ が付かない')
 
 # 14. 未マッチ行に ※ を付けても、末尾の左右が消えないこと。
@@ -243,8 +244,11 @@ for _n in ('フロントバンパーカバー左', 'フロントバンパーカ�
     for _side in ('左', '右'):
         if _side in _n:
             chk(_side in _got, f'14: {_n} -> {_got!r} で「{_side}」が消えた')
-    _seen.setdefault(_got, []).append(_n)
-_dup = {k: v for k, v in _seen.items() if len(v) > 1}
+    # 全角と半角の書き方違いだけの品名（「…アウタ R」と「…　アウタ　Ｒ」）は同じ部品。NEO に書くとき半角にそろえるので
+    # 同じ文字列になってよい（第 4 弾 A3）。別の部品（アウタとインナ・左と右）が同じ文字列になるのを見る
+    import unicodedata as _ud14
+    _seen.setdefault(_got, set()).add(_ud14.normalize('NFKC', _n))
+_dup = {k: sorted(v) for k, v in _seen.items() if len(v) > 1}
 chk(not _dup, f'14: 別部品が同じ文字列になった: {_dup}')
 
 # 15. 税込表記で、丸めの差額を1行に寄せないこと。

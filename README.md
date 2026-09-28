@@ -67,7 +67,7 @@ Addata は画面のサイドバー「🖥️ PC の Addata をこの画面から
 python tests/reg_insurance.py
 ```
 
-回帰テストは `tests/reg_*.py` の **21 本**（2026-09-22 にバグハント第 3 弾の `reg_hunt3` を足した）。受け入れテストは `tests/reg_vendor.py`（実案件 20 件と突き合わせ・不一致 0 が合格）。
+回帰テストは `tests/reg_*.py` の **24 本**（2026-09-22 にバグハント第 3 弾の `reg_hunt3`、第 4 弾の `reg_hunt4`・`reg_screen`（画面の③④を AppTest で通す）・`reg_behavior`（9/21 の直しを振る舞いで確かめる）を足した）。受け入れテストは `tests/reg_vendor.py`（実案件 20 件と突き合わせ・不一致 0 が合格）。
 
 **`reg_vendor_units` は「23 本 OK / 1 本が不合格」が正常**です。vendor に取り込んだ単体テストの写しだけが古く、
 中身は正しく金額も動いていません（引き継ぎ書 §13-6「既知の不合格」を参照）。**数が変わったら本物の退行**。

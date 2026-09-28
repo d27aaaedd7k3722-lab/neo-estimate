@@ -576,6 +576,34 @@ def get_mime_type(filename):
     return mime_map.get(ext, 'application/octet-stream')
 
 
+def _fmt_frac(v) -> str:
+    """表に打たれた数をそのまま見せる（'{:g}' は有効 6 桁で 123456.5 → 123456・1234567.25 → 1.23457e+06 になる。レビュー 5 周目）"""
+    try:
+        s = format(float(v), 'f')
+    except (TypeError, ValueError):
+        return str(v)
+    return (s.rstrip('0').rstrip('.') if '.' in s else s)
+
+
+def _is_fractional_cell(v) -> bool:
+    """表の数の欄に円未満・小数が入っているか。空・NaN・整数（45000.0 を含む）は False（F1）"""
+    try:
+        if v is None:
+            return False
+        f = float(v)
+        if f != f:          # NaN
+            return False
+        return abs(f - round(f)) > 1e-9
+    except (TypeError, ValueError):
+        return False
+
+
+def _doc_hints_mod():
+    """neo_skill.doc_hints を返す（app.py の読み込みの時点では import しない。会社名の略し fit_corp_name などに使う）"""
+    from neo_skill import doc_hints as _dh
+    return _dh
+
+
 def safe_int(val, default=0):
     """OCR由来の「1個」「19,550円」「1.00」「8本」「**」なども整数化"""
     if val is None or val == '' or val == '*' or val == '**':
@@ -678,10 +706,14 @@ def policy_no_or_accept(ins, existing: str = '', merge_mode: bool = False) -> st
     ただし**マージモード**（カスタムのテンプレート NEO の値を残す経路）で、テンプレートに証券番号があるなら空を返して残す
     ＝ 本物の証券番号を事故番号で塗り替えない。スキル経路は draft_estimate.Drafter._insurance が同じ規則"""
     d = ins or {}
+    from neo_skill.doc_hints import is_blank_word as _blank
+    # 「-」「不明」は証券番号ではない（空として事故番号・受付番号を入れる。第 4 弾 C1）
     pol = safe_str(d.get('policy_no', '')).strip()
-    if pol:
+    if pol and not _blank(pol):
         return pol
     acc = safe_str(d.get('accept_no', '')).strip()
+    if _blank(acc):
+        acc = ''
     if acc and merge_mode and safe_str(existing).strip():
         return ''
     return acc
@@ -1444,6 +1476,10 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
             if name == item.get('_original_name', name) or name == item.get('_master_name'):
                 name = item.get('_master_name')
                 parts_no = item.get('_master_part_no', '')
+        # 品名のカタカナ・英数字は半角（NEO の名称欄の決まり §12.26）。CSV の取り込みと③は半角にしているが、ベタ打ちの
+        # 一発生成（pdf_to_neo_pipeline.build_neo_mode_a）は全角のまま書き、同じ明細でも道によって品名が変わっていた
+        # （全角のまま 24 バイトで切れる。第 4 弾 A3）。書き出しのこの 1 か所でそろえる（半角の品名は変わらない）
+        name = to_halfwidth_katakana(str(name or ''))
         # DBマッチなし（CSV取り込み等）の場合はCSVの部品コードをPartsNoに使用
         if not parts_no:
             parts_no = str(item.get('part_no', '') or '')
@@ -2219,8 +2255,13 @@ def _trimmed_cust_values(cust: dict) -> dict:
     return {
         'customer_name': cp932_trim(_strip_control_chars(cust.get('customer_name', '')), _CUST_WIDTH['Name1']),
         # 使用者欄: vehicle_info に user_name があればそれ（車検証の使用者が同上なら '同上'。Codex hunt B7）、無ければ従来どおり顧客名
-        'user_name':     cp932_trim(_strip_control_chars(cust.get('user_name') if str(cust.get('user_name') or '').strip() else cust.get('customer_name', '')), _CUST_WIDTH['UserName']),
-        'owner_name':    cp932_trim(_strip_control_chars(cust.get('owner_name', '')),    _CUST_WIDTH['OwnerName']),
+        # 会社名は所有者名と同じく、入りきらないときだけ ㈱ などに略してから切る（レビュー 5 周目）
+        'user_name':     cp932_trim(_doc_hints_mod().fit_corp_name(
+            _strip_control_chars(cust.get('user_name') if str(cust.get('user_name') or '').strip() else cust.get('customer_name', '')),
+            _CUST_WIDTH['UserName']), _CUST_WIDTH['UserName']),
+        # 会社名は入りきらないときだけ ㈱ などに略してから切る（「…株式会社」→「…株」で切れていた。第 4 弾 C6）
+        'owner_name':    cp932_trim(_doc_hints_mod().fit_corp_name(_strip_control_chars(cust.get('owner_name', '')), _CUST_WIDTH['OwnerName']),
+                                    _CUST_WIDTH['OwnerName']),
         'postal_no':     cp932_trim(_strip_control_chars(cust.get('postal_no', '')),     _CUST_WIDTH['PostalNo']),
         'prefecture':    cp932_trim(_strip_control_chars(cust.get('prefecture', '')),    _CUST_WIDTH['Prefecture']),
         'municipality':  cp932_trim(_strip_control_chars(cust.get('municipality', '')),  _CUST_WIDTH['Municipality']),
@@ -2376,7 +2417,7 @@ def _update_em_db_impl(conn, cust, insurance_info, estimated_date,
     except sqlite3.Error:
         _tpl_policy = ''
     policy_no     = cp932_trim(policy_no_or_accept(insurance_info, _tpl_policy, merge_mode), 20)
-    contractor    = cp932_trim(insurance_info.get('contractor_name', ''), 20)
+    contractor    = cp932_trim(_doc_hints_mod().fit_corp_name(insurance_info.get('contractor_name', ''), 20), 20)   # C6
     agency_name   = cp932_trim(insurance_info.get('agency_name', ''), 20)
     adjuster_name = cp932_trim(insurance_info.get('adjuster_name', ''), 20)
     adjuster_post = cp932_trim(insurance_info.get('adjuster_post', ''), 40)   # 支店・所属（Insurance.AdjusterPost は TEXT(40)。L20）
@@ -2598,7 +2639,7 @@ def update_mail_ini(orig_bytes, cust, grand_total, insurance_info=None, merge_mo
         'TicketNo':             cp932_trim(policy_no_or_accept(ins, read_xml_tag(text, 'TicketNo'), merge_mode), 20),   # 証券番号（vendor と同じ。DB の Insurance.PolicyNo と揃える。空なら事故番号・受付番号）
         'Note2':                '',
         'Note3':                '',
-        'ii_CustomerName':      cp932_trim(ins.get('contractor_name', ''), 20),  # 契約者（vendor と同じ。DB の Insurance.ContractorName と揃える）
+        'ii_CustomerName':      cp932_trim(_doc_hints_mod().fit_corp_name(ins.get('contractor_name', ''), 20), 20),  # 契約者（DB の Insurance.ContractorName と揃える。C6）
         'ii_PresenceDate':      '',
         'ii_AgreedDate':        '',
         'ii_RepairDays':        '',
@@ -5287,7 +5328,8 @@ def analyze_insurance_document(api_key, file_bytes, mime_type, model_name=None):
             _last = e2
             result = {}
     if not _has_data(result):
-        return {'_error': str(_last) if _last else '書類から事故・車両の情報を読み取れませんでした'}
+        # 例外の本文は画面に出さない（API の返事に送った書類の中身が混じりうる。第 4 弾 D2）
+        return {'_error': _safe_err(_last) if _last else '書類から事故・車両の情報を読み取れませんでした'}
     return {k: ('' if v is None else str(v).strip()) for k, v in result.items() if k in _doc_hints.INSURANCE_DOC_KEYS}
 
 
@@ -5407,16 +5449,19 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
     if not _shaken_has_data(result):
         # 例外の本文は入れない（画面に出る。API の返事に送った中身が混じりうる。2026-09-21 監査）
         _msg = (_safe_err(_last_error) if _last_error else '車検証のページを判別できませんでした')
+        # 分類は**生の文**で行う（画面に出す _msg は _safe_err の短い文で「429」「404」「RESOURCE_EXHAUSTED」が消えるので、
+        # それで判定するとモデルの記録も切り替えも起きなかった。第 4 弾 D1）。生の文は画面・ログに出さない
+        _raw_err = str(_last_error) if _last_error else ''
         # 失敗の理由を記録しないと、提供終了やクォータ超過のモデルを
         # 毎回選び直して4回ずつ無駄に叩き続ける（明細側には同じ記録が
         # あるのに、車検証側だけ抜けていた）。
         _model_used = model_name or get_default_gemini_model(api_key)
         _switch = False
-        if _is_model_unavailable_error(_msg):
+        if _is_model_unavailable_error(_raw_err):
             _mark_model_unavailable(api_key, _model_used)
             _msg = f'モデル「{_model_used}」は利用できません（提供終了の可能性があります）'
             _switch = True
-        elif _is_quota_error(_msg):
+        elif _is_quota_error(_raw_err):
             _quota_exhausted_set(api_key).add(_model_used)
             try:
                 _availability_cache().pop(_model_cache_key(api_key), None)
@@ -5424,7 +5469,7 @@ def analyze_vehicle_registration(api_key, file_bytes, mime_type, model_name=None
                 pass
             _msg = 'Gemini APIのクォータが上限に達しました'
             _switch = True
-        elif 'API key not valid' in _msg or 'API_KEY_INVALID' in _msg:
+        elif 'API key not valid' in _raw_err or 'API_KEY_INVALID' in _raw_err:
             _msg = 'Gemini APIキーが正しくありません'
         # モデルが原因なら、使える別モデルで1度だけやり直す
         if _switch and not _retried:
@@ -6316,7 +6361,27 @@ def parse_csv_to_items(csv_text: str, return_notes: bool = False):
         # ③の確認にもつながらなかった（バグハント第 3 弾 B1/B14）
         _nm_n = unicodedata.normalize('NFKC', _nm_s)
         _lab = _AI_DIFF_LABEL_RE.match(_nm_n)
-        if ((_lab and re.fullmatch(r'[\s\d,円¥]*', _nm_n[_lab.end():]))
+        _lab_rest = _nm_n[_lab.end():] if _lab else ''
+        # 符号（-1,200円・▲1,200）も申告の書き方（額は絶対値で比べる）。許さないと明細として取り込まれて金額が変わっていた（レビュー 5 周目）
+        _lab_only = bool(_lab) and re.fullmatch(r'[\s\d,円¥\-+−△▲]*', _lab_rest) is not None
+        if _lab_only and (parts_amt or wage_amt):
+            # 品名が見出し語だけ（「部品差額」「工賃差額 」）で、金額の欄に数字がある行。アプリの指示文が AI に書かせる
+            # 「〜相違」の形で、品名に**同じ金額**が書いてある従来の申告（「部品相違 1,200円」＋部品金額 1,200）だけを申告とみなす。
+            # 「差額・差異」の行（「部品差額 3,000」＋3,000 も）は明細なのか申告なのか決められないので止める
+            # （第 4 弾 A1: 見出し語を「差額・差異」に広げたら、金額のある「部品差額 3,000」の明細を申告として黙って捨て、
+            # NEO が 3,300 円少なくなった。捨てた金額は「読み飛ばしました」にも出なかった。Codex 2 周目 P1）
+            _nm_amt = re.sub(r'\D', '', _lab_rest)
+            # 金額の欄はちょうど 1 つ、見出しの側に（部品相違 → 部品金額・工賃／技術料相違 → 工賃・合計／総額／金額相違 → どちらか）。
+            # 両方の欄に同じ額・逆の欄に額がある行は申告の形ではないので止める（Codex 3 周目 P1）
+            _nz = [x for x in (parts_amt, wage_amt) if x]
+            _side_ok = (bool(parts_amt) if _lab.group(1) == '部品'
+                        else bool(wage_amt) if _lab.group(1) in ('工賃', '技術料') else True)
+            if not (_lab.group(3) == '相違' and _nm_amt and len(_nz) == 1 and abs(_nz[0]) == int(_nm_amt) and _side_ok):
+                _errors.append(f'❌ 「{name.strip()[:24]}」の行は、差額の申告なのか明細なのか分かりません（金額の欄に数字が入っています）。'
+                               '見積書に印字された明細なら品名に一言足して明細と分かるように（例: 「部品差額 調整分」）、'
+                               'AI が書き足した差額の申告なら金額の欄を消してください。')
+                continue
+        if (_lab_only
                 or (re.search(r'相違|差異|差額', _nm_n) and _ai_diff_note(_dn)
                     and parts_amt == 0 and wage_amt == 0 and (not part_no or _lab))):
             _trailer_notes.append(_ai_diff_note(_dn) or _dn)
@@ -6862,6 +6927,10 @@ def check_parts_labor_classification(items):
     for i, item in enumerate(items):
         name      = str(item.get('name', '')).strip()
         method    = str(item.get('method', '')).strip()
+        # 語を探すのは NFKC でそろえた形で（③で品名を半角カナにしたので、全角カナの語が当たらなくなっていた。第 4 弾 A2）。
+        # 画面に出す品名は元のまま
+        name_n    = unicodedata.normalize('NFKC', name)
+        method_n  = unicodedata.normalize('NFKC', method)
         parts_amt = safe_int(item.get('parts_amount', 0))
         wage      = safe_int(item.get('wage', 0))
         # 画面の表の No で呼ぶ（行を消すと位置と No がずれ、別の行を指していた。_ed_no はステップ③の表が付ける）
@@ -6880,7 +6949,7 @@ def check_parts_labor_classification(items):
             })
 
         # パターン1: 脱着系で parts_amount > 0
-        if any(kw in name or kw in method for kw in REMOVAL_KW) and parts_amt > 0:
+        if any(kw in name_n or kw in method_n for kw in REMOVAL_KW) and parts_amt > 0:
             alerts.append({**base,
                 'flag': 'parts_in_labor',
                 'message': f'{row_ref}「{name}」: 脱着系作業なのに部品金額 ¥{parts_amt:,} が計上されています。'
@@ -6890,7 +6959,7 @@ def check_parts_labor_classification(items):
             continue
 
         # パターン2: 材料系名称で wage > 0 かつ parts_amount = 0
-        if any(kw in name for kw in MATERIAL_KW) and wage > 0 and parts_amt == 0:
+        if any(kw in name_n for kw in MATERIAL_KW) and wage > 0 and parts_amt == 0:
             alerts.append({**base,
                 'flag': 'labor_in_parts',
                 'message': f'{row_ref}「{name}」: 材料系品名なのに工賃 ¥{wage:,} のみ計上されています。'
@@ -6900,8 +6969,8 @@ def check_parts_labor_classification(items):
             continue
 
         # パターン3: 作業系名称で parts_amount > 0 かつ wage = 0 （取替除く）
-        if any(kw in name or kw in method for kw in WORK_KW):
-            if parts_amt > 0 and wage == 0 and '取替' not in method and '交換' not in method:
+        if any(kw in name_n or kw in method_n for kw in WORK_KW):
+            if parts_amt > 0 and wage == 0 and '取替' not in method_n and '交換' not in method_n:
                 alerts.append({**base,
                     'flag': 'parts_in_labor',
                     'message': f'{row_ref}「{name}」: 作業系名称なのに部品金額 ¥{parts_amt:,} のみ計上されています。'
@@ -6913,7 +6982,7 @@ def check_parts_labor_classification(items):
         # パターン4: 両方ゼロ（品名があるのに金額なし）
         if parts_amt == 0 and wage == 0 and name:
             zero_ok = {'脱着', '取外', '取付', '組付', '点検', '調整', '清掃'}
-            if not any(kw in name or kw in method for kw in zero_ok):
+            if not any(kw in name_n or kw in method_n for kw in zero_ok):
                 alerts.append({**base,
                     'flag': 'both_zero',
                     'message': f'{row_ref}「{name}」: 部品金額・工賃ともに0円です。金額の読み取り漏れがないか確認してください。',
@@ -8006,6 +8075,8 @@ def p2n_read(pdf_bytes, file_name, api_key, mime_type='application/pdf',
             'settings': dict((rd.check or {}).get('settings') or {}),
         }
         out['app_notes'] = list(getattr(rd, 'app_notes', None) or [])   # アプリ側が写しに書いた指定（報告文にも残す）
+        # 車検証・書類の車両の値（印字と食い違ったとき、どちらが車種の手がかりとして筋が通るかを p2n_make で確かめる。第 4 弾 E1）
+        out['vehicle_hint'] = dict(vehicle_hint or {})
         out['stage'] = 'read'
         if rd.error or not rd.ok:
             # 読み取りが検算に通らない。NEO は作らない（人が該当ページと差額を見る）。
@@ -8133,7 +8204,10 @@ def _defuse_review_sheet(data, ext):
             _out = io.StringIO()
             _w = _csv_mod.writer(_out, lineterminator='\r\n')
             for _r in _csv_mod.reader(io.StringIO(_txt)):
-                _w.writerow([("'" + _v) if re.match(r'[=@]|[+\-](?![\d,.\s]*$)', _v or '') else _v for _v in _r])
+                # 全角（＝＋－＠）は NFKC で半角にし、先頭の空白・タブ・改行を除いてから見る（第 4 弾 P4）
+                _w.writerow([("'" + _v) if re.match(r'[=@]|[+\-](?![\d,.\s]*$)',
+                                                    unicodedata.normalize('NFKC', _v or '').lstrip(' \t\r\n')) else _v
+                             for _v in _r])
             return _out.getvalue().encode('utf-8-sig')
     except Exception:  # noqa: BLE001  読めないシートは元のまま渡す（受け渡しそのものは止めない）
         return data
@@ -8144,6 +8218,32 @@ def _read_review_sheet(path):
     """確認箇所シートのバイト列（数式を文字にしたもの。_defuse_review_sheet）。無ければ None"""
     from neo_skill import maker as _nsk_maker
     return _defuse_review_sheet(_nsk_maker.read_bytes(path), os.path.splitext(path or '')[1])
+
+
+_UNVERIFIED_HEAD = '# ⚠️ 確認用の NEO — 見積書の読み取りが機械検算に通っていません'
+
+
+def _unverified_report(md, fails) -> str:
+    """検算に通らなかった案件の報告文の**先頭**に、確認用の NEO である旨と不合格の理由を置く（第 4 弾 P3）。
+    vendor の報告文は skip_check で作るので「検算: … OK」と書けてしまい、配った報告文だけ合格のように読めた。
+    その「検算」の行は NEO の中の合計どうしが合っているかだけで、見積書の印字と合っている意味ではないことも書く。
+    報告文が無いときは作らない。二度足さない"""
+    base = str(md or '')
+    if not base.strip() or _UNVERIFIED_HEAD in base:
+        return md
+    nl = chr(10)
+    items = [str(f).strip() for f in (fails or []) if str(f).strip()]
+    lines = [_UNVERIFIED_HEAD, '',
+             'この NEO は**そのまま協定に使えません**。下の点を見積書と突き合わせてから使ってください。',
+             '（この報告文の後ろにある「検算」の行は、NEO の中の合計どうしが合っているかだけを見ています。'
+             '見積書の印字と合っているという意味ではありません）', '']
+    lines += [f'- {f}' for f in items[:30]]
+    if len(items) > 30:
+        lines.append(f'- ほか {len(items) - 30} 件（画面の一覧を見てください）')
+    if not items:
+        lines.append('- 不合格の理由は画面の一覧を見てください')
+    lines += ['', '---', '']
+    return nl.join(lines) + nl + base
 
 
 def _with_app_notes(md, notes) -> str:
@@ -8160,6 +8260,155 @@ def _with_app_notes(md, notes) -> str:
     nl = chr(10)
     body = nl.join('- ' + _paint_note_with_real_total(n, base) for n in notes)
     return base.rstrip(nl) + nl + nl + head + nl + body + nl
+
+
+_VEH_ID_KEYS = ('desig', 'category', 'model_code', 'serial_no')
+_VEH_ID_LABELS = {'desig': '型式指定番号', 'category': '類別区分番号', 'model_code': '型式', 'serial_no': '車台番号'}
+# vendor の報告文の車両の行（make_neo.write_report: 「- 車両: 名前 / 車種コード 年式 … 色 …（確度）装備 …」）
+_REPORT_CAR_RE = re.compile(r'^- 車両: (?P<name>.*?) / (?P<code>\S+) 年式 .*?（(?P<conf>[^（）]*)）装備', re.M)
+
+
+def _veh_norm(k, v) -> str:
+    """車両の手がかりを比べる形に（全角・ハイフン・排ガス記号・先頭の 0 の書き方の違いで食い違いにしない）"""
+    from neo_skill import doc_hints as _dh
+    t = _dh.ident_clean(v)
+    if k in ('desig', 'category'):
+        d = re.sub(r'\D', '', t)
+        return d.zfill(5 if k == 'desig' else 4) if d else ''
+    if k == 'model_code':
+        return re.sub(r'[^0-9A-Z]', '', _dh.strip_emission_prefix(t))
+    return re.sub(r'[^0-9A-Z]', '', t)
+
+
+def _veh_split(res) -> tuple:
+    """1 組の結果 → (型式指定・類別の車の集合, 型式・車台番号の車の集合, 車種の候補, 判定)。
+    判定: 'split'（2 つが別の車）/ 'ambiguous'（候補が 2 車種以上）/ 'ok' / 'unknown'（引けなかった）"""
+    res = res if isinstance(res, dict) else {}
+    if res.get('by_desig') is None or res.get('by_serial') is None:
+        return set(), set(), set(), 'unknown'
+    kc, sc = set(res['by_desig']), set(res['by_serial'])
+    if kc and sc and not (kc & sc):
+        return kc, sc, set(), 'split'
+    cands = (kc & sc) if (kc and sc) else (kc or sc)
+    # 候補が 2 車種以上でも、型式指定・類別（KA81）で引けているなら止めない: 同じ車が年式で 2 つの車種コードに分かれている車
+    # （N-BOX SLASH の J84／J89・N-ONE の J51／J52 など。2010 年以降で 235 組）は KA81 も KA06 も 2 コードを返すが、
+    # vendor は初度登録と KA81 の生産期間で 1 つに決める。止めるのは、KA81 で引けず型式・車台番号だけで 2 車種になる
+    # 双子車（ハイゼットカーゴ／アトレー など 408 型式）のとき（第 4 弾 E2。レビュー 5 周目 P1）
+    return kc, sc, cands, ('ambiguous' if (not kc and len(cands) > 1) else 'ok')
+
+
+def _veh_strength(verdict, kc, sc, cands) -> int:
+    """手がかりの組の確かさ: 2 = 型式指定・類別と型式・車台番号の 2 つが同じ車を指す / 1 = 片方だけで 1 車種に決まる / 0 = それ以外"""
+    if verdict != 'ok' or not cands:
+        return 0
+    return 2 if (kc and sc) else 1
+
+
+def _veh_names(names, codes) -> str:
+    return '・'.join(f"{(names or {}).get(c) or '?'}（{c}）" for c in sorted(codes)) or '（見つからない）'
+
+
+def _p2n_vehicle_crosscheck(reading, vehicle_hint, addata_root) -> dict:
+    """NEO を作る前に、車種を決める 2 つの手がかりが同じ車を指すかを確かめる（第 4 弾 E1・E2）。
+    vendor は「型式指定＋類別区分（KA81）で引けた車」と「型式＋車台番号（KA06）で引けた車」が**別の車でも**、両方引けただけで
+    確度を confirmed にして合格にする（1 桁の読み違いで別の車の NEO が ✅ 合格になっていた）。
+    見積書の印字と車検証・書類の値が食い違うときは、車検証の値に替えると 2 つが重なる（＝車種が確かめられる）場合だけ替える。
+    戻り: {'reading': 使う reading（替えたときは写し）, 'note': 報告文に残す注意, 'conflict': 合格にしない理由,
+           'cands': 手がかりの指す車種コード, 'names': {コード: 車名}}。確かめられなかったときは note だけ（止めない）"""
+    out = {'reading': reading, 'note': '', 'conflict': '', 'cands': [], 'names': {}}
+    if not isinstance(reading, dict) or not isinstance(reading.get('vehicle'), dict):
+        return out
+    v = reading['vehicle']
+    if v.get('generic') and not any(str(v.get(k) or '').strip() for k in _VEH_ID_KEYS):
+        return out   # 手がかりの無い汎用車（輸入車など）は突き合わせるものが無い
+    hint = vehicle_hint if isinstance(vehicle_hint, dict) else {}
+    diffs = [k for k in _VEH_ID_KEYS
+             if str(hint.get(k) or '').strip() and str(v.get(k) or '').strip() and _veh_norm(k, hint[k]) != _veh_norm(k, v[k])]
+    variants = [v] + ([dict(v, **{k: hint[k] for k in diffs})] if diffs else [])
+    try:
+        from neo_skill import reader as _nsk_reader
+        r = _nsk_reader._runner('vehicle_crosscheck', addata_root=addata_root, timeout=180,
+                                variants=[{k: str(x.get(k) or '') for k in _VEH_ID_KEYS} for x in variants])
+    except Exception as e:  # noqa: BLE001  確かめられないときは止めない（vendor の車種の決め方のまま。報告文に残す）
+        out['note'] = f'車種の手がかりの突き合わせができませんでした（{type(e).__name__}）。NEO を開いて車種を確かめてください'
+        return out
+    names = dict(r.get('names') or {})
+    out['names'] = names
+    results = list(r.get('results') or [])
+    kc, sc, cands, verdict = _veh_split(results[0] if results else None)
+    if verdict == 'unknown':
+        out['note'] = '車種の手がかりの突き合わせができませんでした（ADDATA を引けない）。NEO を開いて車種を確かめてください'
+        return out
+    labels = '・'.join(_VEH_ID_LABELS[k] for k in diffs)
+    if len(results) > 1:
+        # 車検証・添付書類の値が見積書と違う: **いつも両方の組を引いて**確かさで決める（Codex 本体 1 周目 P1: 見積書の値が読み違いでも
+        # 1 つの車にきれいに当たると、車検証と比べないまま通っていた）。値そのものは出さない（車台番号は個人の情報）
+        kc2, sc2, cands2, verdict2 = _veh_split(results[1])
+        s_a, s_b = _veh_strength(verdict, kc, sc, cands), _veh_strength(verdict2, kc2, sc2, cands2)
+        _recs_a = set((results[0] or {}).get('desig_recs') or [])
+        _recs_b = set((results[1] or {}).get('desig_recs') or [])
+        if (('desig' in diffs or 'category' in diffs) and s_a and s_b and cands == cands2
+                and _recs_a and _recs_b and _recs_a != _recs_b):
+            # 同じ車でも、型式指定・類別の違いでグレード・ボディ・駆動（2WD/4WD）が変わる（スペーシア → カスタム・2WD → 4WD・
+            # C-HR のグレード。実機 NEO で型式指定・類別の 1 桁の読み違いの 1 割がこの形）。どちらの読み違いか決められないので止める
+            out['conflict'] = (f'車種の中身を決められません: 見積書と車検証・添付書類で{labels}が違い、同じ車（{_veh_names(names, cands)}）でも'
+                               'グレード・ボディ・駆動（2WD/4WD）が変わります。どちらかの読み違いです。'
+                               'この NEO の車両の欄は違っているおそれがあります。車検証と見積書を見比べてから使ってください')
+            out['cands'] = sorted(cands)
+            return out
+        if s_a == 2 and s_b == 2 and cands != cands2:
+            out['conflict'] = (f'車種を決められません: 見積書の{labels}は {_veh_names(names, cands)}、車検証・添付書類の{labels}は '
+                               f'{_veh_names(names, cands2)} を指し、どちらも型式・車台番号と食い違いがありません。'
+                               '添付した車検証・書類がこの見積の車のものか確かめてください（この NEO の車種・顧客欄は違っているおそれがあります）')
+            return out
+        if s_a < 2 and s_b == 2:
+            # 車検証の値だけが 2 つの手がかりで同じ車を指す。候補の車が同じでも書き戻す（見積書の型式指定が読み違いで
+            # KA81 に当たらないと、NEO に読み違いの番号が残り、グレード・ボディ・駆動は KA06 の展開で選ばれていた。レビュー 5 周目）
+            # 車検証の値なら 2 つの手がかりが同じ車を指す: そちらを使う（見積書の読み違い）
+            rd2 = copy.deepcopy(reading)
+            rd2['vehicle'].update({k: hint[k] for k in diffs})
+            out.update(reading=rd2, cands=sorted(cands2),
+                       note=(f'見積書から読んだ{labels}では車種が確かめられない（{_veh_names(names, (kc | sc) or cands)}）ので、'
+                             f'車検証・添付書類の{labels}を使いました（{_veh_names(names, cands2)}）'))
+            return out
+        if s_a == 1 and s_b == 1 and cands != cands2:
+            out['conflict'] = (f'車種を決められません: 見積書の{labels}は {_veh_names(names, cands)}、車検証・添付書類の{labels}は '
+                               f'{_veh_names(names, cands2)} を指します。どちらかの読み違いです。'
+                               'この NEO の車種は違っているおそれがあります。車検証と見積書を見比べてから使ってください')
+            return out
+        if s_a >= 1 and cands != cands2:
+            out['note'] = (f'車検証・添付書類の{labels}が見積書と違います（車検証の値では'
+                           f'{"車種が確かめられません" if not s_b else " " + _veh_names(names, cands2) + " を指します"}）。'
+                           f'見積書の値（{_veh_names(names, cands)}）を使いました。添付した車検証がこの見積の車のものか確かめてください')
+    out['cands'] = sorted(cands)
+    if verdict == 'split':
+        out['conflict'] = (f'車種を決められません: 型式指定番号・類別区分番号が指す車（{_veh_names(names, kc)}）と、'
+                           f'型式・車台番号が指す車（{_veh_names(names, sc)}）が違います。どちらかの読み違いです'
+                           + (f'（車検証・添付書類の{labels}に替えても決まりません）' if diffs else '')
+                           + '。この NEO の車種は違っているおそれがあります。車検証と見積書を見比べてから使ってください')
+    elif verdict == 'ambiguous':
+        out['conflict'] = (f'車種を決められません: 型式指定番号・類別区分番号が無く、型式・車台番号だけでは車種が 1 つに決まりません'
+                           f'（候補: {_veh_names(names, cands)}）。この NEO の車種は候補の先頭を仮に選んだものです。'
+                           '車検証を添付して読み直すか、NEO を開いて車種を確かめてください')
+    return out
+
+
+def _p2n_vehicle_verdict(vx, report_md) -> str:
+    """生成のあと、NEO の車種（報告文の車両の行）が手がかりの指す車に入っているか。合格にしない理由（無ければ ''）。
+    読み手が vehicle.generic=true と書くと、ADDATA に載っている車でも汎用車種で作られていた（第 4 弾 E7）"""
+    vx = vx if isinstance(vx, dict) else {}
+    if vx.get('conflict'):
+        return vx['conflict']
+    cands = set(vx.get('cands') or [])
+    m = _REPORT_CAR_RE.search(str(report_md or ''))
+    if not cands or not m:
+        return ''
+    code = m.group('code').strip()
+    if code in cands:
+        return ''
+    what = '汎用車種' if code.upper().startswith('Z') else f"「{m.group('name').strip()[:40]}」（{code}）"
+    return (f'車種を決められません: 型式指定番号・類別区分番号／型式・車台番号が指す車は {_veh_names(vx.get("names"), cands)} なのに、'
+            f'NEO は {what}で作られました。NEO を開いて車種を確かめてください')
 
 
 def p2n_make(state, addata_root=None, record_profile=None, progress=None):
@@ -8184,6 +8433,14 @@ def p2n_make(state, addata_root=None, record_profile=None, progress=None):
         _nsk_maker.remove_case_dir(case_dir)
         return out
     try:
+        # 車種を決める 2 つの手がかりが同じ車を指すかを、作る前に確かめる（第 4 弾 E1）。車検証の値で決まるならそちらを書き戻す
+        _vx = _p2n_vehicle_crosscheck(reading, out.get('vehicle_hint'), addata_root)
+        if _vx.get('reading') is not reading:
+            reading = _vx['reading']
+            _nsk_maker.write_reading(case_dir, reading)
+        if _vx.get('note'):
+            out['app_notes'] = list(out.get('app_notes') or []) + [_vx['note']]
+            out['vehicle_note'] = _vx['note']   # 合格の画面にも出す（報告文の中だけだと気づけない。レビュー 5 周目）
         if out.pop('force_unverified', False):
             # 読み取りが検算に通らなかった案件（2026-09-17 亮平さん指示: ズレがあっても NEO は作って違いを説明する）。
             # 検算の関門を外して作り、合格扱いにはしない。工場プロファイルは記録しない（通っていない読み取りを学習させない）
@@ -8194,7 +8451,12 @@ def p2n_make(state, addata_root=None, record_profile=None, progress=None):
             out['stage'] = 'read'   # 画面は読み取りの不合格のまま（ページごとの検算結果を見せる）
             out['make'] = {'ok': False, 'match_line': mk.match_line, 'reasons': list(mk.reasons),
                            'error': mk.error, 'tail': '\n'.join((mk.stdout or '').splitlines()[-40:])}
-            out['report_md'] = _with_app_notes(_nsk_maker.read_text(mk.report_path) or out.get('report_md'), out.get('app_notes'))
+            _veh_why = _p2n_vehicle_verdict(_vx, _nsk_maker.read_text(mk.report_path))
+            if _veh_why:
+                out['vehicle_conflict'] = _veh_why
+            out['report_md'] = _unverified_report(
+                _with_app_notes(_nsk_maker.read_text(mk.report_path) or out.get('report_md'), out.get('app_notes')),
+                ([_veh_why] if _veh_why else []) + list((out.get('read') or {}).get('fails') or []))
             out['unverified_neo'] = _nsk_maker.read_bytes(mk.ng_neo_path or mk.neo_path)
             out['unverified_review'] = _read_review_sheet(mk.review_path)
             out['unverified_review_ext'] = os.path.splitext(mk.review_path or '')[1] or '.xlsx'
@@ -8256,6 +8518,24 @@ def p2n_make(state, addata_root=None, record_profile=None, progress=None):
         out['make'] = {'ok': mk.ok, 'match_line': mk.match_line, 'reasons': list(mk.reasons),
                        'error': mk.error, 'tail': '\n'.join(mk.stdout.splitlines()[-40:])}
         out['report_md'] = _with_app_notes(out.pop('_first_report_md', None) or _nsk_maker.read_text(mk.report_path), out.get('app_notes'))
+        # 車種が手がかりの指す車と合わない NEO は合格にしない（金額が合っていても、部品コード・標準指数が別の車のものになる。E1・E2・E7）
+        _veh_why = _p2n_vehicle_verdict(_vx, _nsk_maker.read_text(mk.report_path))
+        if _veh_why:
+            out['vehicle_conflict'] = _veh_why
+            out['make']['reasons'] = [_veh_why] + list(out['make']['reasons'])
+            if mk.ok:
+                out['make']['ok'] = False
+                out['error'] = _veh_why
+                out['report_md'] = _unverified_report(out.get('report_md'), [_veh_why])
+                out['repair_zip'] = _nsk_maker.repair_bundle(case_dir, reading)
+                out['unverified_neo'] = _nsk_maker.read_bytes(mk.neo_path)
+                out['unverified_review'] = _read_review_sheet(mk.review_path)
+                out['unverified_review_ext'] = os.path.splitext(mk.review_path or '')[1] or '.xlsx'
+                out['diffs'] = _p2n_diff_lines(mk.stdout)
+                out['download_name'] = _p2n_download_name(mk.estimate_path, out.get('report_md'))
+                if not out['unverified_neo']:
+                    out['unverified_error'] = 'NEO を読み出せませんでした'
+                return out
         if not mk.ok:
             out['error'] = mk.error
             out['repair_zip'] = out.pop('_first_repair_zip', None) or _nsk_maker.repair_bundle(case_dir, reading)
@@ -8277,6 +8557,10 @@ def p2n_make(state, addata_root=None, record_profile=None, progress=None):
             out['unverified_review'] = _un_review or _read_review_sheet(mk_un.review_path)
             out['unverified_review_ext'] = _un_ext or os.path.splitext(mk_un.review_path or '')[1] or '.xlsx'
             out['diffs'] = _un_diffs or _p2n_diff_lines(mk_un.stdout or mk.stdout)
+            # 渡す NEO は確認用なので、報告文の先頭にその旨と不合格の理由を置く（検算を外して作り直した報告文は「検算 OK」と
+            # 読めた。Codex 4 周目。二度は足さない）
+            out['report_md'] = _unverified_report(out.get('report_md'),
+                                                  list(out['make'].get('reasons') or []) or ([str(mk.error)] if mk.error else []))
             out['download_name'] = _p2n_download_name(mk_un.estimate_path or mk.estimate_path, out.get('report_md'))
             if not out['unverified_neo']:
                 out['unverified_error'] = mk.error or '検算を外しても NEO を作れませんでした（下の修正用ファイルで直してください）'
@@ -9337,6 +9621,29 @@ def _beta_generate_ui(_p2n_file, _p2n_bytes, _p2n_file_key, api_key, selected_mo
         st.session_state['pdf2neo_tax_inclusive'] = _p2n_beta_tax
         st.session_state['pdf2neo_result'] = _p2n_beta
         st.rerun()
+
+
+def _p2n_pending_stale_reason(pending, file_key, addata_root, now=None) -> str:
+    """車種フォルダ待ちの取り置き（_bridge_pending）を捨てる理由（書類・事故情報の照合は呼び出し側）。捨てなくてよければ ''。
+    見積書が変わった（別の見積の NEO を出さない）・2 時間待っても届かない（取り置き＝顧客情報を残し続けない）・
+    待っている間に Addata が替わった（前の版で決めた車種で作らない。第 4 弾 Q2）"""
+    import time as _t
+    pending = pending if isinstance(pending, dict) else {}
+    if pending.get('file_key') != file_key:
+        return '見積書が変わったので'
+    if (now if now is not None else _t.time()) - float(pending.get('parked_at') or 0) > 2 * 3600:
+        return '車種フォルダを 2 時間待っても届かなかったので'
+    if pending.get('addata_id') and pending['addata_id'] != _p2n_addata_identity(addata_root):
+        return 'Addata（コグニの車種データ）が読み取りのときと変わったので'
+    return ''
+
+
+def _p2n_discard_pending(ss) -> None:
+    """車種フォルダ待ちの取り置きを捨てる（作業フォルダ＝見積書・読み取りの写し・顧客情報も消す）。戻り値は None（捨てた後の取り置き）"""
+    from neo_skill import maker as _nsk_maker
+    _nsk_maker.remove_case_dir((ss.pop('_bridge_pending', None) or {}).get('case_dir'))
+    ss['_bridge_want'] = ''
+    return None
 
 
 def _p2n_addata_identity(root) -> str:
@@ -10886,12 +11193,8 @@ def main():
                 _p2n_pending = st.session_state.get('_bridge_pending')
                 _p2n_stale_why = ''
                 if _p2n_pending:
-                    import time as _p2n_time
-                    if _p2n_pending.get('file_key') != _p2n_file_key:
-                        _p2n_stale_why = '見積書が変わったので'          # 別の見積の NEO を出さない
-                    elif _p2n_time.time() - float(_p2n_pending.get('parked_at') or 0) > 2 * 3600:
-                        _p2n_stale_why = '車種フォルダを 2 時間待っても届かなかったので'   # 取り置き（顧客情報）を残し続けない
-                    elif _p2n_pending.get('doc_key'):
+                    _p2n_stale_why = _p2n_pending_stale_reason(_p2n_pending, _p2n_file_key, _p2n_addata)
+                    if not _p2n_stale_why and _p2n_pending.get('doc_key'):
                         # 画面を描く途中なので**ここでは読まない**（控えにある分だけで照合する。2026-09-20）。
                         # 書類を差し替えていれば控えに無い ＝ 鍵が変わる ＝ 取り置きを捨てる、で結果も正しい。
                         # 保険は読んだときと同じくサイドバーの値そのもの（書類の値は読んだ時点でサイドバーへ入れてある。C1）
@@ -10900,10 +11203,7 @@ def main():
                                                               _sidebar_insurance_hint()):
                             _p2n_stale_why = '添付の書類や事故・保険情報が変わったので'
                 if _p2n_stale_why:
-                    from neo_skill import maker as _nsk_maker
-                    _nsk_maker.remove_case_dir((st.session_state.pop('_bridge_pending') or {}).get('case_dir'))
-                    st.session_state['_bridge_want'] = ''
-                    _p2n_pending = None
+                    _p2n_pending = _p2n_discard_pending(st.session_state)
                     st.info(f"{_p2n_stale_why}、前の読み取り結果は捨てました。もう一度「見積書からNEOを生成」を押してください。")
                 if _p2n_bridge and _p2n_pending and not st.session_state.get('_bridge_want'):
                     # 車種フォルダの取り込みを待っていた読み取りの続き（部品が送り終わると rerun されてここに来る）
@@ -11008,11 +11308,23 @@ def main():
                                 # 読み取りが検算に通らなかった案件も、ここから先は同じ道を通る
                                 # （車種フォルダを取り寄せてから NEO を作る。取り寄せる前に作ると部品コードが入らない）
                                 _p2n_progress('車種を決めています（PC の Addata の車種マスタ）')
+                                # 車種を決める**前に**見積書と車検証の手がかりを突き合わせる（第 4 弾 E1）。車検証の値で決まるなら
+                                # reading.json を書き戻してから車種を決める（p2n_make で替えると、取り寄せた車種フォルダと食い違う。Codex 3 周目）
+                                _p2n_vx0 = _p2n_vehicle_crosscheck(_p2n_state.get('reading'), _p2n_state.get('vehicle_hint'), _p2n_addata)
+                                if _p2n_vx0.get('reading') is not _p2n_state.get('reading') and _p2n_state.get('case_dir'):
+                                    from neo_skill import maker as _nsk_maker_vx
+                                    _nsk_maker_vx.write_reading(_p2n_state['case_dir'], _p2n_vx0['reading'])
+                                    _p2n_state['reading'] = _p2n_vx0['reading']
+                                    if _p2n_vx0.get('note'):
+                                        _p2n_state['app_notes'] = list(_p2n_state.get('app_notes') or []) + [_p2n_vx0['note']]
                                 _p2n_res = _br.resolve_car(_p2n_addata, _p2n_state.get('reading') or {})
                                 _p2n_car = str(_p2n_res.get('car_code') or '')
                                 _p2n_state['car_code'] = _p2n_car
                                 _p2n_state['file_key'] = _p2n_file_key
                                 _p2n_state['doc_key'] = _p2n_doc_key   # 添付の書類・保険が変われば取り置きを捨てる（Codex 60）
+                                # Addata の同一性（場所＋データ版）も控える。車種を決めた版と、車種フォルダが届いた版が
+                                # 違うと、部品コード・標準指数が別の版のものになる（金額は合うので検算は通る。第 4 弾 Q2）
+                                _p2n_state['addata_id'] = _p2n_addata_identity(_p2n_addata)
                                 import time as _p2n_time
                                 _p2n_state['parked_at'] = _p2n_time.time()
                                 if _p2n_car and not _br.has_car(_p2n_addata, _p2n_car):
@@ -11086,6 +11398,8 @@ def main():
             if _p2n_res.get('error') and _p2n_res.get('stage') in ('error',):
                 st.error(f"❌ {_md_literal(_p2n_res['error'])}")
             elif _p2n_res.get('stage') == 'read' and not _p2n_rd.get('ok'):
+                if _p2n_res.get('vehicle_conflict'):   # 車種の食い違いは、読み取りが不合格の枝でも画面に出す（レビュー 5 周目）
+                    st.error("🚗 " + _md_literal(_p2n_res['vehicle_conflict']))
                 if _p2n_res.get('error'):
                     st.error(f"❌ 読み取りを続けられませんでした: {_md_literal(_p2n_res['error'])}")
                 if not (_p2n_res.get('error') and not (_p2n_rd.get('fails') or _p2n_rd.get('traces'))):
@@ -11122,10 +11436,17 @@ def main():
                     with st.expander("📝 報告文（report.md）", expanded=False):
                         st.markdown(_md_literal(_p2n_res['report_md']))
             elif _p2n_mk and not _p2n_mk.get('ok'):
-                st.error("⚠️ 検算に通らなかった点があります（pdf-to-neo スキル make_neo.py の判定）。"
-                         + ("**NEO は下で渡しますが、見積書と違うところが残っています。** 下の「印字との違い」を必ず確かめてください。"
-                            if _p2n_res.get('unverified_neo') else "下の「印字との違い」を見積書と突き合わせてください。"))
-                for _r in (_p2n_mk.get('reasons') or []):
+                _p2n_vc = _p2n_res.get('vehicle_conflict') or ''
+                if _p2n_vc:
+                    # 車種の食い違い（第 4 弾 E1）は金額の検算とは別の理由。金額は合っていても部品コード・標準指数が別の車のものになる
+                    st.error("🚗 " + _md_literal(_p2n_vc)
+                             + ("（NEO は下で渡しますが、**確認用**です）" if _p2n_res.get('unverified_neo') else ''))
+                _p2n_other = [_r for _r in (_p2n_mk.get('reasons') or []) if _r != _p2n_vc]
+                if _p2n_other or not _p2n_vc:
+                    st.error("⚠️ 検算に通らなかった点があります（pdf-to-neo スキル make_neo.py の判定）。"
+                             + ("**NEO は下で渡しますが、見積書と違うところが残っています。** 下の「印字との違い」を必ず確かめてください。"
+                                if _p2n_res.get('unverified_neo') else "下の「印字との違い」を見積書と突き合わせてください。"))
+                for _r in _p2n_other:
                     st.markdown(f"- {_md_literal(_r)}")
                 _p2n_diffs = _p2n_res.get('diffs') or []
                 if _p2n_diffs:   # 不合格でも NEO を渡す（2026-09-17 亮平さん指示）ので、どこが違うかを最初に出す
@@ -11168,6 +11489,15 @@ def main():
                 else:
                     st.success(_p2n_ok_line)
                 _p2n_render_summary(_p2n_res.get('report_md'), stale=bool(_p2n_res.get('stale')))   # 車両・合計・明細の行数をひと目で（2026-09-20 画面の作り直し）
+                # 車種の確度（第 4 弾 E1）。別の車を指す食い違いは合格にしないので、ここに来るのは同じ車でグレード・ボディ・駆動を
+                # 候補から選んだもの。以前は確認箇所シートの 1 行と、上の帯（52 字で切れる）にしか出ていなかった
+                _p2n_vconf = _REPORT_CAR_RE.search(str(_p2n_res.get('report_md') or ''))
+                if _p2n_res.get('vehicle_note'):
+                    # 車検証・添付書類の値が見積書と違う（車種は見積書の値で決めた）。顧客欄はその車検証から補われるので画面にも出す
+                    st.warning("🚗 " + _md_literal(_p2n_res['vehicle_note']))
+                if _p2n_vconf and _p2n_vconf.group('conf').strip() in ('low', 'medium'):
+                    st.warning(f"🚗 車種の確度が **{_p2n_vconf.group('conf').strip()}** です。グレード・ボディ・駆動（2WD/4WD）が 1 つに決まらず、"
+                               "候補から選んでいます（型式指定番号・類別区分番号が読めると決まります）。NEO を開いて車両の欄を確かめてください。")
                 if (_att_line := _attached_docs_result_line(api_key, selected_model)):
                     st.caption(_att_line)
                 if (_chk_n := _p2n_check_count(_p2n_res.get('report_md'))):
@@ -12143,7 +12473,7 @@ def main():
             # 明細テーブルには原本どおり入るので、同じ .neo の中で数量が
             # 食い違う。黙って丸めず知らせる。
             _qty_over = [str(_it.get('name', '') or '')
-                         for _it in (estimate_data.get('items') or [])
+                         for _it in ((estimate_data or {}).get('items') or [])   # 車検証だけ（明細なし）は None（第 4 弾）
                          if safe_int(_it.get('quantity', 1), 1) > 99]
             if _qty_over:
                 st.warning(
@@ -12219,6 +12549,8 @@ def main():
                 ('カラーコード',    v_colorcode,  _CAR_WIDTH['ColorCode']),
                 ('トリムコード',    v_trimcode,   _CAR_WIDTH['TrimCode']),
             ):
+                # 会社名は NEO に書くとき ㈱ などに略してから切るので、警告もその形で見る（レビュー 5 周目）
+                _val = _doc_hints.fit_corp_name(_val, _w) if _lbl in ('使用者名', '所有者名') else _val
                 _cut = cp932_trim(_val, _w)
                 # 列幅の比較は「cp932 に直した全文」と。「〜」→「～」のように字が置き換わるだけで長さが同じものを
                 # 「超えています」と誤って出していた（バグハント 3 回目 L12）
@@ -12333,19 +12665,25 @@ def main():
                 # 表に入り NEO に書かれる（Codex 講評 第 3 弾 3 周目 P1。いまの版にこの欄を入れる道は無いが、上の断りどおりにする）
                 _part_code   = str(_item.get('part_no', '') or '')
                 _index_value = str(_item.get('index_value', '') or '')
+                # 小数を打った欄は、打った値そのものを戻す（丸めた値で組み直すと、行挿入・コピーのあとに止めをすり抜けた。レビュー 5 周目）
+                _fraw = _item.get('_frac_raw') if isinstance(_item.get('_frac_raw'), dict) else {}
                 _edit_rows.append({
                     'No':     _i + 1,
                     '部品番号': _part_code,
                     '品名':   str(_item.get('name', '')),
                     # 区分（修理方法）も見せて直せるようにする。帳票の「修理方法」にそのまま出る（M11）
                     '区分':   str(_item.get('work_code', '') or _item.get('method', '') or ''),
-                    '数量':   qty_int(_item.get('quantity', 1), 1),
-                    '部品金額': safe_int(_item.get('parts_amount', 0)),
+                    '数量':   _fraw.get('数量', qty_int(_item.get('quantity', 1), 1)),
+                    '部品金額': _fraw.get('部品金額', safe_int(_item.get('parts_amount', 0))),
                     '工数':   _index_value,
-                    '工賃':   safe_int(_item.get('wage', 0)),
+                    '工賃':   _fraw.get('工賃', safe_int(_item.get('wage', 0))),
                 })
             _df_edit = pd.DataFrame(_edit_rows) if _edit_rows else pd.DataFrame(
                 columns=['No', '部品番号', '品名', '区分', '数量', '部品金額', '工数', '工賃'])
+            # 数の 3 列は**小数型**で渡す。整数型だと、画面で打った小数を Streamlit が整数に戻して返し
+            # （45000.5 → 45000、2.5 → 2）、黙って切り捨てられて下の小数の止めも効かない（F1。実画面で確認）
+            for _numc in ('数量', '部品金額', '工賃'):
+                _df_edit[_numc] = pd.to_numeric(_df_edit[_numc], errors='coerce').astype(float)
             # キーを行数と連動させることで行挿入後に data_editor を強制再初期化する
             # 完全な固定キーにすると、行を削除したときのフロント側の
             # 編集状態が残り、振り直した No が画面に反映されない。
@@ -12373,10 +12711,13 @@ def main():
                     '品名':   st.column_config.TextColumn('品名', width='large'),
                     '区分':   st.column_config.TextColumn('区分', width='small',
                                                          help='修理方法（取替・脱着・修理・板金・塗装 など）。帳票の「修理方法」欄にそのまま出ます'),
-                    '数量':   st.column_config.NumberColumn('数量', min_value=1, step=1, width='small'),
-                    '部品金額': st.column_config.NumberColumn('部品金額', step=1, format="¥%d"),
+                    # 数の欄は step=0.01 で**小数も受ける**。step=1 だと画面の部品が「.」を捨てて数字をつなげ、
+                    # 「45000.5」が 450005（10 倍）・「2.5」が 25 になって、そのまま合計と NEO に入っていた
+                    # （2026-09-22 実画面で再現・バグハント第 4 弾 F1）。受け取った小数は下で見つけて④へ進ませない
+                    '数量':   st.column_config.NumberColumn('数量', min_value=1, step=0.01, format="%d", width='small'),
+                    '部品金額': st.column_config.NumberColumn('部品金額', step=0.01, format="¥%d"),
                     '工数':   st.column_config.TextColumn('工数', width='small'),
-                    '工賃':   st.column_config.NumberColumn('工賃', step=1, format="¥%d"),
+                    '工賃':   st.column_config.NumberColumn('工賃', step=0.01, format="¥%d"),
                 },
                 key=_editor_key,
             )
@@ -12415,6 +12756,14 @@ def main():
                     'index_value': _iv,
                     'quantity': safe_int(_row.get('数量', 1), 1),
                     '_qty_blank': bool(pd.isna(_row.get('数量'))),   # 数量を消した行（④に進ませない。B10）
+                    # 円未満・小数が入った欄（④に進ませない。黙って丸めない。F1）
+                    '_frac_cols': [f'{_fl} {_fmt_frac(_fv)}' for _fl, _fv in
+                                   ((_fl, _row.get(_fl)) for _fl in ('数量', '部品金額', '工賃'))
+                                   if _is_fractional_cell(_fv)],
+                    # 打った小数そのもの。行挿入・コピーで表を組み直すときに戻す（丸めた値で組み直すと止めをすり抜けていた。レビュー 5 周目）
+                    '_frac_raw': {_fl: float(_fv) for _fl, _fv in
+                                  ((_fl, _row.get(_fl)) for _fl in ('数量', '部品金額', '工賃'))
+                                  if _is_fractional_cell(_fv)},
                     'parts_amount': safe_int(_row.get('部品金額', 0)),
                     'wage': safe_int(_row.get('工賃', 0)),
                     'part_no': _pc,
@@ -13105,6 +13454,18 @@ def main():
           else:
             amount_confirmed = True
             st.info("💡 見積書なし — 車両情報のみのNEOファイルを作成します")
+            # 明細の無い NEO にも、サイドバーの費用は③でチェックを入れたときだけ入れる（B2 の取りこぼし。第 4 弾:
+            # この道だけ④が確かめずに入れていた。前の案件のレッカー代などが残っていると黙って NEO に入る）
+            _vo_exp = [safe_int(st.session_state.get(_ek, 0)) for _ek in ('exp_towing', 'exp_rental', 'exp_exempt')]
+            _vo_use = False
+            if any(_vo_exp):
+                _vo_use = st.checkbox(
+                    f"サイドバーの費用（レッカー ¥{_vo_exp[0]:,} ／ 代車 ¥{_vo_exp[1]:,} ／ 非課税 ¥{_vo_exp[2]:,}）を"
+                    "この NEO に入れる",
+                    value=False,
+                    key=_ack_key('s3_use_expenses_vo', str(st.session_state.get('_estimate_token') or ''), _vo_exp),
+                    help="チェックを入れないと、サイドバーに費用が入っていても NEO には入れません（前の案件の入力が残っていることがあるため）")
+            st.session_state['_vo_expenses_use'] = list(_vo_exp) if _vo_use else None
 
         if 'amount_confirmed' not in locals():
             amount_confirmed = True
@@ -13147,6 +13508,9 @@ def main():
                           if not str(_it.get('name', '') or '').strip()]
             # 数量を消した行（表では赤の None）は、以前は黙って数量 1 で NEO に入った（バグハント第 3 弾 B10）
             _qty_blank_nos = [_row_ref(_it, _bi) for _bi, _it in enumerate(edited_items or [], 1) if _it.get('_qty_blank')]
+            # 円未満・小数が入った行（F1）。どの欄にいくつ入ったかをそのまま見せる（表の表示は「¥%d」で切り捨てて見えるため）
+            _frac_nos = [f"{_row_ref(_it, _bi)}（{'・'.join(_it.get('_frac_cols') or [])}）"
+                         for _bi, _it in enumerate(edited_items or [], 1) if _it.get('_frac_cols')]
             _all_deleted = bool(estimate_data) and (estimate_data.get('_csv_import') or estimate_data.get('_preview_import')) \
                 and not (estimate_data.get('items') or [])
             if (estimate_data and not estimate_data.get('_expenses_off') and not estimate_data.get('_expenses_use')
@@ -13161,6 +13525,9 @@ def main():
                     st.error(f"❌ 品名が空の行があります（{'、'.join(_blank_nos)}）。品名を入れるか、行を削除してから生成してください。")
                 elif _qty_blank_nos:
                     st.error(f"❌ 数量が空の行があります（{'、'.join(_qty_blank_nos)}）。数量を入れてから生成してください。")
+                elif _frac_nos:
+                    st.error(f"❌ 小数が入っている欄があります（{'、'.join(_frac_nos)}）。"
+                             "数量・金額は整数で入れてください（円未満は使えません。表では切り捨てて見えることがあります）。")
                 else:
                     st.session_state['updated_vehicle'] = updated_vehicle
                     st.session_state['calc_parts']      = calc_parts
@@ -13219,6 +13586,21 @@ def main():
             elif [safe_int(_x) for _x in _exp_use_s4] != _exp_now_s4:
                 st.error("❌ サイドバーの費用が、ステップ③で確かめた値から変わりました。ステップ③に戻って確かめてください。")
                 if st.button("← ステップ③に戻る", key='s4_back_expenses_changed'):
+                    st.session_state['step'] = 3
+                    st.rerun()
+                st.stop()
+        else:
+            # 明細の無い NEO（車検証だけ・明細 0 行の見積）: ③でチェックを入れた値だけ入れる（第 4 弾。以前は確かめずに入れていた。
+            # ③が「車検証だけ」の枝を描く条件と同じにする〔estimate_data が None でなくても明細が無ければこちら〕。レビュー 5 周目 P1）
+            _vo_use_s4 = st.session_state.get('_vo_expenses_use')
+            _vo_now_s4 = [safe_int(expense_info[_ek]) for _ek in ('towing', 'rental_car', 'tax_exempt')]
+            if not _vo_use_s4:
+                if any(_vo_now_s4):
+                    st.caption("サイドバーの費用は、ステップ③でチェックを入れていないので NEO に入れません。")
+                expense_info = {'towing': 0, 'rental_car': 0, 'tax_exempt': 0}
+            elif [safe_int(_x) for _x in _vo_use_s4] != _vo_now_s4:
+                st.error("❌ サイドバーの費用が、ステップ③で確かめた値から変わりました。ステップ③に戻って確かめてください。")
+                if st.button("← ステップ③に戻る", key='s4_back_expenses_changed_vo'):
                     st.session_state['step'] = 3
                     st.rerun()
                 st.stop()

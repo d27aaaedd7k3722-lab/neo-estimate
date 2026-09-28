@@ -392,6 +392,24 @@ def _normalise_values(out: dict, notes: Optional[list]) -> None:
                 d[k] = _dh._clean(v)   # 改行・制御文字は空白に（AnSvMail.ini の行が増えない）・長さの上限
     if bad:
         raise PageShapeError('header.json の形が違う: ' + ' / '.join(bad))
+    ve = out.get('vehicle') if isinstance(out.get('vehicle'), dict) else None
+    if ve is not None and ve.get('reg_date') not in (None, ''):
+        # 初度登録は vendor が読める印字風（'R1.5'・'H27.5'）にそろえる。「令和元年5月」「R元.5」「R1/5」「r2.5」は vendor の
+        # parse_reg_date が読めず、NEO の初度登録が空のまま合格していた（第 4 弾 E6）。そろえられない値は、vendor が読める形
+        # （'2020年5月登録' など先頭が年月）ならそのまま、読めない形なら落とす（車検証の値があれば補われる）
+        _raw_rd = ve['reg_date']
+        _rd = _dh.reg_date_wareki(_raw_rd)
+        _t_rd = unicodedata.normalize('NFKC', str(_raw_rd)).strip()
+        # vendor の parse_reg_date が読む形（先頭が年月）で、年・月がありうる値のときだけ残す（「R0.5」を vendor は 2018 年と読む。Codex 2 周目）
+        _m4 = re.match(r'^(\d{4})[/\-年.]?(\d{1,2})', _t_rd)
+        _me = re.match(r'^(令和|平成|昭和|R|H|S)\s*(\d{1,2})\s*[年.．]\s*(\d{1,2})', _t_rd)
+        _vendor_ok = bool((_m4 and 1926 <= int(_m4.group(1)) <= 2100 and 1 <= int(_m4.group(2)) <= 12)
+                          or (_me and int(_me.group(2)) >= 1 and 1 <= int(_me.group(3)) <= 12))
+        if _rd:
+            ve['reg_date'] = _rd
+        elif not _vendor_ok:
+            ve.pop('reg_date', None)
+            note(f'vehicle.reg_date「{str(_raw_rd)[:16]}」を初度登録として読めないので使わない（車検証の値があれば使う）')
     cu = out.get('customer') if isinstance(out.get('customer'), dict) else None
     if cu is not None:
         rn = cu.get('reg_no')
@@ -426,7 +444,8 @@ def _normalise_values(out: dict, notes: Optional[list]) -> None:
         for k, yy in (('accident_date', True), ('presence_date', False), ('garage_in', False), ('garage_out', False)):
             if ins.get(k) not in (None, ''):
                 _raw_d = ins[k]
-                d8 = _dh.date8_full(_strip_weekday(_raw_d), allow_yy=yy)
+                # 事故日の 2 桁の年は西暦と令和の両方で読む（第 4 弾 C12。以前は 2000 年代と決め打ち）
+                d8 = _dh.accident_date8(_strip_weekday(_raw_d)) if yy else _dh.date8_full(_strip_weekday(_raw_d))
                 if d8:
                     ins[k] = d8
                 else:
@@ -814,12 +833,22 @@ def _paint_material_note(header: dict) -> Optional[str]:
     totals = header.get('totals') if isinstance(header.get('totals'), dict) else {}
 
     def _yen(v) -> int:
-        # totals は paint.total のようには正規化されていない（「76,000円」「¥76,000」「全角」）。読めなければ 0
-        try:
-            s = re.sub(r'[^0-9.\-]', '', unicodedata.normalize('NFKC', str(v if v is not None else 0)))
-            return int(float(s or 0))
-        except (TypeError, ValueError):
+        # totals は paint.total のようには正規化されていない（「76,000円」「¥76,000」「全角」）。読めなければ 0。
+        # **数が 1 つだけ**のときだけ読む（「76,000（税込 83,600）」の数字をつないで 7,600,083,600 円の注意を報告文に
+        # 書いていた。桁あふれ・inf で OverflowError にもなっていた。第 4 弾）
+        if isinstance(v, bool):
             return 0
+        try:
+            if isinstance(v, (int, float)):
+                x = int(v)
+            else:
+                nums = re.findall(r'-?\d[\d,]*(?:\.\d+)?', unicodedata.normalize('NFKC', str(v if v is not None else '')))
+                if len(nums) != 1:
+                    return 0
+                x = int(float(nums[0].replace(',', '')))
+        except (OverflowError, ValueError):
+            return 0
+        return x if abs(x) <= 10 ** 12 else 0   # 円としてありえない桁は読まない（割り算で OverflowError になる）
 
     w = _yen(paint.get('total')) or _yen(totals.get('paint'))
     m = _yen(paint.get('material')) or _yen(totals.get('material'))
@@ -854,6 +883,18 @@ def _manual_rows_guard(header: dict, pages: list) -> tuple:
         return pages, None
     out = copy.deepcopy(pages)
     n = 0
+    heads = 0
+
+    def _pos(v) -> bool:
+        return bool(re.search(r'[1-9]', unicodedata.normalize('NFKC', str(v if v is not None else ''))))
+
+    def _work_head(method, price, wage, index) -> bool:
+        # 区分が空欄・部品代なし・工賃か指数あり = 作業の見出し（第 4 弾 B4。「L フロントサスペンション脱着・分解…」指数 5.5）。
+        # M を外すと下書きが区分空欄を「取替」と決め打ちし、名前の近い別の作業項目に当てていた（金額は同じなので検算は通る）。
+        # 実機の同じ事故の NEO では手入力の行
+        return (not unicodedata.normalize('NFKC', str(method or '')).strip() and not _pos(price)
+                and (_pos(wage) or _pos(index)))
+
     for p in out:
         if not isinstance(p, dict):
             continue
@@ -866,13 +907,25 @@ def _manual_rows_guard(header: dict, pages: list) -> tuple:
                     continue
                 if isinstance(r, str):
                     parts = r.split('|')
-                    if len(parts) > 8 and 'M' in unicodedata.normalize('NFKC', parts[8]).upper():
-                        parts[8] = re.sub('[Mm]', '', unicodedata.normalize('NFKC', parts[8]))
+                    parts += [''] * (9 - len(parts))
+                    fl = unicodedata.normalize('NFKC', parts[8])
+                    if _work_head(parts[2], parts[6], parts[7], parts[4]):
+                        if 'M' not in fl.upper():
+                            parts[8] = fl + 'M'
+                            rs[i] = '|'.join(parts)
+                            heads += 1
+                    elif 'M' in fl.upper():
+                        parts[8] = re.sub('[Mm]', '', fl)
                         rs[i] = '|'.join(parts)
                         n += 1
                 elif isinstance(r, dict):
-                    hit = False
                     fl = unicodedata.normalize('NFKC', str(r.get('flags') or ''))
+                    if _work_head(r.get('method'), r.get('price'), r.get('wage'), r.get('index')):
+                        if 'M' not in fl.upper() and not _is_true(r.get('manual')):
+                            r['flags'] = fl + 'M'
+                            heads += 1
+                        continue
+                    hit = False
                     if 'M' in fl.upper():
                         r['flags'] = re.sub('[Mm]', '', fl)
                         hit = True
@@ -880,10 +933,16 @@ def _manual_rows_guard(header: dict, pages: list) -> tuple:
                         hit = hit or _is_true(r.get('manual'))
                         r.pop('manual')
                     n += 1 if hit else 0
-    if not n:
+    if not n and not heads:
         return pages, None
-    return out, (f'読み手が手入力（M）にした明細 {n} 行を部品の照合に戻した（部品コードの印字が無い見積では「コード欄が空 = 手入力」は'
-                 '当てはまらない。ADDATA に有るかは下書きが決め、照合できない行は手入力にする。金額は印字のまま）')
+    why = []
+    if n:
+        why.append(f'読み手が手入力（M）にした明細 {n} 行を部品の照合に戻した（部品コードの印字が無い見積では「コード欄が空 = 手入力」は'
+                   '当てはまらない。ADDATA に有るかは下書きが決め、照合できない行は手入力にする。金額は印字のまま）')
+    if heads:
+        why.append(f'区分が空欄で工賃だけの明細（作業の見出し）{heads} 行を手入力にそろえた（照合に回すと区分空欄が「取替」とみなされ、'
+                   '名前の近い別の作業の部品コードが付く。読み手の M の有無で NEO が変わらないように。金額は印字のまま）')
+    return out, '。'.join(why)
 
 
 def read_estimate(pdf_bytes: bytes, *, reader, case_dir: str, source_name: str = '',

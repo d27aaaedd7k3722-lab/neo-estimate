@@ -268,8 +268,10 @@ def test_doc_fill_consistency():
         long_branch = 'ケンショウ損保九州損害サポート部福岡自動車センター'   # 20 字を超える
         long_contractor = '株式会社ケンショウロジスティクス九州支店'
         app._doc_fill_to_sidebar({'accept_no': 'ZZ-0001', 'branch': long_branch, 'contractor': long_contractor})
+        # 契約者は 20 バイトの欄に入りきらないので ㈱ に略してから、欄の上限（20 字）で切る（第 4 弾 C6）
+        _want_contractor = '㈱' + long_contractor[len('株式会社'):]
         chk(S.get('adjuster_post') == long_branch[:20] and S['_insdoc_filled'].get('adjuster_post') == long_branch[:20]
-            and S.get('contractor_name') == long_contractor[:20],
+            and S.get('contractor_name') == _want_contractor[:20],
             f'C2: 書類の値を欄の上限で切らずに入れている: {S.get("adjuster_post")!r} {S.get("_insdoc_filled")}')
         # 欄を描いたとき（Streamlit が上限で切る）と、読んだときの保険 hint が同じ（橋渡しの取り置きを捨てない・生成直後に陳腐化しない）
         h_read = app._sidebar_insurance_hint()
