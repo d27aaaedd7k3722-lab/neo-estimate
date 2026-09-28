@@ -380,24 +380,32 @@ chk(_regtags({'car_reg_date': '202408', 'term_date': '20280200'})[4] == '',
 #     請求書単位のまとめ丸めの端数がマイナスだと片方が負になりうる。
 #     税額が負の見積書は帳票として成立しない。合計は変えずに吸収する。
 import itertools as _it26
-for _pa, _wg, _sp, _tw, _rc in _it26.product((0, 1, 3), (0, 1), (0, 1, 7, 13, 20000),
-                                             (0, 1, 3), (0, 1, 3)):
+# 5 円は「行ごとに四捨五入すると和が費用計の税を 1 円超える」形（0.5+0.5 → 1+1 > 1）。
+# 3 欄に割ったとき残りの欄が負になるので、ならす道を通る
+for _pa, _wg, _sp, _tw, _rc in _it26.product((0, 1, 3), (0, 1), (0, 1, 5, 7, 13, 20000),
+                                             (0, 1, 3, 5), (0, 1, 3)):
     for _incl in (False, True):
         _nb26 = app.generate_neo_file(
             TPL, {}, [{'name': 'A', 'method': '取替', 'parts_amount': _pa,
                        'wage': _wg, 'quantity': 1}],
             _sp, {}, {'towing': _tw, 'rental_car': _rc}, _incl, False, False)[0]
         _c26 = neogen.opendb(neogen.unpack(_nb26)['AnSMB.txt']).cursor()
-        (_hp, _hpt, _hw, _hwt, _mp, _mw, _pn, _sub, _tx, _tot) = _c26.execute(
+        # レッカー代は工賃側ではなくレッカー専用欄（hy_Wrecker1）に入る
+        # （2026-09-28 コグニ実機。引き継ぎ書 §13-13）。3欄で内訳を見る
+        (_hp, _hpt, _hw, _hwt, _htw, _htwt, _mp, _mw, _pn, _sub, _tx, _tot) = _c26.execute(
             'select hy_PartsTaxTotalOutTax, hy_PartsTaxTotalTax,'
             ' hy_WageTaxTotalOutTax, hy_WageTaxTotalTax,'
+            ' hy_Wrecker1OutTax, hy_Wrecker1Tax,'
             ' ms_PartsTotalOutTax, ms_WageTotalOutTax, pn_TotalOutTax,'
             ' SubTotal, tx_TotalOutTax, Total from Total').fetchone()
         _tag = f'(部品{_pa} 工賃{_wg} 短ﾊﾟ{_sp} ﾚｯｶｰ{_tw} 代車{_rc} 税込={_incl})'
-        chk(_hpt >= 0 and _hwt >= 0, f'26: 諸経費の税額が負 {_hpt}/{_hwt} {_tag}')
-        chk(_hp + _hw == _sp + _tw + _rc,
-            f'26b: 諸経費の内訳計 {_hp}+{_hw} != {_sp + _tw + _rc} {_tag}')
-        chk(_mp + _mw + _pn + _hp + _hw == _sub,
+        chk(_hpt >= 0 and _hwt >= 0 and _htwt >= 0,
+            f'26: 諸経費の税額が負 {_hpt}/{_hwt}/{_htwt} {_tag}')
+        chk(_hp + _hw + _htw == _sp + _tw + _rc,
+            f'26b: 諸経費の内訳計 {_hp}+{_hw}+{_htw} != {_sp + _tw + _rc} {_tag}')
+        chk((_htw, _hw) == (_tw, _rc),
+            f'26e: レッカー {_htw} 工賃側 {_hw}（期待 レッカー {_tw} 工賃側 {_rc}） {_tag}')
+        chk(_mp + _mw + _pn + _hp + _hw + _htw == _sub,
             f'26c: 課税額計が内訳と合わない {_tag}')
         chk(_sub + _tx == _tot, f'26d: 小計＋消費税が総額と合わない {_tag}')
 
@@ -500,19 +508,33 @@ chk(_h31['name1'] == 'テスト太郎', f'31: 管理領域の顧客名 {_h31["na
 chk(_h31['car_name'] == 'ﾉｱ', f'31: 管理領域の車名 {_h31["car_name"]!r}')
 chk(_h31['carno'] == ('品川', '300', 'あ', '1234'),
     f'31: 管理領域の登録番号 {_h31["carno"]}')
+# 31f. Y・A ナンバー（駐留軍人等）のかな欄は半角英字 1 文字のまま NEO に入ること
+#      （2026-09-28 亮平さん確認:「Y は、半角です」。全角に直すとコグニの登録番号が別物になる）
+chk(app._reg_no_part('Ｙ', kana=True) == 'Y' and app._reg_no_part('y', kana=True) == 'Y'
+    and app._reg_no_part('ｱ', kana=True) == 'あ',
+    f'31f: かな欄の英字: 全角Ｙ→{app._reg_no_part("Ｙ", kana=True)!r} / 小文字y→{app._reg_no_part("y", kana=True)!r}')
+_nb31y = app.generate_neo_file(
+    TPL, dict(_cust31, car_reg_department='横浜', car_reg_division='34',
+              car_reg_business='Ｙ', car_reg_serial='12-34'),
+    [{'name': 'A', 'method': '取替', 'parts_amount': 1000, 'wage': 0, 'quantity': 1}],
+    0, {}, {}, False, False, False)[0]
+chk(_nh31.decode(_nb31y)['carno'] == ('横浜', '34', 'Y', '1234'),
+    f'31f: Y ナンバーの管理領域 {_nh31.decode(_nb31y)["carno"]}')
 chk(_h31['created'][:3] == (_dt31.datetime.now(app.JST).year,
                             _dt31.datetime.now(app.JST).month,
                             _dt31.datetime.now(app.JST).day),
     f'31: 管理領域の作成日 {_h31["created"]}')
 # 金額は [部品計, 工賃計, 塗装計, 諸経費計, 総額]。見積本体と一致すること。
 # 諸経費計には非課税ぶんも入る（非課税のある実機12件すべてでそうだった）。
+# レッカー専用欄（hy_Wrecker1/2）も諸経費計に入る（2026-09-28 コグニ実機。§13-13）
 _SUM31 = ('select ms_PartsTotalOutTax, ms_WageTotalOutTax, pn_TotalOutTax,'
           ' hy_PartsTaxTotalOutTax, hy_WageTaxTotalOutTax,'
-          ' hy_PartsNoTaxTotalOutTax, hy_WageNoTaxTotalOutTax, Total from Total')
+          ' hy_PartsNoTaxTotalOutTax, hy_WageNoTaxTotalOutTax,'
+          ' hy_Wrecker1OutTax + hy_Wrecker2OutTax, Total from Total')
 _c31 = neogen.opendb(neogen.unpack(_nb31)['AnSMB.txt']).cursor()
 _t31 = _c31.execute(_SUM31).fetchone()
 chk([int(v) for v in _h31['totals']] ==
-    [_t31[0], _t31[1], _t31[2], _t31[3] + _t31[4] + _t31[5] + _t31[6], _t31[7]],
+    [_t31[0], _t31[1], _t31[2], _t31[3] + _t31[4] + _t31[5] + _t31[6] + _t31[7], _t31[8]],
     f'31b: 管理領域の金額 {_h31["totals"]} が見積本体 {_t31} と合わない')
 chk(int(_h31['totals'][4]) == _g31, f'31c: 管理領域の総額 {_h31["totals"][4]} != {_g31}')
 
@@ -525,10 +547,10 @@ for _exp31, _lab31 in (({'towing': 20000, 'rental_car': 15000, 'tax_exempt': 110
         1000, {}, dict(_exp31), False, False, False)
     _te = neogen.opendb(neogen.unpack(_n31e)['AnSMB.txt']).cursor().execute(_SUM31).fetchone()
     _he = _nh31.decode(_n31e)['totals']
-    chk(int(_he[3]) == _te[3] + _te[4] + _te[5] + _te[6],
-        f'31e: {_lab31} の諸経費計 {_he[3]} != {_te[3] + _te[4] + _te[5] + _te[6]}')
-    chk(int(_he[4]) == _te[7] == _g31e,
-        f'31e: {_lab31} の総額 {_he[4]} / 本体 {_te[7]} / 返り値 {_g31e}')
+    chk(int(_he[3]) == _te[3] + _te[4] + _te[5] + _te[6] + _te[7],
+        f'31e: {_lab31} の諸経費計 {_he[3]} != {_te[3] + _te[4] + _te[5] + _te[6] + _te[7]}')
+    chk(int(_he[4]) == _te[8] == _g31e,
+        f'31e: {_lab31} の総額 {_he[4]} / 本体 {_te[8]} / 返り値 {_g31e}')
 
 # 31d. 管理領域を書いても内包ファイルは壊れないこと（先頭424Bだけを触る）
 _f31 = neogen.unpack(_nb31)

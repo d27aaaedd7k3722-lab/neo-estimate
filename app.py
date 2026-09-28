@@ -694,6 +694,10 @@ def _reg_no_part(value, digits: bool = False, strip_hyphen: bool = False, kana: 
         # かなは全角ひらがな（実機 108 本すべて）。OCR の半角カナ 'ｱ'・カタカナ 'ア' を 'あ' に（Codex hunt B5）
         s = unicodedata.normalize('NFKC', s)
         s = ''.join(chr(ord(c) - 0x60) if 0x30A1 <= ord(c) <= 0x30F6 else c for c in s)
+        # Y・A ナンバー（駐留軍人等）のかな欄は**半角英字 1 文字**（2026-09-28 亮平さん確認）。
+        # NFKC で全角 'Ｙ' は半角になる。小文字で読めたときは大文字に揃える（実機 17 本すべて大文字）
+        if len(s) == 1 and 'a' <= s <= 'z':
+            s = s.upper()
     if strip_hyphen:
         s = re.sub(r'[\s\-‐‑―ー・･.]', '', s)   # '12-34' → '1234'、'・・12' → '12'
     return s
@@ -1125,6 +1129,48 @@ class NeoInputError(ValueError):
     品名と行の位置だけを含む（③の表に出ている値。車両・顧客の情報は入れない）ので、画面にそのまま出してよい。
     ステップ④は例外の本文を出さない（顧客情報が混じりうる）ため、ValueError のままだと「種類: ValueError」しか出ず、
     どの行をどう直せばよいか分からなかった（バグハント第 3 弾 A1/B6）"""
+
+
+def _split_expense_tax(cols, tax_total, pinned=None):
+    """諸経費の消費税を Total の欄ごとに割る。`cols` は `[(金額, その欄の自然な税), ...]`。
+
+    返り値は欄ごとの税の並びで、必ず次を満たす:
+      ・和が `tax_total`（＝課税額計も消費税も総額も 1 円も動かない）
+      ・金額の無い欄は 0（「金額ゼロなのに税だけある」欄は帳票にできない）。
+        ただし 3 欄とも金額が 0 で `tax_total` だけ残るときは置き場が無いので先頭の欄に載せる
+        （諸経費が 0 なら税も 0 なので、実際には起きない）
+      ・`tax_total` が 0 以上なら、負の欄を作らない
+
+    `tax_total` には請求書単位のまとめ丸めの端数が寄せてあるので、欄ごとの自然な税を
+    足すと `tax_total` を超えることがある。足りないぶんは**金額の大きい欄から
+    0 を下回らない範囲で**引く。負の額を欄のあいだで受け渡すと、同じ額が行き来して
+    ならしが終わらない（Codex レビュー 3 周目。`[[5,1],[5,1],[5,-2]]` で負が残っていた）。
+
+    `pinned` の欄（レッカー専用欄）は**ほかに置き場が無いときだけ**動かす。実機は
+    レッカー専用欄の税を費用行（`Expense.WageTax`）と同じにするので、ここを端数の
+    やり場に使うと、同じレッカー代の税が行と欄で 1 円違う .neo になる
+    （Codex レビュー 5 周目。ショートパーツ 105 ＋ レッカー 517 で 52 が 51 になっていた）。
+    """
+    out = [max(_t, 0) if _a > 0 else 0 for _a, _t in cols]
+    # 金額のある欄を先に、そのなかでは `pinned` 以外を先に、さらに金額の大きい順に。
+    # 「金額のある欄が先」を `pinned` より先に見るのが大事で、逆にすると
+    # レッカー代しか費用が無いときに端数が金額ゼロの欄に載る
+    order = sorted(range(len(cols)),
+                   key=lambda _i: (-(cols[_i][0] > 0), _i == pinned, -cols[_i][0], _i))
+    diff = tax_total - sum(out)
+    if diff < 0:
+        for _i in order:
+            if cols[_i][0] <= 0:
+                continue
+            take = min(out[_i], -diff)
+            out[_i] -= take
+            diff += take
+            if not diff:
+                break
+    if diff:
+        # 余ったぶん（と、どの欄でも引ききれなかったぶん）は金額のいちばん大きい欄へ
+        out[order[0]] += diff
+    return out
 
 
 def update_ansmb(db_bytes, items, short_parts_wage, expenses=None, is_tax_inclusive=False, is_beta_mode=False,
@@ -2078,29 +2124,31 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
             wages_tax_total += _tax_resid
         else:
             expenses_tax_total += _tax_resid
-    # 諸経費の内訳を部品側（ショートパーツ）と工賃側（レッカー・代車）に割る。
+    # 諸経費の内訳を、部品側（ショートパーツ）・レッカー専用欄・工賃側（代車ほか）に割る。
     # 足せば taxable_expenses / expenses_tax_total に戻る＝合計は変わらない。
-    _hy_p_out = sp_out
-    _hy_w_out = taxable_expenses - sp_out
-    _hy_p_tax = sp_tax_total if _hy_p_out > 0 else 0
-    _hy_w_tax = expenses_tax_total - _hy_p_tax
-    if _hy_w_out <= 0:
-        # 工賃側が空なら端数も部品側に寄せる（両方に分けると片方が
-        # 「金額ゼロなのに税だけある」欄になる）。
-        _hy_p_tax, _hy_w_tax = expenses_tax_total, 0
-    if _hy_p_out <= 0:
-        _hy_p_tax, _hy_w_tax = 0, expenses_tax_total
-    # expenses_tax_total には請求書単位のまとめ丸めの端数が寄せてあるため、
-    # 部品側の税をそのまま引くと工賃側が負になることがある
-    # （諸経費がいちばん大きい欄で、かつ端数がマイナスのとき）。
-    # 税額欄が負の見積書は帳票として成立しない。はみ出したぶんは
-    # もう一方の欄で吸収する。合計（_hy_p_tax + _hy_w_tax）は変えない。
-    if _hy_w_tax < 0:
-        _hy_p_tax += _hy_w_tax
-        _hy_w_tax = 0
-    if _hy_p_tax < 0:
-        _hy_w_tax += _hy_p_tax
-        _hy_p_tax = 0
+    #
+    # レッカー代は工賃側（hy_WageTaxTotal）ではなくレッカー専用欄（hy_Wrecker1）に入れる。
+    # 2026-09-28 にコグニセブン実機で確かめた（§13-13）: レッカー代１に 20,000 を
+    # 入れた .neo を開いて保存させると hy_Wrecker1OutTax=20000 / hy_WageTaxTotalOutTax=0
+    # に書き換わる。ショートパーツは hy_PartsTaxTotal、代車（自由行）は hy_WageTaxTotal の
+    # まま動かない。工賃側に入れたまま一覧から帳票を出すと、小計の工賃列が
+    # レッカー代を含んだ額で印字され、その下に「レッカー代１」がもう一度出るので、
+    # 紙の上で 小計＋レッカー代 ≠ 課税額計 になる（総額は合う）。
+    _hy_p_out   = sp_out
+    _hy_tow_out = tow_out
+    _hy_w_out   = taxable_expenses - sp_out - tow_out
+    _hy_p_tax   = sp_tax_total if _hy_p_out > 0 else 0
+    _hy_tow_tax = _round_tax10(tow_out, tax_round) if _hy_tow_out > 0 else 0
+    # 工賃側は「残り」にする（代車だけなら代車の自然な税になり、実機と一致する）。
+    # 端数のやり場は _split_expense_tax に任せる。ここで先に寄せると、
+    # レッカー欄の税が費用行（Expense.WageTax）と食い違う
+    # （Codex レビュー 4 周目: ショートパーツ 517 ＋ レッカー 105・代車なしで、行は 11・欄は 10 になっていた）
+    _hy_w_tax   = expenses_tax_total - _hy_p_tax - _hy_tow_tax
+    # 税額欄が負の見積書・金額ゼロなのに税だけある欄は帳票として成立しない。
+    # 3欄の税の和は expenses_tax_total のまま＝課税額計も消費税も総額も動かない（_split_expense_tax）
+    _hy_p_tax, _hy_tow_tax, _hy_w_tax = _split_expense_tax(
+        [(_hy_p_out, _hy_p_tax), (_hy_tow_out, _hy_tow_tax), (_hy_w_out, _hy_w_tax)],
+        expenses_tax_total, pinned=1)   # レッカー専用欄は費用行と同じ税のままにする
     grand_total       = sub_total + tax_total + tax_exempt  # 非課税は税計算後に加算
     cur.execute("""UPDATE Total SET
         ms_PartsTotalOutTax=?,
@@ -2149,8 +2197,9 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
     """, (
         total_parts, total_parts + parts_tax_total, parts_tax_total,
         total_wages, total_wages + wages_tax_total, wages_tax_total,
-        # 諸経費は部品側（ショートパーツ）と工賃側（レッカー・代車）に分かれる。
+        # 諸経費は部品側（ショートパーツ）と工賃側（代車ほかの自由行）に分かれる。
         # 実機もこの2欄を使い分けており、帳票の部品列・工賃列に別々に出る。
+        # レッカー代はここではなく下のレッカー専用欄に入る。
         # 分けても足せば元の taxable_expenses / expenses_tax_total に戻るので、
         # 課税額計も消費税も総額も1円も動かない。
         _hy_p_out, _hy_p_out + _hy_p_tax, _hy_p_tax,
@@ -2159,12 +2208,12 @@ def _update_ansmb_body(conn, _tmp_db_path, items, short_parts_wage, expenses,
         # 小計＋消費税が合計に届かず、帳票の検算が合わなくなる。
         0, 0, 0,
         tax_exempt, tax_exempt, 0,
-        # レッカー専用欄（hy_Wrecker1）は実機が一度も使っていない。
-        # 実機の .neo 202件はレッカー案件も含めてすべて 0 で、レッカー代は
-        # 費用行（LineNo=5 レッカー代１）か明細行に入っていた。
-        # 課税額計には入らない欄なので総額は変わらないが、専用欄を持つ
-        # 帳票を出したときに同じ金額が2か所に出る。実機に合わせて空にする。
-        0, 0, 0, 0,
+        # レッカー専用欄（hy_Wrecker1）に費用行 LineNo=5 の金額をそのまま入れる。
+        # 2026-09-28 にコグニセブン実機で確かめた（§13-13）。ここを 0 にしたまま
+        # レッカー代を工賃側に入れると、一覧から出した帳票の小計（工賃列）が
+        # レッカー代込みで印字され、その下の「レッカー代１」と二重に見える。
+        # TaxFlag は実機の保存後も 0 のまま（非課税レッカーはこのアプリでは扱わない）。
+        _hy_tow_out, _hy_tow_out + _hy_tow_tax, _hy_tow_tax, 0,
         tax_total,   tax_total,
         sub_total,   grand_total
     ))
@@ -3131,6 +3180,11 @@ def _summary_totals(ansmb_bytes):
     諸経費計には**非課税ぶんも入れる**。非課税は課税額計(SubTotal)には
     入らないが、この欄には入っていた（非課税のある実機 12 件すべてで
     ヘッダの値 = 課税諸経費 + 非課税 だった）。
+
+    レッカー専用欄（hy_Wrecker1/2）も諸経費計に足す。2026-09-28 に
+    コグニセブン実機で確かめた（§13-13）: レッカー代 105 円の .neo を
+    開いて保存させると hy_Wrecker1 に移るが、一覧に出る諸経費計は
+    3,155 のまま＝レッカー代を含んだ額だった。
     """
     tf = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
     try:
@@ -3142,6 +3196,7 @@ def _summary_totals(ansmb_bytes):
                 'SELECT ms_PartsTotalOutTax, ms_WageTotalOutTax, pn_TotalOutTax,'
                 ' hy_PartsTaxTotalOutTax, hy_WageTaxTotalOutTax,'
                 ' hy_PartsNoTaxTotalOutTax, hy_WageNoTaxTotalOutTax,'
+                ' hy_Wrecker1OutTax, hy_Wrecker2OutTax,'
                 ' Total FROM Total').fetchone()
         finally:
             conn.close()
@@ -3155,7 +3210,7 @@ def _summary_totals(ansmb_bytes):
     if not r:
         return None
     v = [safe_int(x) for x in r]
-    return [v[0], v[1], v[2], v[3] + v[4] + v[5] + v[6], v[7]]
+    return [v[0], v[1], v[2], v[3] + v[4] + v[5] + v[6] + v[7] + v[8], v[9]]
 
 
 def _neo_header_source(em_db_bytes):
@@ -5097,8 +5152,8 @@ TASK_PROMPTS["shaken_ocr"] = """<task_execution>
 - municipality: 使用者の住所（同上） → 市区町村
 - address_other: 使用者の住所（同上） → 町名・番地以降
 - car_reg_department: 自動車登録番号の地名部分（例: "北九州", "品川", "福岡"）
-- car_reg_division: 自動車登録番号の分類番号（例: "346"） → 半角数字で出力（コグニの NEO と同じ）
-- car_reg_business: 自動車登録番号のひらがな（例: "の"） → 全角ひらがなで出力
+- car_reg_division: 自動車登録番号の分類番号（例: "346"、"30A"） → 印字どおり半角で出力（数字。2018年以降の希望番号は下2桁が英字のことがある。英字は半角大文字。コグニの NEO と同じ）
+- car_reg_business: 自動車登録番号のひらがな（例: "の"） → 全角ひらがなで出力。Y・A ナンバー（駐留軍人等）でこの位置が英字のときは半角大文字 1 文字（例: "Y"）
 - car_reg_serial: 自動車登録番号の一連番号（例: "1224"） → 半角数字で出力（ハイフンや「・」は付けない）
 - car_serial_no: 車台番号（例: "AYH30-0145328"）
 - car_name: 車名（例: "トヨタ"）
@@ -5122,7 +5177,7 @@ TASK_PROMPTS["shaken_ocr"] = """<task_execution>
 - 読み取り不能な文字列は "" にする
 - 読み取り不能な数値は 0 にする
 - 和暦→西暦変換: 令和1=2019, 令和2=2020, ..., 令和7=2025, 令和8=2026, 令和9=2027 / 平成31=2019, 平成30=2018
-- 自動車登録番号は「地名 分類番号 ひらがな 一連番号」の4要素に正確に分割する
+- 自動車登録番号は「地名 分類番号 ひらがな 一連番号」の4要素に正確に分割する（かなの位置が英字の Y・A ナンバーは、その英字を半角大文字で car_reg_business に入れる）
 - 「自動車検査証記録事項」の場合、「1.基本情報」「2.所有者情報」「3.車両詳細情報」「4.備考」の各セクションを漏れなく読み取る
 
 <output_format>

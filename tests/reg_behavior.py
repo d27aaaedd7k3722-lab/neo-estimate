@@ -651,9 +651,9 @@ with section('PX'):
                                      0, {}, {'towing': 105}, False, False, False)[0]
         _cur = neogen.opendb(neogen.unpack(_neo)['AnSMB.txt']).cursor()
         _row = _cur.execute('select WageOutTax, WageTax, WageInTax from Expense where LineNo=5').fetchone()
-        # 費用行の税と、Total の工賃側の課税費用の税（hy_WageTaxTotalTax）が同じ端数処理で一致すること
-        # （アプリは hy_Wrecker1* を実機 202 本に合わせて 0 にしているので、そこは見ない）
-        _tot = _cur.execute('select hy_WageTaxTotalTax from Total').fetchone()[0]
+        # 費用行の税と、Total のレッカー専用欄の税（hy_Wrecker1Tax）が同じ端数処理で一致すること。
+        # レッカー代は工賃側ではなくこの欄に入る（2026-09-28 コグニ実機。引き継ぎ書 §13-13）
+        _tot = _cur.execute('select hy_Wrecker1Tax from Total').fetchone()[0]
         chk(tuple(_row) == (105, _want, 105 + _want) and _tot == _want,
             f'PX: {_mode} のテンプレートでレッカー 105 円の税が 費用行 {tuple(_row)}／Total {_tot}（コグニ実機は 税 {_want}・税込 {105 + _want}）')
 

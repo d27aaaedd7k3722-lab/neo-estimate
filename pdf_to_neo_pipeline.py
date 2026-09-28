@@ -1708,11 +1708,14 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                             "SELECT Total FROM Total").fetchone()
                         # 明細ぶんの総額（画面で足したレッカー代・代車・非課税の費用を除く）。見積書に印字された総額は
                         # 明細だけのものなので、これと比べる。以前は費用がある .neo では総額を比べておらず、値引きの読み落とし
-                        # などが「検証OK」で素通りしていた（バグハント 3 回目 O1）。費用が無ければ Total と同じ値になる
+                        # などが「検証OK」で素通りしていた（バグハント 3 回目 O1）。費用が無ければ Total と同じ値になる。
+                        # レッカー代はレッカー専用欄（hy_Wrecker1/2）に入るので、ここでも引く。引き忘れると
+                        # レッカー代のぶん明細の総額が大きくなり、正しい NEO が「総額不一致」で止まる（§13-13）
                         try:
                             _nt_items = conn3.execute(
                                 "SELECT SubTotal, hy_PartsTaxTotalOutTax, hy_WageTaxTotalOutTax,"
-                                " ms_PartsTotalInTax, ms_WageTotalInTax FROM Total").fetchone()
+                                " ms_PartsTotalInTax, ms_WageTotalInTax,"
+                                " hy_Wrecker1OutTax, hy_Wrecker2OutTax FROM Total").fetchone()
                         except sqlite3.Error:
                             _nt_items = None
                     finally:
@@ -1734,7 +1737,8 @@ def verify_neo_against_pdf(neo_bytes: bytes, items: List[Dict[str, Any]],
                         _neo_grand = _to_int(_nt[0])
                         if _nt_items is not None:
                             _s_items = (_to_int(_nt_items[0]) - _to_int(_nt_items[1])
-                                        - _to_int(_nt_items[2]))
+                                        - _to_int(_nt_items[2])
+                                        - _to_int(_nt_items[5]) - _to_int(_nt_items[6]))
                             if is_tax_inclusive:
                                 # 税込表記の明細: 税は「原本の税込 − 逆算した税抜」で書いてあるので、明細の税込の合計そのもの
                                 _items_grand = _to_int(_nt_items[3]) + _to_int(_nt_items[4])

@@ -57,7 +57,7 @@ INSURANCE_DOC_PROMPT = """<task_execution>
 - policy_no: 証券番号
 - coverage: 担保種目（対物・車両 など。金額や免責があれば「対物 無制限 免責0」のように続ける）
 - market_value: 時価額（数字だけ。カンマ・円は除く）
-- reg_no: 登録番号（「北九州 539 な 1031」のように 地名 分類番号 かな 一連番号 を半角スペース区切り）
+- reg_no: 登録番号（「北九州 539 な 1031」のように 地名 分類番号 かな 一連番号 を半角スペース区切り。かなの位置が英字の Y・A ナンバーは「横浜 34 Y 1234」のように半角大文字で。分類番号の英字〔30A〕も印字どおり）
 - car_name: 車名（メーカー名や型式が並んでいれば印字どおり）
 - model: 型式（例: 5BA-KSP210）
 - grade: グレード
@@ -372,6 +372,20 @@ _SERIAL_JUNK = re.compile(r'[\s\-‐‑‒–—―−ー・･.]')   # U+2012�
 # ※ 生成器（vendor estimate_to_neo）の登録番号の正規表現は数字 2〜3 桁しか受けないので、スキル経路では
 #    アルファベット入りの分類番号は空欄になる（files 側の残課題。ベタ打ち側は app._reg_no_part がそのまま書く）
 _REG_SPLIT = re.compile(r'^\s*(\S+?)\s*(\d[0-9A-Z]{0,2})\s*([ぁ-んア-ン])\s*([-‐‑‒–—―−ー・･.\s\d]+?)\s*$')   # 分類番号は旧式の 1 桁も（vendor の REG_NO_RE と同じ）
+# かなの位置に**半角英字 1 文字**が来る登録番号（Y・A ナンバー＝駐留軍人等。実機 17 本）。
+# 2026-09-28 亮平さん確認:「Y は、半角です」。全角に直さずそのまま書く。
+# ただし 2018 年〜の希望番号は分類番号の下 2 桁が英字（30A・3AC）なので、
+# 「品川 30A 1234」（かなを読み落とした形）と「品川 30 A 1234」（A ナンバー）は見分けがつかない。
+# **読み方が 1 通りに決まる形だけ**受ける:
+#   ・分類番号が 3 文字（'300Y'・'30AY' は 4 文字になるので、分類番号は前の 3 文字しかありえない）
+#   ・分類番号と英字のあいだに空白がある（車検証の 4 欄をつないだ形はいつもこれ）
+# どちらでもなければ読めなかったことにする（間違った分類番号を黙って書かない）。
+# 例: '品川 30A 1234' は「30A ＋ かな落ち」とも「30 ＋ かな A」とも読めるので受けない。
+#     '横浜34Y1234' も同じ（'34Y' が分類番号かもしれない）。'横浜 34 Y 1234' は空白があるので受ける
+# ※ 生成器（vendor estimate_to_neo.REG_NO_RE）はかなの位置に英字を受けないので、
+#    スキル経路の登録番号はこの形だと空欄のまま（ベタ打ち・車検証の 4 欄は入る）
+_REG_SPLIT_EN = re.compile(
+    r'^\s*(\S+?)\s*(?:(\d[0-9A-Z]{2})\s*|(\d[0-9A-Z]{0,2})\s+)([A-Za-z])\s*([-‐‑‒–—―−ー・･.\s\d]+?)\s*$')
 
 
 def _serial_clean(s) -> str:
@@ -380,13 +394,22 @@ def _serial_clean(s) -> str:
 
 
 def _split_reg(whole: str) -> tuple:
-    """'北九州 539 な 10-31' / '北九州539な・・12' → ('北九州', '539', 'な', '1031' / '12')。分けられなければ ('', '', '', '')"""
-    m = _REG_SPLIT.match(_nfkc(whole or ''))
+    """'北九州 539 な 10-31' / '北九州539な・・12' → ('北九州', '539', 'な', '1031' / '12')。分けられなければ ('', '', '', '')。
+    かなの位置が半角英字の Y・A ナンバー（'横浜 34 Y 12-34'）も読む（英字は半角のまま）"""
+    t = _nfkc(whole or '')
+    m = _REG_SPLIT.match(t)
+    if m:
+        dep, div, biz, ser_raw = m.group(1), m.group(2), kana_hira(m.group(3)), m.group(4)
+    else:
+        m = _REG_SPLIT_EN.match(t)
+        if not m:
+            return ('', '', '', '')
+        dep, div, biz, ser_raw = m.group(1), (m.group(2) or m.group(3)), m.group(4).upper(), m.group(5)
     # 地名に数字は入らない（品川・湘南・つくば・尾張小牧）。地名が空の「 300 あ 1234」を「3」「00」と割って読んでいた（第 4 弾 C8）
-    if not m or re.search(r'[0-9]', m.group(1)):
+    if re.search(r'[0-9]', dep):
         return ('', '', '', '')
-    ser = _serial_clean(m.group(4))
-    return (m.group(1), m.group(2), kana_hira(m.group(3)), ser) if 1 <= len(ser) <= 4 else ('', '', '', '')   # 一連番号は 4 桁まで
+    ser = _serial_clean(ser_raw)
+    return (dep, div, biz, ser) if 1 <= len(ser) <= 4 else ('', '', '', '')   # 一連番号は 4 桁まで
 
 
 def reg_tuple(vd: Optional[dict], doc: Optional[dict] = None) -> tuple:
